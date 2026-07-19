@@ -15,9 +15,11 @@ from matcha.dm_scene.cameras import GSCamera
 from PIL import Image
 import torch
 import matplotlib.pyplot as plt
+import json
 from utils.point_utils import depth_to_normal
 from utils.render_utils import save_img_f32, save_img_u8
 from utils.general_utils import seed_everything
+from matcha.see3d_geometry import build_render_support_mask, robust_align_inverse_depth
 
 def get_surf_cam_normal(view, depth):
     world_normal_map = depth_to_normal(view, depth)
@@ -31,13 +33,23 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument('--source_path', type=str)
     parser.add_argument("--see3d_stage", required=True, type=int)
+    parser.add_argument(
+        "--depthanythingv2_checkpoint_dir",
+        type=str,
+        default="./Depth-Anything-V2/checkpoints/",
+    )
+    parser.add_argument("--depthanything_encoder", type=str, default="vitl")
+    parser.add_argument("--inpaint_dir_name", type=str, default="select-gs-inpainted")
+    parser.add_argument("--support_mask_erosion", type=int, default=1)
+    parser.add_argument("--min_depth_fit_samples", type=int, default=512)
+    parser.add_argument("--max_depth_fit_relative_rmse", type=float, default=0.2)
     args = parser.parse_args()
 
     seed_everything()
 
     cur_see3d_root_dir = os.path.join(args.source_path, 'see3d_render', f'stage{args.see3d_stage}')
     warp_root_dir = os.path.join(cur_see3d_root_dir, 'select-gs')
-    inpaint_root_dir = os.path.join(cur_see3d_root_dir, 'select-gs-inpainted')
+    inpaint_root_dir = os.path.join(cur_see3d_root_dir, args.inpaint_dir_name)
     save_root_dir = os.path.join(cur_see3d_root_dir, 'select-gs-planes')                # save depth, normal and planes
     if os.path.exists(save_root_dir):
         shutil.rmtree(save_root_dir)
@@ -45,6 +57,7 @@ if __name__ == "__main__":
 
     device = 'cuda'
     visible_threshold = 0.9
+    alignment_diagnostics = []
 
     # Load See3D cameras
     see3d_cameras_path = os.path.join(cur_see3d_root_dir, f'stage{args.see3d_stage}_see3d_cameras.npz')
@@ -60,8 +73,8 @@ if __name__ == "__main__":
     # 2. depth and normal
     # generate mono depth by depth anything v2
     model = load_model(
-        checkpoint_dir='./Depth-Anything-V2/checkpoints/',
-        encoder='vitl',
+        checkpoint_dir=args.depthanythingv2_checkpoint_dir,
+        encoder=args.depthanything_encoder,
         device=device,
     )
     for i in range(n_views):
@@ -85,11 +98,30 @@ if __name__ == "__main__":
 
         alpha_path = os.path.join(warp_root_dir, f'alpha_{i:06d}.npy')
         alpha = torch.from_numpy(np.load(alpha_path)).to(device)
-        visible_mask = (alpha > visible_threshold)
+        visibility_path = os.path.join(warp_root_dir, f'mask_frame{i:06d}.png')
+        visibility = torch.from_numpy(
+            np.asarray(Image.open(visibility_path).convert('L')).copy()
+        ).to(device).float() / 255.0
+        visible_mask = build_render_support_mask(
+            alpha,
+            visibility,
+            warp_depth,
+            alpha_threshold=visible_threshold,
+            erosion_radius=args.support_mask_erosion,
+        )
         np.save(os.path.join(save_root_dir, f'visibility_frame{i:06d}.npy'), visible_mask.cpu().numpy())
         Image.fromarray((visible_mask.cpu().numpy() * 255.).astype(np.uint8)).save(os.path.join(save_root_dir, f'visibility_frame{i:06d}.png'))
 
-        aligned_depth = depth_linear_align(disp=mono_disp, render_depth=warp_depth, visible_mask=visible_mask)
+        aligned_depth, fit_diagnostics = robust_align_inverse_depth(
+            mono_disp,
+            warp_depth,
+            visible_mask,
+            min_samples=args.min_depth_fit_samples,
+            max_relative_rmse=args.max_depth_fit_relative_rmse,
+        )
+        frame_diagnostics = {"frame": i, **fit_diagnostics.to_dict()}
+        alignment_diagnostics.append(frame_diagnostics)
+        print(f"[Depth alignment] {frame_diagnostics}")
         surf_normal, surf_normal_cam = get_surf_cam_normal(see3d_gs_cameras_list[i], aligned_depth.unsqueeze(0))
         surf_normal = surf_normal.permute(1,2,0)
         surf_normal_cam = surf_normal_cam.permute(1,2,0)
@@ -117,5 +149,6 @@ if __name__ == "__main__":
 
         print(f'frame {i:06d} done!')
 
+    with open(os.path.join(save_root_dir, 'depth_alignment_diagnostics.json'), 'w') as file:
+        json.dump(alignment_diagnostics, file, indent=2)
     print('All frames done!')
-

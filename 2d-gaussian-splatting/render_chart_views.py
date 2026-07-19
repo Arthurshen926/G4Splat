@@ -1,10 +1,13 @@
 import torch
+import torch.nn.functional as F
 from scene.dataset_readers import load_cameras
 import os
 import sys
 sys.path.append(os.getcwd())
+import json
 import numpy as np
 import shutil
+from pathlib import Path
 from argparse import ArgumentParser
 from arguments import ModelParams
 
@@ -12,11 +15,56 @@ from utils.render_utils import save_img_f32, save_img_u8
 from utils.general_utils import safe_state
 from matcha.dm_scene.charts import load_charts_data, build_priors_from_charts_data, depths_to_points_parallel
 from matcha.dm_utils.rendering import depth2normal_parallel
+from matcha.cambridge_masks import CambridgeMaskLookup, stack_masks_for_image_names
+from matcha.cambridge_training import sanitize_chart_geometry
 from guidance.cam_utils import build_visibility_masks
 
 import cv2
 import matplotlib.pyplot as plt
 import trimesh
+
+
+def resolve_cambridge_mask_config(args):
+    if args.cambridge_mask_pickle:
+        return {
+            "mask_pickle": args.cambridge_mask_pickle,
+            "dataset_path": args.cambridge_mask_dataset_path or args.source_path,
+            "mask_indices": args.cambridge_geometry_mask_indices or [0, 1, 2],
+        }
+    manifest_path = Path(args.source_path).parent / "cambridge_g4_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    mask_root = Path(manifest["config"]["mask_root"])
+    scene = manifest["scene"]
+    return {
+        "mask_pickle": str(mask_root / scene / "processed" / "masks.pkl"),
+        "dataset_path": manifest["dense_dataset"],
+        "mask_indices": manifest["mask_policy"]["geometry_loss_indices"],
+    }
+
+
+def apply_geometry_mask_to_charts_data(charts_data, geometry_masks):
+    masked = dict(charts_data)
+    for key in ("confs", "depths", "prior_depths"):
+        if key in masked and tuple(masked[key].shape[-2:]) == tuple(geometry_masks.shape[-2:]):
+            masked[key] = masked[key] * geometry_masks.to(masked[key].dtype)
+    if "pts" in masked and tuple(masked["pts"].shape[1:3]) == tuple(geometry_masks.shape[-2:]):
+        masked["pts"] = masked["pts"] * geometry_masks[..., None].to(masked["pts"].dtype)
+    return masked
+
+
+def save_charts_data_atomic(path, charts_data):
+    path = Path(path)
+    temporary_path = path.with_name(path.stem + ".masked.tmp.npz")
+    np.savez(
+        temporary_path,
+        **{
+            key: value.detach().cpu().numpy() if torch.is_tensor(value) else value
+            for key, value in charts_data.items()
+        },
+    )
+    os.replace(temporary_path, path)
 
 def save_tensor_as_pcd(pcd, path, pcd_colors=None):
 
@@ -85,6 +133,11 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     parser.add_argument("--save_root_path", required=True, type=str)
+    parser.add_argument("--cambridge_mask_pickle", type=str, default=None)
+    parser.add_argument("--cambridge_mask_dataset_path", type=str, default=None)
+    parser.add_argument("--cambridge_geometry_mask_indices", nargs="*", type=int, default=None)
+    parser.add_argument("--max_chart_abs_depth", type=float, default=50.0)
+    parser.add_argument("--max_chart_abs_point", type=float, default=50.0)
     args = parser.parse_args()
 
     # Initialize system state (RNG)
@@ -101,6 +154,36 @@ if __name__ == "__main__":
     # vis charts data
     charts_data_path = os.path.join(args.source_path, 'charts_data.npz')
     charts_data = load_charts_data(charts_data_path)
+    mask_config = resolve_cambridge_mask_config(args)
+    original_geometry_masks = None
+    if mask_config is not None:
+        original_mask_lookup = CambridgeMaskLookup(
+            mask_config["dataset_path"],
+            mask_config["mask_pickle"],
+            mask_indices=mask_config["mask_indices"],
+        )
+        original_geometry_masks = stack_masks_for_image_names(
+            original_mask_lookup,
+            [view.image_name for view in train_viewpoints],
+            charts_data["depths"].shape[-2:],
+            charts_data["depths"].device,
+        )
+        charts_data = apply_geometry_mask_to_charts_data(
+            charts_data,
+            original_geometry_masks,
+        )
+    charts_data, chart_validity_masks = sanitize_chart_geometry(
+        charts_data,
+        max_abs_depth=args.max_chart_abs_depth,
+        max_abs_point=args.max_chart_abs_point,
+    )
+    save_charts_data_atomic(charts_data_path, charts_data)
+    print(
+        f"[INFO] Persisted chart validity mask into {charts_data_path}; "
+        f"kept {chart_validity_masks.float().mean().item() * 100:.2f}% of pixels "
+        f"(max_abs_depth={args.max_chart_abs_depth}, "
+        f"max_abs_point={args.max_chart_abs_point})."
+    )
     charts_priors = build_priors_from_charts_data(charts_data, train_viewpoints)
     charts_depths = charts_priors['depths']
     charts_depth_normals = get_surf_normal_parallel(train_viewpoints, charts_depths)            # normal from charts depth
@@ -108,6 +191,44 @@ if __name__ == "__main__":
     charts_confs = charts_priors['confs']
     charts_mono_normals = charts_priors['normals']                                              # normal from depth-anything-v2 (MAtCha use this as normal prior)
     charts_curvs = charts_priors['curvs']
+
+    geometry_masks = F.interpolate(
+        chart_validity_masks[:, None].float(),
+        size=charts_depths.shape[-2:],
+        mode="nearest",
+    )[:, 0] > 0.5
+    if mask_config is not None:
+        mask_lookup = CambridgeMaskLookup(
+            mask_config["dataset_path"],
+            mask_config["mask_pickle"],
+            mask_indices=mask_config["mask_indices"],
+        )
+        semantic_masks = stack_masks_for_image_names(
+            mask_lookup,
+            [view.image_name for view in train_viewpoints],
+            charts_depths.shape[-2:],
+            charts_depths.device,
+        )
+        geometry_masks &= semantic_masks
+        print(
+            f"[INFO] Cambridge plane-front-end mask keeps "
+            f"{geometry_masks.float().mean().item() * 100:.2f}% of chart pixels; "
+            f"indices={mask_config['mask_indices']}."
+        )
+    charts_depths = torch.where(
+        geometry_masks[:, None], charts_depths, torch.zeros_like(charts_depths)
+    )
+    charts_prior_depths = torch.where(
+        geometry_masks[:, None], charts_prior_depths, torch.zeros_like(charts_prior_depths)
+    )
+    charts_confs = charts_confs * geometry_masks[:, None].to(charts_confs.dtype)
+    charts_depth_normals = charts_depth_normals * geometry_masks[:, None].to(
+        charts_depth_normals.dtype
+    )
+    charts_mono_normals = charts_mono_normals * geometry_masks[:, None].to(
+        charts_mono_normals.dtype
+    )
+    charts_curvs = charts_curvs * geometry_masks[:, None].to(charts_curvs.dtype)
 
     # # linear alignment prior pcds
     # charts_prior_pcds = depths_to_points_parallel(charts_prior_depths, train_viewpoints)
@@ -118,7 +239,21 @@ if __name__ == "__main__":
     charts_points = depths_to_points_parallel(charts_depths, train_viewpoints)
 
     # save charts pcd
-    save_tensor_as_pcd(charts_points.reshape(-1, 3), os.path.join(args.source_path, 'chart_pcd.ply'))
+    charts_points_spatial = charts_points.reshape(
+        charts_depths.shape[0],
+        charts_depths.shape[-2],
+        charts_depths.shape[-1],
+        3,
+    )
+    chart_point_mask = torch.isfinite(charts_points_spatial).all(dim=-1) & (
+        charts_depths[:, 0] > 0
+    )
+    if geometry_masks is not None:
+        chart_point_mask &= geometry_masks
+    save_tensor_as_pcd(
+        charts_points_spatial[chart_point_mask],
+        os.path.join(args.source_path, 'chart_pcd.ply'),
+    )
 
     for idx in range(len(train_viewpoints)):
         vis_charts_conf = charts_confs[idx][0].detach().cpu().numpy()
@@ -166,17 +301,34 @@ if __name__ == "__main__":
         plt.imsave(os.path.join(train_save_root_path, f'curv_frame{idx:06d}.png'), vis_charts_curv, cmap='viridis')
 
     visibility_times_masks = build_visibility_masks(train_viewpoints, charts_depths, charts_points, mast3r_matching=None, return_origin_masks=True)
+    if geometry_masks is not None:
+        visibility_times_masks = [
+            visibility * geometry_masks[index][None].to(visibility.dtype)
+            for index, visibility in enumerate(visibility_times_masks)
+        ]
     vis_points = []
     for idx in range(len(visibility_times_masks)):
-        rgb_name = train_viewpoints[idx].image_name
-        rgb_path = os.path.join(args.source_path, f'images/{rgb_name}.png')
         dst_rgb_path = os.path.join(train_save_root_path, f'rgb_frame{idx:06d}.png')
-        shutil.copy(rgb_path, dst_rgb_path)
-
-        rgb_image = cv2.imread(rgb_path)
-        rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+        rgb_image = (
+            train_viewpoints[idx].original_image
+            .permute(1, 2, 0)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        save_img_u8(rgb_image, dst_rgb_path)
         match_mask = visibility_times_masks[idx][0].detach().cpu().numpy()
         np.save(os.path.join(train_save_root_path, f'visibility_frame{idx:06d}.npy'), match_mask)
+        if geometry_masks is not None:
+            semantic_keep = geometry_masks[idx].detach().cpu().numpy().astype(np.uint8)
+            np.save(
+                os.path.join(train_save_root_path, f'semantic_keep_frame{idx:06d}.npy'),
+                semantic_keep,
+            )
+            cv2.imwrite(
+                os.path.join(train_save_root_path, f'semantic_keep_frame{idx:06d}.png'),
+                semantic_keep * 255,
+            )
         blended = create_vis_frequency_heatmap(rgb_image, match_mask)
         cv2.imwrite(os.path.join(train_save_root_path, f'visibility_frame{idx:06d}.png'), cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
 
@@ -212,6 +364,14 @@ if __name__ == "__main__":
         # visibility
         shutil.copy(os.path.join(train_save_root_path, f'visibility_frame{idx:06d}.npy'), os.path.join(args.save_root_path, f'visibility_frame{idx:06d}.npy'))
         shutil.copy(os.path.join(train_save_root_path, f'visibility_frame{idx:06d}.png'), os.path.join(args.save_root_path, f'visibility_frame{idx:06d}.png'))
+        if geometry_masks is not None:
+            shutil.copy(
+                os.path.join(train_save_root_path, f'semantic_keep_frame{idx:06d}.npy'),
+                os.path.join(args.save_root_path, f'semantic_keep_frame{idx:06d}.npy'),
+            )
+            shutil.copy(
+                os.path.join(train_save_root_path, f'semantic_keep_frame{idx:06d}.png'),
+                os.path.join(args.save_root_path, f'semantic_keep_frame{idx:06d}.png'),
+            )
 
     print(f'Train views render done!')
-

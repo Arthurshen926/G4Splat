@@ -10,7 +10,7 @@ from arguments import ModelParams
 from scene.dataset_readers import load_cameras
 from utils.general_utils import safe_state
 from guidance.cam_utils import get_covisible_points, project_points_to_image
-from guidance.cam_utils import get_pixel_to_points_tensor, get_visible_points_mask
+from guidance.cam_utils import get_visible_points_mask
 import trimesh
 from PIL import Image
 import json
@@ -89,10 +89,128 @@ def vis_plane_mask_1(plane_mask, plane_id, rgb_path, save_path, transparency=0.6
     blended_image = Image.fromarray(blended.astype(np.uint8))
     blended_image.save(save_path)
 
+def get_plane_point_indices_chunked(
+    camera,
+    points,
+    plane_mask,
+    plane_ids=None,
+    depth_thresh=0.01,
+    chunk_size=262_144,
+):
+    """Project a large point cloud without an H x W x points-per-pixel tensor."""
+    if tuple(plane_mask.shape) != (camera.image_height, camera.image_width):
+        raise ValueError(
+            "Plane mask/camera resolution mismatch: "
+            f"mask={tuple(plane_mask.shape)}, "
+            f"camera={(camera.image_height, camera.image_width)}."
+        )
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    height, width = plane_mask.shape
+    device = points.device
+    min_depth = torch.full(
+        (height * width,),
+        torch.inf,
+        dtype=points.dtype,
+        device=device,
+    )
+
+    # First pass computes the true front depth for every pixel. The original
+    # dense implementation capped each pixel at 500 unsorted points and could
+    # both OOM and miss the closest point in heavily overlapping pointmaps.
+    for start in range(0, points.shape[0], chunk_size):
+        stop = min(start + chunk_size, points.shape[0])
+        depths, points_2d, in_image = project_points_to_image(
+            camera,
+            points[start:stop],
+        )
+        valid = in_image & (depths > 0) & torch.isfinite(depths)
+        if not torch.any(valid):
+            continue
+        coords = torch.round(points_2d[valid]).long()
+        coords[:, 0].clamp_(0, width - 1)
+        coords[:, 1].clamp_(0, height - 1)
+        pixels = coords[:, 1] * width + coords[:, 0]
+        min_depth.scatter_reduce_(
+            0,
+            pixels,
+            depths[valid],
+            reduce="amin",
+            include_self=True,
+        )
+
+    requested_ids = None
+    requested_tensor = None
+    if plane_ids is not None:
+        requested_ids = {int(plane_id) for plane_id in plane_ids if int(plane_id) != 0}
+        requested_tensor = torch.tensor(
+            sorted(requested_ids),
+            dtype=plane_mask.dtype,
+            device=device,
+        )
+    collected = {}
+    plane_mask_flat = plane_mask.reshape(-1)
+
+    # Second pass keeps points on a labelled plane and within the same absolute
+    # front-surface threshold used by get_pixel_to_points_tensor.
+    for start in range(0, points.shape[0], chunk_size):
+        stop = min(start + chunk_size, points.shape[0])
+        depths, points_2d, in_image = project_points_to_image(
+            camera,
+            points[start:stop],
+        )
+        valid = in_image & (depths > 0) & torch.isfinite(depths)
+        if not torch.any(valid):
+            continue
+
+        local_indices = torch.nonzero(valid).squeeze(-1)
+        coords = torch.round(points_2d[valid]).long()
+        coords[:, 0].clamp_(0, width - 1)
+        coords[:, 1].clamp_(0, height - 1)
+        pixels = coords[:, 1] * width + coords[:, 0]
+        labels = plane_mask_flat[pixels]
+        near_surface = depths[valid] < (min_depth[pixels] + depth_thresh)
+        keep = near_surface & (labels != 0)
+        if requested_tensor is not None and keep.any():
+            keep &= torch.isin(labels, requested_tensor)
+        if not torch.any(keep):
+            continue
+
+        kept_labels = labels[keep]
+        point_indices = local_indices[keep] + start
+        for plane_id in torch.unique(kept_labels).tolist():
+            collected.setdefault(int(plane_id), []).append(
+                point_indices[kept_labels == plane_id]
+            )
+
+    result = {}
+    output_ids = requested_ids if requested_ids is not None else collected.keys()
+    for plane_id in output_ids:
+        chunks = collected.get(int(plane_id), [])
+        result[int(plane_id)] = (
+            torch.unique(torch.cat(chunks))
+            if chunks
+            else torch.empty(0, dtype=torch.long, device=device)
+        )
+    return result
+
+
 def get_plane_pnts_idx_from_mask(pixel_pnts_map, plane_mask, plane_id):
     """
     Get plane pnts from plane mask
     """
+    if isinstance(pixel_pnts_map, dict):
+        return pixel_pnts_map.get(
+            int(plane_id),
+            torch.empty(0, dtype=torch.long, device=plane_mask.device),
+        )
+    if pixel_pnts_map.shape[:2] != plane_mask.shape:
+        raise ValueError(
+            "Plane mask/camera resolution mismatch: "
+            f"mask={tuple(plane_mask.shape)}, points={tuple(pixel_pnts_map.shape[:2])}. "
+            "Pass the same --resolution used by render_chart_views.py to plane_refine_depth.py."
+        )
     obj_mask_map = (plane_mask == plane_id)
     plane_pnts_idx_temp = pixel_pnts_map[obj_mask_map]
     plane_pnts_idx = plane_pnts_idx_temp.unique()                   # get unique plane pnts index
@@ -104,6 +222,8 @@ def get_covisibility_rate(plane_pnts_idx_1, plane_pnts_idx_2):
     """
     Get covisibility rate between two plane pnts
     """
+    if plane_pnts_idx_1.numel() == 0 or plane_pnts_idx_2.numel() == 0:
+        return 0.0
     covisible_idx = torch_intersect1d(plane_pnts_idx_1, plane_pnts_idx_2, assume_unique=True)
     
     ratio_1 = covisible_idx.shape[0] / plane_pnts_idx_1.shape[0]
@@ -186,6 +306,9 @@ def final_merge_global_3Dplane(global_3Dplane_pnts_idx, global_3Dplane_ID_dict, 
         # Current plane's point indices and ID information
         current_plane_pnts_idx = global_3Dplane_pnts_idx[i]
         current_plane_ids = global_3Dplane_ID_dict[i].copy()
+        if current_plane_pnts_idx is None or current_plane_pnts_idx.numel() == 0:
+            merged[i] = True
+            continue
         
         # Check if other planes can be merged with current plane
         for j in range(i + 1, len(global_3Dplane_pnts_idx)):
@@ -216,19 +339,35 @@ def get_global_3Dplane(cameras, points, plane_masks, previous_global_3Dplane_ID_
 
     if previous_global_3Dplane_ID_dict is None:
         cur_view_id = 0
-        pixel_pnts_map = get_pixel_to_points_tensor(cameras[cur_view_id], points)
         plane_mask = plane_masks[cur_view_id]
+        pixel_pnts_map = get_plane_point_indices_chunked(
+            cameras[cur_view_id],
+            points,
+            plane_mask,
+        )
         global_3Dplane_pnts_idx, global_3Dplane_ID_dict = get_init_global_3Dplane(pixel_pnts_map, plane_mask, cur_view_id)
     else:
         cur_view_id = 0
         global_3Dplane_ID_dict = previous_global_3Dplane_ID_dict
+        required_plane_ids = {}
         for global_3Dplane_id, local_3Dplane_id_list in global_3Dplane_ID_dict.items():
             for view_id, plane_id in local_3Dplane_id_list:
                 cur_view_id = max(cur_view_id, view_id)
+                required_plane_ids.setdefault(view_id, set()).add(plane_id)
 
         pixel_pnts_map_list = []
         for view_id in range(cur_view_id+1):
-            pixel_pnts_map = get_pixel_to_points_tensor(cameras[view_id], points)
+            view_plane_ids = required_plane_ids.get(view_id)
+            pixel_pnts_map = (
+                get_plane_point_indices_chunked(
+                    cameras[view_id],
+                    points,
+                    plane_masks[view_id],
+                    plane_ids=view_plane_ids,
+                )
+                if view_plane_ids
+                else {}
+            )
             pixel_pnts_map_list.append(pixel_pnts_map)
         
         global_3Dplane_pnts_idx = []
@@ -244,8 +383,12 @@ def get_global_3Dplane(cameras, points, plane_masks, previous_global_3Dplane_ID_
 
     for view_id in range(cur_view_id+1, len(cameras)):
 
-        pixel_pnts_map = get_pixel_to_points_tensor(cameras[view_id], points)
         plane_mask = plane_masks[view_id]
+        pixel_pnts_map = get_plane_point_indices_chunked(
+            cameras[view_id],
+            points,
+            plane_mask,
+        )
         global_3Dplane_pnts_idx, global_3Dplane_ID_dict = update_global_3Dplane(global_3Dplane_pnts_idx, global_3Dplane_ID_dict, pixel_pnts_map, plane_mask, view_id)
     
     global_3Dplane_pnts_idx, global_3Dplane_ID_dict = final_merge_global_3Dplane(global_3Dplane_pnts_idx, global_3Dplane_ID_dict)
@@ -372,8 +515,12 @@ if __name__ == "__main__":
         local_save_root_path = os.path.join(vis_root_path, 'check_local_plane_pnts')
         os.makedirs(local_save_root_path, exist_ok=True)
         for idx in range(len(train_viewpoints)):
-            pixel_pnts_map = get_pixel_to_points_tensor(train_viewpoints[idx], pnts)
             plane_mask = plane_masks[idx]
+            pixel_pnts_map = get_plane_point_indices_chunked(
+                train_viewpoints[idx],
+                pnts,
+                plane_mask,
+            )
             plane_id_list = torch.unique(plane_mask)
             for plane_id in plane_id_list:
                 if plane_id == 0:
@@ -390,5 +537,3 @@ if __name__ == "__main__":
                 print(f'plane{plane_id} mask saved')
 
         print('local plane pnts saved over')
-
-

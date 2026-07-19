@@ -182,12 +182,26 @@ def get_gaussian_parameters_from_charts_data(
         conf_th = 0.1
     
     print("Conf Max/min: ", charts_confs.max(), charts_confs.min())
+
+    valid_masks = charts_confs > conf_th
+    active_charts = valid_masks.reshape(valid_masks.shape[0], -1).sum(dim=1) >= 3
+    if not active_charts.all():
+        kept_indices = active_charts.nonzero(as_tuple=False).flatten().tolist()
+        print(
+            f"[INFO] Dropping {len(active_charts) - len(kept_indices)} charts with "
+            f"no usable geometry before mesh construction; keeping {len(kept_indices)}."
+        )
+        if not kept_indices:
+            raise RuntimeError("No chart has enough valid geometry for Gaussian initialization")
+        charts_pts = charts_pts[active_charts]
+        charts_confs = charts_confs[active_charts]
+        images = [images[index] for index in kept_indices]
     
     # Get manifold mesh and remove faces with low confidence if needed
     manifold = get_manifold_meshes_from_pointmaps(
         points3d=charts_pts,
         imgs=images, 
-        masks=charts_confs > conf_th,  
+        masks=charts_confs > conf_th,
         return_single_mesh_object=True
     )
     
@@ -229,11 +243,21 @@ def get_gaussian_parameters_from_pa_data(
 ):
     """Get gaussian parameters from pa data."""
 
-    # NOTE: pa_conf temp
-    pa_conf = torch.ones((pa_points.shape[0], pa_points.shape[1], 1), device=pa_points.device, dtype=torch.float32)
+    pa_conf = torch.ones(pa_points.shape[:-1], device=pa_points.device, dtype=torch.float32)
 
     if visibility_masks is not None:
-        visibility_masks = torch.cat(visibility_masks, dim=0)
+        if isinstance(visibility_masks, (list, tuple)):
+            visibility_masks = torch.stack(
+                [mask.squeeze().to(device=pa_points.device, dtype=torch.bool) for mask in visibility_masks],
+                dim=0,
+            )
+        else:
+            visibility_masks = visibility_masks.to(device=pa_points.device, dtype=torch.bool)
+        if visibility_masks.shape != pa_conf.shape:
+            raise RuntimeError(
+                f"Visibility mask shape {tuple(visibility_masks.shape)} does not match "
+                f"plane point shape {tuple(pa_conf.shape)}"
+            )
         pa_conf = pa_conf * visibility_masks
         conf_th = 0.1
     
@@ -243,8 +267,7 @@ def get_gaussian_parameters_from_pa_data(
     manifold = get_manifold_meshes_from_pointmaps(
         points3d=pa_points,
         imgs=images, 
-        # masks=pa_conf > conf_th,  
-        masks=None,
+        masks=pa_conf > conf_th,
         return_single_mesh_object=True
     )
     

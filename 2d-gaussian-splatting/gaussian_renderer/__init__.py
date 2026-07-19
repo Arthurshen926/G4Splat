@@ -16,7 +16,15 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    rgb_only: bool = False,
+):
     """
     Render the scene. 
     
@@ -113,6 +121,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
     }
 
+    # Full-train RGB evaluation can contain thousands of cameras.  It has no
+    # consumer for alpha, depth, or normals, and deriving those maps adds both
+    # per-view work and (in the legacy extractor) a large host-memory cache.
+    # Keep the default untouched for training and geometry callers; the
+    # explicit RGB-only path is an inference/export optimisation only.
+    if rgb_only:
+        return rets
+
 
     # additional regularizations
     render_alpha = allmap[1:2]
@@ -161,6 +177,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_normal': surf_normal,
             'surf_normal_cam': surf_normal_cam,
             'rend_depth': render_depth_expected,
+            # Expected-vs-median disagreement is an audit-only indicator of
+            # multi-layer / semi-transparent ray ambiguity.  It is exposed
+            # separately so downstream causal repair never mistakes its own
+            # rendered depth for independent surface evidence.
+            'rend_depth_median': render_depth_median,
     })
 
     return rets
@@ -349,6 +370,7 @@ def render_gslist(viewpoint_camera, pc_list, pipe, bg_color : torch.Tensor, scal
         'surf_depth': surf_depth,
         'surf_normal': surf_normal,
         'rend_depth': render_depth_expected,
+        'rend_depth_median': render_depth_median,
     })
     
     # Add extra field to store starting index for each point cloud, for subsequent loss calculations

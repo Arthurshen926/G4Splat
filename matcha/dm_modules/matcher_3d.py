@@ -9,6 +9,7 @@ def get_points_depth_in_depthmap_parallel(
     cameras:CamerasWrapper,
     padding_mode='zeros',  # 'reflection', 'border'
     znear=1e-6,
+    chunk_size=None,
 ):
     """_summary_
 
@@ -21,6 +22,24 @@ def get_points_depth_in_depthmap_parallel(
         _type_: _description_
     """
     n_depths, image_height, image_width = depthmap.shape[:3]
+    n_points = pts.shape[1]
+
+    if chunk_size is not None and chunk_size > 0 and n_points > chunk_size:
+        map_z = depthmap.new_empty((n_depths, n_points))
+        fov_mask = torch.empty((n_depths, n_points), dtype=torch.bool, device=pts.device)
+        for start in range(0, n_points, chunk_size):
+            end = min(start + chunk_size, n_points)
+            map_z_chunk, fov_mask_chunk = get_points_depth_in_depthmap_parallel(
+                pts=pts[:, start:end],
+                depthmap=depthmap,
+                cameras=cameras,
+                padding_mode=padding_mode,
+                znear=znear,
+                chunk_size=None,
+            )
+            map_z[:, start:end] = map_z_chunk
+            fov_mask[:, start:end] = fov_mask_chunk
+        return map_z, fov_mask
 
     pts_projections = cameras.transform_points_world_to_view(pts)  # (n_depths, N, 3)
     fov_mask = pts_projections[..., 2] > 0.  # (n_depths, N)
@@ -62,6 +81,8 @@ class Matcher3D:
         cameras:CamerasWrapper,
         reference_pts:torch.Tensor=None, 
         reference_depths:torch.Tensor=None,
+        reference_masks:torch.Tensor=None,
+        projection_chunk_size:int=262_144,
     ):
         """_summary_
 
@@ -73,6 +94,8 @@ class Matcher3D:
         """
         self.cameras = cameras
         self.znear = 1e-6
+        self.projection_chunk_size = projection_chunk_size
+        self.reference_masks = reference_masks
         self.update_references(reference_pts, reference_depths)
         
     @torch.no_grad()
@@ -110,33 +133,44 @@ class Matcher3D:
             raise NotImplementedError("Normal threshold not implemented yet.")
         
         n_pts_per_chart = self.height * self.width
-        points_to_match = self.reference_pts.view(1, -1, 3)  # (1, n_charts * n_pts_per_chart, 3)
-        points_to_match = points_to_match.repeat(self.n_charts, 1, 1)  # (n_charts, n_charts * n_pts_per_chart, 3)
-        
-        # For each camera, get the depth of all points in the camera's view
-        true_depth = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(points_to_match)[..., 2]  # (n_charts, n_charts * n_pts_per_chart)
-        
-        # For each camera, get the depth of the projections of all points in the camera's depth map
-        projected_depths, fov_mask = get_points_depth_in_depthmap_parallel(
-            pts=points_to_match,  # (n_charts, n_charts * n_pts_per_chart, 3)
-            depthmap=self.reference_depths,  # (n_charts, height, width)
-            cameras=self.cameras,
-            padding_mode='zeros',  # 'reflection', 'border'
-            znear=self.znear,
-        )  # (n_charts, n_charts * n_pts_per_chart)
-        
-        # A point is considered a match if the difference between the true depth and the projected depth is low
-        depth_errors = (true_depth - projected_depths).abs()
-        depth_errors[~fov_mask] = 1e8
+        all_points_to_match = self.reference_pts.view(-1, 3)  # (n_charts * n_pts_per_chart, 3)
+        n_total_points = all_points_to_match.shape[0]
+        chunk_size = self.projection_chunk_size or n_total_points
+        depth_errors = self.reference_depths.new_empty((self.n_charts, n_total_points))
+
+        for start in range(0, n_total_points, chunk_size):
+            end = min(start + chunk_size, n_total_points)
+            points_to_match = all_points_to_match[start:end][None].expand(self.n_charts, -1, -1)
+
+            # For each camera, get the depth of all points in the camera's view
+            true_depth = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(points_to_match)[..., 2]
+
+            # For each camera, get the depth of the projections of all points in the camera's depth map
+            projected_depths, fov_mask = get_points_depth_in_depthmap_parallel(
+                pts=points_to_match,
+                depthmap=self.reference_depths,
+                cameras=self.cameras,
+                padding_mode='zeros',
+                znear=self.znear,
+                chunk_size=None,
+            )
+
+            depth_errors_chunk = (true_depth - projected_depths).abs()
+            depth_errors_chunk[~fov_mask] = 1e8
+            depth_errors[:, start:end] = depth_errors_chunk
+
         depth_errors = depth_errors.view(self.n_charts, self.n_charts, self.height, self.width)
         
         self.reference_errors = depth_errors
         self.reference_matches = depth_errors < matching_thr
+        if self.reference_masks is not None:
+            self.reference_matches &= self.reference_masks.to(dtype=torch.bool)[None]
     
     def compute_reprojection_errors(
         self, 
         depths=None,
         points=None,
+        source_stride: int = 1,
     ):
         """_summary_
 
@@ -162,26 +196,62 @@ class Matcher3D:
             depths_to_match = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(
                 points
             )[..., 2]  # (n_charts, height, width)
+
+        source_stride = max(int(source_stride), 1)
+        if points_to_match.ndim == 3:
+            expected_points = self.height * self.width
+            if points_to_match.shape[1] != expected_points:
+                raise RuntimeError(
+                    "Unexpected flattened point layout: "
+                    f"{tuple(points_to_match.shape)} for {self.height}x{self.width}"
+                )
+            points_to_match = points_to_match.reshape(
+                self.n_charts, self.height, self.width, 3
+            )
+        elif points_to_match.ndim != 4:
+            raise RuntimeError(
+                f"Unexpected point layout: {tuple(points_to_match.shape)}"
+            )
+        if source_stride > 1:
+            # The target depth maps stay at full resolution.  Only the source
+            # pixels contributing to the pairwise matching loss are sampled,
+            # which avoids materialising an O(N^2 H W) autograd graph for
+            # redundant chart sets while preserving cross-view constraints.
+            points_to_match = points_to_match[:, ::source_stride, ::source_stride]
+        source_height, source_width = points_to_match.shape[1:3]
         
-        n_pts_per_chart = self.height * self.width
-        points_to_match = points_to_match.view(1, -1, 3)  # (1, n_charts * n_pts_per_chart, 3)
-        points_to_match = points_to_match.repeat(self.n_charts, 1, 1)  # (n_charts, n_charts * n_pts_per_chart, 3)
-        
-        # For each camera, get the depth of all points in the camera's view
-        true_depth = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(points_to_match)[..., 2]  # (n_charts, n_charts * n_pts_per_chart)
-        
-        # For each camera, get the depth of the projections of all points in the camera's depth map
-        projected_depths, fov_mask = get_points_depth_in_depthmap_parallel(
-            pts=points_to_match,  # (n_charts, n_charts * n_pts_per_chart, 3)
-            depthmap=depths_to_match,  # (n_charts, height, width)
-            cameras=self.cameras,
-            padding_mode='zeros',  # 'reflection', 'border'
-            znear=self.znear,
-        )  # (n_charts, n_charts * n_pts_per_chart)
-        
-        # A point is considered a match if the difference between the true depth and the projected depth is low
-        depth_errors = (true_depth - projected_depths).abs().nan_to_num()
+        n_pts_per_chart = source_height * source_width
+        all_points_to_match = points_to_match.reshape(-1, 3)  # (n_charts * n_pts_per_chart, 3)
+        n_total_points = all_points_to_match.shape[0]
+        chunk_size = self.projection_chunk_size or n_total_points
+        depth_errors = depths_to_match.new_empty((self.n_charts, n_total_points))
+        fov_mask = torch.empty((self.n_charts, n_total_points), dtype=torch.bool, device=depths_to_match.device)
+
+        for start in range(0, n_total_points, chunk_size):
+            end = min(start + chunk_size, n_total_points)
+            points_to_match_chunk = all_points_to_match[start:end][None].expand(self.n_charts, -1, -1)
+
+            # For each camera, get the depth of all points in the camera's view
+            true_depth = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(points_to_match_chunk)[..., 2]
+
+            # For each camera, get the depth of the projections of all points in the camera's depth map
+            projected_depths_chunk, fov_mask_chunk = get_points_depth_in_depthmap_parallel(
+                pts=points_to_match_chunk,
+                depthmap=depths_to_match,
+                cameras=self.cameras,
+                padding_mode='zeros',
+                znear=self.znear,
+                chunk_size=None,
+            )
+
+            depth_errors[:, start:end] = (true_depth - projected_depths_chunk).abs().nan_to_num()
+            fov_mask[:, start:end] = fov_mask_chunk
+
         # depth_errors[~fov_mask] = 1e8
-        depth_errors = depth_errors.view(self.n_charts, self.n_charts, self.height, self.width)
-        fov_mask = fov_mask.view(self.n_charts, self.n_charts, self.height, self.width)
+        depth_errors = depth_errors.view(
+            self.n_charts, self.n_charts, source_height, source_width
+        )
+        fov_mask = fov_mask.view(
+            self.n_charts, self.n_charts, source_height, source_width
+        )
         return depth_errors, fov_mask

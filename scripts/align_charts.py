@@ -9,6 +9,7 @@ import yaml
 from matcha.pointmap.depthanythingv2 import get_pointmap_from_mast3r_scene_with_depthanything
 from matcha.dm_scene.cameras import CamerasWrapper, rescale_cameras, create_gs_cameras_from_pointmap
 from matcha.dm_trainers.charts_alignment import align_charts_in_parallel
+from matcha.cambridge_masks import CambridgeMaskLookup, combine_optional_masks, stack_masks_for_image_names
 
 from rich.console import Console
 
@@ -33,6 +34,9 @@ if __name__ == '__main__':
     
     # Config
     parser.add_argument('-c', '--config', type=str, default='default')
+    parser.add_argument("--cambridge_mask_pickle", type=str, default=None)
+    parser.add_argument("--cambridge_mask_dataset_path", type=str, default=None)
+    parser.add_argument("--cambridge_mask_indices", nargs="*", type=int, default=None)
     
     args = parser.parse_args()
     
@@ -109,6 +113,29 @@ if __name__ == '__main__':
     else:
         mast3r_masks = None
         CONSOLE.print("[INFO] All MASt3R-SfM points will be used for charts alignment.")
+    cambridge_masks = None
+    if args.cambridge_mask_pickle is not None:
+        cambridge_mask_dataset_path = args.cambridge_mask_dataset_path or args.source_path
+        cambridge_mask_indices = args.cambridge_mask_indices or [0, 1, 2]
+        cambridge_mask_lookup = CambridgeMaskLookup(
+            cambridge_mask_dataset_path,
+            args.cambridge_mask_pickle,
+            mask_indices=cambridge_mask_indices,
+        )
+        cambridge_masks = stack_masks_for_image_names(
+            cambridge_mask_lookup,
+            [camera.image_name for camera in _pointmap_cameras.gs_cameras],
+            mast3r_pm.confidence.shape[-2:],
+            device,
+        )
+        CONSOLE.print(
+            f"[INFO] Cambridge alignment mask keeps {cambridge_masks.float().mean().item() * 100:.2f}% "
+            f"of chart pixels with indices {cambridge_mask_indices}."
+        )
+
+    alignment_masks = combine_optional_masks(mast3r_masks, cambridge_masks)
+    if alignment_masks is not None:
+        CONSOLE.print(f"[INFO] Combined alignment mask keeps {alignment_masks.float().mean().item() * 100:.2f}% of chart pixels.")
     
     # Align the charts
     output = align_charts_in_parallel(
@@ -116,7 +143,7 @@ if __name__ == '__main__':
         scene_pm,
         # Data parameters
         reference_data,
-        masks=mast3r_masks,
+        masks=alignment_masks,
         rendering_size=pm_config['max_img_size'],
         target_scale=scene_config['target_scale'],
         verbose=True,

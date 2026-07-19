@@ -1,0 +1,4 @@
+# Reproducible single-view causal smoke test on a real StMarysChurch train
+# image.  It remains part of the 1,487-image reconstruction supervision set;
+# this file is a diagnostic target list, never a validation split.
+seq12/frame00097.png

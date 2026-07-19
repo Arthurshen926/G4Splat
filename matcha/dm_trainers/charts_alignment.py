@@ -14,6 +14,87 @@ from matcha.dm_scene.cameras import CamerasWrapper, create_gs_cameras_from_point
 from matcha.pointmap.mast3r import load_mast3r_matches
 
 
+def restore_unaligned_geometry(
+    output_verts,
+    output_depths,
+    output_confs,
+    initial_verts,
+    initial_depths,
+    masks,
+):
+    """Restore the pointmap prior where alignment has no supervision.
+
+    Alignment masks identify pixels where a deformation is constrained; they
+    are not visibility masks. Deleting confidence outside them removes useful
+    MASt3R geometry and creates coverage holes. Use aligned geometry inside the
+    mask and the original pointmap everywhere else.
+    """
+    if masks is None:
+        return output_verts, output_depths, output_confs
+
+    valid = masks.to(device=output_depths.device, dtype=torch.bool)
+    if valid.shape != output_depths.shape:
+        raise ValueError(
+            f"Alignment mask shape {tuple(valid.shape)} does not match depth "
+            f"shape {tuple(output_depths.shape)}"
+        )
+    initial_verts = initial_verts.reshape(*output_depths.shape, 3)
+    output_verts = output_verts.reshape(*output_depths.shape, 3)
+    output_verts = torch.where(valid[..., None], output_verts, initial_verts)
+    output_depths = torch.where(valid, output_depths, initial_depths)
+    return output_verts, output_depths, output_confs
+
+
+@torch.no_grad()
+def reject_catastrophic_alignment_confidences(
+    output_confs,
+    output_depths,
+    prior_depths,
+    masks=None,
+    *,
+    median_relative_error_threshold=0.75,
+    bad_pixel_relative_error=0.25,
+    bad_pixel_fraction_threshold=0.90,
+    minimum_valid_pixels=64,
+):
+    """Disable a chart only when alignment collapses its depth at global scale."""
+    confidences = output_confs.clone()
+    rejected = torch.zeros(
+        output_depths.shape[0],
+        dtype=torch.bool,
+        device=output_depths.device,
+    )
+    relative_medians = torch.full(
+        (output_depths.shape[0],),
+        float("nan"),
+        dtype=output_depths.dtype,
+        device=output_depths.device,
+    )
+    bad_fractions = torch.full_like(relative_medians, float("nan"))
+
+    for chart_index in range(output_depths.shape[0]):
+        aligned = output_depths[chart_index]
+        prior = prior_depths[chart_index]
+        valid = torch.isfinite(aligned) & torch.isfinite(prior) & (aligned > 0) & (prior > 0)
+        if masks is not None:
+            valid &= masks[chart_index].to(device=valid.device, dtype=torch.bool)
+        if int(valid.sum()) < minimum_valid_pixels:
+            continue
+        relative_error = (aligned[valid] - prior[valid]).abs() / prior[valid].clamp_min(1e-6)
+        median_error = relative_error.median()
+        bad_fraction = (relative_error > bad_pixel_relative_error).float().mean()
+        relative_medians[chart_index] = median_error
+        bad_fractions[chart_index] = bad_fraction
+        if (
+            median_error > median_relative_error_threshold
+            and bad_fraction > bad_pixel_fraction_threshold
+        ):
+            confidences[chart_index].zero_()
+            rejected[chart_index] = True
+
+    return confidences, rejected, relative_medians, bad_fractions
+
+
 # TODO: Update the default values of the parameters
 def align_charts_in_parallel(
     # Scene
@@ -57,6 +138,9 @@ def align_charts_in_parallel(
     matching_loss_weight=5.,
     chart_encodings_norm_loss_weight=2.,
     total_variation_on_depth_encodings_weight=5.0,
+    projection_chunk_size=262_144,
+    matching_pixel_stride=1,
+    chart_encoding_norm_chunk_rows=0,
     encodings_lr=1e-2,
     mlp_lr=1e-3,
     confidence_lr=1e-3,
@@ -174,6 +258,9 @@ def align_charts_in_parallel(
         reprojection_loss_power=reprojection_loss_power,
         chart_encodings_norm_loss_weight=chart_encodings_norm_loss_weight,
         total_variation_on_depth_encodings_weight=total_variation_on_depth_encodings_weight,
+        projection_chunk_size=projection_chunk_size,
+        matching_pixel_stride=matching_pixel_stride,
+        chart_encoding_norm_chunk_rows=chart_encoding_norm_chunk_rows,
         encodings_lr=encodings_lr,
         mlp_lr=mlp_lr,
         confidence_lr=confidence_lr,
@@ -196,6 +283,32 @@ def align_charts_in_parallel(
             output_confs = pa.confidence
     else:
         output_confs = 4. * torch.ones_like(output_depths)
+    output_verts, output_depths, output_confs = restore_unaligned_geometry(
+        output_verts,
+        output_depths,
+        output_confs,
+        _verts,
+        initial_depths,
+        masks,
+    )
+    (
+        output_confs,
+        rejected_alignment_charts,
+        alignment_relative_medians,
+        alignment_bad_fractions,
+    ) = reject_catastrophic_alignment_confidences(
+        output_confs,
+        output_depths,
+        initial_depths,
+        masks,
+    )
+    for chart_index in torch.nonzero(rejected_alignment_charts).flatten().tolist():
+        print(
+            "[WARN] Rejecting catastrophic aligned chart "
+            f"{chart_index}: median relative depth error="
+            f"{alignment_relative_medians[chart_index].item():.3f}, "
+            f"bad-pixel fraction={alignment_bad_fractions[chart_index].item():.3f}."
+        )
     
     if save_charts_data:
         save_path = os.path.join(charts_data_path, "charts_data.npz")
@@ -215,6 +328,9 @@ def align_charts_in_parallel(
             pts=charts_pts.cpu().numpy(),
             confs=charts_confs.cpu().numpy(),
             scale_factor=charts_scale_factor,
+            alignment_chart_valid=(~rejected_alignment_charts).cpu().numpy(),
+            alignment_prior_relative_median=alignment_relative_medians.cpu().numpy(),
+            alignment_prior_gt25_fraction=alignment_bad_fractions.cpu().numpy(),
         )
     
     if use_learnable_confidence:
@@ -228,4 +344,3 @@ def align_charts_in_parallel(
         else:
             return output_verts, output_depths
         
-

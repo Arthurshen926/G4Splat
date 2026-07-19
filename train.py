@@ -5,8 +5,21 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import shutil
+import shlex
+import numpy as np
+
+
+def prefer_conda_runtime_libraries():
+    """Let compiled CUDA extensions use the C++ runtime they were built against."""
+    conda_lib = os.path.join(sys.prefix, "lib")
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    entries = [entry for entry in current.split(os.pathsep) if entry]
+    if conda_lib not in entries:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([conda_lib, *entries])
 
 def run_command_safe(command):
+    if command.startswith("python "):
+        command = f"{shlex.quote(sys.executable)} {command[len('python '):]}"
     print(f"Running command: {command}")
     exit_code = os.system(command)
     if exit_code != 0:
@@ -16,6 +29,7 @@ def run_command_safe(command):
         print("Command succeeded!")
 
 if __name__ == '__main__':
+    prefer_conda_runtime_libraries()
     parser = argparse.ArgumentParser()
     
     # Scene arguments
@@ -37,7 +51,18 @@ if __name__ == '__main__':
     # Dense supervision (Optional)
     parser.add_argument('--dense_supervision', action='store_true', 
         help='Use dense RGB supervision with a COLMAP dataset. Should only be used with --sfm_config posed.')
-    parser.add_argument('--dense_regul', type=str, default='default', help='Strength of dense regularization. Can be "default", "strong", "weak", or "none".')
+    parser.add_argument('--dense_data_path', type=str, default=None,
+        help='Posed COLMAP dataset used for real dense RGB/depth supervision. Defaults to source_path.')
+    parser.add_argument('--dense_regul', type=str, default='default', help='Dense depth schedule: default, strong, strong_decay, weak, or none.')
+    parser.add_argument('--dense_depth_cache', type=str, default=None)
+    parser.add_argument(
+        '--dense_final_only',
+        action='store_true',
+        help=(
+            'Use chart/See3D supervision for preliminary refinements and enable the full '
+            'dense dataset only for the final refinement.'
+        ),
+    )
     
     # Output mesh parameters
     parser.add_argument('--use_multires_tsdf', action='store_true', help='Use multi-resolution TSDF fusion instead of adaptive tetrahedralization for mesh extraction (not recommended).')
@@ -51,12 +76,66 @@ if __name__ == '__main__':
     parser.add_argument('--depth_model', type=str, default="depthanythingv2")
     parser.add_argument('--depthanythingv2_checkpoint_dir', type=str, default='./Depth-Anything-V2/checkpoints/')
     parser.add_argument('--depthanything_encoder', type=str, default='vitl')
+    parser.add_argument(
+        '--gate_aligned_chart_conflicts',
+        action='store_true',
+        help='Disable chart geometry with extreme aligned-depth/prior disagreement.',
+    )
+    parser.add_argument('--aligned_chart_max_relative_p90', type=float, default=0.50)
+    parser.add_argument('--aligned_chart_max_gt25_fraction', type=float, default=0.50)
+    parser.add_argument('--aligned_chart_min_valid_fraction', type=float, default=0.05)
     
     # Free Gaussians config
     parser.add_argument('--free_gaussians_config', type=str, default=None, 
-        help='Config for Free Gaussians refinement. '\
-        'By default, the config used is "default" for sparse supervision, and "long" for dense supervision.'
+        help=(
+            'Config for preliminary Free Gaussians refinement. Defaults to "default"; '
+            'the final dense pass is controlled separately.'
+        )
     )
+    parser.add_argument('--final_free_gaussians_config', type=str, default=None,
+        help='Final refinement config after the last See3D stage. Defaults to long with dense supervision.')
+    parser.add_argument(
+        '--final_free_gaussians_iterations',
+        type=int,
+        default=None,
+        help='Override the final refinement length without changing the screen schedule.',
+    )
+    parser.add_argument(
+        '--final_non_position_lr_decay_from',
+        type=int,
+        default=-1,
+        help='Start decaying non-xyz learning rates at this final-stage iteration.',
+    )
+    parser.add_argument(
+        '--final_non_position_lr_final_mult',
+        type=float,
+        default=1.0,
+        help='Final multiplier for non-xyz learning rates after the decay begins.',
+    )
+    parser.add_argument('--data_device', choices=['cpu', 'cuda'], default='cpu')
+    parser.add_argument('--resolution', type=int, default=-1)
+    parser.add_argument('--white_background', action='store_true')
+    parser.add_argument('--cambridge_mask_pickle', type=str, default=None)
+    parser.add_argument('--cambridge_mask_dataset_path', type=str, default=None)
+    parser.add_argument('--cambridge_mask_indices', type=int, nargs='*', default=[0, 1, 2])
+    parser.add_argument('--cambridge_geometry_mask_indices', type=int, nargs='*', default=[0, 1, 2])
+    parser.add_argument('--cambridge_alpha_mask_indices', type=int, nargs='*', default=None)
+    parser.add_argument('--semantic_alpha_weight', type=float, default=0.0)
+    parser.add_argument('--cambridge_tree_mask_pickle', type=str, default=None)
+    parser.add_argument('--cambridge_tree_mask_dataset_path', type=str, default=None)
+    parser.add_argument('--cambridge_tree_mask_index', type=int, default=3)
+    parser.add_argument('--cambridge_tree_support_dir', type=str, default=None)
+    parser.add_argument('--tree_rgb_floor', type=float, default=0.25)
+    parser.add_argument('--tree_rgb_support_gain', type=float, default=0.50)
+    parser.add_argument('--tree_geometry_floor', type=float, default=0.05)
+    parser.add_argument('--tree_geometry_support_gain', type=float, default=0.25)
+    parser.add_argument('--tree_planar_weight', type=float, default=0.0)
+    parser.add_argument('--tree_sky_feather', type=int, default=4)
+    parser.add_argument('--tree_boundary_feather', type=int, default=6)
+    parser.add_argument('--rgb_loss_type', choices=['l1', 'charbonnier'], default='l1')
+    parser.add_argument('--use_color_correction', action='store_true')
+    parser.add_argument('--color_correction_lr', type=float, default=1e-3)
+    parser.add_argument('--color_correction_reg', type=float, default=1e-2)
     
     # Multi-resolution TSDF config
     parser.add_argument('--tsdf_config', type=str, default='default', help='Config for multi-resolution TSDF fusion')
@@ -70,6 +149,63 @@ if __name__ == '__main__':
 
     # G4Splat config
     parser.add_argument('--select_inpaint_num', type=int, default=20, help='Number of views to select for inpainting.')
+    parser.add_argument(
+        '--see3d_iteration',
+        type=int,
+        default=7000,
+        help='Gaussian iteration used to render See3D conditioning views.',
+    )
+    parser.add_argument(
+        '--scene_aligned_see3d_cameras',
+        action='store_true',
+        help='Use pose-graph See3D camera proposals for trajectory-style scenes.',
+    )
+    parser.add_argument(
+        '--preserve_visible_see3d_render',
+        action='store_true',
+        help='Keep the current GS render in observed pseudo-view pixels.',
+    )
+    parser.add_argument(
+        '--skip_plane_see3d_views',
+        action='store_true',
+        help='Do not use globally refined planes to propose See3D cameras.',
+    )
+    parser.add_argument(
+        '--disable_see3d',
+        action='store_true',
+        help='Skip all See3D stages and run the final refinement from real-view plane priors only.',
+    )
+    parser.add_argument(
+        '--quality_filter_see3d',
+        action='store_true',
+        help='Reject high-synthesis, blurry, or depth-inconsistent pseudo-views.',
+    )
+    parser.add_argument(
+        '--skip_see3d_plane_extraction',
+        action='store_true',
+        help='Skip SAM plane extraction in conservative warm-start experiments.',
+    )
+    parser.add_argument(
+        '--pseudo_initialization_mode',
+        choices=['all', 'inpaint_only', 'none'],
+        default='all',
+    )
+    parser.add_argument(
+        '--pseudo_geometry_mask_mode',
+        choices=['all', 'inpaint_only', 'none'],
+        default='all',
+    )
+    parser.add_argument('--pseudo_rgb_weight', type=float, default=0.01)
+    parser.add_argument('--pseudo_geometry_weight', type=float, default=0.25)
+    parser.add_argument('--pseudo_geometry_final_weight', type=float, default=0.02)
+    parser.add_argument('--pseudo_geometry_decay_until', type=int, default=7000)
+    parser.add_argument(
+        '--artifact_mask_see3d',
+        action='store_true',
+        help='Augment See3D visibility masks with conservative no-reference artifact masks.',
+    )
+    parser.add_argument('--artifact_detector_repo', type=str, default='/root/STDLoc')
+    parser.add_argument('--artifact_max_edit_fraction', type=float, default=0.35)
     parser.add_argument('--use_downsample_gaussians', action='store_true', help='Use downsample gaussians for training')
     parser.add_argument('--downsample_gaussians_type', type=str, default='warp', choices=['warp', 'voxel'],
         help='Downsample method used when --use_downsample_gaussians is set')
@@ -77,11 +213,91 @@ if __name__ == '__main__':
         help='Relative depth error threshold for warp-based Gaussian downsample')
     parser.add_argument('--warp_downsample_pixel_grid_size', type=int, default=-1,
         help='Pixel grid stride for warp-based Gaussian initialization')
+    parser.add_argument(
+        '--gate_plane_refinement',
+        action='store_true',
+        help='Fall back to aligned chart depth when plane support or depth changes are unsafe.',
+    )
+    parser.add_argument('--plane_gate_min_support_fraction', type=float, default=0.50)
+    parser.add_argument('--plane_gate_max_relative_p90', type=float, default=0.25)
+    parser.add_argument('--plane_gate_max_gt25_fraction', type=float, default=0.25)
+    parser.add_argument('--plane_gate_max_pixel_relative_change', type=float, default=0.50)
+    parser.add_argument(
+        '--min_global_plane_views',
+        type=int,
+        default=2,
+        help='Require cross-view support before a fused plane rewrites Chart depth.',
+    )
     parser.add_argument('--downweight_input_view_color_loss', action='store_true',
         help='Also reduce color loss weight for input views; See3D views are always reduced')
     parser.add_argument('--use_mesh_filter', action='store_true', help='Use mesh filter')
     parser.add_argument('--use_dense_view', action='store_true', help='Use dense view for training')                    # Add an additional input stage to extend plane-aware depth estimation across all input views
+    parser.add_argument(
+        '--skip_default_render_eval',
+        action='store_true',
+        help='Skip dense train-view export and the repository default evaluator; use an explicit heldout evaluator.',
+    )
+    parser.add_argument(
+        '--stop_after_initial_refinement',
+        action='store_true',
+        help='Stop after the first refinement pass. Intended for 7k geometry screening.',
+    )
+    parser.add_argument(
+        '--stop_after_alignment_gate',
+        action='store_true',
+        help='Stop after alignment and its chart gate so rejected charts can be replaced.',
+    )
+    parser.add_argument(
+        '--continue_after_initial_refinement',
+        action='store_true',
+        help=(
+            'Reuse an existing mast3r_sfm/plane-refine-depths and initial 7k model in '
+            'output_path, then continue with G4Splat stages and the final refinement.'
+        ),
+    )
+    parser.add_argument(
+        '--continue_after_see3d_plane_stage',
+        type=int,
+        choices=[1, 2, 3],
+        default=None,
+        help=(
+            'Resume after the selected See3D generation and plane-refinement stage, '
+            'before its Gaussian refinement. Intended for recovering a completed '
+            'expensive generation stage after a downstream failure.'
+        ),
+    )
+    parser.add_argument(
+        '--continue_after_sfm',
+        action='store_true',
+        help='Reuse completed mast3r_sfm pointmaps, then rerun alignment and all later stages.',
+    )
+    parser.add_argument(
+        '--continue_after_alignment',
+        action='store_true',
+        help='Reuse completed charts_data.npz, then run plane construction and later stages.',
+    )
+    parser.add_argument(
+        '--continue_after_plane_refinement',
+        action='store_true',
+        help='Reuse completed chart alignment and plane-refined depths, then restart Gaussian refinement.',
+    )
     args = parser.parse_args()
+    if args.stop_after_initial_refinement and (
+        args.continue_after_initial_refinement
+        or args.continue_after_see3d_plane_stage is not None
+    ):
+        raise ValueError(
+            '--stop_after_initial_refinement cannot be combined with a later-stage continuation'
+        )
+    continuation_modes = sum((
+        args.continue_after_sfm,
+        args.continue_after_alignment,
+        args.continue_after_plane_refinement,
+        args.continue_after_initial_refinement,
+        args.continue_after_see3d_plane_stage is not None,
+    ))
+    if continuation_modes > 1:
+        raise ValueError('Only one continuation mode may be selected')
     
     # Set output paths
     if args.output_path is None:
@@ -113,12 +329,15 @@ if __name__ == '__main__':
             dense_view_idx_list = dense_view_json['train']
             print(f"Use {len(dense_view_idx_list)} views from {dense_view_json_path} as dense view")
     
-    # NOTE: Not use dense supervision from MAtCha
+    dense_data_path = args.dense_data_path or args.source_path
     dense_arg = ""
-    
-    # Free Gaussians refinement default config
+    if args.dense_supervision:
+        dense_arg = " ".join(["--dense_data_path", dense_data_path])
+
     if args.free_gaussians_config is None:
-        args.free_gaussians_config = 'long' if args.dense_supervision else 'default'
+        args.free_gaussians_config = 'default'
+    if args.final_free_gaussians_config is None:
+        args.final_free_gaussians_config = 'long' if args.dense_supervision else args.free_gaussians_config
 
     if args.use_view_config:
         n_images = None
@@ -148,6 +367,25 @@ if __name__ == '__main__':
         "--randomize_images" if args.randomize_images else "",
     ])
     
+    # Charts seed the entire geometry pipeline, so canonical trees must be
+    # excluded *before* chart alignment and the aligned-depth conflict audit.
+    # The later free-Gaussian stage can retain its softer tree weighting, but
+    # an occluding tree pixel must never become a hard chart/plane anchor.
+    alignment_mask_pickle = args.cambridge_tree_mask_pickle or args.cambridge_mask_pickle
+    alignment_mask_dataset_path = (
+        args.cambridge_tree_mask_dataset_path
+        or args.cambridge_mask_dataset_path
+        or dense_data_path
+    )
+    alignment_mask_indices = list(args.cambridge_geometry_mask_indices)
+    if args.cambridge_tree_mask_pickle:
+        alignment_mask_indices = list(
+            dict.fromkeys([
+                *alignment_mask_indices,
+                int(args.cambridge_tree_mask_index),
+            ])
+        )
+
     align_charts_command = " ".join([
         "python", "scripts/align_charts.py",
         "--source_path", mast3r_scene_path,
@@ -157,25 +395,135 @@ if __name__ == '__main__':
         "--depth_model", args.depth_model,
         "--depthanythingv2_checkpoint_dir", args.depthanythingv2_checkpoint_dir,
         "--depthanything_encoder", args.depthanything_encoder,
+        "--cambridge_mask_pickle" if alignment_mask_pickle else "",
+        alignment_mask_pickle or "",
+        "--cambridge_mask_dataset_path" if alignment_mask_pickle else "",
+        alignment_mask_dataset_path if alignment_mask_pickle else "",
+        "--cambridge_mask_indices" if alignment_mask_pickle else "",
+        " ".join(str(index) for index in alignment_mask_indices)
+        if alignment_mask_pickle else "",
     ])
+    aligned_chart_gate_command = None
+    if args.gate_aligned_chart_conflicts:
+        aligned_chart_gate_command = " ".join([
+            "python", "scripts/gate_aligned_charts.py",
+            "--mast3r-scene", mast3r_scene_path,
+            "--mask-pickle" if alignment_mask_pickle else "",
+            alignment_mask_pickle or "",
+            "--mask-dataset-path" if alignment_mask_pickle else "",
+            alignment_mask_dataset_path if alignment_mask_pickle else "",
+            "--mask-indices" if alignment_mask_pickle else "",
+            " ".join(str(index) for index in alignment_mask_indices)
+            if alignment_mask_pickle else "",
+            "--max-relative-p90", str(args.aligned_chart_max_relative_p90),
+            "--max-gt25-fraction", str(args.aligned_chart_max_gt25_fraction),
+            "--min-valid-fraction", str(args.aligned_chart_min_valid_fraction),
+        ])
+    tree_support_command = None
+    if args.cambridge_tree_mask_pickle and args.cambridge_tree_support_dir:
+        tree_support_command = " ".join([
+            "python", "scripts/build_tree_support_maps.py",
+            "--mast3r-scene", mast3r_scene_path,
+            "--mask-pickle", args.cambridge_tree_mask_pickle,
+            "--mask-dataset-path",
+            args.cambridge_tree_mask_dataset_path or args.cambridge_mask_dataset_path or dense_data_path,
+            "--output", args.cambridge_tree_support_dir,
+            "--tree-mask-index", str(args.cambridge_tree_mask_index),
+        ])
     
     # NOTE: hard code plane-refine-depths path
     plane_root_path = os.path.join(mast3r_scene_path, 'plane-refine-depths')
 
-    refine_free_gaussians_command = " ".join([
-        "python", "scripts/refine_free_gaussians.py",
-        "--mast3r_scene", mast3r_scene_path,
-        "--output_path", free_gaussians_path,
-        "--config", args.free_gaussians_config,
-        dense_arg,
-        "--dense_regul", args.dense_regul,
-        "--refine_depth_path", plane_root_path,
-        "--use_downsample_gaussians" if args.use_downsample_gaussians else "",
-        "--downsample_gaussians_type", args.downsample_gaussians_type,
-        "--warp_depth_error_thresh", str(args.warp_depth_error_thresh),
-        "--warp_downsample_pixel_grid_size", str(args.warp_downsample_pixel_grid_size),
-        "--downweight_input_view_color_loss" if args.downweight_input_view_color_loss else "",
-    ])
+    def get_refine_free_gaussians_command(
+        config_name,
+        use_dense_data,
+        *,
+        init_ply=None,
+        freeze_init_ply=False,
+        iterations=None,
+        non_position_lr_decay_from=-1,
+        non_position_lr_final_mult=1.0,
+    ):
+        stage_dense_arg = dense_arg if use_dense_data else ""
+        stage_dense_regul = args.dense_regul if use_dense_data else "none"
+        schedule_args = []
+        if iterations is not None:
+            schedule_args.extend(["--iterations", str(iterations)])
+        if non_position_lr_decay_from >= 0 or non_position_lr_final_mult != 1.0:
+            schedule_args.extend([
+                "--non-position-lr-decay-from", str(non_position_lr_decay_from),
+                "--non-position-lr-final-mult", str(non_position_lr_final_mult),
+            ])
+        return " ".join([
+            "python", "scripts/refine_free_gaussians.py",
+            "--mast3r_scene", mast3r_scene_path,
+            "--output_path", free_gaussians_path,
+            "--config", config_name,
+            *schedule_args,
+            "--data_device", args.data_device,
+            "--resolution", str(args.resolution),
+            "--white_background" if args.white_background else "",
+            stage_dense_arg,
+            "--dense_regul", stage_dense_regul,
+            "--depthanythingv2_checkpoint_dir", args.depthanythingv2_checkpoint_dir,
+            "--depthanything_encoder", args.depthanything_encoder,
+            "--dense_depth_cache" if use_dense_data and args.dense_depth_cache else "",
+            args.dense_depth_cache if use_dense_data and args.dense_depth_cache else "",
+            "--refine_depth_path", plane_root_path,
+            "--use_downsample_gaussians" if args.use_downsample_gaussians else "",
+            "--downsample_gaussians_type", args.downsample_gaussians_type,
+            "--warp_depth_error_thresh", str(args.warp_depth_error_thresh),
+            "--warp_downsample_pixel_grid_size", str(args.warp_downsample_pixel_grid_size),
+            "--downweight_input_view_color_loss" if args.downweight_input_view_color_loss else "",
+            "--cambridge_mask_pickle" if args.cambridge_mask_pickle else "",
+            args.cambridge_mask_pickle or "",
+            "--cambridge_mask_dataset_path" if args.cambridge_mask_pickle else "",
+            (args.cambridge_mask_dataset_path or dense_data_path) if args.cambridge_mask_pickle else "",
+            "--cambridge_mask_indices" if args.cambridge_mask_pickle else "",
+            " ".join(str(index) for index in args.cambridge_mask_indices)
+            if args.cambridge_mask_pickle else "",
+            "--cambridge_geometry_mask_pickle" if args.cambridge_mask_pickle else "",
+            args.cambridge_mask_pickle or "",
+            "--cambridge_geometry_mask_dataset_path" if args.cambridge_mask_pickle else "",
+            (args.cambridge_mask_dataset_path or dense_data_path) if args.cambridge_mask_pickle else "",
+            "--cambridge_geometry_mask_indices" if args.cambridge_mask_pickle else "",
+            " ".join(str(index) for index in args.cambridge_geometry_mask_indices)
+            if args.cambridge_mask_pickle else "",
+            "--cambridge_alpha_mask_indices"
+            if args.cambridge_mask_pickle and args.cambridge_alpha_mask_indices else "",
+            " ".join(str(index) for index in args.cambridge_alpha_mask_indices)
+            if args.cambridge_mask_pickle and args.cambridge_alpha_mask_indices else "",
+            "--semantic_alpha_weight", str(args.semantic_alpha_weight),
+            "--cambridge_tree_mask_pickle" if args.cambridge_tree_mask_pickle else "",
+            args.cambridge_tree_mask_pickle or "",
+            "--cambridge_tree_mask_dataset_path" if args.cambridge_tree_mask_pickle else "",
+            (args.cambridge_tree_mask_dataset_path or args.cambridge_mask_dataset_path or dense_data_path)
+            if args.cambridge_tree_mask_pickle else "",
+            "--cambridge_tree_mask_index" if args.cambridge_tree_mask_pickle else "",
+            str(args.cambridge_tree_mask_index) if args.cambridge_tree_mask_pickle else "",
+            "--cambridge_tree_support_dir" if args.cambridge_tree_support_dir else "",
+            args.cambridge_tree_support_dir or "",
+            "--tree_rgb_floor", str(args.tree_rgb_floor),
+            "--tree_rgb_support_gain", str(args.tree_rgb_support_gain),
+            "--tree_geometry_floor", str(args.tree_geometry_floor),
+            "--tree_geometry_support_gain", str(args.tree_geometry_support_gain),
+            "--tree_planar_weight", str(args.tree_planar_weight),
+            "--tree_sky_feather", str(args.tree_sky_feather),
+            "--tree_boundary_feather", str(args.tree_boundary_feather),
+            "--rgb_loss_type", args.rgb_loss_type,
+            "--use_color_correction" if args.use_color_correction else "",
+            "--color_correction_lr", str(args.color_correction_lr),
+            "--color_correction_reg", str(args.color_correction_reg),
+            "--pseudo_initialization_mode", args.pseudo_initialization_mode,
+            "--pseudo_geometry_mask_mode", args.pseudo_geometry_mask_mode,
+            "--pseudo_rgb_weight", str(args.pseudo_rgb_weight),
+            "--pseudo_geometry_weight", str(args.pseudo_geometry_weight),
+            "--pseudo_geometry_final_weight", str(args.pseudo_geometry_final_weight),
+            "--pseudo_geometry_decay_until", str(args.pseudo_geometry_decay_until),
+            "--init_ply" if init_ply else "",
+            init_ply or "",
+            "--freeze_init_ply" if freeze_init_ply else "",
+        ])
 
     render_all_img_command = " ".join([
         "python", "2d-gaussian-splatting/render_multires.py",
@@ -196,7 +544,7 @@ if __name__ == '__main__':
     ])
     
     tetra_command = " ".join([
-        "python", "scripts/extract_tetra_mesh.py",
+        sys.executable, "scripts/extract_tetra_mesh.py",
         "--mast3r_scene", mast3r_scene_path,
         "--model_path", free_gaussians_path,
         "--output_path", tetra_meshes_path,
@@ -212,10 +560,22 @@ if __name__ == '__main__':
         "--source_path", mast3r_scene_path,
         "--model_path", free_gaussians_path,
         "--plane_root_dir", plane_root_path,
-        "--iteration", '7000',
-        "--see3d_stage", str(stage),
-        "--select_inpaint_num", str(select_inpaint_num),
-    ])
+        "--iteration", str(args.see3d_iteration),
+            "--see3d_stage", str(stage),
+            "--select_inpaint_num", str(select_inpaint_num),
+            "--depthanythingv2_checkpoint_dir", args.depthanythingv2_checkpoint_dir,
+            "--depthanything_encoder", args.depthanything_encoder,
+            "--scene_aligned_cameras" if args.scene_aligned_see3d_cameras else "",
+            "--preserve_visible_render" if args.preserve_visible_see3d_render else "",
+            "--skip_plane_views" if args.skip_plane_see3d_views else "",
+            "--quality_filter" if args.quality_filter_see3d else "",
+            "--skip_plane_extraction" if args.skip_see3d_plane_extraction else "",
+            "--artifact_mask_detector" if args.artifact_mask_see3d else "",
+            "--artifact_detector_repo" if args.artifact_mask_see3d else "",
+            args.artifact_detector_repo if args.artifact_mask_see3d else "",
+            "--artifact_max_edit_fraction" if args.artifact_mask_see3d else "",
+            str(args.artifact_max_edit_fraction) if args.artifact_mask_see3d else "",
+        ])
 
     eval_command = " ".join([
         "python", "2d-gaussian-splatting/eval/eval.py",
@@ -228,6 +588,15 @@ if __name__ == '__main__':
         "python", "2d-gaussian-splatting/render_chart_views.py",
         "--source_path", mast3r_scene_path,
         "--save_root_path", plane_root_path,
+        "--data_device", args.data_device,
+        "--resolution", str(args.resolution),
+        "--cambridge_mask_pickle" if alignment_mask_pickle else "",
+        alignment_mask_pickle or "",
+        "--cambridge_mask_dataset_path" if alignment_mask_pickle else "",
+        alignment_mask_dataset_path if alignment_mask_pickle else "",
+        "--cambridge_geometry_mask_indices" if alignment_mask_pickle else "",
+        " ".join(str(index) for index in alignment_mask_indices)
+        if alignment_mask_pickle else "",
     ])
 
     generate_2Dplane_command = " ".join([
@@ -235,10 +604,24 @@ if __name__ == '__main__':
         "--plane_root_path", plane_root_path,
     ])
 
+    plane_safety_gate_command = " ".join([
+        "python", "scripts/gate_plane_refinement.py",
+        "--plane-root", plane_root_path,
+        "--min-support-fraction", str(args.plane_gate_min_support_fraction),
+        "--max-relative-p90", str(args.plane_gate_max_relative_p90),
+        "--max-gt25-fraction", str(args.plane_gate_max_gt25_fraction),
+        "--max-pixel-relative-change", str(args.plane_gate_max_pixel_relative_change),
+    ])
+
     pnts_path = os.path.join(mast3r_scene_path, 'chart_pcd.ply')
     vis_plane_path = os.path.join(mast3r_scene_path, 'vis_plane')
 
     def get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=None):
+        camera_args = [
+            "--resolution", str(args.resolution),
+            "--data_device", args.data_device,
+            "--min_global_plane_views", str(args.min_global_plane_views),
+        ]
         if see3d_root_path is not None:
             if anchor_view_id_json_path is not None:
                 return " ".join([
@@ -248,6 +631,7 @@ if __name__ == '__main__':
                     "--pnts_path", pnts_path,
                     "--anchor_view_id_json_path", anchor_view_id_json_path,
                     "--see3d_root_path", see3d_root_path,
+                    *camera_args,
                 ])
             else:
                 return " ".join([
@@ -256,6 +640,7 @@ if __name__ == '__main__':
                     "--plane_root_path", plane_root_path,
                     "--pnts_path", pnts_path,
                     "--see3d_root_path", see3d_root_path,
+                    *camera_args,
                 ])
         else:
             return " ".join([
@@ -263,6 +648,7 @@ if __name__ == '__main__':
                 "--source_path", mast3r_scene_path,
                 "--plane_root_path", plane_root_path,
                 "--pnts_path", pnts_path,
+                *camera_args,
             ])
         
     see3d_root_path = os.path.join(mast3r_scene_path, 'see3d_render')
@@ -271,15 +657,113 @@ if __name__ == '__main__':
 
     t1 = time.time()
     
-    # run MAtCha training
-    run_command_safe(sfm_command)
-    run_command_safe(align_charts_command)
+    preliminary_uses_dense = args.dense_supervision and (
+        not args.dense_final_only or args.stop_after_initial_refinement
+    )
+    if (
+        args.continue_after_initial_refinement
+        or args.continue_after_see3d_plane_stage is not None
+    ):
+        required_resume_paths = [
+            os.path.join(mast3r_scene_path, 'charts_data.npz'),
+            os.path.join(plane_root_path, 'refine_depth_frame000000.tiff'),
+            os.path.join(free_gaussians_path, 'point_cloud', 'iteration_7000', 'point_cloud.ply'),
+        ]
+        if args.continue_after_see3d_plane_stage is not None:
+            stage = args.continue_after_see3d_plane_stage
+            required_resume_paths.extend([
+                os.path.join(see3d_root_path, 'see3d_cameras.npz'),
+                os.path.join(see3d_root_path, 'inpainted_images'),
+                os.path.join(see3d_root_path, f'stage{stage}', 'anchor_view_id.json'),
+            ])
+        missing_resume_paths = [path for path in required_resume_paths if not os.path.exists(path)]
+        if missing_resume_paths:
+            raise FileNotFoundError(
+                'Cannot continue from the requested refinement stage; missing: '
+                + ', '.join(missing_resume_paths)
+            )
+        if args.continue_after_see3d_plane_stage is not None:
+            print(
+                '[INFO] Reusing completed See3D/plane stage '
+                f'{args.continue_after_see3d_plane_stage} artifacts.'
+            )
+        else:
+            print('[INFO] Reusing completed MASt3R/alignment/plane/initial-refinement artifacts.')
+    else:
+        if args.continue_after_plane_refinement:
+            required_plane_paths = [
+                os.path.join(mast3r_scene_path, 'charts_data.npz'),
+                os.path.join(plane_root_path, 'refine_depth_frame000000.tiff'),
+                os.path.join(plane_root_path, 'global_3Dplane_ID_dict.json'),
+            ]
+            missing_plane_paths = [path for path in required_plane_paths if not os.path.exists(path)]
+            if missing_plane_paths:
+                raise FileNotFoundError(
+                    'Cannot continue after plane refinement; missing: '
+                    + ', '.join(missing_plane_paths)
+                )
+            print('[INFO] Reusing completed MASt3R/alignment/plane-refinement artifacts.')
+        else:
+            if args.continue_after_alignment:
+                charts_data_path = os.path.join(mast3r_scene_path, 'charts_data.npz')
+                if not os.path.exists(charts_data_path):
+                    raise FileNotFoundError(
+                        'Cannot continue after alignment; missing: ' + charts_data_path
+                    )
+                print('[INFO] Reusing completed MASt3R SfM and chart alignment artifacts.')
+            elif args.continue_after_sfm:
+                required_sfm_paths = [
+                    os.path.join(mast3r_scene_path, 'sparse', '0', 'images.bin'),
+                    os.path.join(mast3r_scene_path, 'pointmaps'),
+                ]
+                missing_sfm_paths = [path for path in required_sfm_paths if not os.path.exists(path)]
+                if missing_sfm_paths:
+                    raise FileNotFoundError(
+                        'Cannot continue after SfM; missing: ' + ', '.join(missing_sfm_paths)
+                    )
+                print('[INFO] Reusing completed MASt3R SfM artifacts.')
+            else:
+                run_command_safe(sfm_command)
+            if not args.continue_after_alignment:
+                run_command_safe(align_charts_command)
+            reuse_existing_alignment_gate = False
+            if args.continue_after_alignment:
+                charts_data_path = os.path.join(mast3r_scene_path, 'charts_data.npz')
+                with np.load(charts_data_path) as existing_charts:
+                    reuse_existing_alignment_gate = (
+                        'alignment_gate_valid' in existing_charts.files
+                    )
+                if reuse_existing_alignment_gate:
+                    print(
+                        '[INFO] Reusing persisted aligned-chart gate; '
+                        'resume will not overwrite the audited active set.'
+                    )
+            if aligned_chart_gate_command is not None and not reuse_existing_alignment_gate:
+                run_command_safe(aligned_chart_gate_command)
+            if args.stop_after_alignment_gate:
+                print('[INFO] Stopping after aligned-chart gate for feedback reselection.')
+                sys.exit(0)
+            if tree_support_command is not None:
+                run_command_safe(tree_support_command)
 
-    # generate 2D planes + refine depth for input views + init gaussian training
-    run_command_safe(render_charts_command)
-    run_command_safe(generate_2Dplane_command)
-    run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=None))
-    run_command_safe(refine_free_gaussians_command)
+            # generate 2D planes and refine depth for input views
+            run_command_safe(render_charts_command)
+            run_command_safe(generate_2Dplane_command)
+            run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=None))
+            if args.gate_plane_refinement:
+                run_command_safe(plane_safety_gate_command)
+
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.free_gaussians_config,
+                preliminary_uses_dense,
+            )
+        )
+
+    if args.stop_after_initial_refinement:
+        print("Finished initial refinement screening pass.")
+        print(f"Total running time: {time.time() - t1} seconds")
+        sys.exit(0)
 
     if args.use_dense_view:
         # replace the sparse/0 with dense-view-sparse/0, use dense view for training
@@ -310,10 +794,19 @@ if __name__ == '__main__':
         run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=None))
         mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-chart-views'
         run_command_safe(mv_cmd)
-        run_command_safe(refine_free_gaussians_command)
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.final_free_gaussians_config,
+                args.dense_supervision,
+                iterations=args.final_free_gaussians_iterations,
+                non_position_lr_decay_from=args.final_non_position_lr_decay_from,
+                non_position_lr_final_mult=args.final_non_position_lr_final_mult,
+            )
+        )
 
         # render all images, export mesh, and evaluate
-        run_command_safe(render_all_img_command)
+        if not args.skip_default_render_eval:
+            run_command_safe(render_all_img_command)
         run_command_safe(tetra_command)
 
         print("Finished training dense view without See3D prior!")
@@ -323,30 +816,86 @@ if __name__ == '__main__':
         exit()
 
 
+    if args.disable_see3d:
+        print('[INFO] See3D disabled: continuing the 7k Gaussian state with real-view priors.')
+        initial_ply = os.path.join(
+            free_gaussians_path,
+            'point_cloud',
+            'iteration_7000',
+            'point_cloud.ply',
+        )
+        if not os.path.exists(initial_ply):
+            raise FileNotFoundError(
+                'The final real-view refinement requires the initial 7k PLY: '
+                + initial_ply
+            )
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.final_free_gaussians_config,
+                args.dense_supervision,
+                init_ply=initial_ply,
+                iterations=args.final_free_gaussians_iterations,
+                non_position_lr_decay_from=args.final_non_position_lr_decay_from,
+                non_position_lr_final_mult=args.final_non_position_lr_final_mult,
+            )
+        )
+        if not args.skip_default_render_eval:
+            run_command_safe(render_all_img_command)
+        run_command_safe(tetra_command)
+        print('Finished training without See3D.')
+        print(f'Total running time: {time.time() - t1} seconds')
+        sys.exit(0)
+
     # see3d inpainting stage 1 + refine depth with 2D planes + continue gaussian training
-    run_command_safe(get_see3d_inpaint_command(1, args.select_inpaint_num))
-    run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=see3d_root_path))
-    mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-ori'
-    run_command_safe(mv_cmd)
-    run_command_safe(refine_free_gaussians_command)
+    resume_see3d_stage = args.continue_after_see3d_plane_stage
+    if resume_see3d_stage is None or resume_see3d_stage < 1:
+        run_command_safe(get_see3d_inpaint_command(1, args.select_inpaint_num))
+        run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=see3d_root_path))
+    if resume_see3d_stage is None or resume_see3d_stage <= 1:
+        mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-ori'
+        run_command_safe(mv_cmd)
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.free_gaussians_config,
+                preliminary_uses_dense,
+            )
+        )
 
     # see3d inpainting stage 2 + refine depth with 2D planes + continue gaussian training
-    run_command_safe(get_see3d_inpaint_command(2, args.select_inpaint_num))
-    run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=see3d_root_path))
-    mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-s1'
-    run_command_safe(mv_cmd)
-    run_command_safe(refine_free_gaussians_command)
+    if resume_see3d_stage is None or resume_see3d_stage < 2:
+        run_command_safe(get_see3d_inpaint_command(2, args.select_inpaint_num))
+        run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=see3d_root_path))
+    if resume_see3d_stage is None or resume_see3d_stage <= 2:
+        mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-s1'
+        run_command_safe(mv_cmd)
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.free_gaussians_config,
+                preliminary_uses_dense,
+            )
+        )
 
     # see3d inpainting stage 3 + refine depth with 2D planes + continue gaussian training
-    run_command_safe(get_see3d_inpaint_command(3, args.select_inpaint_num))
-    anchor_view_id_json_path = os.path.join(see3d_root_path, 'stage3', 'anchor_view_id.json')
-    run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=anchor_view_id_json_path, see3d_root_path=see3d_root_path))
-    mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-s2'
-    run_command_safe(mv_cmd)
-    run_command_safe(refine_free_gaussians_command)
+    if resume_see3d_stage is None or resume_see3d_stage < 3:
+        run_command_safe(get_see3d_inpaint_command(3, args.select_inpaint_num))
+        anchor_view_id_json_path = os.path.join(see3d_root_path, 'stage3', 'anchor_view_id.json')
+        run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=anchor_view_id_json_path, see3d_root_path=see3d_root_path))
+    if resume_see3d_stage is None or resume_see3d_stage <= 3:
+        mv_cmd = f'mv {free_gaussians_path}/point_cloud {free_gaussians_path}/point_cloud-s2'
+        run_command_safe(mv_cmd)
+        run_command_safe(
+            get_refine_free_gaussians_command(
+                args.final_free_gaussians_config,
+                args.dense_supervision,
+                iterations=args.final_free_gaussians_iterations,
+                non_position_lr_decay_from=args.final_non_position_lr_decay_from,
+                non_position_lr_final_mult=args.final_non_position_lr_final_mult,
+            )
+        )
 
     # render all images, export mesh, and evaluate
-    run_command_safe(render_all_img_command)
+    if not args.skip_default_render_eval:
+        run_command_safe(render_all_img_command)
     run_command_safe(tetra_command)
 
     if args.use_mesh_filter:
@@ -365,7 +914,8 @@ if __name__ == '__main__':
         mv_cmd = f'mv {filtered_mesh_path} {mesh_path}'
         run_command_safe(mv_cmd)
 
-    run_command_safe(eval_command)
+    if not args.skip_default_render_eval:
+        run_command_safe(eval_command)
 
     # # vis global 3D plane by mesh (NOTE: slightly slow)
     # mesh_list = os.listdir(tetra_meshes_path)

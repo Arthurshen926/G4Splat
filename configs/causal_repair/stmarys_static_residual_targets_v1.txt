@@ -1,0 +1,9 @@
+# Full-train residual probes selected after intersecting the 100k in-sample
+# static residual ranking with the canonical-tree mask audit (tree ratio <= .20).
+# They deliberately cover separate static failure modes rather than the
+# tree-dominated seq1/frame00084 and seq2/frame00127 views.
+seq12/frame00098.png
+seq4/frame00212.png
+seq12/frame00147.png
+seq2/frame00282.png
+seq10/frame00014.png

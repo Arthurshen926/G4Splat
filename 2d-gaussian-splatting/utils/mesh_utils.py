@@ -279,17 +279,21 @@ class GaussianExtractor(object):
         return mesh
 
     @torch.no_grad()
-    def export_image(self, path):
+    def export_image(self, path, rgb_only=False, index_offset=0):
         render_path = os.path.join(path, "renders")
         gts_path = os.path.join(path, "gt")
-        vis_path = os.path.join(path, "vis")
         os.makedirs(render_path, exist_ok=True)
-        os.makedirs(vis_path, exist_ok=True)
         os.makedirs(gts_path, exist_ok=True)
+        vis_path = None
+        if not rgb_only:
+            vis_path = os.path.join(path, "vis")
+            os.makedirs(vis_path, exist_ok=True)
         for idx, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="export images"):
+            output_idx = idx + index_offset
             gt = viewpoint_cam.original_image[0:3, :, :]
-            save_img_u8(gt.permute(1,2,0).cpu().numpy(), os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-            save_img_u8(self.rgbmaps[idx].permute(1,2,0).cpu().numpy(), os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-            save_img_f32(self.depthmaps[idx][0].cpu().numpy(), os.path.join(vis_path, 'depth_{0:05d}'.format(idx) + ".tiff"))
+            save_img_u8(gt.permute(1,2,0).cpu().numpy(), os.path.join(gts_path, '{0:05d}'.format(output_idx) + ".png"))
+            save_img_u8(self.rgbmaps[idx].permute(1,2,0).cpu().numpy(), os.path.join(render_path, '{0:05d}'.format(output_idx) + ".png"))
+            if not rgb_only:
+                save_img_f32(self.depthmaps[idx][0].cpu().numpy(), os.path.join(vis_path, 'depth_{0:05d}'.format(output_idx) + ".tiff"))
             # save_img_u8(self.normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(vis_path, 'normal_{0:05d}'.format(idx) + ".png"))
             # save_img_u8(self.depth_normals[idx].permute(1,2,0).cpu().numpy() * 0.5 + 0.5, os.path.join(vis_path, 'depth_normal_{0:05d}'.format(idx) + ".png"))

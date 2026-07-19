@@ -22,6 +22,10 @@ from sklearn.linear_model import RANSACRegressor
 import matplotlib.pyplot as plt
 import json
 from sklearn.base import BaseEstimator, RegressorMixin
+from planes.global_plane_support import (
+    append_plane_coverage_audit,
+    filter_global_planes_by_view_support,
+)
 
 
 class GeneralPlaneRegressor(BaseEstimator, RegressorMixin):
@@ -476,7 +480,18 @@ if __name__ == "__main__":
     model = ModelParams(parser, sentinel=True)
     parser.add_argument("--plane_root_path", required=True, type=str)
     parser.add_argument("--see3d_root_path", type=str, default=None)
+    parser.add_argument(
+        "--min_global_plane_views",
+        type=int,
+        default=2,
+        help=(
+            "Minimum number of distinct views required before a fused plane "
+            "may rewrite aligned Chart depth."
+        ),
+    )
     args = parser.parse_args()
+    if args.min_global_plane_views < 1:
+        raise ValueError("--min_global_plane_views must be at least one")
 
     print('NOTE: Using training views from data_path')
     # Initialize system state (RNG)
@@ -543,6 +558,32 @@ if __name__ == "__main__":
     with open(global_3Dplane_ID_dict_path, 'r') as f:
         temp_global_3Dplane_ID_dict = json.load(f)
     global_3Dplane_ID_dict = {int(k): v for k, v in temp_global_3Dplane_ID_dict.items()}
+    (
+        global_3Dplane_ID_dict,
+        global_plane_support_audit,
+    ) = filter_global_planes_by_view_support(
+        global_3Dplane_ID_dict,
+        minimum_distinct_views=args.min_global_plane_views,
+        real_view_upper_bound=input_view_num,
+    )
+    append_plane_coverage_audit(
+        global_plane_support_audit,
+        active_global_plane_members=global_3Dplane_ID_dict,
+        plane_masks=plane_mask_list,
+        visibility_masks=conf_map_list,
+    )
+    global_plane_support_audit_path = os.path.join(
+        data_path,
+        "global_plane_cross_view_support_audit.json",
+    )
+    with open(global_plane_support_audit_path, "w") as f:
+        json.dump(global_plane_support_audit, f, indent=2)
+    print(
+        "Global plane cross-view support: "
+        f"{global_plane_support_audit['accepted_global_plane_count']}/"
+        f"{global_plane_support_audit['total_global_plane_count']} eligible "
+        f"(min views={args.min_global_plane_views})"
+    )
 
     # align global 3D plane
     for key, value in global_3Dplane_ID_dict.items():
@@ -652,5 +693,3 @@ if __name__ == "__main__":
         print(f'refine points saved to {os.path.join(data_path, f"refine_points_frame{view_id:06d}.ply")}')
     
     print('done')
-
-

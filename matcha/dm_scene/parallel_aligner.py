@@ -25,6 +25,62 @@ from tqdm import tqdm
 
 # ----- ParallelAligner parameters -----
 
+def _append_optional_numpy(payload: dict, key: str, value) -> None:
+    if value is None:
+        return
+    if torch.is_tensor(value):
+        payload[key] = value.detach().cpu().numpy()
+    else:
+        payload[key] = np.asarray(value)
+
+
+def _masked_mean(values: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    valid = masks.to(device=values.device, dtype=torch.bool)
+    if valid.ndim < values.ndim:
+        if tuple(values.shape[: valid.ndim]) == tuple(valid.shape):
+            for _ in range(values.ndim - valid.ndim):
+                valid = valid.unsqueeze(-1)
+        elif tuple(values.shape[-valid.ndim :]) == tuple(valid.shape):
+            for _ in range(values.ndim - valid.ndim):
+                valid = valid.unsqueeze(0)
+        else:
+            raise RuntimeError(
+                f"Mask shape {tuple(valid.shape)} cannot broadcast to {tuple(values.shape)}"
+            )
+    valid = valid.expand_as(values) & torch.isfinite(values)
+    safe_values = torch.where(valid, values, torch.zeros_like(values))
+    return safe_values.sum() / valid.sum().clamp_min(1).to(values.dtype)
+
+
+def _backward_chunked_chart_encoding_norm(
+    charts_encoding: torch.nn.Module,
+    pts_uv: torch.Tensor,
+    *,
+    chunk_rows: int,
+    weight: float,
+) -> float:
+    """Backpropagate the exact sampled encoding-norm mean in spatial chunks.
+
+    The caller owns gradient clearing and optimizer stepping.  Calling
+    ``backward`` per independent spatial chunk avoids retaining every
+    grid-sample activation until the main alignment loss is backpropagated.
+    """
+    if pts_uv.ndim != 4 or pts_uv.shape[-1] != 2:
+        raise ValueError("pts_uv must have shape (charts, height, width, 2)")
+    if int(chunk_rows) < 1:
+        raise ValueError("chunk_rows must be positive")
+    total_count = float(np.prod(pts_uv.shape[:3]))
+    total_norm = 0.0
+    for row_start in range(0, int(pts_uv.shape[1]), int(chunk_rows)):
+        row_stop = min(int(pts_uv.shape[1]), row_start + int(chunk_rows))
+        encoding_chunk = charts_encoding(pts_uv[:, row_start:row_stop])
+        norm_sum = encoding_chunk.norm(dim=-1).sum()
+        (float(weight) * norm_sum / total_count).backward()
+        total_norm += float(norm_sum.detach().item())
+        del encoding_chunk, norm_sum
+    return total_norm / total_count
+
+
 class ChartsEncodingParams():
     def __init__(
         self,
@@ -453,9 +509,11 @@ class ParallelAligner(torch.nn.Module):
             diff = confidence * diff - self.confidence_weighting * torch.log(confidence)
         
         if masks is not None:
-            diff = masks * diff
-        
-        return diff.mean()
+            valid_mask = masks.to(dtype=torch.bool)
+            if reference_depths.shape == diff.shape:
+                valid_mask = valid_mask & torch.isfinite(reference_depths)
+            return _masked_mean(diff, valid_mask)
+        return torch.nan_to_num(diff, nan=1e4, posinf=1e4, neginf=1e4).mean()
     
     @torch.no_grad()
     def reset_encodings(self):
@@ -633,6 +691,9 @@ class ParallelAligner(torch.nn.Module):
         chart_encodings_norm_loss_weight:float=0.5,
         use_total_variation_on_depth_encodings:bool=False,
         total_variation_on_depth_encodings_weight:float=1.0,
+        projection_chunk_size:int=262_144,
+        matching_pixel_stride:int=1,
+        chart_encoding_norm_chunk_rows:int=0,
     ):
         """_summary_
 
@@ -695,7 +756,19 @@ class ParallelAligner(torch.nn.Module):
         if use_matching_loss:
             if self.using_pts_as_reference:
                 raise NotImplementedError("Matching loss is not implemented yet for point clouds.")
-            matcher = Matcher3D(cameras=self.cameras, reference_depths=reference_depths)
+            matching_reference_depths = reference_depths
+            if masks is not None:
+                matching_reference_depths = torch.where(
+                    masks.to(dtype=torch.bool),
+                    reference_depths,
+                    torch.zeros_like(reference_depths),
+                )
+            matcher = Matcher3D(
+                cameras=self.cameras,
+                reference_depths=matching_reference_depths,
+                reference_masks=masks,
+                projection_chunk_size=projection_chunk_size,
+            )
             if matching_thr is None:
                 matching_thr = self.cameras.get_spatial_extent() / 20.
             matcher.match(matching_thr)
@@ -722,6 +795,18 @@ class ParallelAligner(torch.nn.Module):
             self.initial_curvatures = None
 
         # Optimization loop
+        # A second full-resolution chart-encoding forward solely for the norm
+        # regularizer can exceed a 24 GB card once 40+ Charts are aligned.  The
+        # regularizer is separable over pixels, so backpropagate its exact mean
+        # in spatial chunks *before* the main graph is constructed.  This keeps
+        # its gradients identical to the dense objective while preventing the
+        # regularizer graph from coexisting with the much larger deformation,
+        # normal, curvature, and matching graphs.
+        norm_chunk_rows = int(chart_encoding_norm_chunk_rows)
+        if norm_chunk_rows < 0:
+            raise ValueError("chart_encoding_norm_chunk_rows must be non-negative")
+        if norm_chunk_rows == 0:
+            norm_chunk_rows = self.pm_h
         progress_bar = tqdm(range(n_iterations), desc="Aligning charts")
         for i_iter in range(n_iterations):
             if i_iter in lr_update_iters:
@@ -747,6 +832,17 @@ class ParallelAligner(torch.nn.Module):
                     for param_group in self.optimizer.param_groups:
                         print(f"      > {param_group['name']}: {param_group['lr']}")
             
+            chart_encodings_norm_loss = None
+            if regularize_chart_encodings_norms:
+                chart_encodings_norm_loss = _backward_chunked_chart_encoding_norm(
+                    self.charts_encoding,
+                    self._pts_uv,
+                    chunk_rows=norm_chunk_rows,
+                    weight=float(chart_encodings_norm_loss_weight),
+                )
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
             # Compute deformed depth
             _deformed_verts = self.verts
             _deformed_depths = self.cameras.p3d_cameras.get_world_to_view_transform().transform_points(
@@ -756,6 +852,12 @@ class ParallelAligner(torch.nn.Module):
             # Compute loss
             loss = self.loss(reference_depths=reference_depths, pred_depths=_deformed_depths, masks=masks)
             _loss = loss.detach().item()
+            if chart_encodings_norm_loss is not None:
+                # The norm gradient was already accumulated in bounded chunks;
+                # add its detached scalar only for correct loss reporting.
+                loss = loss + loss.new_tensor(
+                    float(chart_encodings_norm_loss_weight) * chart_encodings_norm_loss
+                )
             
             if use_gradient_loss:
                 if gradient_masks is not None:
@@ -775,7 +877,11 @@ class ParallelAligner(torch.nn.Module):
                 
             if use_normal_loss:
                 _deformed_normals = depth2normal_parallel(_deformed_depths, self.cameras)
-                normal_loss = normal_loss_weight * (1. - torch.sum(_normals * _deformed_normals, dim=-1)).mean()
+                normal_error = 1. - torch.sum(_normals * _deformed_normals, dim=-1)
+                normal_loss = normal_loss_weight * (
+                    _masked_mean(normal_error, masks)
+                    if masks is not None else normal_error.mean()
+                )
                 loss += normal_loss
                 normal_loss = normal_loss.detach().item()
                 
@@ -783,16 +889,49 @@ class ParallelAligner(torch.nn.Module):
                 if not use_normal_loss:
                     _deformed_normals = depth2normal_parallel(_deformed_depths, self.cameras)
                 _deformed_curvatures = normal2curv_parallel(_deformed_normals, mask=torch.ones_like(_deformed_normals, dtype=torch.bool))
-                curv_loss = curvature_loss_weight * (_curvatures - _deformed_curvatures).abs().mean()
+                curvature_error = (_curvatures - _deformed_curvatures).abs()
+                curv_loss = curvature_loss_weight * (
+                    _masked_mean(curvature_error, masks)
+                    if masks is not None else curvature_error.mean()
+                )
                 loss += curv_loss
                 curv_loss = curv_loss.detach().item()
             
             if use_matching_loss:
-                reprojection_errors, fov_mask = matcher.compute_reprojection_errors(depths=_deformed_depths)
-                reprojection_errors = reprojection_errors * fov_mask * matcher.reference_matches  # (n_charts, n_charts, h, w)
+                matching_depths = _deformed_depths
+                if masks is not None:
+                    matching_depths = torch.where(
+                        masks.to(dtype=torch.bool),
+                        _deformed_depths,
+                        torch.zeros_like(_deformed_depths),
+                    )
+                reprojection_errors, fov_mask = matcher.compute_reprojection_errors(
+                    depths=matching_depths,
+                    source_stride=matching_pixel_stride,
+                )
+                reference_matches = matcher.reference_matches[
+                    ..., ::matching_pixel_stride, ::matching_pixel_stride
+                ]
+                matching_valid = fov_mask & reference_matches
                 if use_confidence_in_matching_loss:
-                    reprojection_errors = reprojection_errors * self.confidence.detach()[None]  # (n_charts, n_charts, h, w)
-                matching_loss = matching_loss_weight * reprojection_errors.mean()
+                    reprojection_errors = reprojection_errors * self.confidence.detach()[None]
+                if masks is not None:
+                    source_valid = masks.to(dtype=torch.bool)[
+                        None, ..., ::matching_pixel_stride, ::matching_pixel_stride
+                    ].expand_as(reprojection_errors)
+                    safe_errors = torch.where(
+                        matching_valid,
+                        reprojection_errors,
+                        torch.zeros_like(reprojection_errors),
+                    )
+                    matching_loss = matching_loss_weight * (
+                        safe_errors.sum()
+                        / source_valid.sum().clamp_min(1).to(reprojection_errors.dtype)
+                    )
+                else:
+                    matching_loss = matching_loss_weight * (
+                        reprojection_errors * matching_valid
+                    ).mean()
                 loss += matching_loss
                 matching_loss = matching_loss.detach().item()
                 
@@ -807,11 +946,6 @@ class ParallelAligner(torch.nn.Module):
                 reprojection_loss = reprojection_loss_weight * minimal_projections_diffs.mean()
                 loss += reprojection_loss
                 reprojection_loss = reprojection_loss.detach().item()
-                
-            if regularize_chart_encodings_norms:
-                chart_encodings_norm_loss = self.charts_encoding(self._pts_uv).norm(dim=-1).mean()
-                loss += chart_encodings_norm_loss_weight * chart_encodings_norm_loss
-                chart_encodings_norm_loss = chart_encodings_norm_loss.detach().item()
                 
             if use_total_variation_on_depth_encodings:
                 depth_encodings_tv_loss = (self.depth_encoding.encodings[..., 1:] - self.depth_encoding.encodings[..., :-1]).abs().mean()
@@ -828,7 +962,14 @@ class ParallelAligner(torch.nn.Module):
             # Update matchings if needed
             if use_matching_loss and (matching_update_iters is not None) and (i_iter in matching_update_iters):
                 print("\n[INFO] Updating matchings.")
-                matcher.update_references(reference_depths=_deformed_depths.detach())
+                updated_reference_depths = _deformed_depths.detach()
+                if masks is not None:
+                    updated_reference_depths = torch.where(
+                        masks.to(dtype=torch.bool),
+                        updated_reference_depths,
+                        torch.zeros_like(updated_reference_depths),
+                    )
+                matcher.update_references(reference_depths=updated_reference_depths)
                 matcher.match(matching_thr)
             
             with torch.no_grad():
@@ -978,12 +1119,12 @@ class ParallelAligner(torch.nn.Module):
             curvatures = None
 
         if path is not None:
-            np.savez(
-                path, 
-                pts=(output_pts * scale_factor).cpu().numpy(), 
-                cols=output_col.cpu().numpy(), 
-                confs=output_confs.cpu().numpy(), 
-                depths=(output_depths).cpu().numpy(), 
-                normals=normals.cpu().numpy(), 
-                curvatures=curvatures.cpu().numpy()
-            )
+            payload = {
+                "pts": (output_pts * scale_factor).cpu().numpy(),
+                "cols": output_col.cpu().numpy(),
+                "confs": output_confs.cpu().numpy(),
+                "depths": output_depths.cpu().numpy(),
+            }
+            _append_optional_numpy(payload, "normals", normals)
+            _append_optional_numpy(payload, "curvatures", curvatures)
+            np.savez(path, **payload)

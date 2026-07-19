@@ -40,18 +40,31 @@ def normals_cluster(normals: np.ndarray, img_shape: tuple, n_init_clusters: int 
     else:
         normals_flat = normals
     
-    # KMeans clustering
-    kmeans = KMeans(n_clusters=n_init_clusters, random_state=0, n_init=1).fit(normals_flat)
-    pred = kmeans.labels_
+    valid = np.isfinite(normals_flat).all(axis=1) & (np.linalg.norm(normals_flat, axis=1) > 1e-6)
+    if not np.any(valid):
+        return []
+    unique_count = len(np.unique(np.round(normals_flat[valid], decimals=5), axis=0))
+    init_clusters = min(n_init_clusters, int(valid.sum()), unique_count)
+    if init_clusters <= 0:
+        return []
+    kmeans = KMeans(n_clusters=init_clusters, random_state=0, n_init=1).fit(normals_flat[valid])
+    pred = np.full(len(normals_flat), -1, dtype=np.int32)
+    pred[valid] = kmeans.labels_
     centers = kmeans.cluster_centers_
 
     # Select the first `n_clusters` clusters c1, c2, ..., where Size(c1) > Size(c2) > ... (sorted by size)
-    count_values = np.bincount(pred)
-    topk = np.argpartition(count_values, -n_clusters)[-n_clusters:]
+    count_values = np.bincount(pred[valid], minlength=init_clusters)
+    keep_clusters = min(n_clusters, int(np.count_nonzero(count_values)))
+    if keep_clusters <= 0:
+        return []
+    topk = np.argpartition(count_values, -keep_clusters)[-keep_clusters:]
     sorted_topk_idx = np.argsort(count_values[topk])
     sorted_topk = topk[sorted_topk_idx][::-1]
 
-    pred, sorted_topk, num_clusters = merge_normal_clusters(pred, sorted_topk, centers)
+    merged_valid, sorted_topk, num_clusters = merge_normal_clusters(
+        pred[valid], sorted_topk, centers
+    )
+    pred[valid] = merged_valid
 
     min_plane_size = img_shape[0] * img_shape[1] * min_size_ratio
     
@@ -115,17 +128,32 @@ class PlaneExcavator:
         """
         Cluster the surface normals.
         """
-        kmeans = KMeans(n_clusters=self.n_init_normal_clusters, random_state=0, n_init=1).fit(normals.reshape(-1, 3))
-        pred = kmeans.labels_
+        flat_normals = normals.reshape(-1, 3)
+        valid = np.isfinite(flat_normals).all(axis=1) & (np.linalg.norm(flat_normals, axis=1) > 1e-6)
+        if not np.any(valid):
+            return []
+        unique_count = len(np.unique(np.round(flat_normals[valid], decimals=5), axis=0))
+        init_clusters = min(self.n_init_normal_clusters, int(valid.sum()), unique_count)
+        if init_clusters <= 0:
+            return []
+        kmeans = KMeans(n_clusters=init_clusters, random_state=0, n_init=1).fit(flat_normals[valid])
+        pred = np.full(len(flat_normals), -1, dtype=np.int32)
+        pred[valid] = kmeans.labels_
         centers = kmeans.cluster_centers_
 
         # Select the first `num_max_clusters` clusters c1, c2, ..., where Size(c1) > Size(c2) > ... (sorted by size)
-        count_values = np.bincount(pred)
-        topk = np.argpartition(count_values,-self.n_normal_clusters)[-self.n_normal_clusters:]
+        count_values = np.bincount(pred[valid], minlength=init_clusters)
+        keep_clusters = min(self.n_normal_clusters, int(np.count_nonzero(count_values)))
+        if keep_clusters <= 0:
+            return []
+        topk = np.argpartition(count_values, -keep_clusters)[-keep_clusters:]
         sorted_topk_idx = np.argsort(count_values[topk])
         sorted_topk = topk[sorted_topk_idx][::-1]
 
-        pred, sorted_topk, num_clusters = merge_normal_clusters(pred, sorted_topk, centers)
+        merged_valid, sorted_topk, num_clusters = merge_normal_clusters(
+            pred[valid], sorted_topk, centers
+        )
+        pred[valid] = merged_valid
 
         count_valid_cluster = 0
         normal_masks = []
@@ -186,13 +214,17 @@ class PlaneExcavator:
             area = mask.sum()
             if area < self.min_plane_size:
                 continue
+
+            avg_normal = np.mean(normals[mask], axis=0)
+            normal_norm = np.linalg.norm(avg_normal)
+            if not np.isfinite(normal_norm) or normal_norm <= 1e-8:
+                continue
+
             new_count += 1
             new_seg_mask[mask] = new_count
             masks_areas.append(area)
             plane_instances.append(mask)
-
-            avg_normal = np.mean(normals[mask], axis=0)
-            avg_normal /= np.sqrt((avg_normal ** 2).sum())  # normalize
+            avg_normal /= normal_norm
             masks_avg_normals.append(avg_normal)
 
         if len(masks_avg_normals) == 0:

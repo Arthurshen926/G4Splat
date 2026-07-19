@@ -181,6 +181,16 @@ python train.py -s data/denseview/scan1 -o output/denseview/scan1 --sfm_config p
 # Note: If your captured data exhibits severe illumination variations, append "--downweight_input_view_color_loss" to achieve smoother surface geometry.
 ```
 
+### Experimental Cambridge adaptation
+
+The independent Cambridge runner adds posed full-dataset supervision, training
+view quality control, target-k-center chart selection, semantic-masked strong
+alignment/losses, regularized per-image exposure correction, and
+an explicitly labelled all-train in-sample fit audit.  Every image in
+`datasets_full/<scene>/train` remains reconstruction input; QC is not a
+train/validation split. See
+[`docs/cambridge.md`](docs/cambridge.md) for the exact policy and commands.
+
 
 ## Acknowledgements
 Some codes are borrowed from [MAtCha](https://github.com/Anttwo/MAtCha), [NeuralPlane](https://github.com/3dv-casia/NeuralPlane), [See3D](https://github.com/baaivision/See3D), [MASt3R-SfM](https://github.com/naver/mast3r), [DepthAnythingV2](https://github.com/DepthAnything/Depth-Anything-V2), [2DGS](https://github.com/hbb1/2d-gaussian-splatting) and [GOF](https://github.com/autonomousvision/gaussian-opacity-fields). We thank all the authors for their great work. 
@@ -196,4 +206,3 @@ Some codes are borrowed from [MAtCha](https://github.com/Anttwo/MAtCha), [Neural
     year={2026}
 }
 ```
-

@@ -61,6 +61,11 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
 
 
 def qvec2rotmat(qvec):
+    qvec = np.asarray(qvec, dtype=np.float64)
+    qvec_norm = np.linalg.norm(qvec)
+    if not np.isfinite(qvec).all() or qvec_norm <= 1e-12:
+        raise ValueError("COLMAP camera quaternion is non-finite or has zero norm")
+    qvec = qvec / qvec_norm
     return np.array([
         [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
          2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],

@@ -1,0 +1,7 @@
+# Deliberately diverse, real training-view residuals for posterior causal repair.
+# These are not a validation split: every listed image remains part of the
+# 1487-image reconstruction supervision set.
+seq2/frame00127.png
+seq4/frame00205.png
+seq4/frame00212.png
+seq12/frame00097.png

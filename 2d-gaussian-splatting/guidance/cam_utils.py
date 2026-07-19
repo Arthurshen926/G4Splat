@@ -111,6 +111,134 @@ def interpolate_camera_path(poses, num_views, add_random_trans=False):
 
     return new_poses
 
+
+def estimate_camera_vertical_axis(c2ws: np.ndarray) -> np.ndarray:
+    """Estimate the world-space image vertical axis from calibrated cameras."""
+    c2ws = np.asarray(c2ws, dtype=np.float64)
+    if c2ws.ndim != 3 or c2ws.shape[1:] != (4, 4) or len(c2ws) == 0:
+        raise ValueError("c2ws must have shape [N, 4, 4]")
+
+    verticals = c2ws[:, :3, 1].copy()
+    reference = verticals[0] / (np.linalg.norm(verticals[0]) + 1e-12)
+    signs = np.sign(verticals @ reference)
+    signs[signs == 0] = 1
+    verticals *= signs[:, None]
+    vertical = np.median(verticals, axis=0)
+    norm = np.linalg.norm(vertical)
+    if not np.isfinite(norm) or norm < 1e-8:
+        return reference.astype(np.float32)
+    return (vertical / norm).astype(np.float32)
+
+
+def build_pose_graph_interpolated_c2ws(
+    c2ws: np.ndarray,
+    n_frames: int = 60,
+    neighbor_count: int = 3,
+    interpolation_fractions=(0.5, 0.33, 0.67),
+) -> np.ndarray:
+    """Interpolate nearby calibrated poses without leaving the camera manifold."""
+    c2ws = np.asarray(c2ws, dtype=np.float64)
+    if c2ws.ndim != 3 or c2ws.shape[1:] != (4, 4):
+        raise ValueError("c2ws must have shape [N, 4, 4]")
+    if n_frames <= 0 or len(c2ws) < 2:
+        return np.empty((0, 4, 4), dtype=np.float32)
+
+    centers = c2ws[:, :3, 3]
+    rotations = c2ws[:, :3, :3]
+    center_distances = np.linalg.norm(centers[:, None] - centers[None, :], axis=-1)
+    nonzero_distances = center_distances[center_distances > 1e-8]
+    scene_scale = (
+        float(np.percentile(nonzero_distances, 75))
+        if nonzero_distances.size
+        else 1.0
+    )
+    scene_scale = max(scene_scale, 1e-8)
+
+    forward = rotations[:, :, 2]
+    forward_cos = np.clip(forward @ forward.T, -1.0, 1.0)
+    forward_angles = np.arccos(forward_cos)
+    vertical = rotations[:, :, 1]
+    vertical_cos = np.clip(vertical @ vertical.T, -1.0, 1.0)
+    vertical_angles = np.arccos(vertical_cos)
+    pose_distance = (
+        center_distances / scene_scale
+        + 0.5 * forward_angles
+        + 0.25 * vertical_angles
+    )
+    np.fill_diagonal(pose_distance, np.inf)
+
+    neighbor_count = max(1, min(int(neighbor_count), len(c2ws) - 1))
+    neighbor_order = np.argsort(pose_distance, axis=1)[:, :neighbor_count]
+    pairs = []
+    seen_pairs = set()
+    for rank in range(neighbor_count):
+        for source_id in range(len(c2ws)):
+            target_id = int(neighbor_order[source_id, rank])
+            pair = tuple(sorted((source_id, target_id)))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            pairs.append(pair)
+
+    candidates = []
+    for fraction in interpolation_fractions:
+        fraction = float(fraction)
+        if not 0.0 < fraction < 1.0:
+            raise ValueError("interpolation fractions must be in (0, 1)")
+        for source_id, target_id in pairs:
+            key_rotations = Rotation.from_matrix(rotations[[source_id, target_id]])
+            rotation = Slerp([0.0, 1.0], key_rotations)([fraction]).as_matrix()[0]
+            center = (
+                (1.0 - fraction) * centers[source_id]
+                + fraction * centers[target_id]
+            )
+            pose = np.eye(4, dtype=np.float64)
+            pose[:3, :3] = rotation
+            pose[:3, 3] = center
+            candidates.append(pose)
+            if len(candidates) >= n_frames:
+                return np.asarray(candidates, dtype=np.float32)
+
+    return np.asarray(candidates, dtype=np.float32)
+
+
+def generate_pose_graph_interpolated_camera_poses(
+    train_cams,
+    visibility_grid,
+    n_frames=60,
+    neighbor_count=3,
+    width=512,
+    height=512,
+    fovy_deg=60,
+    fovx_deg=None,
+    device='cuda',
+):
+    """Generate cameras between pose-neighbor charts for trajectory-style scenes."""
+    fovy = np.deg2rad(fovy_deg)
+    fovx = fovy if fovx_deg is None else np.deg2rad(fovx_deg)
+    train_w2cs = [cam.world_view_transform.transpose(0, 1).cpu().numpy() for cam in train_cams]
+    train_c2ws = np.stack([np.linalg.inv(w2c) for w2c in train_w2cs], axis=0)
+    interpolated_c2ws = build_pose_graph_interpolated_c2ws(
+        train_c2ws,
+        n_frames=n_frames,
+        neighbor_count=neighbor_count,
+    )
+
+    if len(interpolated_c2ws) and visibility_grid is not None:
+        centers = torch.as_tensor(
+            interpolated_c2ws[:, :3, 3], dtype=torch.float32, device=device
+        )
+        valid_mask = visibility_grid.check_valid_camera_center(centers).cpu().numpy()
+        valid_poses = interpolated_c2ws[valid_mask]
+        if len(valid_poses):
+            interpolated_c2ws = valid_poses
+
+    cameras = [
+        MiniCam(c2w, width, height, fovy=fovy, fovx=fovx)
+        for c2w in interpolated_c2ws
+    ]
+    return interpolated_c2ws, cameras
+
 def generate_random_perturbed_camera_poses(
     gs_cameras,
     visibility_grid,
@@ -754,7 +882,17 @@ def generate_see3d_camera_by_lookat_none_vis_plane(train_cams, visibility_grid, 
 
     return new_poses, cur_cams
 
-def generate_see3d_camera_by_lookat_all_plane(train_cams, visibility_grid, plane_all_points_dict, traj_center=None, width=512, height=512, fovy_deg=60, fovx_deg=None):
+def generate_see3d_camera_by_lookat_all_plane(
+    train_cams,
+    visibility_grid,
+    plane_all_points_dict,
+    traj_center=None,
+    width=512,
+    height=512,
+    fovy_deg=60,
+    fovx_deg=None,
+    use_camera_vertical=False,
+):
     """
     Generate see3d camera by lookat all plane points.
     """
@@ -879,8 +1017,15 @@ def generate_see3d_camera_by_lookat_all_plane(train_cams, visibility_grid, plane
         lookat_points.append(lookat_point)
         novel_cam_centers.append(camera_center)
 
-    # NOTE: hard code up vector for colmap coords
-    up = np.array([0, 0, -1])
+    if use_camera_vertical:
+        train_w2cs = [
+            cam.world_view_transform.transpose(0, 1).cpu().numpy()
+            for cam in train_cams
+        ]
+        train_c2ws = np.stack([np.linalg.inv(w2c) for w2c in train_w2cs], axis=0)
+        up = estimate_camera_vertical_axis(train_c2ws)
+    else:
+        up = np.array([0, 0, -1])
     new_poses = np.stack([viewmatrix(p - lookat, up, p) for p, lookat in zip(novel_cam_centers, lookat_points)])
 
     homogeneous_row = np.zeros((len(new_poses), 1, 4))
@@ -1883,4 +2028,3 @@ class MiniCam:
         )
         self.full_proj_transform = self.world_view_transform @ self.projection_matrix
         self.camera_center = torch.tensor(c2w[:3, 3]).cuda()                     # TODO: need check whether this is correct, camera center used to compute the SH
-

@@ -1,142 +1,141 @@
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import subprocess
-
 import argparse
+from pathlib import Path
+import subprocess
+import sys
+
 import yaml
 
-def run_command_safe(command):
-    print(f"Running command: {command}")
-    exit_code = os.system(command)
-    if exit_code != 0:
-        print("Command failed!")
-        sys.exit(1)
-    else:
-        print("Command succeeded!")
 
-if __name__ == '__main__':
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
+
+
+def build_command(args, config):
+    command = [
+        sys.executable,
+        "mast3r/run_mast3r.py",
+        "--scene_path",
+        args.source_path,
+        "--output_dir",
+        args.output_path,
+        "--weights_path",
+        str(config["weights_path"]),
+        "--retrieval_model",
+        str(config["retrieval_model"]),
+        "--min_conf_thr",
+        str(config["min_conf_thr"]),
+        "--matching_conf_thr",
+        str(config["matching_conf_thr"]),
+        "--n_coarse_iterations",
+        str(config["n_coarse_iterations"]),
+        "--n_refinement_iterations",
+        str(config["n_refinement_iterations"]),
+        "--TSDF_thresh",
+        str(config["TSDF_thresh"]),
+        "--n_images",
+        str(args.n_images),
+    ]
+
+    for key, flag in (
+        ("fix_focal", "--fix_focal"),
+        ("fix_principal_point", "--fix_principal_point"),
+        ("fix_rotation", "--fix_rotation"),
+        ("fix_translation", "--fix_translation"),
+    ):
+        if config.get(key, False):
+            command.append(flag)
+
+    if args.use_all_images:
+        command.append("--use_all_images")
+    if args.image_idx is not None:
+        command.append("--image_idx")
+        command.extend(str(index) for index in args.image_idx)
+    if args.randomize_images:
+        command.append("--randomize_images")
+
+    command.extend(
+        [
+            "--image_size",
+            str(config["image_size"]),
+            "--max_window_size",
+            str(config["max_window_size"]),
+            "--max_refid",
+            str(config["max_refid"]),
+            "--output_conf_thr",
+            str(config["output_conf_thr"]),
+        ]
+    )
+    for key, flag in (
+        ("use_calibrated_poses", "--use_calibrated_poses"),
+        ("save_glb", "--save_glb"),
+        ("align_camera_locations", "--align_camera_locations"),
+    ):
+        if config.get(key, False):
+            command.append(flag)
+    return command
+
+
+def parse_args():
     parser = argparse.ArgumentParser()
-    
-    parser.add_argument('-s', '--source_path', type=str, 
-        help='Path to the source data to use. Can be a directory containing images, or a colmap output directory.')
-    parser.add_argument('-o', '--output_path', type=str, default=None, 
-        help='Path to the output directory.')
-    
-    # Data parameters
-    # parser.add_argument('--use_all_images', action='store_true', help='Use all images for optimization.')
-    parser.add_argument('--n_images', type=int, default=None, 
-        help='Number of images to use for optimization, sampled with constant spacing. If not provided, all images will be used.')
-    parser.add_argument('--image_idx', type=int, nargs='*', default=None, 
-        help='View indices to use for optimization (zero-based indexing). If provided, this will override the --n_images.')
-    parser.add_argument('--randomize_images', action='store_true', 
-        help='Shuffle training images before sampling with constant spacing. If image_idx is provided, this will be ignored.')
-    
-    # Config
-    parser.add_argument('-c', '--config', type=str, default='unposed',
-        help='name of the config to use. Should be either "unposed", "posed" or a custom config.')
-    
-    # Environment
-    # parser.add_argument('--env', type=str, default='matcha',
-    #     help='name of the environment to use.')
+    parser.add_argument(
+        "-s",
+        "--source_path",
+        type=str,
+        required=True,
+        help="Directory containing images or a COLMAP dataset.",
+    )
+    parser.add_argument("-o", "--output_path", type=str, default=None)
+    parser.add_argument(
+        "--n_images",
+        type=int,
+        default=None,
+        help="Number of uniformly sampled views. Prefer explicit --image_idx.",
+    )
+    parser.add_argument(
+        "--image_idx",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit zero-based view indices; mutually exclusive with --n_images.",
+    )
+    parser.add_argument("--randomize_images", action="store_true")
+    parser.add_argument("-c", "--config", type=str, default="unposed")
+    return parser.parse_args()
 
-    # Set image arguments
-    args = parser.parse_args()
-    if args.n_images is None: 
-        if args.image_idx is None:
-            args.use_all_images = True
-            args.randomize_images = False
-            args.n_images = -1  # Just a placeholder
-            print(f"[INFO] Using all images for optimization.")
-        else:
-            args.use_all_images = False
-            args.randomize_images = False
-            args.n_images = len(args.image_idx)
-            print(f"[INFO] Using {args.n_images} images for optimization.")
+
+def main():
+    args = parse_args()
+    if args.n_images is not None and args.image_idx is not None:
+        raise ValueError("Cannot provide both --n_images and --image_idx.")
+
+    if args.image_idx is not None:
+        args.use_all_images = False
+        args.randomize_images = False
+        args.n_images = len(args.image_idx)
+        print(f"[INFO] Using {args.n_images} explicitly selected images.")
+    elif args.n_images is None:
+        args.use_all_images = True
+        args.randomize_images = False
+        args.n_images = -1
+        print("[INFO] Using all images for optimization.")
     else:
-        if args.image_idx is not None:
-            raise ValueError("Cannot provide both --n_images and --image_idx arguments.")
-        else:
-            args.use_all_images = False
-            print(f"[INFO] Using {args.n_images} images for optimization.")
-            
-    # Set output path
+        args.use_all_images = False
+        print(f"[INFO] Using {args.n_images} sampled images.")
+
     if args.output_path is None:
-        if args.source_path.endswith(os.sep):
-            output_dir_name = args.source_path.split(os.sep)[-2]
-        else:
-            output_dir_name = args.source_path.split(os.sep)[-1]
-        args.output_path = os.path.join('output', output_dir_name)
-        args.output_path = os.path.join(args.output_path, 'mast3r_sfm')
-    os.makedirs(args.output_path, exist_ok=True)
+        source_name = Path(args.source_path).resolve().name
+        args.output_path = str(Path("output") / source_name / "mast3r_sfm")
+    Path(args.output_path).mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Scene will be saved to: {args.output_path}")
-            
-    # Load config
-    config_path = os.path.join('configs/mast3r', args.config + '.yaml')
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-        
-    # Define command
-    tmp_idx = args.image_idx if args.image_idx is not None else []
-    command = " ".join([
-        # "conda",  "run", "-n", args.env, 
-        "python", "mast3r/run_mast3r.py",
-        "--scene_path", args.source_path,
-        "--output_dir", args.output_path,
-        "--weights_path", config['weights_path'],
-        "--retrieval_model", config['retrieval_model'],
-        "--min_conf_thr", str(config['min_conf_thr']),
-        "--matching_conf_thr", str(config['matching_conf_thr']),
-        "--n_coarse_iterations", str(config['n_coarse_iterations']),
-        "--n_refinement_iterations", str(config['n_refinement_iterations']),
-        "--TSDF_thresh", str(config['TSDF_thresh']),
-        "--fix_focal" if config['fix_focal'] else "",
-        "--fix_principal_point" if config['fix_principal_point'] else "",
-        "--fix_rotation" if config['fix_rotation'] else "",
-        "--fix_translation" if config['fix_translation'] else "",
-        "--n_images", str(args.n_images),
-        "--use_all_images" if args.use_all_images else "",
-        "--image_idx" if args.image_idx is not None else "", 
-        *[str(i) for i in tmp_idx],
-        "--randomize_images" if args.randomize_images else "",
-        "--image_size", str(config['image_size']),
-        "--max_window_size", str(config['max_window_size']),
-        "--max_refid", str(config['max_refid']),
-        "--use_calibrated_poses" if config['use_calibrated_poses'] else "",
-        "--save_glb" if config['save_glb'] else "",
-        "--output_conf_thr", str(config['output_conf_thr']),
-        "--align_camera_locations" if config['align_camera_locations'] else "",
-    ])
-    
-    # Run command
-    print(f"[INFO] Running command:\n", command)
-    run_command_safe(command)
-    
-    # subprocess.run([
-    #     "conda",  "run", "-n", args.env, "python", "mast3r/run_mast3r.py",
-    #     "--scene_path", args.source_path,
-    #     "--output_dir", args.output_path,
-    #     "--weights_path", config['weights_path'],
-    #     "--retrieval_model", config['retrieval_model'],
-    #     "--min_conf_thr", str(config['min_conf_thr']),
-    #     "--matching_conf_thr", str(config['matching_conf_thr']),
-    #     "--n_coarse_iterations", str(config['n_coarse_iterations']),
-    #     "--n_refinement_iterations", str(config['n_refinement_iterations']),
-    #     "--TSDF_thresh", str(config['TSDF_thresh']),
-    #     "--fix_focal" if config['fix_focal'] else "",
-    #     "--fix_principal_point" if config['fix_principal_point'] else "",
-    #     "--fix_rotation" if config['fix_rotation'] else "",
-    #     "--fix_translation" if config['fix_translation'] else "",
-    #     "--n_images", str(args.n_images),
-    #     "--use_all_images" if args.use_all_images else "",
-    #     "--image_idx" if args.image_idx is not None else "", 
-    #     *[str(i) for i in tmp_idx],
-    #     "--randomize_images" if args.randomize_images else "",
-    #     "--image_size", str(config['image_size']),
-    #     "--max_window_size", str(config['max_window_size']),
-    #     "--max_refid", str(config['max_refid']),
-    #     "--use_calibrated_poses" if config['use_calibrated_poses'] else "",
-    #     "--save_glb" if config['save_glb'] else "",
-    #     "--output_conf_thr", str(config['output_conf_thr']),
-    #     "--align_camera_locations" if config['align_camera_locations'] else "",
-    # ])
+
+    config_path = REPO_ROOT / "configs" / "mast3r" / f"{args.config}.yaml"
+    with config_path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    command = build_command(args, config)
+    print("[INFO] Running command:\n", " ".join(command))
+    subprocess.run(command, cwd=REPO_ROOT, check=True)
+
+
+if __name__ == "__main__":
+    main()

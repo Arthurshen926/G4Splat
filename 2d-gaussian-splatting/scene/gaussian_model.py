@@ -17,7 +17,7 @@ from torch import nn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import C0, RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -245,6 +245,165 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def append_from_parameters(
+        self,
+        means,
+        scales,
+        quaternions,
+        colors,
+        *,
+        initial_opacity=0.05,
+    ):
+        """Append conservative reseed Gaussians before optimizer construction."""
+        if self.optimizer is not None:
+            raise RuntimeError("append_from_parameters must run before training_setup")
+        if len(means) == 0:
+            return 0
+        if not (len(means) == len(scales) == len(quaternions) == len(colors)):
+            raise ValueError("Reseed Gaussian parameter lengths do not match")
+
+        means = means.to(device=self._xyz.device, dtype=self._xyz.dtype)
+        scales = scales.to(device=self._scaling.device, dtype=self._scaling.dtype).clamp_min(1e-8)
+        quaternions = F.normalize(
+            quaternions.to(device=self._rotation.device, dtype=self._rotation.dtype),
+            dim=-1,
+        )
+        colors = colors.to(device=self._features_dc.device, dtype=self._features_dc.dtype)
+        features_dc = RGB2SH(colors)[:, None, :]
+        features_rest = torch.zeros(
+            (len(means), (self.max_sh_degree + 1) ** 2 - 1, 3),
+            device=self._features_rest.device,
+            dtype=self._features_rest.dtype,
+        )
+        opacities = self.inverse_opacity_activation(
+            torch.full(
+                (len(means), 1),
+                float(initial_opacity),
+                device=self._opacity.device,
+                dtype=self._opacity.dtype,
+            )
+        )
+
+        self._xyz = nn.Parameter(torch.cat([self._xyz.detach(), means], dim=0).requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            torch.cat([self._features_dc.detach(), features_dc], dim=0).requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            torch.cat([self._features_rest.detach(), features_rest], dim=0).requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(
+            torch.cat([self._scaling.detach(), torch.log(scales)], dim=0).requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            torch.cat([self._rotation.detach(), quaternions], dim=0).requires_grad_(True)
+        )
+        self._opacity = nn.Parameter(
+            torch.cat([self._opacity.detach(), opacities], dim=0).requires_grad_(True)
+        )
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self._xyz.device)
+
+        if self.use_mip_filter:
+            old_filter = getattr(self, "mip_filter", None)
+            if old_filter is None or len(old_filter) != len(self._xyz) - len(means):
+                old_filter = torch.zeros(
+                    (len(self._xyz) - len(means), 1),
+                    device=self._xyz.device,
+                    dtype=self._xyz.dtype,
+                )
+            new_filter = torch.zeros(
+                (len(means), 1),
+                device=old_filter.device,
+                dtype=old_filter.dtype,
+            )
+            self.mip_filter = torch.cat([old_filter, new_filter], dim=0)
+        return len(means)
+
+    def freeze_prefix_gradients(self, point_count):
+        """Freeze a loaded baseline prefix while allowing appended points to train."""
+        point_count = int(point_count)
+        if point_count < 0 or point_count > len(self._xyz):
+            raise ValueError(
+                f"Cannot freeze {point_count} of {len(self._xyz)} Gaussian points"
+            )
+        handles = getattr(self, "_prefix_gradient_hook_handles", [])
+        for handle in handles:
+            handle.remove()
+        self._prefix_gradient_hook_handles = []
+        self._frozen_prefix_count = point_count
+        self._warmstart_suffix_initial_xyz = self._xyz[point_count:].detach().clone()
+        if hasattr(self, "mip_filter") and len(self.mip_filter) >= point_count:
+            self._frozen_prefix_mip_filter = self.mip_filter[:point_count].detach().clone()
+
+        for parameter in (
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._opacity,
+            self._scaling,
+            self._rotation,
+        ):
+            trainable = torch.ones(
+                (len(parameter),) + (1,) * (parameter.ndim - 1),
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            trainable[:point_count] = 0
+            self._prefix_gradient_hook_handles.append(
+                parameter.register_hook(lambda gradient, mask=trainable: gradient * mask)
+            )
+        print(
+            f"[INFO] Frozen {point_count} baseline Gaussians; "
+            f"{len(self._xyz) - point_count} appended Gaussians remain trainable."
+        )
+
+    @torch.no_grad()
+    def constrain_trainable_suffix(
+        self,
+        point_count,
+        max_opacity=1.0,
+        max_scale=0.0,
+        max_position_delta=0.0,
+        diffuse_only=False,
+        clamp_dc=False,
+    ):
+        """Project sparse warm-start additions back into conservative bounds."""
+        point_count = int(point_count)
+        if point_count < 0 or point_count > len(self._xyz):
+            raise ValueError(f"Invalid warm-start prefix size: {point_count}")
+        suffix = slice(point_count, None)
+        if 0.0 < float(max_opacity) < 1.0:
+            cap = self.inverse_opacity_activation(
+                self._opacity.new_tensor(float(max_opacity))
+            )
+            self._opacity[suffix].clamp_(max=cap)
+        if float(max_scale) > 0.0:
+            self._scaling[suffix].clamp_(
+                max=float(np.log(float(max_scale)))
+            )
+        if float(max_position_delta) > 0.0:
+            initial = getattr(self, "_warmstart_suffix_initial_xyz", None)
+            if initial is None or len(initial) != len(self._xyz) - point_count:
+                raise RuntimeError("Warm-start position constraints require a frozen suffix snapshot")
+            delta = self._xyz[suffix] - initial
+            norm = torch.linalg.vector_norm(delta, dim=-1, keepdim=True).clamp_min(1e-12)
+            scale = torch.clamp(float(max_position_delta) / norm, max=1.0)
+            self._xyz[suffix].copy_(initial + delta * scale)
+        if diffuse_only:
+            self._features_rest[suffix].zero_()
+        if clamp_dc:
+            dc_limit = 0.5 / C0
+            self._features_dc[suffix].clamp_(min=-dc_limit, max=dc_limit)
+
+    @torch.no_grad()
+    def restore_frozen_prefix_mip_filter(self):
+        frozen = getattr(self, "_frozen_prefix_mip_filter", None)
+        point_count = int(getattr(self, "_frozen_prefix_count", 0))
+        if frozen is None or point_count <= 0 or not hasattr(self, "mip_filter"):
+            return
+        if len(self.mip_filter) < point_count:
+            raise RuntimeError("MIP filter is shorter than the frozen warm-start prefix")
+        self.mip_filter[:point_count].copy_(frozen)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -260,6 +419,13 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.non_position_base_lrs = {
+            group["name"]: group["lr"] for group in self.optimizer.param_groups
+            if group["name"] != "xyz"
+        }
+        self.non_position_lr_decay_from = int(training_args.non_position_lr_decay_from)
+        self.non_position_lr_decay_until = max(int(training_args.iterations), 1)
+        self.non_position_lr_final_mult = float(training_args.non_position_lr_final_mult)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -267,6 +433,21 @@ class GaussianModel:
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
+        if self.non_position_lr_decay_from >= 0:
+            span = max(
+                self.non_position_lr_decay_until - self.non_position_lr_decay_from,
+                1,
+            )
+            progress = min(
+                max((iteration - self.non_position_lr_decay_from) / span, 0.0),
+                1.0,
+            )
+            final_mult = max(self.non_position_lr_final_mult, 1e-8)
+            multiplier = final_mult ** progress
+            for param_group in self.optimizer.param_groups:
+                name = param_group["name"]
+                if name != "xyz":
+                    param_group["lr"] = self.non_position_base_lrs[name] * multiplier
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
@@ -432,6 +613,7 @@ class GaussianModel:
         
         mip_filter = distance / focal_length * (filter_variance ** 0.5)
         self.mip_filter = mip_filter[..., None]
+        self.restore_frozen_prefix_mip_filter()
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -949,6 +1131,7 @@ def get_gaussian_parameters_by_warp_from_depths(
     min_scale=0.0005,
     max_scale=0.05,
     downsample_pixel_grid_size=-1,
+    valid_masks=None,
 ):
     """
     Initialize one Gaussian only for pixels that are not already covered by earlier
@@ -960,7 +1143,22 @@ def get_gaussian_parameters_by_warp_from_depths(
     colors = []
     initialized_view_ids = []
 
-    for idx, (depth, view) in enumerate(tqdm(list(zip(depths, views)), desc="Initializing Gaussians by warp")):
+    if valid_masks is not None and len(valid_masks) != len(depths):
+        raise ValueError("valid_masks must have one entry per depth/view")
+
+    masked_depths = []
+    for idx, depth in enumerate(depths):
+        masked_depth = depth.squeeze().cuda()
+        if valid_masks is not None:
+            mask = valid_masks[idx].squeeze().to(masked_depth.device, dtype=torch.bool)
+            if mask.shape != masked_depth.shape:
+                raise ValueError(
+                    f"valid mask {idx} has shape {tuple(mask.shape)}, expected {tuple(masked_depth.shape)}"
+                )
+            masked_depth = torch.where(mask, masked_depth, torch.zeros_like(masked_depth))
+        masked_depths.append(masked_depth)
+
+    for idx, (depth, view) in enumerate(tqdm(list(zip(masked_depths, views)), desc="Initializing Gaussians by warp")):
         depth = depth.squeeze().cuda()
         points_world = depths_to_points(view, depth).reshape(depth.shape[0], depth.shape[1], 3)
         valid_mask = depth > 0.0
@@ -977,7 +1175,7 @@ def get_gaussian_parameters_by_warp_from_depths(
                 points_world,
                 valid_mask,
                 views[initialized_idx],
-                depths[initialized_idx].squeeze().cuda(),
+                masked_depths[initialized_idx],
                 depth_error_thresh,
             )
 

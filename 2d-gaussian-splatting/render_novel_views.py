@@ -7,6 +7,7 @@ sys.path.append(os.getcwd())
 import json
 import numpy as np
 import shutil
+import cv2
 from gaussian_renderer import render
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
@@ -28,13 +29,98 @@ from guidance.cam_utils import (
     generate_look_around_camera_poses, 
     generate_see3d_camera_by_view_angle,
     generate_see3d_camera_by_lookat_none_vis_plane,
-    generate_see3d_camera_by_lookat_all_plane
+    generate_see3d_camera_by_lookat_all_plane,
+    generate_pose_graph_interpolated_camera_poses,
 )
 
 from matcha.dm_scene.charts import depths_to_points_parallel
 
 from guidance.vis_grid import VisibilityGrid
 from planes.get_global_3Dpnts import get_none_vis_global_3Dpnts, get_visible_mask_for_input_views, get_all_global_3Dpnts
+
+
+def select_reference_viewpoints(reference_viewpoints, target_viewpoints, count):
+    if count <= 0 or count >= len(reference_viewpoints):
+        return list(reference_viewpoints)
+    if not target_viewpoints:
+        return list(reference_viewpoints[:count])
+
+    reference_centers = np.stack([
+        camera.camera_center.detach().cpu().numpy() for camera in reference_viewpoints
+    ])
+    target_centers = np.stack([
+        camera.camera_center.detach().cpu().numpy() for camera in target_viewpoints
+    ])
+    reference_forwards = np.stack([
+        torch.linalg.inv(camera.world_view_transform)[2, :3].detach().cpu().numpy()
+        for camera in reference_viewpoints
+    ])
+    target_forwards = np.stack([
+        torch.linalg.inv(camera.world_view_transform)[2, :3].detach().cpu().numpy()
+        for camera in target_viewpoints
+    ])
+    reference_forwards /= np.maximum(np.linalg.norm(reference_forwards, axis=1, keepdims=True), 1e-8)
+    target_forwards /= np.maximum(np.linalg.norm(target_forwards, axis=1, keepdims=True), 1e-8)
+    scene_scale = max(float(np.linalg.norm(reference_centers.max(0) - reference_centers.min(0))), 1e-6)
+    center_distance = np.linalg.norm(
+        reference_centers[:, None] - target_centers[None], axis=2
+    ) / scene_scale
+    direction_distance = 1.0 - np.clip(reference_forwards @ target_forwards.T, -1.0, 1.0)
+    target_score = center_distance + 0.25 * direction_distance
+
+    selected = []
+    uncovered = set(range(len(target_viewpoints)))
+    while len(selected) < count:
+        best_index = None
+        best_score = float("inf")
+        target_indices = sorted(uncovered) if uncovered else list(range(len(target_viewpoints)))
+        for index in range(len(reference_viewpoints)):
+            if index in selected:
+                continue
+            score = float(target_score[index, target_indices].min())
+            if selected:
+                separation = np.min(
+                    np.linalg.norm(
+                        reference_centers[selected] - reference_centers[index], axis=1
+                    )
+                ) / scene_scale
+                score -= 0.10 * min(float(separation), 0.25)
+            if score < best_score:
+                best_score = score
+                best_index = index
+        if best_index is None:
+            break
+        selected.append(best_index)
+        covered_target = min(
+            target_indices, key=lambda target: target_score[best_index, target]
+        )
+        uncovered.discard(covered_target)
+    return [reference_viewpoints[index] for index in selected]
+
+
+def novel_view_quality(rgb_path, mask_path):
+    rgb = np.asarray(Image.open(rgb_path).convert('RGB'), dtype=np.uint8)
+    known = np.asarray(Image.open(mask_path).convert('L'), dtype=np.uint8) > 127
+    edit_fraction = float((~known).mean())
+    if not np.any(known):
+        return {
+            'accepted': False,
+            'edit_fraction': edit_fraction,
+            'rgb_std': 0.0,
+            'known_laplacian_variance': 0.0,
+        }
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+    rgb_std = float(rgb[known].astype(np.float32).std() / 255.0)
+    laplacian_variance = float(laplacian[known].var())
+    return {
+        'accepted': bool(
+            edit_fraction >= 0.002 and rgb_std >= 0.04 and laplacian_variance >= 0.5
+        ),
+        'edit_fraction': edit_fraction,
+        'rgb_std': rgb_std,
+        'known_laplacian_variance': laplacian_variance,
+    }
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -44,6 +130,30 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", required=True, type=str)
     parser.add_argument("--see3d_stage", required=True, type=int)
     parser.add_argument("--select_inpaint_num", required=True, type=str)
+    parser.add_argument(
+        "--scene_aligned_cameras",
+        action="store_true",
+        help="Generate See3D views on a pose-neighbor graph instead of fixed world axes.",
+    )
+    parser.add_argument(
+        "--skip_plane_views",
+        action="store_true",
+        help=(
+            "Do not generate candidates from globally refined planes. This supports "
+            "warm-start runs where plane rewrites are intentionally disabled."
+        ),
+    )
+    parser.add_argument(
+        "--max_reference_views",
+        type=int,
+        default=6,
+        help="Keep only pose-near, direction-compatible real reference views; zero keeps all.",
+    )
+    parser.add_argument(
+        "--no_prefilter_novel_views",
+        action="store_true",
+        help="Disable blank/flat/no-edit candidate rejection before See3D.",
+    )
     args = get_combined_args(parser)
 
     # Initialize system state (RNG)
@@ -56,23 +166,15 @@ if __name__ == "__main__":
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     train_viewpoints = scene.getTrainCameras().copy()
+    reference_viewpoints = train_viewpoints.copy()
     input_view_num = len(train_viewpoints)
 
     see3d_render_path = os.path.join(args.source_path, 'see3d_render')
     os.makedirs(see3d_render_path, exist_ok=True)
 
-    # copy reference images
+    # Reference images are selected after the target novel cameras are known.
     ref_views_save_root_path = os.path.join(see3d_render_path, 'ref-views')
-    if not os.path.exists(ref_views_save_root_path):
-        os.makedirs(ref_views_save_root_path, exist_ok=True)
-
-        # copy ref-views from source_path
-        src_image_root_path = os.path.join(args.source_path, 'images')
-        temp_image_name = os.listdir(src_image_root_path)[0]
-        postfix = temp_image_name.split('.')[-1]
-        for viewpoint in train_viewpoints:
-            image_name = f'{viewpoint.image_name}.{postfix}'
-            shutil.copy(os.path.join(src_image_root_path, image_name), os.path.join(ref_views_save_root_path, image_name))
+    os.makedirs(ref_views_save_root_path, exist_ok=True)
 
     # load see3d cameras
     see3d_cam_path = os.path.join(see3d_render_path, 'see3d_cameras.npz')
@@ -125,35 +227,67 @@ if __name__ == "__main__":
     novel_poses, novel_cams = [], []
     plane_root_path = os.path.join(args.source_path, 'plane-refine-depths')
     vis_plane_pnts_path = os.path.join(novel_views_save_root_path, f'stage{args.see3d_stage}_vis_global_3Dplane_points')
+    if args.scene_aligned_cameras:
+        chart_fovy_deg = float(np.rad2deg(np.median([float(cam.FoVy) for cam in input_viewpoints])))
+        chart_fovx_deg = float(np.rad2deg(np.median([float(cam.FoVx) for cam in input_viewpoints])))
+
     if args.see3d_stage == 1:
-        used_fov_deg = 80
         only_warp_input_views = False
         select_view_method = 'covisibility_rate'
         used_top_k = 5
+        if args.scene_aligned_cameras:
+            used_fovy_deg = chart_fovy_deg
+            used_fovx_deg = chart_fovx_deg
+            novel_poses_1, novel_cams_1 = generate_pose_graph_interpolated_camera_poses(
+                input_viewpoints,
+                visibility_grid,
+                n_frames=80,
+                neighbor_count=3,
+                fovy_deg=used_fovy_deg,
+                fovx_deg=used_fovx_deg,
+            )
+            novel_poses.extend(novel_poses_1)
+            novel_cams.extend(novel_cams_1)
+        else:
+            used_fovy_deg = 80
+            used_fovx_deg = 80
 
-        # look at scene center
-        novel_poses_1, novel_cams_1 = generate_see3d_camera_by_lookat_object_centric(train_viewpoints, visibility_grid, n_frames=40, fovy_deg=used_fov_deg)
-        novel_poses.extend(novel_poses_1)
-        novel_cams.extend(novel_cams_1)
+            # look at scene center
+            novel_poses_1, novel_cams_1 = generate_see3d_camera_by_lookat_object_centric(train_viewpoints, visibility_grid, n_frames=40, fovy_deg=used_fovy_deg)
+            novel_poses.extend(novel_poses_1)
+            novel_cams.extend(novel_cams_1)
 
-        # look at scene around
-        novel_poses_2, novel_cams_2 = generate_see3d_camera_by_lookat(input_viewpoints, visibility_grid, gs_input_view_depths.squeeze(1), gs_input_view_points, n_frames=40, fovy_deg=used_fov_deg)
-        novel_poses.extend(novel_poses_2)
-        novel_cams.extend(novel_cams_2)
+            # look at scene around
+            novel_poses_2, novel_cams_2 = generate_see3d_camera_by_lookat(input_viewpoints, visibility_grid, gs_input_view_depths.squeeze(1), gs_input_view_points, n_frames=40, fovy_deg=used_fovy_deg)
+            novel_poses.extend(novel_poses_2)
+            novel_cams.extend(novel_cams_2)
 
     elif args.see3d_stage == 2:
-        used_fov_deg = 80
         only_warp_input_views = False
         select_view_method = 'covisibility_rate'
         used_top_k = 5
-
-        # look around in input views position
-        novel_poses_1, novel_cams_1 = generate_see3d_camera_by_view_angle(input_viewpoints, visibility_grid, fovy_deg=used_fov_deg, n_frames=60)
+        if args.scene_aligned_cameras:
+            used_fovy_deg = chart_fovy_deg
+            used_fovx_deg = chart_fovx_deg
+            novel_poses_1, novel_cams_1 = generate_pose_graph_interpolated_camera_poses(
+                input_viewpoints,
+                visibility_grid,
+                n_frames=60,
+                neighbor_count=4,
+                fovy_deg=used_fovy_deg,
+                fovx_deg=used_fovx_deg,
+            )
+        else:
+            used_fovy_deg = 80
+            used_fovx_deg = 80
+            # look around in input views position
+            novel_poses_1, novel_cams_1 = generate_see3d_camera_by_view_angle(input_viewpoints, visibility_grid, fovy_deg=used_fovy_deg, n_frames=60)
         novel_poses.extend(novel_poses_1)
         novel_cams.extend(novel_cams_1)
 
     elif args.see3d_stage == 3:
-        used_fov_deg = 100
+        used_fovy_deg = chart_fovy_deg if args.scene_aligned_cameras else 100
+        used_fovx_deg = chart_fovx_deg if args.scene_aligned_cameras else 100
         used_top_k = 10
         only_warp_input_views = True
         select_view_method = 'none_visible_rate'
@@ -161,10 +295,26 @@ if __name__ == "__main__":
     else:
         raise ValueError(f'Invalid see3d_stage: {args.see3d_stage}')
     
-    plane_all_points_dict = get_all_global_3Dpnts(args.source_path, plane_root_path, see3d_render_path, vis_plane_pnts_path, top_k=used_top_k)
-    novel_poses_3, novel_cams_3 = generate_see3d_camera_by_lookat_all_plane(train_viewpoints, visibility_grid, plane_all_points_dict, fovy_deg=used_fov_deg)
-    novel_poses.extend(novel_poses_3)
-    novel_cams.extend(novel_cams_3)
+    if args.skip_plane_views:
+        print("[INFO] Skipping global-plane camera proposals.")
+    else:
+        plane_all_points_dict = get_all_global_3Dpnts(
+            args.source_path,
+            plane_root_path,
+            see3d_render_path,
+            vis_plane_pnts_path,
+            top_k=used_top_k,
+        )
+        novel_poses_3, novel_cams_3 = generate_see3d_camera_by_lookat_all_plane(
+            train_viewpoints,
+            visibility_grid,
+            plane_all_points_dict,
+            fovy_deg=used_fovy_deg,
+            fovx_deg=used_fovx_deg,
+            use_camera_vertical=args.scene_aligned_cameras,
+        )
+        novel_poses.extend(novel_poses_3)
+        novel_cams.extend(novel_cams_3)
 
     # # vis train camera
     # train_c2ws = []
@@ -260,11 +410,64 @@ if __name__ == "__main__":
     else:
         raise ValueError(f'Invalid select_view_method: {select_view_method}')
 
+    quality_report = {}
+    if not args.no_prefilter_novel_views:
+        for index in range(len(novel_cams)):
+            quality_report[index] = novel_view_quality(
+                os.path.join(gs_output_dir, f'ori_warp_frame{index:06d}.png'),
+                os.path.join(gs_output_dir, f'mask_frame{index:06d}.png'),
+            )
+        requested = int(args.select_inpaint_num)
+        filtered = [index for index in need_inpaint_views if quality_report[index]['accepted']]
+        remaining = sorted(
+            (
+                index for index in range(len(novel_cams))
+                if index not in filtered
+                and quality_report[index]['accepted']
+                and none_visible_rate_list[index] < max_none_visible_thresh
+            ),
+            key=lambda index: abs(none_visible_rate_list[index] - 0.20),
+        )
+        need_inpaint_views = (filtered + remaining)[:requested]
+        if not need_inpaint_views:
+            raise RuntimeError('Novel-view quality prefilter rejected every See3D candidate')
+        with open(os.path.join(novel_views_save_root_path, 'novel_view_quality.json'), 'w') as handle:
+            json.dump(
+                {
+                    'selected_indices': need_inpaint_views,
+                    'views': {str(index): value for index, value in quality_report.items()},
+                },
+                handle,
+                indent=2,
+            )
+
     print(f'Need inpaint views: {need_inpaint_views}')
 
     select_gs_output_dir = os.path.join(novel_views_save_root_path, 'select-gs')
     os.makedirs(select_gs_output_dir, exist_ok=True)
     need_inpaint_views_cams = [novel_cams[i] for i in need_inpaint_views]
+    selected_references = select_reference_viewpoints(
+        reference_viewpoints, need_inpaint_views_cams, int(args.max_reference_views)
+    )
+    for path in os.listdir(ref_views_save_root_path):
+        full_path = os.path.join(ref_views_save_root_path, path)
+        if os.path.isfile(full_path) or os.path.islink(full_path):
+            os.remove(full_path)
+    src_image_root_path = os.path.join(args.source_path, 'images')
+    image_files = {
+        os.path.splitext(name)[0]: name for name in os.listdir(src_image_root_path)
+    }
+    for viewpoint in selected_references:
+        source_name = image_files.get(viewpoint.image_name)
+        if source_name is None:
+            raise FileNotFoundError(f'Missing reference image for {viewpoint.image_name}')
+        shutil.copy(
+            os.path.join(src_image_root_path, source_name),
+            os.path.join(ref_views_save_root_path, source_name),
+        )
+    with open(os.path.join(novel_views_save_root_path, 'selected_reference_views.json'), 'w') as handle:
+        json.dump([viewpoint.image_name for viewpoint in selected_references], handle, indent=2)
+    print(f'Selected {len(selected_references)} pose-aware real reference views.')
     need_inpaint_views_depths = [gs_depths[i] for i in need_inpaint_views]
     need_inpaint_views_depths = torch.stack(need_inpaint_views_depths, dim=0)
 
@@ -315,4 +518,3 @@ if __name__ == "__main__":
     np.savez(os.path.join(novel_views_save_root_path, f'stage{args.see3d_stage}_see3d_cameras.npz'), **save_cameras)
 
     print(f'See3D stage {args.see3d_stage} save done!')
-

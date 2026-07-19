@@ -136,14 +136,21 @@ def storePly(path, xyz, rgb):
 def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     if eval:
+        # G4Splat datasets may provide an all-sparse model for evaluation, while
+        # standard posed COLMAP datasets (including Cambridge QC subsets) only
+        # contain sparse/0. Prefer the former without requiring it.
+        eval_sparse_dir = "all-sparse/0"
+        all_sparse_path = os.path.join(path, eval_sparse_dir)
+        if not os.path.isdir(all_sparse_path):
+            eval_sparse_dir = "sparse/0"
         try:
-            cameras_extrinsic_file = os.path.join(path, "all-sparse/0", "images.bin")
-            cameras_intrinsic_file = os.path.join(path, "all-sparse/0", "cameras.bin")
+            cameras_extrinsic_file = os.path.join(path, eval_sparse_dir, "images.bin")
+            cameras_intrinsic_file = os.path.join(path, eval_sparse_dir, "cameras.bin")
             cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
             cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
         except:
-            cameras_extrinsic_file = os.path.join(path, "all-sparse/0", "images.txt")
-            cameras_intrinsic_file = os.path.join(path, "all-sparse/0", "cameras.txt")
+            cameras_extrinsic_file = os.path.join(path, eval_sparse_dir, "images.txt")
+            cameras_intrinsic_file = os.path.join(path, eval_sparse_dir, "cameras.txt")
             cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
             cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
@@ -296,13 +303,18 @@ sceneLoadTypeCallbacks = {
 
 # NOTE: load gaussian cameras
 def fill_config_args(args):
-    args.sh_degree = 3
-    args.images = 'images'
-    args.resolution = -1
-    args.white_background = False
-    args.data_device = "cuda"
-    args.eval = False
-    args.render_items=['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+    defaults = {
+        "sh_degree": 3,
+        "images": "images",
+        "resolution": -1,
+        "white_background": False,
+        "data_device": "cuda",
+        "eval": False,
+        "render_items": ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature'],
+    }
+    for name, value in defaults.items():
+        if not hasattr(args, name) or getattr(args, name) is None:
+            setattr(args, name, value)
 
     return args
 
