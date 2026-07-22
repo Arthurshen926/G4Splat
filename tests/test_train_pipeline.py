@@ -10,6 +10,8 @@ def test_chart_plane_frontend_uses_requested_resolution_and_device():
     render_command = render_command.split("])\n", 1)[0]
     assert '"--resolution", str(args.resolution)' in render_command
     assert '"--data_device", args.data_device' in render_command
+    assert '"--max_chart_abs_depth", str(args.max_chart_abs_depth)' in render_command
+    assert '"--max_chart_abs_point", str(args.max_chart_abs_point)' in render_command
 
 
 def test_camera_config_defaults_do_not_overwrite_explicit_resolution():

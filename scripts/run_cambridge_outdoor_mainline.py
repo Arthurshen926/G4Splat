@@ -169,6 +169,15 @@ def _train_with_mainline_contract(command: list[str], *, semantic_manifest: Path
         "0.004",
         "--plane-min-pixels",
         "64",
+        # The scene scale is recorded in the immutable camera contract.  Do
+        # not reintroduce a fixed world-coordinate/depth box while rendering
+        # Charts for planes: distant facade geometry is precisely the case
+        # the outdoor mainline must retain.  ``0`` is the explicit no-cap
+        # sentinel understood by sanitize_chart_geometry.
+        "--max-chart-abs-depth",
+        "0",
+        "--max-chart-abs-point",
+        "0",
         "--cambridge-task-semantic-policy",
         "outdoor_task_specific_v1",
         "--cambridge-task-semantic-manifest",

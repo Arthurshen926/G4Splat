@@ -330,6 +330,24 @@ if __name__ == '__main__':
         help='Optional legacy depth cap; unset for the outdoor inverse-depth mainline.',
     )
     parser.add_argument(
+        '--max_chart_abs_depth',
+        type=float,
+        default=50.0,
+        help=(
+            'Absolute aligned-Chart depth cap before plane construction. '
+            'Set to 0 to disable the legacy cap for the outdoor inverse-depth mainline.'
+        ),
+    )
+    parser.add_argument(
+        '--max_chart_abs_point',
+        type=float,
+        default=50.0,
+        help=(
+            'Absolute aligned-Chart point-coordinate cap before plane construction. '
+            'Set to 0 to disable the legacy cap for the outdoor inverse-depth mainline.'
+        ),
+    )
+    parser.add_argument(
         '--min_global_plane_views',
         type=int,
         default=2,
@@ -772,6 +790,8 @@ if __name__ == '__main__':
         "--save_root_path", plane_root_path,
         "--data_device", args.data_device,
         "--resolution", str(args.resolution),
+        "--max_chart_abs_depth", str(args.max_chart_abs_depth),
+        "--max_chart_abs_point", str(args.max_chart_abs_point),
         "--cambridge_mask_pickle" if alignment_mask_pickle else "",
         alignment_mask_pickle or "",
         "--cambridge_mask_dataset_path" if alignment_mask_pickle else "",

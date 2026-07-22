@@ -453,6 +453,14 @@ def test_sanitize_chart_geometry_removes_unsupported_and_extreme_pixels():
     assert torch.count_nonzero(sanitized["pts"]) == 3
     assert sanitized["scale_factor"] is charts["scale_factor"]
 
+    uncapped, uncapped_valid = sanitize_chart_geometry(
+        charts,
+        max_abs_depth=0.0,
+        max_abs_point=0.0,
+    )
+    assert torch.equal(uncapped_valid, torch.tensor([[[True, False], [True, False]]]))
+    assert uncapped["depths"][0, 1, 0] == 60.0
+
 
 def test_dense_depth_cache_checks_camera_order(tmp_path: Path):
     path = tmp_path / "depths.pt"
