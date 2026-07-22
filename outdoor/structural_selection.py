@@ -12,7 +12,7 @@ from outdoor.structure_graph import triangulation_angle_degrees
 from scripts.select_chart_views import build_pose_geometry, load_scene_poses
 
 
-STRUCTURAL_SELECTION_VERSION = "outdoor-structural-chart-selection-v1"
+STRUCTURAL_SELECTION_VERSION = "outdoor-structural-chart-selection-v2"
 
 
 def _rank01(values: np.ndarray, *, higher_is_better: bool = True) -> np.ndarray:
@@ -65,22 +65,64 @@ def _gate_reliability(records: dict[str, dict[str, Any]], names: list[str]) -> n
     return 0.60 * _rank01(valid) + 0.25 * _rank01(relative_p90, higher_is_better=False) + 0.15 * _rank01(gt25, higher_is_better=False)
 
 
-def _connected(selected: list[int], pair_score: np.ndarray, threshold: float) -> bool:
+def _structural_components(pair_score: np.ndarray) -> np.ndarray:
+    """Label connected components using only verified structural pair support.
+
+    A fixed calibrated camera contract may cover several disjoint facades or
+    trajectory segments.  Their lack of a shared static track is evidence that
+    they must not be connected by a fabricated geometric edge, not evidence
+    that one component should be silently discarded.
+    """
+    pair_score = np.asarray(pair_score, dtype=np.float32)
+    if pair_score.ndim != 2 or pair_score.shape[0] != pair_score.shape[1]:
+        raise ValueError("pair_score must be square")
+    components = np.full(pair_score.shape[0], -1, dtype=np.int32)
+    component = 0
+    for root in range(len(components)):
+        if components[root] >= 0:
+            continue
+        components[root] = component
+        frontier = [root]
+        while frontier:
+            current = frontier.pop()
+            neighbours = np.flatnonzero(pair_score[current] > 0.0)
+            for neighbour in neighbours:
+                neighbour = int(neighbour)
+                if neighbour == current or components[neighbour] >= 0:
+                    continue
+                components[neighbour] = component
+                frontier.append(neighbour)
+        component += 1
+    return components
+
+
+def _forest_connected(
+    selected: list[int],
+    pair_score: np.ndarray,
+    component_ids: np.ndarray,
+) -> bool:
+    """Require connectivity within every selected static-structure component."""
     if len(selected) <= 1:
         return True
-    visited = {selected[0]}
-    frontier = [selected[0]]
-    selected_set = set(selected)
-    while frontier:
-        current = frontier.pop()
-        neighbours = [
-            candidate
-            for candidate in selected_set - visited
-            if pair_score[current, candidate] >= threshold
-        ]
-        visited.update(neighbours)
-        frontier.extend(neighbours)
-    return visited == selected_set
+    for component in np.unique(component_ids[np.asarray(selected, dtype=np.int64)]):
+        members = [index for index in selected if component_ids[index] == component]
+        if len(members) <= 1:
+            continue
+        visited = {members[0]}
+        frontier = [members[0]]
+        member_set = set(members)
+        while frontier:
+            current = frontier.pop()
+            neighbours = [
+                candidate
+                for candidate in member_set - visited
+                if pair_score[current, candidate] > 0.0
+            ]
+            visited.update(neighbours)
+            frontier.extend(neighbours)
+        if visited != member_set:
+            return False
+    return True
 
 
 def _pair_unit_quality(
@@ -144,13 +186,19 @@ def _diagnostics(
     block_weight: np.ndarray,
     min_block_views: int,
     pair_score: np.ndarray,
-    edge_threshold: float,
+    component_ids: np.ndarray,
     support_cap: int,
 ) -> dict[str, Any]:
     unit_count = np.zeros(len(unit_weight), dtype=np.int16)
     for index in selected:
         unit_count += (support[index] > 0.0).astype(np.int16)
-    coverage = float(np.sum(unit_weight * np.minimum(unit_count / max(support_cap, 1), 1.0)))
+    available_unit_views = np.sum(support > 0.0, axis=0).astype(np.int16)
+    # A two-view unit cannot satisfy a uniform three-view objective.  Make
+    # coverage demand the strongest support that the hard-gated evidence can
+    # actually provide, while retaining the stronger three-view preference
+    # wherever it is available.
+    unit_target_views = np.clip(available_unit_views, 1, support_cap)
+    coverage = float(np.sum(unit_weight * np.minimum(unit_count / unit_target_views, 1.0)))
     if len(selected) < 2:
         pair_best = np.zeros(len(unit_weight), dtype=np.float32)
     else:
@@ -174,14 +222,37 @@ def _diagnostics(
                 "passed": selected_support >= required,
             }
         )
+    component_diagnostics = []
+    for component in np.unique(component_ids):
+        available = np.flatnonzero(component_ids == component)
+        selected_members = [index for index in selected if component_ids[index] == component]
+        required = min(min_block_views, len(available))
+        component_diagnostics.append(
+            {
+                "component": int(component),
+                "available_views": int(len(available)),
+                "selected_views": int(len(selected_members)),
+                "required_views": int(required),
+                "passed": len(selected_members) >= required,
+            }
+        )
     return {
         "structural_coverage": coverage,
         "triangulated_multiview_coverage": pair_coverage,
-        "connected": _connected(selected, pair_score, edge_threshold),
+        "connected": _forest_connected(selected, pair_score, component_ids),
+        "connectivity_policy": "per_static_component_forest",
+        "component_count": int(len(component_diagnostics)),
+        "component_diagnostics": component_diagnostics,
+        "all_components_anchored": all(record["passed"] for record in component_diagnostics),
         "block_diagnostics": blocks,
         "all_blocks_supported": all(record["passed"] for record in blocks),
         "selected_count": len(selected),
         "support_cap": support_cap,
+        "support_target_policy": "min(support_cap, available_static_views)",
+        "available_unit_view_histogram": {
+            str(int(count)): int(np.sum(available_unit_views == count))
+            for count in np.unique(available_unit_views)
+        },
     }
 
 
@@ -201,7 +272,7 @@ def select_structural_charts(
     target_triangulation_angle_degrees: float = 8.0,
     minimum_marginal_gain: float = 0.001,
 ) -> dict[str, Any]:
-    """Select a connected Global+Local Chart set until structure is covered."""
+    """Select a connected structural forest until static support is covered."""
     if not 0.0 < target_structural_coverage <= 1.0:
         raise ValueError("target_structural_coverage must be in (0, 1]")
     if not 0.0 < target_multiview_coverage <= 1.0:
@@ -246,8 +317,7 @@ def select_structural_charts(
         target_triangulation_angle_degrees=target_triangulation_angle_degrees,
     )
     pair_score = _pair_summary(pair_unit, unit_weight)
-    nonzero_edges = pair_score[np.triu_indices(len(names), k=1)]
-    edge_threshold = max(float(np.quantile(nonzero_edges[nonzero_edges > 0.0], 0.10)) * 0.2, 1e-6) if np.any(nonzero_edges > 0.0) else 1e-6
+    component_ids = _structural_components(pair_score)
     pose = _pose_features(Path(target_scene_path), names)
     pose_normalizer = max(float(np.quantile(np.linalg.norm(pose[:, None] - pose[None, :], axis=2), 0.90)), 1e-6)
 
@@ -300,20 +370,36 @@ def select_structural_charts(
     while len(selected) < max_charts:
         candidates = [index for index in range(len(names)) if index not in selected]
         if selected:
-            connected_candidates = [
+            selected_by_component = {
+                component: [
+                    index for index in selected if component_ids[index] == component
+                ]
+                for component in np.unique(component_ids[np.asarray(selected, dtype=np.int64)])
+            }
+            candidates = [
                 candidate
                 for candidate in candidates
-                if float(np.max(pair_score[candidate, np.asarray(selected)])) >= edge_threshold
+                if (
+                    component_ids[candidate] not in selected_by_component
+                    # A first Chart is a local anchor for a previously
+                    # unrepresented component.  Once anchored, every added
+                    # Chart needs a verified multi-view structural edge to
+                    # retain a connected component rather than inventing a
+                    # global bridge between unrelated facades.
+                    or np.any(
+                        pair_score[
+                            candidate,
+                            np.asarray(selected_by_component[component_ids[candidate]])
+                        ]
+                        > 0.0
+                    )
+                )
             ]
-            # A hard graph disconnect is evidence of a broken alignment or
-            # missing structural bridge, not a reason to silently select an
-            # isolated camera merely to satisfy a fixed count.
-            if not connected_candidates:
+            if not candidates:
                 raise RuntimeError(
-                    "Structural view graph disconnected before coverage targets were met; "
+                    "No verified structural-forest extension remains before coverage targets were met; "
                     "replace/re-align the broad Chart pool."
                 )
-            candidates = connected_candidates
         scores = {candidate: candidate_score(candidate) for candidate in candidates}
         chosen = max(candidates, key=lambda item: (scores[item][0], -item))
         score, parts = scores[chosen]
@@ -334,7 +420,7 @@ def select_structural_charts(
             block_weight=block_weight,
             min_block_views=min_block_views,
             pair_score=pair_score,
-            edge_threshold=edge_threshold,
+            component_ids=component_ids,
             support_cap=support_cap,
         )
         trace.append({"image_name": names[chosen], "score": score, **parts, **current})
@@ -343,6 +429,7 @@ def select_structural_charts(
             and current["structural_coverage"] >= target_structural_coverage
             and current["triangulated_multiview_coverage"] >= target_multiview_coverage
             and current["all_blocks_supported"]
+            and current["all_components_anchored"]
             and current["connected"]
         )
         if enough:
@@ -363,7 +450,7 @@ def select_structural_charts(
         block_weight=block_weight,
         min_block_views=min_block_views,
         pair_score=pair_score,
-        edge_threshold=edge_threshold,
+        component_ids=component_ids,
         support_cap=support_cap,
     )
     if not (
@@ -371,6 +458,7 @@ def select_structural_charts(
         and diagnostics["structural_coverage"] >= target_structural_coverage
         and diagnostics["triangulated_multiview_coverage"] >= target_multiview_coverage
         and diagnostics["all_blocks_supported"]
+        and diagnostics["all_components_anchored"]
         and diagnostics["connected"]
     ):
         raise RuntimeError(
@@ -408,7 +496,8 @@ def select_structural_charts(
             "target_structural_coverage": target_structural_coverage,
             "target_multiview_coverage": target_multiview_coverage,
             "min_block_views": min_block_views,
-            "edge_threshold": edge_threshold,
+            "connectivity_policy": "per_static_component_forest",
+            "component_count": int(np.max(component_ids) + 1),
             "reliability": {name: float(reliabilities[index]) for index, name in enumerate(names)},
             "selection_trace": trace,
             "diagnostics": diagnostics,
@@ -434,11 +523,21 @@ def validate_structural_selection(selection_path: Path, gate_report: Path) -> di
     if rejected:
         raise RuntimeError(f"Structural selection reactivates invalid Chart(s): {rejected[:5]}")
     diagnostics = selection.get("structural_selection", {}).get("diagnostics", {})
-    expected = ["structural_coverage", "triangulated_multiview_coverage", "connected", "all_blocks_supported"]
+    expected = [
+        "structural_coverage",
+        "triangulated_multiview_coverage",
+        "connected",
+        "all_components_anchored",
+        "all_blocks_supported",
+    ]
     if any(key not in diagnostics for key in expected):
         raise RuntimeError("Structural selection lacks final structural diagnostics")
-    if diagnostics["connected"] is not True or diagnostics["all_blocks_supported"] is not True:
-        raise RuntimeError("Structural selection failed connectivity/block constraints")
+    if (
+        diagnostics["connected"] is not True
+        or diagnostics["all_components_anchored"] is not True
+        or diagnostics["all_blocks_supported"] is not True
+    ):
+        raise RuntimeError("Structural selection failed connectivity/component/block constraints")
     return {
         "selected_count": len(names),
         "structural_coverage": diagnostics["structural_coverage"],

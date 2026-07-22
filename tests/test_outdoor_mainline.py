@@ -160,6 +160,61 @@ def test_structural_selector_stops_on_coverage_not_fixed_chart_count(tmp_path):
     assert selection["structural_selection"]["diagnostics"]["structural_coverage"] >= 0.90
 
 
+def test_structural_selector_preserves_disconnected_static_components(tmp_path):
+    names = ["a.png", "b.png", "c.png", "d.png"]
+    target_scene = tmp_path / "target"
+    _write_target_scene(target_scene, names)
+    graph_path = tmp_path / "graph.npz"
+    np.savez_compressed(
+        graph_path,
+        image_names=np.asarray(names),
+        # Each structure unit has only two genuine observations.  The two
+        # facades have no shared static track, so an implementation must keep
+        # them as two calibrated local components rather than inventing an
+        # edge or rejecting the whole scene for missing three-view support.
+        unit_support=np.asarray(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], dtype=np.float32
+        ),
+        unit_weight=np.asarray([0.5, 0.5], dtype=np.float32),
+        unit_centers=np.asarray([[0.0, 0.0, 5.0], [10.0, 0.0, 5.0]], dtype=np.float32),
+        camera_centers=np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 0.0, 0.0], [11.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        unit_block_ids=np.asarray([0, 1], dtype=np.int32),
+        block_weight=np.asarray([0.5, 0.5], dtype=np.float32),
+        valid_fractions=np.asarray([0.9, 0.8, 0.85, 0.75], dtype=np.float32),
+    )
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps({"records": [
+        {"image_name": name, "rejected": False, "valid_fraction": 0.9, "relative_p90": 0.1, "gt25_fraction": 0.05}
+        for name in names
+    ]}))
+    output = tmp_path / "selection.json"
+
+    selection = select_structural_charts(
+        graph_path,
+        gate_path,
+        target_scene,
+        output,
+        min_charts=2,
+        max_charts=4,
+        target_structural_coverage=0.90,
+        target_multiview_coverage=0.70,
+        min_block_views=2,
+        min_triangulation_angle_degrees=0.5,
+        target_triangulation_angle_degrees=5.0,
+    )
+
+    diagnostics = selection["structural_selection"]["diagnostics"]
+    assert selection["actual_n_images"] == 4
+    assert diagnostics["component_count"] == 2
+    assert diagnostics["connected"] is True
+    assert diagnostics["all_components_anchored"] is True
+    assert diagnostics["structural_coverage"] >= 0.90
+    assert validate_structural_selection(output, gate_path)["passed"]
+
+
 def test_mainline_config_freezes_cameras_and_real_view_topology(tmp_path):
     args = SimpleNamespace(
         datasets_root=tmp_path / "datasets",
