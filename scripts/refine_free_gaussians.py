@@ -185,6 +185,18 @@ if __name__ == '__main__':
     parser.add_argument('--tree_planar_weight', type=float, default=0.0)
     parser.add_argument('--tree_sky_feather', type=int, default=4)
     parser.add_argument('--tree_boundary_feather', type=int, default=6)
+    parser.add_argument(
+        '--tree-missing-support-policy',
+        choices=['error', 'neutral', 'legacy_zero'],
+        default='legacy_zero',
+    )
+    parser.add_argument('--tree-neutral-support-value', type=float, default=0.5)
+    parser.add_argument(
+        '--cambridge-task-semantic-policy',
+        choices=['legacy', 'outdoor_task_specific_v1'],
+        default='legacy',
+    )
+    parser.add_argument('--cambridge-task-semantic-manifest', type=str, default=None)
     parser.add_argument('--rgb_loss_type', choices=['l1', 'charbonnier'], default='l1')
     parser.add_argument('--rgb_charbonnier_eps', type=float, default=1e-3)
     parser.add_argument(
@@ -231,6 +243,12 @@ if __name__ == '__main__':
     parser.add_argument('--color_correction_reg', type=float, default=1e-2)
     parser.add_argument('--geometry_view_every_n_iter', type=int, default=5)
     parser.add_argument('--dense_only_from_iter', type=int, default=3000)
+    parser.add_argument(
+        '--dense-view-sampling-policy',
+        choices=['uniform', 'spatial_block_balanced'],
+        default='uniform',
+    )
+    parser.add_argument('--dense-view-block-bins', type=int, default=4)
     parser.add_argument('--pseudo_rgb_weight', type=float, default=0.01)
     parser.add_argument('--pseudo_geometry_weight', type=float, default=0.25)
     parser.add_argument('--pseudo_geometry_final_weight', type=float, default=0.02)
@@ -245,7 +263,12 @@ if __name__ == '__main__':
         choices=['all', 'inpaint_only', 'none'],
         default='all',
     )
-    parser.add_argument('--max_plane_abs_depth', type=float, default=50.0)
+    parser.add_argument(
+        '--max_plane_abs_depth',
+        type=float,
+        default=None,
+        help='Optional legacy depth cap; unset for inverse-depth outdoor fusion.',
+    )
     parser.add_argument('--init_fill_unsupported_with_prior', action='store_true')
     parser.add_argument('--init_ply', type=str, default=None)
     parser.add_argument('--freeze_init_ply', action='store_true')
@@ -321,13 +344,16 @@ if __name__ == '__main__':
             "--color_correction_reg", str(args.color_correction_reg),
             "--geometry_view_every_n_iter", str(args.geometry_view_every_n_iter),
             "--dense_only_from_iter", str(args.dense_only_from_iter),
+            "--dense-view-sampling-policy", args.dense_view_sampling_policy,
+            "--dense-view-block-bins", str(args.dense_view_block_bins),
             "--pseudo_rgb_weight", str(args.pseudo_rgb_weight),
             "--pseudo_geometry_weight", str(args.pseudo_geometry_weight),
             "--pseudo_geometry_final_weight", str(args.pseudo_geometry_final_weight),
             "--pseudo_geometry_decay_until", str(args.pseudo_geometry_decay_until),
             "--pseudo_initialization_mode", args.pseudo_initialization_mode,
             "--pseudo_geometry_mask_mode", args.pseudo_geometry_mask_mode,
-            "--max_plane_abs_depth", str(args.max_plane_abs_depth),
+            "--max_plane_abs_depth" if args.max_plane_abs_depth is not None else "",
+            str(args.max_plane_abs_depth) if args.max_plane_abs_depth is not None else "",
             "--init_fill_unsupported_with_prior" if args.init_fill_unsupported_with_prior else "",
             "--semantic_alpha_weight", str(args.semantic_alpha_weight),
             "--init_ply" if args.init_ply else "",
@@ -380,9 +406,20 @@ if __name__ == '__main__':
                 "--tree_planar_weight", str(args.tree_planar_weight),
                 "--tree_sky_feather", str(args.tree_sky_feather),
                 "--tree_boundary_feather", str(args.tree_boundary_feather),
+                "--tree-missing-support-policy", args.tree_missing_support_policy,
+                "--tree-neutral-support-value", str(args.tree_neutral_support_value),
             ])
             if args.cambridge_tree_support_dir is not None:
                 command.extend(["--cambridge_tree_support_dir", args.cambridge_tree_support_dir])
+        if args.cambridge_task_semantic_policy != 'legacy':
+            command.extend([
+                "--cambridge-task-semantic-policy", args.cambridge_task_semantic_policy,
+            ])
+            if args.cambridge_task_semantic_manifest is not None:
+                command.extend([
+                    "--cambridge-task-semantic-manifest",
+                    args.cambridge_task_semantic_manifest,
+                ])
         command = [argument for argument in command if argument]
     else:
         raise ValueError('refine depth path is required')

@@ -58,6 +58,13 @@ if __name__ == '__main__':
     parser.add_argument('--dense_regul', type=str, default='default', help='Dense depth schedule: default, strong, strong_decay, weak, or none.')
     parser.add_argument('--dense_depth_cache', type=str, default=None)
     parser.add_argument(
+        '--dense-view-sampling-policy',
+        choices=['uniform', 'spatial_block_balanced'],
+        default='uniform',
+        help='Sampling policy for all-real dense cameras during Gaussian refinement.',
+    )
+    parser.add_argument('--dense-view-block-bins', type=int, default=4)
+    parser.add_argument(
         '--dense_final_only',
         action='store_true',
         help=(
@@ -165,6 +172,19 @@ if __name__ == '__main__':
     parser.add_argument('--tree_planar_weight', type=float, default=0.0)
     parser.add_argument('--tree_sky_feather', type=int, default=4)
     parser.add_argument('--tree_boundary_feather', type=int, default=6)
+    parser.add_argument(
+        '--tree-missing-support-policy',
+        choices=['error', 'neutral', 'legacy_zero'],
+        default='legacy_zero',
+        help='How a dense real view without a tree support map is interpreted.',
+    )
+    parser.add_argument('--tree-neutral-support-value', type=float, default=0.5)
+    parser.add_argument(
+        '--cambridge-task-semantic-policy',
+        choices=['legacy', 'outdoor_task_specific_v1'],
+        default='legacy',
+    )
+    parser.add_argument('--cambridge-task-semantic-manifest', type=str, default=None)
     parser.add_argument('--rgb_loss_type', choices=['l1', 'charbonnier'], default='l1')
     parser.add_argument(
         '--rgb-supervision-profile',
@@ -304,6 +324,12 @@ if __name__ == '__main__':
     parser.add_argument('--plane_gate_max_gt25_fraction', type=float, default=0.25)
     parser.add_argument('--plane_gate_max_pixel_relative_change', type=float, default=0.50)
     parser.add_argument(
+        '--max_plane_abs_depth',
+        type=float,
+        default=None,
+        help='Optional legacy depth cap; unset for the outdoor inverse-depth mainline.',
+    )
+    parser.add_argument(
         '--min_global_plane_views',
         type=int,
         default=2,
@@ -327,6 +353,17 @@ if __name__ == '__main__':
         '--stop_after_alignment_gate',
         action='store_true',
         help='Stop after alignment and its chart gate so rejected charts can be replaced.',
+    )
+    parser.add_argument(
+        '--stop_after_plane_refinement',
+        action='store_true',
+        help='Stop after real-view plane refinement so inverse-depth fusion can run before Gaussian training.',
+    )
+    parser.add_argument(
+        '--refine_depth_path_override',
+        type=str,
+        default=None,
+        help='Use a provenance-carrying fused depth directory instead of plane-refine-depths for Gaussian training.',
     )
     parser.add_argument(
         '--continue_after_initial_refinement',
@@ -539,6 +576,7 @@ if __name__ == '__main__':
     
     # NOTE: hard code plane-refine-depths path
     plane_root_path = os.path.join(mast3r_scene_path, 'plane-refine-depths')
+    refine_depth_input_path = args.refine_depth_path_override or plane_root_path
 
     def get_refine_free_gaussians_command(
         config_name,
@@ -571,11 +609,13 @@ if __name__ == '__main__':
             "--white_background" if args.white_background else "",
             stage_dense_arg,
             "--dense_regul", stage_dense_regul,
+            "--dense-view-sampling-policy", args.dense_view_sampling_policy,
+            "--dense-view-block-bins", str(args.dense_view_block_bins),
             "--depthanythingv2_checkpoint_dir", args.depthanythingv2_checkpoint_dir,
             "--depthanything_encoder", args.depthanything_encoder,
             "--dense_depth_cache" if use_dense_data and args.dense_depth_cache else "",
             args.dense_depth_cache if use_dense_data and args.dense_depth_cache else "",
-            "--refine_depth_path", plane_root_path,
+            "--refine_depth_path", refine_depth_input_path,
             "--use_downsample_gaussians" if args.use_downsample_gaussians else "",
             "--downsample_gaussians_type", args.downsample_gaussians_type,
             "--warp_depth_error_thresh", str(args.warp_depth_error_thresh),
@@ -616,6 +656,11 @@ if __name__ == '__main__':
             "--tree_planar_weight", str(args.tree_planar_weight),
             "--tree_sky_feather", str(args.tree_sky_feather),
             "--tree_boundary_feather", str(args.tree_boundary_feather),
+            "--tree-missing-support-policy", args.tree_missing_support_policy,
+            "--tree-neutral-support-value", str(args.tree_neutral_support_value),
+            "--cambridge-task-semantic-policy", args.cambridge_task_semantic_policy,
+            "--cambridge-task-semantic-manifest" if args.cambridge_task_semantic_manifest else "",
+            args.cambridge_task_semantic_manifest or "",
             "--rgb_loss_type", args.rgb_loss_type,
             "--rgb-supervision-profile", args.rgb_supervision_profile,
             "--rgb-sampling-policy", args.rgb_sampling_policy,
@@ -631,6 +676,8 @@ if __name__ == '__main__':
             "--pseudo_geometry_weight", str(args.pseudo_geometry_weight),
             "--pseudo_geometry_final_weight", str(args.pseudo_geometry_final_weight),
             "--pseudo_geometry_decay_until", str(args.pseudo_geometry_decay_until),
+            "--max_plane_abs_depth" if args.max_plane_abs_depth is not None else "",
+            str(args.max_plane_abs_depth) if args.max_plane_abs_depth is not None else "",
             "--init_ply" if init_ply else "",
             init_ply or "",
             "--freeze_init_ply" if freeze_init_ply else "",
@@ -866,6 +913,9 @@ if __name__ == '__main__':
             run_command_safe(get_plane_refine_depth_command(anchor_view_id_json_path=None, see3d_root_path=None))
             if args.gate_plane_refinement:
                 run_command_safe(plane_safety_gate_command)
+            if args.stop_after_plane_refinement:
+                print('[INFO] Stopping after plane refinement for inverse-depth fusion.')
+                sys.exit(0)
 
         run_command_safe(
             get_refine_free_gaussians_command(

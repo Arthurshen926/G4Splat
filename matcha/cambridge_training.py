@@ -135,6 +135,129 @@ def masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Ten
     return (values * weight).sum() / denominator
 
 
+def fused_inverse_depth_nll(
+    rendered_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    rho_variance: torch.Tensor,
+    *,
+    confidence: Optional[torch.Tensor] = None,
+    source_bitmask: Optional[torch.Tensor] = None,
+    mono_only_weight: float = 0.15,
+    variance_floor: float = 0.05,
+    variance_ceiling: float = 20.0,
+) -> torch.Tensor:
+    """Variance-aware inverse-depth likelihood for fused outdoor geometry.
+
+    The fusion stage stores variance in inverse-depth space.  Its absolute
+    calibration can differ between cameras, so normalize it by the robust
+    median for the current target map before evaluating the likelihood.  This
+    preserves its relative certainty while keeping one unusually large-scale
+    Chart from changing the global loss scale.  Pixels backed only by a mono
+    source receive a deliberately weak weight; plane/Chart evidence remains
+    the primary geometric anchor.
+    """
+    if not 0.0 <= mono_only_weight <= 1.0:
+        raise ValueError("mono_only_weight must be in [0, 1]")
+    if not 0.0 < variance_floor <= variance_ceiling:
+        raise ValueError("variance bounds must satisfy 0 < floor <= ceiling")
+    target_depth = target_depth.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+    variance = rho_variance.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+    if target_depth.shape != rendered_depth.shape:
+        target_depth = F.interpolate(
+            target_depth.reshape(1, 1, *target_depth.shape[-2:]),
+            size=rendered_depth.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+    if variance.shape != rendered_depth.shape:
+        variance = F.interpolate(
+            variance.reshape(1, 1, *variance.shape[-2:]),
+            size=rendered_depth.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+    valid = (
+        torch.isfinite(rendered_depth)
+        & torch.isfinite(target_depth)
+        & torch.isfinite(variance)
+        & (rendered_depth > 1e-8)
+        & (target_depth > 1e-8)
+        & (variance > 0.0)
+    )
+    if not torch.any(valid):
+        return rendered_depth.sum() * 0.0
+    reference_variance = variance[valid].detach().median().clamp_min(1e-12)
+    normalized_variance = (variance / reference_variance).clamp(
+        min=variance_floor,
+        max=variance_ceiling,
+    )
+    rendered_rho = torch.reciprocal(rendered_depth.clamp_min(1e-8))
+    target_rho = torch.reciprocal(target_depth.clamp_min(1e-8))
+    nll = 0.5 * (
+        (rendered_rho - target_rho).square() / normalized_variance
+        + torch.log(normalized_variance)
+    )
+    weight = valid.to(dtype=rendered_depth.dtype)
+    if confidence is not None:
+        confidence = confidence.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+        if confidence.shape != rendered_depth.shape:
+            confidence = F.interpolate(
+                confidence.reshape(1, 1, *confidence.shape[-2:]),
+                size=rendered_depth.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+        weight = weight * confidence.clamp(0.0, 1.0)
+    if source_bitmask is not None:
+        source_bitmask = source_bitmask.to(device=rendered_depth.device)
+        if source_bitmask.shape != rendered_depth.shape:
+            source_bitmask = F.interpolate(
+                source_bitmask.reshape(1, 1, *source_bitmask.shape[-2:]).to(torch.float32),
+                size=rendered_depth.shape[-2:],
+                mode="nearest",
+            )[0, 0].to(torch.uint8)
+        multiview = (source_bitmask & 0b0011) != 0
+        mono_only = ((source_bitmask & 0b0100) != 0) & (~multiview)
+        source_weight = torch.where(
+            multiview,
+            torch.ones_like(weight),
+            torch.where(mono_only, torch.full_like(weight, mono_only_weight), torch.zeros_like(weight)),
+        )
+        weight = weight * source_weight
+    return masked_mean(nll, weight)
+
+
+def build_spatial_camera_blocks(
+    camera_centers: torch.Tensor,
+    *,
+    bins: int = 4,
+) -> list[list[int]]:
+    """Partition real cameras into deterministic, non-empty spatial blocks.
+
+    The blocks are used for sampling rather than for a hard geometric split:
+    each dense-training cycle draws one camera from every occupied block.  It
+    prevents a long, high-frame-rate traversal from monopolizing RGB and
+    topology statistics while keeping all real views eligible.
+    """
+    if bins < 1:
+        raise ValueError("bins must be positive")
+    centers = torch.as_tensor(camera_centers, dtype=torch.float32).detach().cpu()
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError(f"camera_centers must have shape [N, 3], got {tuple(centers.shape)}")
+    if centers.shape[0] == 0:
+        raise ValueError("at least one camera center is required")
+    lower = torch.quantile(centers, 0.02, dim=0)
+    upper = torch.quantile(centers, 0.98, dim=0)
+    span = (upper - lower).clamp_min(1e-6)
+    coordinates = torch.floor((centers - lower) / span * bins).to(torch.int64)
+    coordinates = coordinates.clamp(min=0, max=bins - 1)
+    codes = coordinates[:, 0] * bins * bins + coordinates[:, 1] * bins + coordinates[:, 2]
+    blocks: list[list[int]] = []
+    for code in torch.unique(codes, sorted=True).tolist():
+        blocks.append(torch.nonzero(codes == code, as_tuple=False).flatten().tolist())
+    return blocks
+
+
 def photometric_difference(
     residual: torch.Tensor,
     loss_type: str = "l1",

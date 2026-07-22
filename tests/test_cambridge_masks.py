@@ -186,3 +186,30 @@ def test_tree_support_coverage_distinguishes_missing_evidence_from_zero_support(
     assert audit["explicit_map_behavior"] == "all_explicit_maps_zero_support_tree_floor"
     assert audit["missing_view_examples"] == ["seq1__frame00002.png"]
     assert audit["missing_map_behavior"] == "zero_support_tree_floor_not_canonical_evidence"
+
+
+def test_tree_neutral_support_policy_does_not_numerically_merge_unknown_with_zero(tmp_path):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "name_mapping.json").write_text(
+        json.dumps({"seq1__frame00001.png": "seq1/frame00001.png"})
+    )
+    masks = tuple(torch.ones((2, 2), dtype=torch.bool) for _ in range(4))
+    mask_pickle = tmp_path / "masks.pkl"
+    with mask_pickle.open("wb") as handle:
+        pickle.dump({"seq1/frame00001.png": masks}, handle)
+
+    weights = CambridgeTreeWeightLookup(
+        CambridgeMaskLookup(dataset, mask_pickle, mask_indices=[0, 1, 2]),
+        support_dir=tmp_path / "missing_support",
+        missing_support_policy="neutral",
+        neutral_support_value=0.5,
+    )
+
+    support = weights.support("seq1__frame00001.png", (2, 2), torch.device("cpu"))
+    audit = weights.support_coverage_audit(["seq1__frame00001.png"])
+
+    assert torch.allclose(support, torch.full((2, 2), 0.5))
+    assert weights.support_valid("seq1__frame00001.png") is False
+    assert audit["missing_map_behavior"] == "neutral_prior_unknown_evidence"
+    assert audit["unknown_evidence_is_distinct_from_zero_support"] is True

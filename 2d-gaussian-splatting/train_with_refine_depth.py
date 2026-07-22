@@ -12,6 +12,7 @@
 import os
 import sys
 import json
+from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.getcwd(), '2d-gaussian-splatting'))
 from scene.dataset_readers import load_see3d_cameras
@@ -44,10 +45,12 @@ from matcha.dm_scene.charts import (
 from matcha.dm_utils.rendering import normal2curv
 from matcha.cambridge_masks import CambridgeMaskLookup, CambridgeTreeWeightLookup
 from matcha.cambridge_training import (
+    build_spatial_camera_blocks,
     compute_masked_depth_order_loss,
     compute_rgb_loss,
     dense_depth_weight,
     densification_stats_from_view,
+    fused_inverse_depth_nll,
     geometry_chart_sampling_indices,
     geometry_iteration,
     linear_weight,
@@ -122,10 +125,11 @@ def training(
     continue_opacity_resets_after_densify=False,
     chart_geometry_prior_weight=1.0,
     dense_depth_cache=None, geometry_view_every_n_iter=5, dense_only_from_iter=3000,
+    dense_view_sampling_policy="uniform", dense_view_block_bins=4,
     pseudo_rgb_weight=0.01, pseudo_geometry_weight=0.25,
     pseudo_geometry_final_weight=0.02, pseudo_geometry_decay_until=7000,
     pseudo_initialization_mode="all", pseudo_geometry_mask_mode="all",
-    max_plane_abs_depth=50.0,
+    max_plane_abs_depth=None,
     init_fill_unsupported_with_prior=False,
     use_color_correction=False, color_correction_lr=1e-3,
     color_correction_reg=1e-2,
@@ -135,6 +139,8 @@ def training(
     tree_rgb_floor=0.25, tree_rgb_support_gain=0.50,
     tree_geometry_floor=0.05, tree_geometry_support_gain=0.25,
     tree_planar_weight=0.0, tree_sky_feather=4, tree_boundary_feather=6,
+    tree_missing_support_policy="legacy_zero", tree_neutral_support_value=0.5,
+    cambridge_task_semantic_policy="legacy", cambridge_task_semantic_manifest=None,
     init_ply=None, freeze_init_ply=False, warmstart_reseed_pixel_stride=8,
     warmstart_reseed_max_scale=0.05,
     warmstart_max_opacity=1.0, warmstart_max_scale=0.0,
@@ -224,6 +230,28 @@ def training(
             f"indices={alpha_mask_lookup.mask_indices}, weight={semantic_alpha_weight}."
         )
 
+    if cambridge_task_semantic_policy not in {"legacy", "outdoor_task_specific_v1"}:
+        raise ValueError(
+            "cambridge_task_semantic_policy must be legacy or outdoor_task_specific_v1"
+        )
+    if cambridge_task_semantic_policy == "outdoor_task_specific_v1":
+        if cambridge_task_semantic_manifest is None:
+            raise ValueError(
+                "outdoor_task_specific_v1 requires --cambridge-task-semantic-manifest"
+            )
+        semantic_manifest_path = Path(cambridge_task_semantic_manifest)
+        if not semantic_manifest_path.is_file():
+            raise FileNotFoundError(semantic_manifest_path)
+        semantic_manifest = json.loads(semantic_manifest_path.read_text(encoding="utf-8"))
+        if semantic_manifest.get("schema_version") != "outdoor_task_specific_v1":
+            raise RuntimeError(
+                "Task semantic manifest does not declare outdoor_task_specific_v1"
+            )
+        print(
+            "[INFO] Outdoor task-specific semantic fields enabled: "
+            f"{semantic_manifest_path}."
+        )
+
     tree_weight_lookup = None
     if cambridge_tree_mask_pickle is not None:
         tree_dataset_path = cambridge_tree_mask_dataset_path or mask_dataset_path
@@ -243,18 +271,31 @@ def training(
             planar_tree_weight=tree_planar_weight,
             sky_feather_pixels=tree_sky_feather,
             tree_feather_pixels=tree_boundary_feather,
+            missing_support_policy=tree_missing_support_policy,
+            neutral_support_value=tree_neutral_support_value,
         )
         print(
             "[INFO] Canonical-tree soft weighting enabled: "
             f"index={cambridge_tree_mask_index}, support={cambridge_tree_support_dir}, "
             f"rgb=({tree_rgb_floor}+{tree_rgb_support_gain}*S), "
             f"geometry=({tree_geometry_floor}+{tree_geometry_support_gain}*S), "
-            f"planar={tree_planar_weight}."
+            f"planar={tree_planar_weight}, missing_support={tree_missing_support_policy}."
         )
 
     use_dense_supervision = dense_data_path is not None
     dense_viewpoint_cams = []
     dense_viewpoint_idx_stack = None
+    dense_block_idx_stack = None
+    dense_block_view_idx_stacks = []
+    dense_view_blocks = []
+    if dense_view_sampling_policy not in {"uniform", "spatial_block_balanced"}:
+        raise ValueError(
+            "dense_view_sampling_policy must be uniform or spatial_block_balanced"
+        )
+    if dense_view_sampling_policy == "spatial_block_balanced" and not use_dense_supervision:
+        raise ValueError(
+            "spatial_block_balanced dense sampling requires --dense_data_path"
+        )
     if use_dense_supervision:
         print(f"[INFO] Loading real dense supervision from: {dense_data_path}")
         dense_dataset = copy.deepcopy(dataset)
@@ -270,6 +311,21 @@ def training(
             f"[INFO] Dense cameras: {len(dense_viewpoint_cams)}; "
             f"resolution: {tuple(dense_viewpoint_cams[0].original_image.shape)}"
         )
+        if dense_view_sampling_policy == "spatial_block_balanced":
+            dense_view_blocks = build_spatial_camera_blocks(
+                torch.stack([
+                    camera.camera_center.detach().cpu()
+                    for camera in dense_viewpoint_cams
+                ]),
+                bins=dense_view_block_bins,
+            )
+            dense_block_view_idx_stacks = [None for _ in dense_view_blocks]
+            print(
+                "[INFO] Dense view sampling: spatial_block_balanced; "
+                f"blocks={len(dense_view_blocks)}, bins={dense_view_block_bins}, "
+                f"min/max cameras per block={min(map(len, dense_view_blocks))}/"
+                f"{max(map(len, dense_view_blocks))}."
+            )
         del dense_gaussians, dense_scene
         gc.collect()
         torch.cuda.empty_cache()
@@ -295,8 +351,8 @@ def training(
                 "[WARNING] Tree-support maps cover "
                 f"{tree_support_audit['present_map_count']}/"
                 f"{tree_support_audit['requested_view_count']} training cameras. "
-                "Missing maps use the legacy zero-support tree floor and must not "
-                "be interpreted as canonical-tree evidence."
+                f"Missing maps follow explicit policy={tree_missing_support_policy}; "
+                "unknown evidence is not interpreted as zero canonical support."
             )
         else:
             print(
@@ -343,6 +399,11 @@ def training(
     print(f'[INFO]: Load plane-aware depth from: {refine_depth_path}')
     pa_depths = []
     pa_confident_maps_list = []
+    # The outdoor fusion directory optionally carries per-pixel inverse-depth
+    # uncertainty and source provenance.  Keep this optional so historical
+    # plane-only experiments remain byte-for-byte compatible.
+    pa_rho_variances_list = []
+    pa_source_bitmasks_list = []
 
     input_view_num = len(scene.getTrainCameras())
     see3d_view_num = len(see3d_gs_cameras_list)
@@ -385,6 +446,9 @@ def training(
             if tree_weight_lookup is not None
             else None
         ),
+        "task_semantic_policy": cambridge_task_semantic_policy,
+        "task_semantic_manifest": cambridge_task_semantic_manifest,
+        "tree_missing_support_policy": tree_missing_support_policy,
     }
     if rgb_sampling_policy == "all_train_importance" and see3d_view_num > 0:
         raise ValueError(
@@ -500,6 +564,17 @@ def training(
             not use_dense_supervision or not missing_dense_chart_names
         ),
     }
+    scheduler_audit["dense_view_sampling"] = {
+        "policy": dense_view_sampling_policy,
+        "spatial_block_bins": int(dense_view_block_bins),
+        "occupied_block_count": len(dense_view_blocks),
+        "views_per_block": [len(block) for block in dense_view_blocks],
+        "sampling_contract": (
+            "one_random_real_camera_per_occupied_block_per_cycle"
+            if dense_view_sampling_policy == "spatial_block_balanced"
+            else "uniform_without_replacement_over_all_real_cameras_per_cycle"
+        ),
+    }
     scheduler_audit["densification_stats"] = {
         "policy": densification_view_policy,
         "topology_last_iteration": topology_last_iteration,
@@ -560,6 +635,31 @@ def training(
         pa_confident_map = torch.from_numpy(pa_confident_map).cuda()
         pa_confident_maps_list.append(pa_confident_map)
 
+        rho_variance_path = os.path.join(refine_depth_path, f'rho_variance_frame{idx:06d}.npy')
+        source_bitmask_path = os.path.join(refine_depth_path, f'source_bitmask_frame{idx:06d}.npy')
+        if os.path.isfile(rho_variance_path):
+            rho_variance = np.load(rho_variance_path)
+            if rho_variance.shape != pa_depth.shape:
+                raise RuntimeError(
+                    f'Inverse-depth variance shape mismatch for frame {idx}: '
+                    f'{rho_variance.shape} vs {tuple(pa_depth.shape)}'
+                )
+            pa_rho_variances_list.append(torch.from_numpy(rho_variance.astype(np.float32, copy=False)).cuda())
+        else:
+            pa_rho_variances_list.append(None)
+        if os.path.isfile(source_bitmask_path):
+            source_bitmask = np.load(source_bitmask_path)
+            if source_bitmask.shape != pa_depth.shape:
+                raise RuntimeError(
+                    f'Inverse-depth source map shape mismatch for frame {idx}: '
+                    f'{source_bitmask.shape} vs {tuple(pa_depth.shape)}'
+                )
+            pa_source_bitmasks_list.append(
+                torch.from_numpy(source_bitmask.astype(np.uint8, copy=False)).cuda()
+            )
+        else:
+            pa_source_bitmasks_list.append(None)
+
     plane_valid_masks = []
     for idx, (depth, confidence) in enumerate(zip(pa_depths, pa_confident_maps_list)):
         semantic_mask = None
@@ -577,6 +677,13 @@ def training(
         )
         pa_depths[idx] = clean_depth
         plane_valid_masks.append(valid_mask)
+        if pa_rho_variances_list[idx] is not None:
+            variance = pa_rho_variances_list[idx]
+            pa_rho_variances_list[idx] = torch.where(
+                valid_mask & torch.isfinite(variance) & (variance > 0.0),
+                variance,
+                torch.full_like(variance, float('inf')),
+            )
 
     # The quality selector preserves input-camera order for provenance, so
     # enforce its hard exclusions again at the plane interface.  In
@@ -588,6 +695,12 @@ def training(
         pa_depths[idx] = torch.zeros_like(pa_depths[idx])
         pa_confident_maps_list[idx] = torch.zeros_like(pa_confident_maps_list[idx])
         plane_valid_masks[idx] = torch.zeros_like(plane_valid_masks[idx], dtype=torch.bool)
+        if pa_rho_variances_list[idx] is not None:
+            pa_rho_variances_list[idx] = torch.full_like(
+                pa_rho_variances_list[idx], float('inf')
+            )
+        if pa_source_bitmasks_list[idx] is not None:
+            pa_source_bitmasks_list[idx] = torch.zeros_like(pa_source_bitmasks_list[idx])
 
     pseudo_inpaint_masks = None
     if see3d_view_num > 0 and (
@@ -924,6 +1037,22 @@ def training(
     input_refine_depths = torch.stack(input_refine_depths, dim=0).cuda()
     input_pseudo_confs = pa_confident_maps_list[:input_view_num]
     input_pseudo_confs = torch.stack(input_pseudo_confs, dim=0).cuda()
+    input_rho_variances = pa_rho_variances_list[:input_view_num]
+    input_source_bitmasks = pa_source_bitmasks_list[:input_view_num]
+    input_has_fused_uncertainty = all(value is not None for value in input_rho_variances)
+    input_has_fused_sources = all(value is not None for value in input_source_bitmasks)
+    if (
+        cambridge_task_semantic_policy == "outdoor_task_specific_v1"
+        and (not input_has_fused_uncertainty or not input_has_fused_sources)
+    ):
+        raise RuntimeError(
+            "outdoor_task_specific_v1 requires rho_variance_frame*.npy and "
+            "source_bitmask_frame*.npy for every real Chart; run inverse-depth fusion first."
+        )
+    if input_has_fused_uncertainty:
+        input_rho_variances = torch.stack(input_rho_variances, dim=0).cuda()
+    else:
+        input_rho_variances = None
     input_world_view_transforms = torch.stack([input_cams[i].world_view_transform for i in range(len(input_cams))])
     input_full_proj_transforms = torch.stack([input_cams[i].full_proj_transform for i in range(len(input_cams))])
     input_prior_normals = depth2normal_parallel(
@@ -974,6 +1103,11 @@ def training(
         total_views_list = input_cams + see3d_gs_cameras_list
         total_confs_list = [input_pseudo_confs[idx] for idx in range(len(input_pseudo_confs))] + [see3d_pseudo_confs[idx].unsqueeze(0) for idx in range(len(see3d_pseudo_confs))]
         total_depths_list = [input_refine_depths[idx] for idx in range(len(input_refine_depths))] + [see3d_refine_depths[idx].unsqueeze(0) for idx in range(len(see3d_refine_depths))]
+        total_rho_variances_list = [
+            input_rho_variances[idx] if input_rho_variances is not None else None
+            for idx in range(len(input_refine_depths))
+        ] + [None for _ in range(len(see3d_refine_depths))]
+        total_source_bitmasks_list = list(input_source_bitmasks) + [None for _ in range(len(see3d_refine_depths))]
         total_normals_list = [input_prior_normals[idx] for idx in range(len(input_prior_normals))] + [see3d_prior_normals[idx] for idx in range(len(see3d_prior_normals))]
         total_curvs_list = [input_prior_curvs[idx] for idx in range(len(input_prior_curvs))] + [see3d_prior_curvs[idx] for idx in range(len(see3d_prior_curvs))]
         total_geometry_masks_list = [input_geometry_masks[idx] for idx in range(len(input_geometry_masks))] + [see3d_geometry_masks[idx] for idx in range(len(see3d_geometry_masks))]
@@ -981,6 +1115,11 @@ def training(
         total_views_list = input_cams
         total_confs_list = [input_pseudo_confs[idx] for idx in range(len(input_pseudo_confs))]
         total_depths_list = [input_refine_depths[idx] for idx in range(len(input_refine_depths))]
+        total_rho_variances_list = [
+            input_rho_variances[idx] if input_rho_variances is not None else None
+            for idx in range(len(input_refine_depths))
+        ]
+        total_source_bitmasks_list = list(input_source_bitmasks)
         total_normals_list = [input_prior_normals[idx] for idx in range(len(input_prior_normals))]
         total_curvs_list = [input_prior_curvs[idx] for idx in range(len(input_prior_curvs))]
         total_geometry_masks_list = [input_geometry_masks[idx] for idx in range(len(input_geometry_masks))]
@@ -997,6 +1136,22 @@ def training(
         f"{len(see3d_gs_cameras_list) if use_pseudo_supervision else 0}/"
         f"{len(see3d_gs_cameras_list)}"
     )
+    if cambridge_task_semantic_policy == "outdoor_task_specific_v1":
+        fused_count = sum(value is not None for value in total_rho_variances_list)
+        scheduler_audit["inverse_depth_fusion"] = {
+            "loss": "variance_aware_inverse_depth_nll",
+            "fused_variance_views": fused_count,
+            "total_geometry_views": len(total_rho_variances_list),
+            "mono_only_weight": 0.15,
+            "source_bitmask_required_for_real_charts": True,
+        }
+        with open(scheduler_audit_path, "w", encoding="utf-8") as handle:
+            json.dump(scheduler_audit, handle, indent=2)
+            handle.write("\n")
+        print(
+            "[INFO] Outdoor inverse-depth likelihood: "
+            f"variance/source evidence for {fused_count}/{len(total_rho_variances_list)} geometry view(s)."
+        )
 
     color_correction = None
     color_correction_optimizer = None
@@ -1099,11 +1254,23 @@ def training(
             is_pseudo_view = viewpoint_idx >= input_view_num
             current_geometry_mask = total_geometry_masks_list[viewpoint_idx]
         else:
-            if not dense_viewpoint_idx_stack:
-                dense_viewpoint_idx_stack = list(range(len(dense_viewpoint_cams)))
-            dense_viewpoint_idx = dense_viewpoint_idx_stack.pop(
-                randint(0, len(dense_viewpoint_idx_stack) - 1)
-            )
+            if dense_view_sampling_policy == "spatial_block_balanced":
+                if not dense_block_idx_stack:
+                    dense_block_idx_stack = list(range(len(dense_view_blocks)))
+                block_idx = dense_block_idx_stack.pop(
+                    randint(0, len(dense_block_idx_stack) - 1)
+                )
+                if not dense_block_view_idx_stacks[block_idx]:
+                    dense_block_view_idx_stacks[block_idx] = list(dense_view_blocks[block_idx])
+                dense_viewpoint_idx = dense_block_view_idx_stacks[block_idx].pop(
+                    randint(0, len(dense_block_view_idx_stacks[block_idx]) - 1)
+                )
+            else:
+                if not dense_viewpoint_idx_stack:
+                    dense_viewpoint_idx_stack = list(range(len(dense_viewpoint_cams)))
+                dense_viewpoint_idx = dense_viewpoint_idx_stack.pop(
+                    randint(0, len(dense_viewpoint_idx_stack) - 1)
+                )
             viewpoint_cam = dense_viewpoint_cams[dense_viewpoint_idx]
             viewpoint_idx = None
             is_pseudo_view = False
@@ -1270,6 +1437,8 @@ def training(
             current_normal = total_normals_list[viewpoint_idx]
             current_curv = total_curvs_list[viewpoint_idx]
             current_conf = total_confs_list[viewpoint_idx].to(surf_depth.device)
+            current_rho_variance = total_rho_variances_list[viewpoint_idx]
+            current_source_bitmask = total_source_bitmasks_list[viewpoint_idx]
             current_geometry_mask = current_geometry_mask.to(surf_depth.device)
             rend_curvature = normal2curv(
                 render_pkg['rend_normal'],
@@ -1283,13 +1452,29 @@ def training(
             lambda_prior_curvature = regularization_factor * 0.25
             confidence_weight = 0.5 * current_conf.clamp(0.0, 1.0)
 
-            depth_term = confidence_weight * torch.log(
-                1.0 + charts_scale_factor * (current_depth - surf_depth).abs()
-            )
-            depth_prior_loss = lambda_prior_depth * masked_mean(
-                depth_term,
-                current_geometry_mask,
-            )
+            if (
+                cambridge_task_semantic_policy == "outdoor_task_specific_v1"
+                and current_rho_variance is not None
+            ):
+                # The fused outdoor evidence is calibrated in inverse depth.
+                # Its source map preserves the intended hierarchy: bounded
+                # planes and aligned Charts dominate; mono-only support is a
+                # weak fallback rather than an equally strong anchor.
+                depth_prior_loss = lambda_prior_depth * fused_inverse_depth_nll(
+                    surf_depth,
+                    current_depth,
+                    current_rho_variance,
+                    confidence=confidence_weight * current_geometry_mask,
+                    source_bitmask=current_source_bitmask,
+                )
+            else:
+                depth_term = confidence_weight * torch.log(
+                    1.0 + charts_scale_factor * (current_depth - surf_depth).abs()
+                )
+                depth_prior_loss = lambda_prior_depth * masked_mean(
+                    depth_term,
+                    current_geometry_mask,
+                )
             if lambda_prior_depth_derivative > 0:
                 depth_prior_loss = depth_prior_loss + lambda_prior_depth_derivative * masked_mean(
                     1.0 - (surf_normal * current_normal).sum(dim=0),
@@ -1771,6 +1956,18 @@ if __name__ == "__main__":
     parser.add_argument("--tree_planar_weight", type=float, default=0.0)
     parser.add_argument("--tree_sky_feather", type=int, default=4)
     parser.add_argument("--tree_boundary_feather", type=int, default=6)
+    parser.add_argument(
+        "--tree-missing-support-policy",
+        choices=["error", "neutral", "legacy_zero"],
+        default="legacy_zero",
+    )
+    parser.add_argument("--tree-neutral-support-value", type=float, default=0.5)
+    parser.add_argument(
+        "--cambridge-task-semantic-policy",
+        choices=["legacy", "outdoor_task_specific_v1"],
+        default="legacy",
+    )
+    parser.add_argument("--cambridge-task-semantic-manifest", type=str, default=None)
     parser.add_argument("--rgb_loss_type", choices=["l1", "charbonnier"], default="l1")
     parser.add_argument("--rgb_charbonnier_eps", type=float, default=1e-3)
     parser.add_argument(
@@ -1825,6 +2022,13 @@ if __name__ == "__main__":
     parser.add_argument("--dense_depth_cache", type=str, default=None)
     parser.add_argument("--geometry_view_every_n_iter", type=int, default=5)
     parser.add_argument("--dense_only_from_iter", type=int, default=3000)
+    parser.add_argument(
+        "--dense-view-sampling-policy",
+        choices=["uniform", "spatial_block_balanced"],
+        default="uniform",
+        help="Sampling policy for all-real dense cameras.",
+    )
+    parser.add_argument("--dense-view-block-bins", type=int, default=4)
     parser.add_argument("--pseudo_rgb_weight", type=float, default=0.01)
     parser.add_argument("--pseudo_geometry_weight", type=float, default=0.25)
     parser.add_argument("--pseudo_geometry_final_weight", type=float, default=0.02)
@@ -1839,7 +2043,12 @@ if __name__ == "__main__":
         choices=["all", "inpaint_only", "none"],
         default="all",
     )
-    parser.add_argument("--max_plane_abs_depth", type=float, default=50.0)
+    parser.add_argument(
+        "--max_plane_abs_depth",
+        type=float,
+        default=None,
+        help="Optional legacy absolute depth cap. The outdoor mainline leaves it unset.",
+    )
     parser.add_argument(
         "--init_fill_unsupported_with_prior",
         action="store_true",
@@ -1937,6 +2146,7 @@ if __name__ == "__main__":
         args.continue_opacity_resets_after_densify,
         args.chart_geometry_prior_weight,
         args.dense_depth_cache, args.geometry_view_every_n_iter, args.dense_only_from_iter,
+        args.dense_view_sampling_policy, args.dense_view_block_bins,
         args.pseudo_rgb_weight, args.pseudo_geometry_weight,
         args.pseudo_geometry_final_weight, args.pseudo_geometry_decay_until,
         args.pseudo_initialization_mode, args.pseudo_geometry_mask_mode,
@@ -1950,6 +2160,8 @@ if __name__ == "__main__":
         args.tree_rgb_floor, args.tree_rgb_support_gain,
         args.tree_geometry_floor, args.tree_geometry_support_gain,
         args.tree_planar_weight, args.tree_sky_feather, args.tree_boundary_feather,
+        args.tree_missing_support_policy, args.tree_neutral_support_value,
+        args.cambridge_task_semantic_policy, args.cambridge_task_semantic_manifest,
         args.init_ply, args.freeze_init_ply, args.warmstart_reseed_pixel_stride,
         args.warmstart_reseed_max_scale,
         args.warmstart_max_opacity, args.warmstart_max_scale,

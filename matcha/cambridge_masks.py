@@ -292,6 +292,8 @@ class CambridgeTreeWeightLookup:
         planar_tree_weight: float = 0.0,
         sky_feather_pixels: int = 4,
         tree_feather_pixels: int = 6,
+        missing_support_policy: str = "legacy_zero",
+        neutral_support_value: float = 0.5,
     ):
         self.mask_lookup = mask_lookup
         self.tree_mask_index = int(tree_mask_index)
@@ -303,7 +305,10 @@ class CambridgeTreeWeightLookup:
         self.planar_tree_weight = float(planar_tree_weight)
         self.sky_feather_pixels = int(sky_feather_pixels)
         self.tree_feather_pixels = int(tree_feather_pixels)
+        self.missing_support_policy = str(missing_support_policy)
+        self.neutral_support_value = float(neutral_support_value)
         self._support_cache: dict[str, torch.Tensor] = {}
+        self._support_valid_cache: dict[str, bool] = {}
 
         for name, value in (
             ("rgb_floor", self.rgb_floor),
@@ -314,6 +319,12 @@ class CambridgeTreeWeightLookup:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if self.missing_support_policy not in {"error", "neutral", "legacy_zero"}:
+            raise ValueError(
+                "missing_support_policy must be 'error', 'neutral', or 'legacy_zero'"
+            )
+        if not 0.0 <= self.neutral_support_value <= 1.0:
+            raise ValueError("neutral_support_value must be in [0, 1]")
 
     def _support_path(self, image_name: str) -> Optional[Path]:
         if self.support_dir is None:
@@ -400,10 +411,18 @@ class CambridgeTreeWeightLookup:
             "explicit_map_behavior": explicit_map_behavior,
             "missing_view_examples": missing[:20],
             "missing_map_behavior": (
-                "zero_support_tree_floor_not_canonical_evidence"
-                if missing
-                else "all_requested_views_have_explicit_support_maps"
+                (
+                    "neutral_prior_unknown_evidence"
+                    if self.missing_support_policy == "neutral"
+                    else "error_required_evidence"
+                    if self.missing_support_policy == "error"
+                    else "zero_support_tree_floor_not_canonical_evidence"
+                )
+                if missing else "all_requested_views_have_explicit_support_maps"
             ),
+            "missing_support_policy": self.missing_support_policy,
+            "neutral_support_value": self.neutral_support_value,
+            "unknown_evidence_is_distinct_from_zero_support": True,
         }
 
     def support(self, image_name: str, shape: tuple[int, int], device: torch.device) -> torch.Tensor:
@@ -411,14 +430,36 @@ class CambridgeTreeWeightLookup:
         if source_name not in self._support_cache:
             path = self._support_path(image_name)
             if path is None:
-                support = torch.zeros((1, 1), dtype=torch.float32)
+                if self.missing_support_policy == "error":
+                    raise FileNotFoundError(
+                        "Tree support is required by policy but missing for "
+                        f"{image_name} under {self.support_dir}"
+                    )
+                support = torch.full(
+                    (1, 1),
+                    self.neutral_support_value
+                    if self.missing_support_policy == "neutral"
+                    else 0.0,
+                    dtype=torch.float32,
+                )
+                self._support_valid_cache[source_name] = False
             else:
                 array = np.load(path)
                 if array.ndim != 2 or not np.isfinite(array).all():
                     raise RuntimeError(f"Invalid tree support map: {path}")
                 support = torch.from_numpy(array.astype(np.float32, copy=False)).clamp(0.0, 1.0)
+                self._support_valid_cache[source_name] = True
             self._support_cache[source_name] = support
         return tensor_to_resized_weight(self._support_cache[source_name], shape, device)
+
+    def support_valid(self, image_name: str) -> bool:
+        """Whether the support value comes from an explicit evidence map."""
+        source_name = self.mask_lookup.source_name_for(image_name)
+        if source_name not in self._support_cache:
+            # Populate the same cache path used by ``support`` without tying
+            # validity to a particular raster resolution/device.
+            self.support(image_name, (1, 1), torch.device("cpu"))
+        return self._support_valid_cache[source_name]
 
     def components(
         self,
