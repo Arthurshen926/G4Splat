@@ -756,6 +756,21 @@ def sanitize_depth(
     return torch.where(valid, depth, torch.zeros_like(depth)), valid
 
 
+def fused_geometry_validity_mask(source_bitmask: torch.Tensor) -> torch.Tensor:
+    """Return pixels anchored by plane or aligned-Chart geometry.
+
+    Outdoor inverse-depth fusion stores a continuous precision-derived
+    confidence.  That quantity is appropriate as a loss weight, but its scale
+    is deliberately much lower than the legacy binary plane-confidence map.
+    Initialization must therefore use source provenance rather than applying
+    the old ``confidence > 0.5`` rule to it.  Mono-only pixels remain excluded
+    from Gaussian initialization because they have no verified multi-view
+    geometry anchor.
+    """
+    source_bitmask = torch.as_tensor(source_bitmask)
+    return (source_bitmask.to(torch.uint8) & 0b0011) != 0
+
+
 def sanitize_chart_geometry(
     charts_data: dict[str, torch.Tensor],
     *,

@@ -11,6 +11,7 @@ from matcha.cambridge_training import (
     compute_rgb_loss,
     dense_depth_weight,
     densification_stats_from_view,
+    fused_geometry_validity_mask,
     geometry_chart_sampling_indices,
     geometry_iteration,
     load_depth_cache,
@@ -434,6 +435,18 @@ def test_sanitize_depth_combines_confidence_semantics_and_outlier_limit():
 
     assert torch.equal(valid, torch.tensor([[True, False], [False, False]]))
     assert torch.equal(clean, torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+
+
+def test_fused_geometry_validity_uses_verified_sources_not_confidence_scale():
+    # Bits: plane=1, aligned Chart=2, calibrated mono=4. Mono-only depth is
+    # useful as weak supervision but must not seed geometry without a static
+    # multi-view anchor.
+    source = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.uint8)
+
+    assert torch.equal(
+        fused_geometry_validity_mask(source),
+        torch.tensor([[False, True, True, True], [False, True, True, True]]),
+    )
 
 
 def test_sanitize_chart_geometry_removes_unsupported_and_extreme_pixels():

@@ -50,6 +50,7 @@ from matcha.cambridge_training import (
     compute_rgb_loss,
     dense_depth_weight,
     densification_stats_from_view,
+    fused_geometry_validity_mask,
     fused_inverse_depth_nll,
     geometry_chart_sampling_indices,
     geometry_iteration,
@@ -404,6 +405,15 @@ def training(
     # plane-only experiments remain byte-for-byte compatible.
     pa_rho_variances_list = []
     pa_source_bitmasks_list = []
+    fused_inverse_depth = os.path.isfile(
+        os.path.join(refine_depth_path, "inverse_depth_fusion_manifest.json")
+    )
+    if fused_inverse_depth:
+        print(
+            "[INFO] Inverse-depth fusion detected; plane initialization validity "
+            "will use plane/Chart source provenance while retaining continuous "
+            "fusion confidence for loss weighting."
+        )
 
     input_view_num = len(scene.getTrainCameras())
     see3d_view_num = len(see3d_gs_cameras_list)
@@ -669,9 +679,20 @@ def training(
                 depth.shape[-2:],
                 depth.device,
             )
+        validity_confidence = confidence
+        if fused_inverse_depth:
+            source_bitmask = pa_source_bitmasks_list[idx]
+            if source_bitmask is None:
+                raise RuntimeError(
+                    "Inverse-depth fusion manifest requires source_bitmask_frame*.npy "
+                    f"for frame {idx}."
+                )
+            validity_confidence = fused_geometry_validity_mask(source_bitmask).to(
+                dtype=depth.dtype
+            )
         clean_depth, valid_mask = sanitize_depth(
             depth,
-            confidence=confidence,
+            confidence=validity_confidence,
             semantic_mask=semantic_mask,
             max_abs_depth=max_plane_abs_depth,
         )
