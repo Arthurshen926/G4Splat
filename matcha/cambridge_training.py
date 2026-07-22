@@ -160,8 +160,25 @@ def fused_inverse_depth_nll(
         raise ValueError("mono_only_weight must be in [0, 1]")
     if not 0.0 < variance_floor <= variance_ceiling:
         raise ValueError("variance bounds must satisfy 0 < floor <= ceiling")
-    target_depth = target_depth.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
-    variance = rho_variance.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+
+    def single_map(value: torch.Tensor, *, name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
+        result = value.to(device=rendered_depth.device, dtype=dtype)
+        if result.ndim == 2:
+            return result
+        if result.ndim == 3 and result.shape[0] == 1:
+            return result[0]
+        if result.ndim == 4 and result.shape[:2] == (1, 1):
+            return result[0, 0]
+        raise RuntimeError(
+            f"{name} must be a single [height,width] depth map, got {tuple(result.shape)}"
+        )
+
+    # Gaussian renderer depth is [1,H,W], whereas persisted fusion maps are
+    # [H,W].  Canonicalize the per-view loss to 2D before boolean indexing so
+    # variance/provenance maps cannot be accidentally broadcast to a new axis.
+    rendered_depth = single_map(rendered_depth, name="rendered_depth", dtype=rendered_depth.dtype)
+    target_depth = single_map(target_depth, name="target_depth", dtype=rendered_depth.dtype)
+    variance = single_map(rho_variance, name="rho_variance", dtype=rendered_depth.dtype)
     if target_depth.shape != rendered_depth.shape:
         target_depth = F.interpolate(
             target_depth.reshape(1, 1, *target_depth.shape[-2:]),
@@ -199,7 +216,7 @@ def fused_inverse_depth_nll(
     )
     weight = valid.to(dtype=rendered_depth.dtype)
     if confidence is not None:
-        confidence = confidence.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+        confidence = single_map(confidence, name="confidence", dtype=rendered_depth.dtype)
         if confidence.shape != rendered_depth.shape:
             confidence = F.interpolate(
                 confidence.reshape(1, 1, *confidence.shape[-2:]),
@@ -209,7 +226,7 @@ def fused_inverse_depth_nll(
             )[0, 0]
         weight = weight * confidence.clamp(0.0, 1.0)
     if source_bitmask is not None:
-        source_bitmask = source_bitmask.to(device=rendered_depth.device)
+        source_bitmask = single_map(source_bitmask, name="source_bitmask", dtype=torch.uint8)
         if source_bitmask.shape != rendered_depth.shape:
             source_bitmask = F.interpolate(
                 source_bitmask.reshape(1, 1, *source_bitmask.shape[-2:]).to(torch.float32),

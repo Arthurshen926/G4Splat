@@ -90,6 +90,22 @@ def test_variance_aware_inverse_depth_loss_downweights_mono_only_evidence():
     assert second_is_mono_only < all_multiview
 
 
+def test_variance_aware_inverse_depth_loss_normalizes_renderer_channel_dimension():
+    rendered = torch.tensor([[[1.1, 1.2], [0.9, 1.3]]], dtype=torch.float32)
+    target = torch.ones((2, 2), dtype=torch.float32)
+    variance = torch.ones((2, 2), dtype=torch.float32)
+
+    loss = fused_inverse_depth_nll(
+        rendered,
+        target,
+        variance,
+        confidence=torch.ones((2, 2)),
+        source_bitmask=torch.full((2, 2), 2, dtype=torch.uint8),
+    )
+
+    assert torch.isfinite(loss)
+
+
 def test_spatial_camera_blocks_keep_all_real_views_but_balance_cycles():
     blocks = build_spatial_camera_blocks(
         torch.tensor([
