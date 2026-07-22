@@ -14,6 +14,13 @@ def test_chart_plane_frontend_uses_requested_resolution_and_device():
     assert '"--max_chart_abs_point", str(args.max_chart_abs_point)' in render_command
 
 
+def test_train_entrypoint_accepts_mainline_chart_cap_flag_spelling():
+    source = Path("train.py").read_text()
+
+    assert "'--max-chart-abs-depth'" in source
+    assert "'--max-chart-abs-point'" in source
+
+
 def test_camera_config_defaults_do_not_overwrite_explicit_resolution():
     source = Path("2d-gaussian-splatting/scene/dataset_readers.py").read_text()
 

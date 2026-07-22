@@ -331,6 +331,8 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--max_chart_abs_depth',
+        '--max-chart-abs-depth',
+        dest='max_chart_abs_depth',
         type=float,
         default=50.0,
         help=(
@@ -340,6 +342,8 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--max_chart_abs_point',
+        '--max-chart-abs-point',
+        dest='max_chart_abs_point',
         type=float,
         default=50.0,
         help=(
