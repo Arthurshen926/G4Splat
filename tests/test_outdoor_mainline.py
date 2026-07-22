@@ -17,6 +17,7 @@ from scripts.run_cambridge_outdoor_mainline import (
     _completed_sfm_can_resume_alignment,
     _hydrate_schedule_compatible_frontend,
     _mainline_runtime_env,
+    _run_heldout_evaluation,
     _train_with_mainline_contract,
     _reuse_compatible_frontend,
     _serialized_config,
@@ -381,3 +382,46 @@ def test_mainline_contract_enables_block_balanced_real_view_sampling(tmp_path):
     assert command[command.index("--plane-min-pixels") + 1] == "64"
     assert command[command.index("--max-chart-abs-depth") + 1] == "0"
     assert command[command.index("--max-chart-abs-point") + 1] == "0"
+
+
+def test_mainline_marks_overlapping_heldout_trajectory_unavailable(tmp_path):
+    scene = "StMarysChurch"
+    heldout_dataset = tmp_path / "datasets" / scene / "heldout_eval"
+    heldout_dataset.mkdir(parents=True)
+    prepared = tmp_path / "prepared"
+    audit_dir = prepared / "audit"
+    audit_dir.mkdir(parents=True)
+    database_contract = prepared / "scene_manifest.json"
+    heldout_contract = prepared / "heldout_scene_manifest.json"
+    database_contract.write_text(json.dumps({
+        "records": [{"source_image_name": "seq1/frame00001.png"}],
+    }))
+    heldout_contract.write_text(json.dumps({
+        "records": [{"source_image_name": "seq1/frame00001.png"}],
+    }))
+    output = tmp_path / "run"
+    paths = SimpleNamespace(
+        audit_dir=audit_dir,
+        mask_pickle=tmp_path / "masks.pkl",
+    )
+    config = SimpleNamespace(
+        datasets_root=tmp_path / "datasets",
+        final_iterations=40_000,
+    )
+
+    _run_heldout_evaluation(
+        paths,
+        config,
+        {"CUDA_VISIBLE_DEVICES": "0"},
+        scene=scene,
+        scene_contract=database_contract,
+        output=output,
+        dry_run=False,
+    )
+
+    manifest = json.loads(
+        (output / "evaluation" / "trajectory_heldout" / "heldout_evaluation_manifest.json").read_text()
+    )
+    assert manifest["status"] == "unavailable"
+    assert manifest["reason"] == "database_query_camera_overlap"
+    assert manifest["database_query_disjointness"]["overlap_count"] == 1

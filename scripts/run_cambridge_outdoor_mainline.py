@@ -5,7 +5,8 @@ This runner intentionally composes the proven QC/MASt3R/2DGS infrastructure
 instead of creating a second training stack.  It changes the mainline
 contract: fixed calibrated cameras, task-specific semantics, broad candidates
 followed by mandatory structural selection, inverse-depth fusion, all-real
-topology growth and held-out evaluation.
+topology growth, transductive train-fit evaluation, and a hard guard against
+misreporting an overlapping query trajectory as held out.
 """
 
 from __future__ import annotations
@@ -336,18 +337,48 @@ def _write_mainline_manifest(
         "representation_policy": "hybrid_surface_volume_sky_v1",
         "densification_policy": "real_block_balanced_v1",
         "generation_policy": "none",
-        "evaluation_policy": "trainfit_and_heldout_v1",
+        "evaluation_policy": "transductive_trainfit_with_disjointness_guard_v1",
         "scene_contract": str(scene_contract),
         "task_semantic_manifest": str(semantic_manifest),
         "structural_graph": str(structural_graph) if structural_graph is not None else None,
         "structural_selection": str(structural_selection) if structural_selection is not None else None,
         "fused_inverse_depth": str(fused_depth) if fused_depth is not None else None,
         "dense_real_dataset": str(paths.qc_dataset),
-        "query_images_excluded_from_training": True,
+        # This mainline intentionally fits every real image in ``train``.
+        # A trajectory may be evaluated only when its contract is provably
+        # disjoint; do not let the manifest imply a conventional held-out
+        # split when the scene was optimized transductively.
+        "query_images_excluded_from_training": False,
+        "heldout_metric_policy": "only_when_database_query_contracts_are_disjoint",
     }
     (output / "outdoor_mainline_manifest.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def _database_query_disjointness(
+    database_contract: Path,
+    query_contract: Path,
+) -> dict[str, Any]:
+    """Summarize camera-name overlap without weakening the leak guard."""
+    database = json.loads(database_contract.read_text(encoding="utf-8"))
+    query = json.loads(query_contract.read_text(encoding="utf-8"))
+    database_names = {
+        str(record["source_image_name"])
+        for record in database.get("records", [])
+    }
+    query_names = {
+        str(record["source_image_name"])
+        for record in query.get("records", [])
+    }
+    overlap = sorted(database_names & query_names)
+    return {
+        "database_image_count": len(database_names),
+        "query_image_count": len(query_names),
+        "overlap_count": len(overlap),
+        "overlap_examples": overlap[:20],
+        "passed": not overlap,
+    }
 
 
 def _run_heldout_evaluation(
@@ -375,6 +406,40 @@ def _run_heldout_evaluation(
             split="query_heldout",
         )
     evaluation_output = output / "evaluation" / "trajectory_heldout"
+    disjointness = _database_query_disjointness(scene_contract, heldout_contract)
+    if not disjointness["passed"]:
+        # The mainline is deliberately transductive.  Preserve the strict
+        # leakage check, but make its outcome a first-class, machine-readable
+        # result rather than failing after the expensive train-fit render has
+        # already completed.
+        evaluation_output.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "evaluation_kind": "trajectory_heldout_not_run",
+            "status": "unavailable",
+            "reason": "database_query_camera_overlap",
+            "model_path": str((output / "free_gaussians").resolve()),
+            "dataset_path": str(heldout_dataset.resolve()),
+            "iteration": config.final_iterations,
+            "color_correction": "not_applicable",
+            "database_contract": str(scene_contract.resolve()),
+            "heldout_contract": str(heldout_contract.resolve()),
+            "database_query_disjointness": disjointness,
+        }
+        (evaluation_output / "heldout_evaluation_manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        (evaluation_output / "heldout_eval.log").write_text(
+            "[SKIP] Held-out trajectory overlaps the transductive training set.\n"
+            + json.dumps(manifest, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "[SKIP] Held-out trajectory is not disjoint from the transductive "
+            f"database (overlap={disjointness['overlap_count']}).",
+            flush=True,
+        )
+        return
     command = [
         sys.executable,
         "scripts/evaluate_cambridge_heldout.py",
@@ -661,18 +726,6 @@ def run_mainline(args: argparse.Namespace) -> None:
             screen_only=False,
             active_chart_selection=structural_selection,
         )
-        _write_mainline_manifest(
-            paths.full_output,
-            scene=args.scene,
-            config=config,
-            paths=paths,
-            stage="full_real_view_refinement",
-            scene_contract=scene_contract,
-            semantic_manifest=semantic_manifest,
-            structural_graph=structural_graph,
-            structural_selection=structural_selection,
-            fused_depth=fused_depth,
-        )
         run_logged(
             full_command,
             cwd=REPO_ROOT,
@@ -681,6 +734,21 @@ def run_mainline(args: argparse.Namespace) -> None:
         )
     if not full_model.is_file():
         raise FileNotFoundError(f"Full training did not produce {full_model}")
+    # Also refresh the run contract when reusing an existing full model.  This
+    # keeps policy corrections (notably the transductive evaluation semantics)
+    # from being stranded in stale manifests created before a later eval run.
+    _write_mainline_manifest(
+        paths.full_output,
+        scene=args.scene,
+        config=config,
+        paths=paths,
+        stage="full_real_view_refinement",
+        scene_contract=scene_contract,
+        semantic_manifest=semantic_manifest,
+        structural_graph=structural_graph,
+        structural_selection=structural_selection,
+        fused_depth=fused_depth,
+    )
     if args.phase == "full":
         return
 
