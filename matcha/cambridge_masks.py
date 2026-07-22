@@ -127,6 +127,22 @@ class CambridgeMaskLookup:
         if not mapping_path.exists():
             raise FileNotFoundError(f"Expected {mapping_path} to map staged image names to source image names")
         self.staged_to_source = json.loads(mapping_path.read_text())
+        # A Cambridge mask dictionary is encountered in two legitimate forms:
+        # the original ULF/STDLoc pickle is keyed by nested source names
+        # (``seq1/frame00001.png``), while the external-control adapter rekeys
+        # its intentionally reduced pickle by staged COLMAP names
+        # (``seq1__frame00001.png``).  Keep both sides of the mapping so the
+        # lookup resolves to a *real pickle key*, rather than assuming the
+        # mapping value is always the key.
+        self.staged_by_stem = {
+            Path(staged_name).stem: staged_name
+            for staged_name in self.staged_to_source
+        }
+        if len(self.staged_by_stem) != len(self.staged_to_source):
+            raise RuntimeError(
+                "Staged Cambridge image names are ambiguous after extension "
+                f"normalization in {mapping_path}"
+            )
         self.source_by_stem = {
             Path(staged_name).stem: source_name for staged_name, source_name in self.staged_to_source.items()
         }
@@ -140,22 +156,43 @@ class CambridgeMaskLookup:
         lookup.mask_indices = list(mask_indices)
         lookup.masks = self.masks
         lookup.staged_to_source = self.staged_to_source
+        lookup.staged_by_stem = self.staged_by_stem
         lookup.source_by_stem = self.source_by_stem
         lookup._valid_ratio_cache = {}
         lookup._resized_mask_cache = {}
         return lookup
 
     def source_name_for(self, image_name: str) -> str:
+        """Return the actual key of ``masks`` for a loaded camera name.
+
+        The historical name of this method is retained because downstream
+        support-map code uses it too, but its contract is intentionally the
+        concrete mask key.  Returning a nested source name that is absent from
+        an adapter's staged-key pickle deferred the error until a later direct
+        ``lookup.masks[...]`` access and made the ULF-compatible control
+        unusable.
+        """
         if image_name in self.masks:
             return image_name
 
         image_basename = Path(image_name).name
-        if image_basename in self.staged_to_source:
-            return self.staged_to_source[image_basename]
+        if image_basename in self.masks:
+            return image_basename
 
         image_stem = Path(image_basename).stem
+        staged_name = self.staged_by_stem.get(image_stem)
+        if staged_name is not None and staged_name in self.masks:
+            return staged_name
+
+        if image_basename in self.staged_to_source:
+            source_name = self.staged_to_source[image_basename]
+            if source_name in self.masks:
+                return source_name
+
         if image_stem in self.source_by_stem:
-            return self.source_by_stem[image_stem]
+            source_name = self.source_by_stem[image_stem]
+            if source_name in self.masks:
+                return source_name
 
         # Staged Cambridge names are losslessly encoded as
         # ``sequence__frame``.  A QC subset's name_mapping.json may omit a
@@ -168,7 +205,11 @@ class CambridgeMaskLookup:
             if canonical_name in self.masks:
                 return canonical_name
 
-        raise RuntimeError(f"Could not map staged image name {image_name!r} using {self.dataset_path / 'name_mapping.json'}")
+        raise RuntimeError(
+            f"Could not resolve a mask key for staged image name {image_name!r} "
+            f"using {self.dataset_path / 'name_mapping.json'} and "
+            f"{self.mask_pickle}"
+        )
 
     def get_mask(self, image_name: str, shape: tuple[int, int], device: torch.device) -> torch.Tensor:
         source_name = self.source_name_for(image_name)
@@ -283,6 +324,87 @@ class CambridgeTreeWeightLookup:
             self.support_dir / f"{source_name.replace('/', '__').rsplit('.', 1)[0]}.npy",
         ]
         return next((path for path in candidates if path.exists()), None)
+
+    def support_coverage_audit(self, image_names: list[str]) -> dict:
+        """Describe whether canonical support evidence exists for every view.
+
+        Missing maps historically fall back to an all-zero support tensor.  That
+        preserves the conservative tree-floor behavior, but it is *not*
+        evidence that the tree pixels are non-canonical.  Report the distinction
+        before training so a chart-only support directory cannot be mislabeled
+        as full all-train canonical support.  File existence is insufficient:
+        an exported all-zero map has exactly the same numerical effect as a
+        missing map, so audit its values as well.
+        """
+        names = list(dict.fromkeys(str(name) for name in image_names))
+        present = []
+        missing = []
+        stats_by_path: dict[Path, tuple[bool, float, float]] = {}
+        for name in names:
+            path = self._support_path(name)
+            if path is None:
+                missing.append(name)
+            else:
+                present.append(name)
+                if path not in stats_by_path:
+                    # mmap keeps this startup audit bounded even when a future
+                    # all-train support export contains thousands of maps.
+                    array = np.load(path, mmap_mode="r")
+                    if array.ndim != 2 or not np.isfinite(array).all():
+                        raise RuntimeError(f"Invalid tree support map: {path}")
+                    clipped = np.clip(array, 0.0, 1.0)
+                    stats_by_path[path] = (
+                        bool(np.any(clipped > 0.0)),
+                        float(np.mean(clipped)),
+                        float(np.max(clipped)),
+                    )
+        requested = len(names)
+        present_stats = [
+            stats_by_path[self._support_path(name)]
+            for name in present
+        ]
+        nonzero_map_count = sum(has_support for has_support, _, _ in present_stats)
+        mean_support = (
+            float(np.mean([mean for _, mean, _ in present_stats]))
+            if present_stats
+            else 0.0
+        )
+        max_support = (
+            float(max(maximum for _, _, maximum in present_stats))
+            if present_stats
+            else 0.0
+        )
+        if not present:
+            explicit_map_behavior = "no_explicit_support_maps"
+        elif nonzero_map_count == 0:
+            explicit_map_behavior = "all_explicit_maps_zero_support_tree_floor"
+        elif nonzero_map_count < len(present):
+            explicit_map_behavior = "some_explicit_maps_zero_support"
+        else:
+            explicit_map_behavior = "all_explicit_maps_have_nonzero_support"
+        return {
+            "support_dir": None if self.support_dir is None else str(self.support_dir),
+            "requested_view_count": requested,
+            "present_map_count": len(present),
+            "missing_map_count": len(missing),
+            "map_coverage_fraction": (
+                float(len(present) / requested) if requested else 1.0
+            ),
+            "nonzero_map_count": nonzero_map_count,
+            "zero_support_map_count": len(present) - nonzero_map_count,
+            "nonzero_map_coverage_fraction": (
+                float(nonzero_map_count / requested) if requested else 1.0
+            ),
+            "mean_support_value_across_present_maps": mean_support,
+            "max_support_value_across_present_maps": max_support,
+            "explicit_map_behavior": explicit_map_behavior,
+            "missing_view_examples": missing[:20],
+            "missing_map_behavior": (
+                "zero_support_tree_floor_not_canonical_evidence"
+                if missing
+                else "all_requested_views_have_explicit_support_maps"
+            ),
+        }
 
     def support(self, image_name: str, shape: tuple[int, int], device: torch.device) -> torch.Tensor:
         source_name = self.mask_lookup.source_name_for(image_name)

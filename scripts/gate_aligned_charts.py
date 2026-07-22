@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disable chart geometry that strongly contradicts its aligned depth prior."""
+"""Hard-gate Chart geometry against the depth target used for alignment."""
 
 from __future__ import annotations
 
@@ -31,6 +31,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-valid-fraction", type=float, default=0.05)
     parser.add_argument("--max-abs-depth", type=float, default=50.0)
     parser.add_argument("--max-abs-point", type=float, default=50.0)
+    parser.add_argument(
+        "--require-reference-depths",
+        action="store_true",
+        help=(
+            "Refuse legacy prior-only Chart archives.  New strict runs persist "
+            "the MASt3R target depth used by alignment and must be gated against it."
+        ),
+    )
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
 
@@ -58,27 +66,54 @@ def gate_charts(
 ) -> tuple[dict[str, np.ndarray], list[dict[str, object]]]:
     depths = np.asarray(payload["depths"])
     priors = np.asarray(payload["prior_depths"])
+    reference_depths = np.asarray(payload.get("reference_depths", priors))
+    reference_source = (
+        "mast3r_reference_depths"
+        if "reference_depths" in payload
+        else "depthanything_prior_legacy"
+    )
+    reference_masks = payload.get("alignment_reference_mask")
+    if reference_masks is not None:
+        reference_masks = np.asarray(reference_masks)
     confs = np.asarray(payload["confs"]).copy()
     points = payload.get("pts", payload.get("pts3d"))
-    if not (len(names) == len(depths) == len(priors) == len(confs)):
+    if not (
+        len(names)
+        == len(depths)
+        == len(priors)
+        == len(reference_depths)
+        == len(confs)
+    ):
         raise RuntimeError("Camera and charts_data counts do not match")
+    if reference_depths.shape != depths.shape:
+        raise RuntimeError(
+            "reference_depths must match depths, got "
+            f"{reference_depths.shape} and {depths.shape}"
+        )
+    if reference_masks is not None and reference_masks.shape != depths.shape:
+        raise RuntimeError(
+            "alignment_reference_mask must match depths, got "
+            f"{reference_masks.shape} and {depths.shape}"
+        )
 
     records: list[dict[str, object]] = []
     absolute_outlier_masks: list[np.ndarray] = []
     for index, name in enumerate(names):
         depth = np.squeeze(depths[index])
         prior = np.squeeze(priors[index])
+        reference = np.squeeze(reference_depths[index])
         confidence = np.squeeze(confs[index])
         valid = (
             np.isfinite(depth)
-            & np.isfinite(prior)
+            & np.isfinite(reference)
             & (depth > 0.0)
-            & (prior > 0.0)
+            & (reference > 0.0)
             & (confidence > 0.5)
         )
         absolute_outlier = np.zeros(depth.shape, dtype=bool)
         if max_abs_depth is not None and max_abs_depth > 0:
             absolute_outlier |= np.abs(depth) > max_abs_depth
+            absolute_outlier |= np.abs(reference) > max_abs_depth
             absolute_outlier |= np.abs(prior) > max_abs_depth
         if points is not None and max_abs_point is not None and max_abs_point > 0:
             point = np.asarray(points[index])
@@ -94,17 +129,33 @@ def gate_charts(
         eligible = np.ones(depth.shape, dtype=bool)
         if semantic_masks is not None:
             eligible = _resize_mask(semantic_masks[index], depth.shape)
-            valid &= eligible
+        if reference_masks is not None:
+            eligible &= _resize_mask(reference_masks[index], depth.shape)
+        valid &= eligible
         valid_fraction = float(valid.mean())
         eligible_pixels = int(eligible.sum())
         support_ratio = float(valid.sum() / max(eligible_pixels, 1))
-        relative = np.abs(depth - prior) / np.maximum(np.abs(prior), 1e-6)
+        relative = np.abs(depth - reference) / np.maximum(np.abs(reference), 1e-6)
+        prior_relative = np.abs(depth - prior) / np.maximum(np.abs(prior), 1e-6)
         if np.any(valid):
             relative_p90 = float(np.quantile(relative[valid], 0.9))
             gt25_fraction = float(np.mean(relative[valid] > 0.25))
+            prior_valid = valid & np.isfinite(prior) & (prior > 0.0)
+            prior_relative_p90 = (
+                float(np.quantile(prior_relative[prior_valid], 0.9))
+                if np.any(prior_valid)
+                else None
+            )
+            prior_gt25_fraction = (
+                float(np.mean(prior_relative[prior_valid] > 0.25))
+                if np.any(prior_valid)
+                else None
+            )
         else:
             relative_p90 = None
             gt25_fraction = None
+            prior_relative_p90 = None
+            prior_gt25_fraction = None
         insufficient_support = support_ratio < min_valid_fraction
         depth_conflict = (
             (relative_p90 is not None and relative_p90 > max_relative_p90)
@@ -125,8 +176,11 @@ def gate_charts(
                 "eligible_fraction": float(eligible.mean()),
                 "support_ratio": support_ratio,
                 "absolute_outlier_fraction": float(absolute_outlier.mean()),
+                "reference_source": reference_source,
                 "relative_p90": relative_p90,
                 "gt25_fraction": gt25_fraction,
+                "prior_relative_p90": prior_relative_p90,
+                "prior_gt25_fraction": prior_gt25_fraction,
                 "insufficient_support": bool(insufficient_support),
                 "depth_conflict": bool(depth_conflict),
                 "rejection_reasons": [
@@ -200,6 +254,11 @@ def main() -> None:
 
     with np.load(source_path) as loaded:
         payload = {key: loaded[key] for key in loaded.files}
+    if args.require_reference_depths and "reference_depths" not in payload:
+        raise RuntimeError(
+            "Strict Chart gating requires persisted MASt3R reference_depths; "
+            f"{source_path} is a legacy prior-only archive. Re-run alignment."
+        )
     gated, records = gate_charts(
         payload,
         names,
@@ -220,11 +279,17 @@ def main() -> None:
         "source": str(source_path),
         "output": str(charts_path),
         "thresholds": {
+            "reference_source": (
+                "mast3r_reference_depths"
+                if "reference_depths" in payload
+                else "depthanything_prior_legacy"
+            ),
             "max_relative_p90": args.max_relative_p90,
             "max_gt25_fraction": args.max_gt25_fraction,
             "min_valid_fraction": args.min_valid_fraction,
             "max_abs_depth": args.max_abs_depth,
             "max_abs_point": args.max_abs_point,
+            "require_reference_depths": bool(args.require_reference_depths),
         },
         "rejected_count": sum(record["rejected"] for record in records),
         "records": records,

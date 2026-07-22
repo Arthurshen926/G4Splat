@@ -63,6 +63,8 @@ def build_command(args, config):
             str(config["max_refid"]),
             "--output_conf_thr",
             str(config["output_conf_thr"]),
+            "--sparse_export_stride",
+            str(args.sparse_export_stride),
         ]
     )
     for key, flag in (
@@ -72,6 +74,10 @@ def build_command(args, config):
     ):
         if config.get(key, False):
             command.append(flag)
+    if getattr(args, "strict_calibrated_poses", False):
+        command.append("--strict_calibrated_poses")
+    if getattr(args, "per_view_calibrated_intrinsics", False):
+        command.append("--per_view_calibrated_intrinsics")
     return command
 
 
@@ -99,6 +105,31 @@ def parse_args():
         help="Explicit zero-based view indices; mutually exclusive with --n_images.",
     )
     parser.add_argument("--randomize_images", action="store_true")
+    parser.add_argument(
+        "--sparse-export-stride",
+        type=int,
+        default=1,
+        help=(
+            "Regular image-lattice stride for MASt3R's diagnostic COLMAP sparse export. "
+            "It does not downsample the pointmaps consumed by Chart alignment."
+        ),
+    )
+    parser.add_argument(
+        "--strict_calibrated_poses",
+        action="store_true",
+        help=(
+            "Keep calibrated camera translation and scale fixed during MASt3R "
+            "global alignment (an explicit single-variable ablation)."
+        ),
+    )
+    parser.add_argument(
+        "--per_view_calibrated_intrinsics",
+        action="store_true",
+        help=(
+            "Keep individual calibrated intrinsics rather than the historical "
+            "shared-focal MASt3R parameterization."
+        ),
+    )
     parser.add_argument("-c", "--config", type=str, default="unposed")
     return parser.parse_args()
 
@@ -107,6 +138,8 @@ def main():
     args = parse_args()
     if args.n_images is not None and args.image_idx is not None:
         raise ValueError("Cannot provide both --n_images and --image_idx.")
+    if args.sparse_export_stride < 1:
+        raise ValueError("--sparse-export-stride must be at least one")
 
     if args.image_idx is not None:
         args.use_all_images = False

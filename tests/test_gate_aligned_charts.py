@@ -84,3 +84,54 @@ def test_gate_charts_hard_filters_joint_absolute_outliers():
     assert gated["confs"][0, 0, 1] == -2
     assert gated["depths"][0, 0, 0] == 0
     assert gated["pts"][0, 0, 1, 0] == 0
+
+
+def test_gate_uses_persisted_mast3r_target_not_depthanything_change_magnitude():
+    prior = np.ones((1, 4, 4), dtype=np.float32)
+    reference = np.full_like(prior, 2.0)
+    payload = {
+        "depths": reference.copy(),
+        "prior_depths": prior,
+        "reference_depths": reference,
+        "alignment_reference_mask": np.ones_like(prior, dtype=bool),
+        "confs": np.ones_like(prior),
+    }
+
+    gated, records = gate_charts(
+        payload,
+        ["corrected.png"],
+        [np.ones((4, 4), dtype=bool)],
+        max_relative_p90=0.5,
+        max_gt25_fraction=0.5,
+        min_valid_fraction=0.05,
+    )
+
+    assert not records[0]["rejected"]
+    assert records[0]["reference_source"] == "mast3r_reference_depths"
+    assert records[0]["relative_p90"] == 0.0
+    assert records[0]["prior_relative_p90"] == 1.0
+    assert np.all(gated["depths"] == 2.0)
+
+
+def test_gate_rejects_depth_that_disagrees_with_persisted_mast3r_target():
+    prior = np.ones((1, 4, 4), dtype=np.float32)
+    payload = {
+        "depths": np.full_like(prior, 2.0),
+        "prior_depths": prior,
+        "reference_depths": prior.copy(),
+        "alignment_reference_mask": np.ones_like(prior, dtype=bool),
+        "confs": np.ones_like(prior),
+    }
+
+    gated, records = gate_charts(
+        payload,
+        ["wrong.png"],
+        [np.ones((4, 4), dtype=bool)],
+        max_relative_p90=0.5,
+        max_gt25_fraction=0.5,
+        min_valid_fraction=0.05,
+    )
+
+    assert records[0]["rejected"]
+    assert records[0]["rejection_reasons"] == ["depth_conflict"]
+    assert np.all(gated["depths"] == 0.0)

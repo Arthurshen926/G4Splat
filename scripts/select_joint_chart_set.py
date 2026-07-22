@@ -20,6 +20,7 @@ from scripts.select_chart_views import (  # noqa: E402
     load_scene_poses,
     normalize_required_name,
     select_clustered_coverage_indices,
+    select_gate_replacement_reserves,
 )
 import numpy as np
 
@@ -162,6 +163,10 @@ def build_joint_selection(
     correlated_failure_min_run_length: int = 3,
     correlated_failure_padding: int = 2,
     correlated_failure_max_bridge_gap: int = 2,
+    gate_failure_budget: int | None = None,
+    reserve_max_pose_distance: float | None = None,
+    reserves_per_vulnerable_support: int = 1,
+    joint_reserve_candidate_limit: int = 48,
 ) -> dict:
     """Re-optimize the complete set; no previous accepted chart is pinned.
 
@@ -292,6 +297,28 @@ def build_joint_selection(
                     "pose_distance": distance,
                 }
             )
+    sequence_coverage_mode = str(previous_coverage.get("sequence_coverage_mode", "off"))
+    min_views_per_sequence = int(previous_coverage.get("min_views_per_sequence", 0))
+    post_gate_min_views_per_sequence = int(
+        previous_coverage.get(
+            "post_gate_min_views_per_sequence", min_views_per_sequence
+        )
+    )
+    sequence_gate_failure_budget = int(
+        previous_coverage.get("sequence_gate_failure_budget", 0)
+    )
+    raw_candidate_reliability = selection.get("candidate_reliability", {})
+    if not isinstance(raw_candidate_reliability, dict):
+        raise ValueError("Selection candidate_reliability must be a mapping")
+    candidate_reliability = raw_candidate_reliability.get(
+        "scores",
+        raw_candidate_reliability.get("selected_scores", raw_candidate_reliability),
+    )
+    if not isinstance(candidate_reliability, dict):
+        raise ValueError("Selection candidate_reliability.selected_scores must be a mapping")
+    reliability_weight = float(
+        previous_coverage.get("candidate_reliability_weight", 0.0)
+    )
     selected_indices, coverage = select_clustered_coverage_indices(
         image_names=image_names,
         candidate_image_names=candidate_pool,
@@ -308,8 +335,62 @@ def build_joint_selection(
         ),
         coverage_objective="target_kcenter",
         required_names=required_names,
+        candidate_reliability={
+            normalize_required_name(name): float(value)
+            for name, value in candidate_reliability.items()
+        },
+        reliability_weight=reliability_weight,
+        min_views_per_sequence=min_views_per_sequence,
+        post_gate_min_views_per_sequence=post_gate_min_views_per_sequence,
+        sequence_gate_failure_budget=sequence_gate_failure_budget,
+        sequence_coverage_mode=sequence_coverage_mode,
     )
     selected_names = [image_names[index] for index in selected_indices]
+    configured_gate_budget = int(
+        gate_failure_budget
+        if gate_failure_budget is not None
+        else selection.get("gate_replacement_reserves", {}).get(
+            "gate_failure_budget",
+            previous_coverage.get("gate_failure_budget", 0),
+        )
+    )
+    if configured_gate_budget < 0:
+        raise ValueError("gate_failure_budget must be non-negative")
+    if reserves_per_vulnerable_support < 0:
+        raise ValueError("reserves_per_vulnerable_support must be non-negative")
+    reserves = None
+    if configured_gate_budget > 0:
+        effective_reserve_distance = float(
+            reserve_max_pose_distance
+            if reserve_max_pose_distance is not None
+            else previous_coverage.get("min_global_pose_distance", 0.05)
+        )
+        # The failed images are removed from this candidate pool.  Their count
+        # is evidence for reselecting the full set, not a claim that every
+        # replacement in the same pose cell will fail identically.  Retain the
+        # explicitly configured forward failure budget instead of escalating
+        # the reserve proof with historical rejected names a second time.
+        reserves = select_gate_replacement_reserves(
+            image_names=image_names,
+            candidate_image_names=candidate_pool,
+            poses=poses,
+            selected_indices=selected_indices,
+            n_view_clusters=int(coverage.get("view_clusters", 8)),
+            post_gate_min_views_per_cluster=int(
+                selection.get("gate_replacement_reserves", {}).get(
+                    "post_gate_min_views_per_cluster",
+                    previous_coverage.get("post_gate_min_views_per_cluster", 2),
+                )
+            ),
+            min_baseline_ratio=float(coverage.get("min_baseline_ratio", 0.02)),
+            max_borrowed_support_distance=float(
+                coverage.get("max_borrowed_support_distance", 0.25)
+            ),
+            reserve_max_pose_distance=effective_reserve_distance,
+            reserves_per_vulnerable_support=reserves_per_vulnerable_support,
+            gate_failure_budget=configured_gate_budget,
+            joint_reserve_candidate_limit=joint_reserve_candidate_limit,
+        )
     history = list(selection.get("alignment_feedback_history", []))
     history.append(
         {
@@ -331,7 +412,7 @@ def build_joint_selection(
             "joint_selected_names": selected_names,
         }
     )
-    return {
+    result = {
         **selection,
         "n_images": int(n_images),
         "requested_n_images": int(n_images),
@@ -360,10 +441,21 @@ def build_joint_selection(
             "correlated_failure_padding": int(correlated_failure_padding),
             "correlated_failure_max_bridge_gap": int(correlated_failure_max_bridge_gap),
             "target_active_charts_after_gate": 24,
+            "sequence_coverage_mode": sequence_coverage_mode,
+            "min_views_per_sequence": min_views_per_sequence,
+            "post_gate_min_views_per_sequence": post_gate_min_views_per_sequence,
+            "sequence_gate_failure_budget": sequence_gate_failure_budget,
+            "gate_failure_budget": configured_gate_budget,
             "preserve_reference_names": bool(preserve_reference_names),
             "reference_anchor_assignments": reference_assignments,
         },
     }
+    if reserves is not None:
+        result["gate_replacement_reserves"] = reserves
+        result["alignment_run_sfm_arg"] = "--image_idx " + " ".join(
+            str(index) for index in reserves["alignment_image_idx"]
+        )
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -430,6 +522,21 @@ def parse_args() -> argparse.Namespace:
         help="Keep every available proven reference chart exactly; otherwise prefer same-sequence replacements.",
     )
     parser.add_argument("--min-global-pose-distance", type=float)
+    parser.add_argument(
+        "--gate-failure-budget",
+        type=int,
+        help=(
+            "Override the forward correlated-failure reserve proof. Defaults to "
+            "the broad selection's configured budget."
+        ),
+    )
+    parser.add_argument(
+        "--reserve-max-pose-distance",
+        type=float,
+        help="Pose+direction distance allowed for a gate replacement reserve.",
+    )
+    parser.add_argument("--reserves-per-vulnerable-support", type=int, default=1)
+    parser.add_argument("--joint-reserve-candidate-limit", type=int, default=48)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -482,6 +589,10 @@ def main() -> None:
         correlated_failure_min_run_length=args.correlated_failure_min_run_length,
         correlated_failure_padding=args.correlated_failure_padding,
         correlated_failure_max_bridge_gap=args.correlated_failure_max_bridge_gap,
+        gate_failure_budget=args.gate_failure_budget,
+        reserve_max_pose_distance=args.reserve_max_pose_distance,
+        reserves_per_vulnerable_support=args.reserves_per_vulnerable_support,
+        joint_reserve_candidate_limit=args.joint_reserve_candidate_limit,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2))

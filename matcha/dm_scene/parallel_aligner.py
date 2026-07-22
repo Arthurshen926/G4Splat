@@ -693,6 +693,7 @@ class ParallelAligner(torch.nn.Module):
         total_variation_on_depth_encodings_weight:float=1.0,
         projection_chunk_size:int=262_144,
         matching_pixel_stride:int=1,
+        matching_checkpoint_chunks:bool=False,
         chart_encoding_norm_chunk_rows:int=0,
     ):
         """_summary_
@@ -771,7 +772,9 @@ class ParallelAligner(torch.nn.Module):
             )
             if matching_thr is None:
                 matching_thr = self.cameras.get_spatial_extent() / 20.
-            matcher.match(matching_thr)
+            matcher.match(matching_thr, source_stride=matching_pixel_stride)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
             
         # Prepare for optimization
         self.prepare_for_optimization(
@@ -905,33 +908,18 @@ class ParallelAligner(torch.nn.Module):
                         _deformed_depths,
                         torch.zeros_like(_deformed_depths),
                     )
-                reprojection_errors, fov_mask = matcher.compute_reprojection_errors(
+                matching_loss = matcher.compute_matching_loss(
                     depths=matching_depths,
                     source_stride=matching_pixel_stride,
+                    source_masks=masks,
+                    source_confidence=(
+                        self.confidence.detach()
+                        if use_confidence_in_matching_loss
+                        else None
+                    ),
+                    checkpoint_chunks=matching_checkpoint_chunks,
                 )
-                reference_matches = matcher.reference_matches[
-                    ..., ::matching_pixel_stride, ::matching_pixel_stride
-                ]
-                matching_valid = fov_mask & reference_matches
-                if use_confidence_in_matching_loss:
-                    reprojection_errors = reprojection_errors * self.confidence.detach()[None]
-                if masks is not None:
-                    source_valid = masks.to(dtype=torch.bool)[
-                        None, ..., ::matching_pixel_stride, ::matching_pixel_stride
-                    ].expand_as(reprojection_errors)
-                    safe_errors = torch.where(
-                        matching_valid,
-                        reprojection_errors,
-                        torch.zeros_like(reprojection_errors),
-                    )
-                    matching_loss = matching_loss_weight * (
-                        safe_errors.sum()
-                        / source_valid.sum().clamp_min(1).to(reprojection_errors.dtype)
-                    )
-                else:
-                    matching_loss = matching_loss_weight * (
-                        reprojection_errors * matching_valid
-                    ).mean()
+                matching_loss = matching_loss_weight * matching_loss
                 loss += matching_loss
                 matching_loss = matching_loss.detach().item()
                 
@@ -970,7 +958,9 @@ class ParallelAligner(torch.nn.Module):
                         torch.zeros_like(updated_reference_depths),
                     )
                 matcher.update_references(reference_depths=updated_reference_depths)
-                matcher.match(matching_thr)
+                matcher.match(matching_thr, source_stride=matching_pixel_stride)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
             
             with torch.no_grad():
                 iter_interval = n_iterations // 50

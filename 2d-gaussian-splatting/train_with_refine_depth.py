@@ -11,6 +11,7 @@
 
 import os
 import sys
+import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.getcwd(), '2d-gaussian-splatting'))
 from scene.dataset_readers import load_see3d_cameras
@@ -46,14 +47,24 @@ from matcha.cambridge_training import (
     compute_masked_depth_order_loss,
     compute_rgb_loss,
     dense_depth_weight,
+    densification_stats_from_view,
+    geometry_chart_sampling_indices,
     geometry_iteration,
     linear_weight,
+    apply_per_image_affine_color_correction,
     load_depth_cache,
     masked_mean,
+    opacity_reset_due,
     PerImageAffineColorCorrection,
+    rgb_sampling_importance_weights,
+    resolve_active_chart_indices,
     rgb_supervision_weight,
+    scale_chart_geometry_priors,
     sanitize_depth,
+    save_per_image_affine_color_correction,
     save_depth_cache,
+    ulfloc_masked_supervision,
+    validate_chart_camera_order,
 )
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -105,6 +116,11 @@ def training(
     cambridge_mask_pickle=None, cambridge_mask_dataset_path=None, cambridge_mask_indices=None,
     cambridge_geometry_mask_pickle=None, cambridge_geometry_mask_dataset_path=None,
     cambridge_geometry_mask_indices=None, rgb_loss_type="l1", rgb_charbonnier_eps=1e-3,
+    rgb_supervision_profile="g4_tree_masked", rgb_sampling_policy="all_train_importance",
+    chart_geometry_sampling_policy="active_only",
+    densification_view_policy="legacy_current",
+    continue_opacity_resets_after_densify=False,
+    chart_geometry_prior_weight=1.0,
     dense_depth_cache=None, geometry_view_every_n_iter=5, dense_only_from_iter=3000,
     pseudo_rgb_weight=0.01, pseudo_geometry_weight=0.25,
     pseudo_geometry_final_weight=0.02, pseudo_geometry_decay_until=7000,
@@ -154,6 +170,27 @@ def training(
             f"[INFO] Cambridge RGB mask indices: {rgb_mask_lookup.mask_indices}; "
             f"source: {cambridge_mask_pickle}"
         )
+    if rgb_supervision_profile not in {
+        "g4_tree_masked",
+        "full_rgb",
+        "ulfloc_legacy",
+    }:
+        raise ValueError(
+            "rgb_supervision_profile must be 'g4_tree_masked', 'full_rgb', or "
+            f"'ulfloc_legacy', got {rgb_supervision_profile!r}"
+        )
+    if rgb_supervision_profile == "ulfloc_legacy" and rgb_mask_lookup is None:
+        raise ValueError(
+            "ulfloc_legacy RGB supervision requires --cambridge_mask_pickle "
+            "with object/sky/distortion channels [0, 1, 2]"
+        )
+    print(f"[INFO] Cambridge RGB supervision profile: {rgb_supervision_profile}")
+    if chart_geometry_prior_weight < 0.0:
+        raise ValueError("--chart-geometry-prior-weight must be non-negative")
+    print(
+        "[INFO] Chart-exclusive geometry-prior weight: "
+        f"{chart_geometry_prior_weight}."
+    )
     if cambridge_geometry_mask_pickle is None and cambridge_geometry_mask_indices is not None:
         cambridge_geometry_mask_pickle = cambridge_mask_pickle
     if cambridge_geometry_mask_pickle is not None:
@@ -237,6 +274,45 @@ def training(
         gc.collect()
         torch.cuda.empty_cache()
 
+    # A chart-only support directory used to be silently interpreted as zero
+    # canonical support for every remaining dense camera.  Preserve that
+    # conservative numerical fallback for reproducibility, but make the
+    # missing-evidence condition explicit and auditable.
+    if tree_weight_lookup is not None:
+        support_audit_views = (
+            dense_viewpoint_cams if use_dense_supervision else input_cams
+        )
+        tree_support_audit = tree_weight_lookup.support_coverage_audit(
+            [camera.image_name for camera in support_audit_views]
+        )
+        tree_support_audit_path = os.path.join(
+            dataset.model_path, "tree_support_coverage.json"
+        )
+        with open(tree_support_audit_path, "w", encoding="utf-8") as handle:
+            json.dump(tree_support_audit, handle, indent=2)
+        if tree_support_audit["missing_map_count"]:
+            print(
+                "[WARNING] Tree-support maps cover "
+                f"{tree_support_audit['present_map_count']}/"
+                f"{tree_support_audit['requested_view_count']} training cameras. "
+                "Missing maps use the legacy zero-support tree floor and must not "
+                "be interpreted as canonical-tree evidence."
+            )
+        else:
+            print(
+                "[INFO] Explicit canonical-tree support maps cover every requested "
+                "training camera."
+            )
+        if (
+            tree_support_audit["present_map_count"]
+            and tree_support_audit["nonzero_map_count"] == 0
+        ):
+            print(
+                "[WARNING] Every explicit tree-support map is numerically zero; "
+                "tree RGB/geometry weights therefore use their zero-support floors, "
+                "not measured canonical support."
+            )
+
     # NOTE: hard code for See3D root path
     see3d_root_path = os.path.join(dataset.source_path, 'see3d_render')
     see3d_cam_path = os.path.join(see3d_root_path, 'see3d_cameras.npz')
@@ -271,6 +347,206 @@ def training(
     input_view_num = len(scene.getTrainCameras())
     see3d_view_num = len(see3d_gs_cameras_list)
     training_view_num = input_view_num + see3d_view_num
+    if "depths" not in charts_data or charts_data["depths"].ndim < 1:
+        raise RuntimeError("Aligned charts_data is missing a camera-indexed depths tensor")
+    validate_chart_camera_order(
+        dataset.source_path,
+        [camera.image_name for camera in input_cams],
+        chart_tensor_count=int(charts_data["depths"].shape[0]),
+    )
+    active_input_chart_indices = resolve_active_chart_indices(
+        input_view_num,
+        alignment_gate_valid=charts_data.get("alignment_gate_valid"),
+        quality_selection_active=charts_data.get("quality_selection_active"),
+    )
+    geometry_input_chart_indices = geometry_chart_sampling_indices(
+        input_view_num,
+        active_chart_indices=active_input_chart_indices,
+        policy=chart_geometry_sampling_policy,
+    )
+    active_input_chart_set = set(active_input_chart_indices)
+    scheduler_audit = {
+        "version": 3,
+        "policy": chart_geometry_sampling_policy,
+        "chart_geometry_prior_weight": float(chart_geometry_prior_weight),
+        "input_chart_count": input_view_num,
+        "active_chart_indices": active_input_chart_indices,
+        "active_chart_names": [
+            input_cams[index].image_name for index in active_input_chart_indices
+        ],
+        "scheduled_chart_indices": geometry_input_chart_indices,
+        "scheduled_chart_names": [
+            input_cams[index].image_name for index in geometry_input_chart_indices
+        ],
+        "alignment_gate_present": "alignment_gate_valid" in charts_data,
+        "quality_selection_present": "quality_selection_active" in charts_data,
+        "tree_support_coverage_path": (
+            os.path.join(dataset.model_path, "tree_support_coverage.json")
+            if tree_weight_lookup is not None
+            else None
+        ),
+    }
+    if rgb_sampling_policy == "all_train_importance" and see3d_view_num > 0:
+        raise ValueError(
+            "all_train_importance requires See3D to be disabled because generated "
+            "views have no all-real-camera sampling probability"
+        )
+    input_chart_names = {
+        input_cams[index].image_name for index in geometry_input_chart_indices
+    }
+    if use_dense_supervision:
+        dense_names = {camera.image_name for camera in dense_viewpoint_cams}
+        missing_dense_chart_names = sorted(input_chart_names - dense_names)
+        if missing_dense_chart_names:
+            raise RuntimeError(
+                "The all-train dense set is missing Chart camera(s), so RGB sampling "
+                f"cannot be audited: {missing_dense_chart_names[:3]}"
+            )
+    chart_rgb_sampling_weight, non_chart_rgb_sampling_weight = rgb_sampling_importance_weights(
+        policy=rgb_sampling_policy,
+        total_iterations=opt.iterations,
+        dense_view_count=len(dense_viewpoint_cams),
+        chart_view_count=len(geometry_input_chart_indices),
+        use_dense_supervision=use_dense_supervision,
+        geometry_view_every_n_iter=geometry_view_every_n_iter,
+        dense_only_from_iter=dense_only_from_iter,
+    )
+    print(
+        "[INFO] RGB sampling policy: "
+        f"{rgb_sampling_policy}; chart_weight={chart_rgb_sampling_weight:.6f}, "
+        f"non_chart_weight={non_chart_rgb_sampling_weight:.6f}."
+    )
+    geometry_iteration_count = sum(
+        geometry_iteration(
+            iteration,
+            use_dense_supervision=use_dense_supervision,
+            every_n=geometry_view_every_n_iter,
+            dense_only_from_iter=dense_only_from_iter,
+        )
+        for iteration in range(1, opt.iterations + 1)
+    )
+    # Densification is a separate sampling process from the RGB objective.
+    # Its window is open on exactly ``iteration < densify_until_iter``.  Keep
+    # an explicit audit of which rendered views may feed screen-space radii
+    # and position-gradient statistics, otherwise a Chart-heavy geometry
+    # schedule can silently become a Chart-heavy capacity allocator.
+    topology_last_iteration = min(
+        int(opt.iterations),
+        max(int(opt.densify_until_iter) - 1, 0),
+    )
+    topology_geometry_iteration_count = sum(
+        geometry_iteration(
+            iteration,
+            use_dense_supervision=use_dense_supervision,
+            every_n=geometry_view_every_n_iter,
+            dense_only_from_iter=dense_only_from_iter,
+        )
+        for iteration in range(1, topology_last_iteration + 1)
+    )
+    topology_dense_iteration_count = (
+        topology_last_iteration - topology_geometry_iteration_count
+    )
+    opacity_reset_iterations = [
+        iteration
+        for iteration in range(1, int(opt.iterations) + 1)
+        if opacity_reset_due(
+            iteration,
+            opacity_reset_interval=int(opt.opacity_reset_interval),
+            densify_from_iter=int(opt.densify_from_iter),
+            densify_until_iter=int(opt.densify_until_iter),
+            white_background=bool(dataset.white_background),
+            continue_after_densify=bool(continue_opacity_resets_after_densify),
+        )
+    ]
+    topology_geometry_stats_iteration_count = (
+        topology_geometry_iteration_count
+        if densification_stats_from_view(
+            policy=densification_view_policy,
+            use_dense_supervision=use_dense_supervision,
+            is_geometry_view=True,
+        )
+        else 0
+    )
+    topology_dense_stats_iteration_count = (
+        topology_dense_iteration_count
+        if densification_stats_from_view(
+            policy=densification_view_policy,
+            use_dense_supervision=use_dense_supervision,
+            is_geometry_view=False,
+        )
+        else 0
+    )
+    expected_chart_topology_stats = (
+        topology_geometry_stats_iteration_count / float(len(geometry_input_chart_indices))
+    )
+    expected_non_chart_topology_stats = None
+    if use_dense_supervision:
+        expected_chart_topology_stats += (
+            topology_dense_stats_iteration_count / float(len(dense_viewpoint_cams))
+        )
+        expected_non_chart_topology_stats = (
+            topology_dense_stats_iteration_count / float(len(dense_viewpoint_cams))
+        )
+    scheduler_audit["rgb_sampling"] = {
+        "policy": rgb_sampling_policy,
+        "dense_camera_count": len(dense_viewpoint_cams),
+        "geometry_iteration_count": geometry_iteration_count,
+        "total_iteration_count": int(opt.iterations),
+        "geometry_view_every_n_iter": int(geometry_view_every_n_iter),
+        "dense_only_from_iter": int(dense_only_from_iter),
+        "chart_importance_weight": chart_rgb_sampling_weight,
+        "non_chart_importance_weight": non_chart_rgb_sampling_weight,
+        "all_scheduled_chart_names_present_in_dense_set": (
+            not use_dense_supervision or not missing_dense_chart_names
+        ),
+    }
+    scheduler_audit["densification_stats"] = {
+        "policy": densification_view_policy,
+        "topology_last_iteration": topology_last_iteration,
+        "topology_iteration_count": topology_last_iteration,
+        "scheduled_geometry_iteration_count": topology_geometry_iteration_count,
+        "scheduled_dense_iteration_count": topology_dense_iteration_count,
+        "geometry_stats_iteration_count": topology_geometry_stats_iteration_count,
+        "dense_stats_iteration_count": topology_dense_stats_iteration_count,
+        "skipped_stats_iteration_count": (
+            topology_last_iteration
+            - topology_geometry_stats_iteration_count
+            - topology_dense_stats_iteration_count
+        ),
+        "expected_stats_per_scheduled_chart": expected_chart_topology_stats,
+        "expected_stats_per_non_chart_dense_camera": expected_non_chart_topology_stats,
+    }
+    scheduler_audit["opacity_resets"] = {
+        "native_window_bounded": not bool(continue_opacity_resets_after_densify),
+        "continue_after_densify": bool(continue_opacity_resets_after_densify),
+        "densify_until_iter": int(opt.densify_until_iter),
+        "opacity_reset_interval": int(opt.opacity_reset_interval),
+        "iterations": opacity_reset_iterations,
+    }
+    scheduler_audit_path = os.path.join(dataset.model_path, "chart_geometry_scheduler.json")
+    with open(scheduler_audit_path, "w", encoding="utf-8") as handle:
+        json.dump(scheduler_audit, handle, indent=2)
+        handle.write("\n")
+    print(
+        "[INFO] Chart geometry scheduler: "
+        f"{chart_geometry_sampling_policy}; active={len(active_input_chart_indices)}/"
+        f"{input_view_num}, scheduled_input_charts={len(geometry_input_chart_indices)}; "
+        f"audit={scheduler_audit_path}."
+    )
+    print(
+        "[INFO] Densification statistics: "
+        f"{densification_view_policy}; topology_iters={topology_last_iteration}, "
+        f"chart_stats={topology_geometry_stats_iteration_count}, "
+        f"dense_stats={topology_dense_stats_iteration_count}, "
+        f"expected_per_chart={expected_chart_topology_stats:.6f}, "
+        "expected_per_non_chart="
+        f"{expected_non_chart_topology_stats if expected_non_chart_topology_stats is not None else 'n/a'}."
+    )
+    print(
+        "[INFO] Opacity reset schedule: "
+        f"{opacity_reset_iterations}; "
+        f"continue_after_densify={bool(continue_opacity_resets_after_densify)}."
+    )
     for idx in range(training_view_num):
         pa_depth_path = os.path.join(refine_depth_path, f'refine_depth_frame{idx:06d}.tiff')
         pa_depth = Image.open(pa_depth_path)
@@ -302,6 +578,17 @@ def training(
         pa_depths[idx] = clean_depth
         plane_valid_masks.append(valid_mask)
 
+    # The quality selector preserves input-camera order for provenance, so
+    # enforce its hard exclusions again at the plane interface.  In
+    # particular, ``--init_fill_unsupported_with_prior`` must never revive a
+    # Chart that the selection intentionally removed.
+    for idx in range(input_view_num):
+        if idx in active_input_chart_set:
+            continue
+        pa_depths[idx] = torch.zeros_like(pa_depths[idx])
+        pa_confident_maps_list[idx] = torch.zeros_like(pa_confident_maps_list[idx])
+        plane_valid_masks[idx] = torch.zeros_like(plane_valid_masks[idx], dtype=torch.bool)
+
     pseudo_inpaint_masks = None
     if see3d_view_num > 0 and (
         pseudo_initialization_mode == "inpaint_only"
@@ -317,9 +604,13 @@ def training(
             f"mean synthesized ratio={torch.stack(pseudo_inpaint_masks).float().mean().item():.3f}."
         )
     input_valid_ratio = torch.stack(plane_valid_masks[:input_view_num]).float().mean().item()
+    active_input_valid_ratio = torch.stack(
+        [plane_valid_masks[idx] for idx in active_input_chart_indices]
+    ).float().mean().item()
     print(
         f"[INFO] Plane depth validity after confidence/outlier/semantic filtering: "
-        f"{input_valid_ratio * 100:.2f}% over real chart views."
+        f"{input_valid_ratio * 100:.2f}% over all aligned charts; "
+        f"{active_input_valid_ratio * 100:.2f}% over active charts."
     )
 
     # ===================================================================================
@@ -342,7 +633,7 @@ def training(
         )[:, 0]
         filled_pixels = 0
         static_pixels = 0
-        for idx in range(input_view_num):
+        for idx in active_input_chart_indices:
             semantic_mask = torch.ones_like(initialization_valid_masks[idx])
             if geometry_mask_lookup is not None:
                 semantic_mask = geometry_mask_lookup.get_mask(
@@ -389,27 +680,33 @@ def training(
             else voxel_max_init_gs_input_view_num
         )
     )
-    if max_init_gs_input_view_num is not None and input_view_num > max_init_gs_input_view_num:
-        print(f'[INFO]: Input view num is too large: {input_view_num}, use {max_init_gs_input_view_num} views for gs initialization')
-        init_view_ids = np.linspace(0, input_view_num - 1, max_init_gs_input_view_num, dtype=int)
+    if (
+        max_init_gs_input_view_num is not None
+        and len(active_input_chart_indices) > max_init_gs_input_view_num
+    ):
+        print(
+            f'[INFO]: Active input Chart num is too large: {len(active_input_chart_indices)}, '
+            f'use {max_init_gs_input_view_num} views for gs initialization'
+        )
+        active_positions = np.linspace(
+            0,
+            len(active_input_chart_indices) - 1,
+            max_init_gs_input_view_num,
+            dtype=int,
+        )
+        init_view_ids = [active_input_chart_indices[position] for position in active_positions]
         init_input_view_depths = [input_view_depths[i] for i in init_view_ids]
         init_input_views = [scene.getTrainCameras()[i] for i in init_view_ids]
         init_images = [_images[i] for i in init_view_ids]
     else:
-        init_input_view_depths = input_view_depths
-        init_input_views = scene.getTrainCameras()
-        init_images = _images
+        init_view_ids = list(active_input_chart_indices)
+        init_input_view_depths = [input_view_depths[i] for i in init_view_ids]
+        init_input_views = [scene.getTrainCameras()[i] for i in init_view_ids]
+        init_images = [_images[i] for i in init_view_ids]
 
     warp_init_depths = list(init_input_view_depths)
     warp_init_views = list(init_input_views)
-    warp_init_valid_masks = [
-        initialization_valid_masks[i]
-        for i in (
-            init_view_ids
-            if max_init_gs_input_view_num is not None and input_view_num > max_init_gs_input_view_num
-            else range(input_view_num)
-        )
-    ]
+    warp_init_valid_masks = [initialization_valid_masks[i] for i in init_view_ids]
     
     use_pseudo_initialization = see3d_view_num > 0 and pseudo_initialization_mode != "none"
     if use_pseudo_initialization:
@@ -510,9 +807,12 @@ def training(
             ratio_th=5.,
             normal_scale=1e-10,
             normalized_scales=0.5,
-            visibility_masks=[initialization_valid_masks[i] for i in init_view_ids]
-            if max_init_gs_input_view_num is not None and input_view_num > max_init_gs_input_view_num
-            else initialization_valid_masks,
+            # ``init_input_views`` may be a hard-selected subset even when
+            # the original Chart count is below the legacy 50-view cap.  Its
+            # depth/image/mask lists must therefore use the same indices in
+            # every branch; passing all masks here could attach an excluded
+            # Chart mask to a selected Chart's depth map.
+            visibility_masks=[initialization_valid_masks[i] for i in init_view_ids],
         )
 
         if use_pseudo_initialization:
@@ -685,6 +985,12 @@ def training(
         total_curvs_list = [input_prior_curvs[idx] for idx in range(len(input_prior_curvs))]
         total_geometry_masks_list = [input_geometry_masks[idx] for idx in range(len(input_geometry_masks))]
 
+    geometry_view_indices = list(geometry_input_chart_indices)
+    if use_pseudo_supervision:
+        geometry_view_indices.extend(range(input_view_num, len(total_views_list)))
+    if not geometry_view_indices:
+        raise RuntimeError("No geometry-supervision views remain after Chart filtering")
+
     print(
         f"[INFO] Total number of supervised views: {len(total_views_list)}, "
         f"input views: {len(input_cams)}, enabled See3D views: "
@@ -708,10 +1014,13 @@ def training(
             f"lr={color_correction_lr}, reg={color_correction_reg}."
         )
 
-    # Set mip filter
+    # Set the MIP state explicitly in both directions.  ``load_ply`` restores
+    # an embedded filter when a warm-start PLY contains one; only setting this
+    # flag in the true branch would therefore make a later ``--no MIP``
+    # ablation silently keep using the inherited renderer filter.
+    gaussians.set_mip_filter(bool(use_mip_filter))
     if use_mip_filter:
         print("[INFO] Using mip filter during training.")
-        gaussians.set_mip_filter(use_mip_filter)
         gaussians.compute_mip_filter(cameras=dense_viewpoint_cams if use_dense_supervision else total_views_list)
 
     dense_depth_priors = None
@@ -783,7 +1092,7 @@ def training(
         )
         if use_geometry_view:
             if not viewpoint_idx_stack:
-                viewpoint_idx_stack = list(range(len(total_views_list)))
+                viewpoint_idx_stack = list(geometry_view_indices)
             viewpoint_idx = viewpoint_idx_stack.pop(randint(0, len(viewpoint_idx_stack) - 1))
             viewpoint_cam = total_views_list[viewpoint_idx]
             dense_viewpoint_idx = None
@@ -799,6 +1108,15 @@ def training(
             viewpoint_idx = None
             is_pseudo_view = False
             current_geometry_mask = None
+
+        is_input_chart_view = (
+            not is_pseudo_view and viewpoint_cam.image_name in input_chart_names
+        )
+        rgb_sampling_weight = (
+            chart_rgb_sampling_weight
+            if is_input_chart_view
+            else non_chart_rgb_sampling_weight
+        )
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -808,14 +1126,20 @@ def training(
         current_tree_geometry_weight = None
         current_tree_planar_weight = None
         if tree_weight_lookup is not None and not is_pseudo_view:
-            rgb_mask, current_tree_geometry_weight, current_tree_planar_weight = (
+            tree_rgb_weight, current_tree_geometry_weight, current_tree_planar_weight = (
                 tree_weight_lookup.weights(
                     viewpoint_cam.image_name,
                     gt_image.shape[-2:],
                     gt_image.device,
                 )
             )
-        elif rgb_mask_lookup is not None and not is_pseudo_view:
+            if rgb_supervision_profile == "g4_tree_masked":
+                rgb_mask = tree_rgb_weight
+        elif (
+            rgb_supervision_profile == "g4_tree_masked"
+            and rgb_mask_lookup is not None
+            and not is_pseudo_view
+        ):
             rgb_mask = rgb_mask_lookup.get_mask(
                 viewpoint_cam.image_name,
                 gt_image.shape[-2:],
@@ -823,23 +1147,47 @@ def training(
             )
         image_for_rgb_loss = image
         if color_correction is not None and not is_pseudo_view:
-            image_for_rgb_loss = color_correction(image, viewpoint_cam.image_name)
-        Ll1, loss = compute_rgb_loss(
-            image_for_rgb_loss,
-            gt_image,
-            mask=rgb_mask,
-            lambda_dssim=opt.lambda_dssim,
-            ssim_fn=ssim,
-            loss_type=rgb_loss_type,
-            charbonnier_eps=rgb_charbonnier_eps,
-        )
+            image_for_rgb_loss = apply_per_image_affine_color_correction(
+                color_correction, image, viewpoint_cam.image_name
+            )
+        if rgb_supervision_profile == "ulfloc_legacy" and not is_pseudo_view:
+            object_mask = rgb_mask_lookup.get_index_mask(
+                viewpoint_cam.image_name, 0, gt_image.shape[-2:], gt_image.device
+            )
+            sky_mask = rgb_mask_lookup.get_index_mask(
+                viewpoint_cam.image_name, 1, gt_image.shape[-2:], gt_image.device
+            )
+            distortion_mask = rgb_mask_lookup.get_index_mask(
+                viewpoint_cam.image_name, 2, gt_image.shape[-2:], gt_image.device
+            )
+            legacy_image, legacy_target, _ = ulfloc_masked_supervision(
+                image_for_rgb_loss,
+                gt_image,
+                object_mask=object_mask,
+                sky_mask=sky_mask,
+                distortion_mask=distortion_mask,
+            )
+            Ll1 = l1_loss(legacy_image, legacy_target)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
+                1.0 - ssim(legacy_image, legacy_target)
+            )
+        else:
+            Ll1, loss = compute_rgb_loss(
+                image_for_rgb_loss,
+                gt_image,
+                mask=rgb_mask,
+                lambda_dssim=opt.lambda_dssim,
+                ssim_fn=ssim,
+                loss_type=rgb_loss_type,
+                charbonnier_eps=rgb_charbonnier_eps,
+            )
         loss = loss * rgb_supervision_weight(
             is_pseudo_view=is_pseudo_view,
             is_geometry_view=use_geometry_view,
             use_dense_supervision=use_dense_supervision,
             downweight_input_view_color_loss=downweight_input_view_color_loss,
             pseudo_rgb_weight=pseudo_rgb_weight,
-        )
+        ) * rgb_sampling_weight
 
         if current_geometry_mask is None and geometry_mask_lookup is not None and not is_pseudo_view:
             current_geometry_mask = geometry_mask_lookup.get_mask(
@@ -883,7 +1231,7 @@ def training(
                 image.shape[-2:],
                 image.device,
             )
-            alpha_suppression_loss = semantic_alpha_weight * masked_mean(
+            alpha_suppression_loss = rgb_sampling_weight * semantic_alpha_weight * masked_mean(
                 render_pkg["rend_alpha"],
                 ~alpha_keep_mask,
             )
@@ -1015,6 +1363,28 @@ def training(
             ).mean()
             total_regularization_loss = total_regularization_loss + anisotropy_loss
 
+        if use_geometry_view:
+            (
+                depth_prior_loss,
+                normal_prior_loss,
+                curv_prior_loss,
+                anisotropy_loss,
+            ) = scale_chart_geometry_priors(
+                (
+                    depth_prior_loss,
+                    normal_prior_loss,
+                    curv_prior_loss,
+                    anisotropy_loss,
+                ),
+                weight=chart_geometry_prior_weight,
+            )
+            total_regularization_loss = (
+                depth_prior_loss
+                + normal_prior_loss
+                + curv_prior_loss
+                + anisotropy_loss
+            )
+
         total_loss = total_loss + total_regularization_loss
         
         # ===================================================================================
@@ -1116,16 +1486,56 @@ def training(
                     iteration,
                 )
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(
+                tb_writer,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                report_train_cameras=(
+                    dense_viewpoint_cams if use_dense_supervision else None
+                ),
+                report_train_name=(
+                    "dense_train_samples" if use_dense_supervision else "chart_train_samples"
+                ),
+                color_correction=color_correction,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if color_correction is not None:
+                    save_per_image_affine_color_correction(
+                        color_correction,
+                        os.path.join(
+                            scene.model_path,
+                            "point_cloud",
+                            f"iteration_{iteration}",
+                            "color_correction.pth",
+                        ),
+                    )
 
 
             # Densification
             if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                update_densification_stats = densification_stats_from_view(
+                    policy=densification_view_policy,
+                    use_dense_supervision=use_dense_supervision,
+                    is_geometry_view=use_geometry_view,
+                )
+                if update_densification_stats:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter],
+                        radii[visibility_filter],
+                    )
+                    gaussians.add_densification_stats(
+                        viewspace_point_tensor,
+                        visibility_filter,
+                    )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -1135,8 +1545,15 @@ def training(
                             cameras=dense_viewpoint_cams if use_dense_supervision else total_views_list
                         )
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+            if opacity_reset_due(
+                iteration,
+                opacity_reset_interval=int(opt.opacity_reset_interval),
+                densify_from_iter=int(opt.densify_from_iter),
+                densify_until_iter=int(opt.densify_until_iter),
+                white_background=bool(dataset.white_background),
+                continue_after_densify=bool(continue_opacity_resets_after_densify),
+            ):
+                gaussians.reset_opacity()
                     
             if iteration % 100 == 0 and iteration > opt.densify_until_iter:
                 if iteration < opt.iterations - 100:  # don't update in the end of training
@@ -1226,18 +1643,47 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 @torch.no_grad()
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(
+    tb_writer,
+    iteration,
+    Ll1,
+    loss,
+    l1_loss,
+    elapsed,
+    testing_iterations,
+    scene: Scene,
+    renderFunc,
+    renderArgs,
+    *,
+    report_train_cameras=None,
+    report_train_name="chart_train_samples",
+    color_correction=None,
+):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
 
-    # Report test and samples of training set
+    # Report test and a small, explicitly-labelled training sample.  With
+    # dense RGB supervision, ``scene`` contains only the Chart cameras, so
+    # silently calling that sample "train" makes it look like an all-train
+    # metric even though it is not representative of the 1,487 real views.
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        train_cameras = (
+            scene.getTrainCameras()
+            if report_train_cameras is None
+            else report_train_cameras
+        )
+        train_samples = [
+            train_cameras[idx % len(train_cameras)]
+            for idx in range(5, 30, 5)
+        ] if train_cameras else []
+        validation_configs = (
+            {'name': 'test', 'cameras': scene.getTestCameras()},
+            {'name': report_train_name, 'cameras': train_samples},
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -1245,7 +1691,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
-                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    image = apply_per_image_affine_color_correction(
+                        color_correction,
+                        render_pkg["render"],
+                        viewpoint.image_name,
+                    )
+                    image = torch.clamp(image, 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         from utils.general_utils import colormap
@@ -1322,6 +1773,55 @@ if __name__ == "__main__":
     parser.add_argument("--tree_boundary_feather", type=int, default=6)
     parser.add_argument("--rgb_loss_type", choices=["l1", "charbonnier"], default="l1")
     parser.add_argument("--rgb_charbonnier_eps", type=float, default=1e-3)
+    parser.add_argument(
+        "--rgb-supervision-profile",
+        choices=["g4_tree_masked", "full_rgb", "ulfloc_legacy"],
+        default="g4_tree_masked",
+        help=(
+            "g4_tree_masked keeps the existing semantic/tree-weighted objective; "
+            "full_rgb supervises every real RGB pixel while leaving geometry and alpha "
+            "terms unchanged; ulfloc_legacy changes RGB pixels only to ULF-Loc's "
+            "object/distortion/sky protocol."
+        ),
+    )
+    parser.add_argument(
+        "--rgb-sampling-policy",
+        choices=["legacy_interleaved", "all_train_importance"],
+        default="all_train_importance",
+        help=(
+            "Whether RGB losses preserve the legacy Chart oversampling or use "
+            "importance weights whose expectation is uniform over all real train cameras."
+        ),
+    )
+    parser.add_argument(
+        "--chart-geometry-sampling-policy",
+        choices=["legacy_all_input", "active_only"],
+        default="active_only",
+        help=(
+            "Whether chart geometry iterations sample every aligned camera (legacy) "
+            "or only Charts that survived gate and quality filtering."
+        ),
+    )
+    parser.add_argument(
+        "--densification-view-policy",
+        choices=["legacy_current", "dense_only"],
+        default="legacy_current",
+        help=(
+            "Which rendered views may update 2DGS split/prune statistics. "
+            "dense_only retains Chart geometry losses but prevents their "
+            "oversampling from allocating disproportionate topology."
+        ),
+    )
+    parser.add_argument(
+        "--chart-geometry-prior-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Common multiplier for Chart-exclusive aligned depth/normal/curvature/"
+            "depth-order/anisotropy priors. Zero preserves the Chart camera schedule "
+            "but removes those extra geometry residuals for a strict ablation."
+        ),
+    )
     parser.add_argument("--dense_depth_cache", type=str, default=None)
     parser.add_argument("--geometry_view_every_n_iter", type=int, default=5)
     parser.add_argument("--dense_only_from_iter", type=int, default=3000)
@@ -1388,6 +1888,15 @@ if __name__ == "__main__":
     parser.add_argument("--use_mip_filter", action="store_true", default=False)
     parser.add_argument("--dense_data_path", type=str, default=None)
     parser.add_argument("--use_chart_view_every_n_iter", type=int, default=999_999)
+    parser.add_argument(
+        "--continue-opacity-resets-after-densify",
+        action="store_true",
+        help=(
+            "Experimental causal-control switch: keep the opacity reset cadence "
+            "after topology densification stops. Default preserves native 2DGS/"
+            "ULF/STDLoc behavior, where reset ends with densification."
+        ),
+    )
     parser.add_argument("--normal_consistency_from", type=int, default=3500)
     parser.add_argument("--distortion_from", type=int, default=1500)
     parser.add_argument('--depthanythingv2_checkpoint_dir', type=str, default='../Depth-Anything-V2/checkpoints/')
@@ -1422,6 +1931,11 @@ if __name__ == "__main__":
         args.cambridge_mask_pickle, args.cambridge_mask_dataset_path, args.cambridge_mask_indices,
         args.cambridge_geometry_mask_pickle, args.cambridge_geometry_mask_dataset_path,
         args.cambridge_geometry_mask_indices, args.rgb_loss_type, args.rgb_charbonnier_eps,
+        args.rgb_supervision_profile, args.rgb_sampling_policy,
+        args.chart_geometry_sampling_policy,
+        args.densification_view_policy,
+        args.continue_opacity_resets_after_densify,
+        args.chart_geometry_prior_weight,
         args.dense_depth_cache, args.geometry_view_every_n_iter, args.dense_only_from_iter,
         args.pseudo_rgb_weight, args.pseudo_geometry_weight,
         args.pseudo_geometry_final_weight, args.pseudo_geometry_decay_until,

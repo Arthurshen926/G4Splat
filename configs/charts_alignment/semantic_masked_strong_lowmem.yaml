@@ -53,6 +53,9 @@ alignment:
   # matching objective, but evaluate reprojections in genuinely small chunks.
   projection_chunk_size: 32768
   matching_pixel_stride: 2
+  # Stream the all-pairs matching reduction through activation checkpoints.
+  # This retains the same objective without retaining an O(N^2HW) graph.
+  matching_checkpoint_chunks: true
   # The norm regularizer is exact but backwarded in spatial chunks before the
   # main deformation graph, avoiding a second 48-chart full-resolution graph.
   chart_encoding_norm_chunk_rows: 64

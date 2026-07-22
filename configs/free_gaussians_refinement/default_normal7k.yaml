@@ -1,0 +1,11 @@
+# Strict schedule ablation: identical to ``default.yaml`` except that native
+# 2DGS normal consistency starts after 7,000 iterations, matching the released
+# ULF-Loc/STDLoc schedule.  It is therefore inactive in a 7k screen.
+type: '2dgs'
+iterations: 7000
+densify_until_iter: 3500
+opacity_reset_interval: 1000
+depth_ratio: 0.5
+normal_consistency_from: 7000
+distortion_from: 1500
+use_mip_filter: true

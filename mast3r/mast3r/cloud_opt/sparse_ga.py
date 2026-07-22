@@ -31,6 +31,27 @@ from dust3r.cloud_opt.base_opt import clean_pointcloud
 from dust3r.viz import SceneViz
 
 
+def unique_optimizer_parameters(parameters):
+    """Return optimizer parameters once, preserving their original order.
+
+    In the shared-intrinsics mode, ``pps`` and ``log_focals`` intentionally
+    contain repeated references to the same ``nn.Parameter``.  Passing that
+    raw list to Adam makes the parameter receive repeated updates in one
+    iteration (and emits PyTorch's duplicate-parameter warning).  This helper
+    keeps the shared camera model while giving each parameter exactly one
+    optimizer slot.
+    """
+    unique = []
+    seen = set()
+    for parameter in parameters:
+        identifier = id(parameter)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        unique.append(parameter)
+    return unique
+
+
 class SparseGA():
     def __init__(self, img_paths, pairs_in, res_fine, anchors, canonical_paths=None):
         def fetch_img(im):
@@ -449,7 +470,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
         # create optimizer
-        params = pps + log_focals + quats + trans + log_sizes + core_depth
+        params = unique_optimizer_parameters(
+            pps + log_focals + quats + trans + log_sizes + core_depth
+        )
         optimizer = torch.optim.Adam(params, lr=1, weight_decay=0, betas=(0.9, 0.9))
         ploss = pix_loss if 'meta' in repr(pix_loss) else (lambda a: pix_loss)
 

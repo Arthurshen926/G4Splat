@@ -1,0 +1,13 @@
+# Real St Mary's Church training views used only for targeted diagnostics.
+# These are not a held-out validation split: all 1487 train views remain input
+# supervision for every reconstruction in the ablation.
+#
+# seq12/frame00097 (image 00207) is the opaque/blurred-layer regression case.
+# The seq4 views were absent from the legacy reduced geometry input and expose
+# whether the all-train frontend actually preserves difficult real cameras.
+seq12/frame00097.png
+seq4/frame00037.png
+seq4/frame00038.png
+seq4/frame00272.png
+seq4/frame00308.png
+seq4/frame00327.png

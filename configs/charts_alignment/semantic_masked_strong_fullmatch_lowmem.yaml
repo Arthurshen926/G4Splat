@@ -1,0 +1,72 @@
+# Strict control for semantic_masked_strong_lowmem.yaml.
+#
+# This keeps the exact same masks, regularizers, optimizer, chunking and seed
+# path.  The only parsed intervention is full-resolution source sampling for
+# the cross-view matching loss.  It is intended for a smaller, preselected
+# Chart set that fits on one 24 GB GPU.
+
+# Pointmap
+pointmap:
+  eval_split: False
+  eval_split_interval: 8
+  max_img_size: 1600
+  pointmap_img_size: 512
+  randomize_images: False
+  max_sfm_points: null
+  sfm_confidence_threshold: -1.
+  average_focal_distances: False
+
+# Scene
+scene:
+  target_scale: 5.
+
+# Semantic masks are combined with MASt3R confidence before alignment losses.
+masking:
+  use_masks_for_alignment: True
+  sfm_mask_threshold: 0.25
+
+alignment:
+  use_learnable_depth_encoding: True
+  learnable_depth_encoding_mode: 'add'
+  predict_in_disparity_space: False
+  use_learnable_confidence: True
+  use_meta_mlp: False
+  use_lora_mlp: False
+  lora_rank: 4
+  n_lora_layers: 2
+  use_multi_res_charts_encoding: True
+
+  n_iterations: 1000
+  encodings_lr: 0.01
+  mlp_lr: 0.001
+  confidence_lr: 0.001
+  lr_update_iters: [1000]
+  lr_update_factor: 0.1
+
+  use_gradient_loss: False
+  gradient_loss_weight: 50.
+  use_hessian_loss: False
+  hessian_loss_weight: 100.
+  use_normal_loss: True
+  normal_loss_weight: 4.
+  use_curvature_loss: True
+  curvature_loss_weight: 1.
+
+  use_matching_loss: True
+  matching_update_iters: null
+  matching_loss_weight: 5.
+  projection_chunk_size: 32768
+  matching_pixel_stride: 1
+  matching_checkpoint_chunks: true
+  chart_encoding_norm_chunk_rows: 64
+  matching_thr_factor: 0.05
+  use_confidence_in_matching_loss: False
+  use_reprojection_loss: False
+  reprojection_loss_weight: 2.
+  reprojection_loss_power: 0.5
+
+  regularize_chart_encodings_norms: True
+  use_total_variation_on_depth_encodings: True
+  weight_encodings_with_confidence: True
+  chart_encodings_norm_loss_weight: 2.
+  total_variation_on_depth_encodings_weight: 5.

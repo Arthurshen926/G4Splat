@@ -40,6 +40,33 @@ import open3d as o3d
 from PIL import Image
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
+from matcha.cambridge_training import (
+    apply_per_image_affine_color_correction,
+    load_per_image_affine_color_correction,
+)
+
+
+def load_checkpoint_color_correction(
+    model_path: str,
+    iteration: int,
+    device: torch.device,
+    *,
+    expected: bool = False,
+):
+    """Load the optional affine train-camera model stored with a checkpoint."""
+    state_path = Path(model_path) / "point_cloud" / f"iteration_{iteration}" / "color_correction.pth"
+    if not state_path.is_file():
+        if expected:
+            print(
+                "[WARNING] This cfg_args requests per-image affine color correction, "
+                f"but {state_path} is absent. RGB exports are uncorrected and cannot "
+                "be treated as a faithful train-objective evaluation."
+            )
+        return None
+    correction = load_per_image_affine_color_correction(state_path, device=device)
+    print(f"Loaded per-image affine color correction from {state_path}")
+    return correction
 
 
 @torch.no_grad()
@@ -51,6 +78,8 @@ def export_rgb_stream(
     background: torch.Tensor,
     output_path: str,
     index_offset: int = 0,
+    color_correction=None,
+    raw_output_path: Optional[str] = None,
 ) -> None:
     """Render and write RGB one camera at a time.
 
@@ -64,19 +93,29 @@ def export_rgb_stream(
     gts_path = os.path.join(output_path, "gt")
     os.makedirs(render_path, exist_ok=True)
     os.makedirs(gts_path, exist_ok=True)
+    raw_render_path = None
+    raw_gts_path = None
+    if raw_output_path is not None:
+        raw_render_path = os.path.join(raw_output_path, "renders")
+        raw_gts_path = os.path.join(raw_output_path, "gt")
+        os.makedirs(raw_render_path, exist_ok=True)
+        os.makedirs(raw_gts_path, exist_ok=True)
     for index, viewpoint_cam in tqdm(
         enumerate(viewpoint_stack),
         total=len(viewpoint_stack),
         desc="stream RGB images",
     ):
         output_index = index + index_offset
-        rendered = render(
+        raw_rendered = render(
             viewpoint_cam,
             gaussians,
             pipe,
             background,
             rgb_only=True,
         )["render"]
+        rendered = apply_per_image_affine_color_correction(
+            color_correction, raw_rendered, viewpoint_cam.image_name
+        )
         gt = viewpoint_cam.original_image[0:3, :, :]
         save_img_u8(
             gt.permute(1, 2, 0).cpu().numpy(),
@@ -86,6 +125,15 @@ def export_rgb_stream(
             rendered.permute(1, 2, 0).cpu().numpy(),
             os.path.join(render_path, f"{output_index:05d}.png"),
         )
+        if raw_render_path is not None and raw_gts_path is not None:
+            save_img_u8(
+                raw_rendered.permute(1, 2, 0).cpu().numpy(),
+                os.path.join(raw_render_path, f"{output_index:05d}.png"),
+            )
+            save_img_u8(
+                gt.permute(1, 2, 0).cpu().numpy(),
+                os.path.join(raw_gts_path, f"{output_index:05d}.png"),
+            )
 
 
 def _colmap_camera_metadata(dataset) -> list[SimpleNamespace]:
@@ -174,18 +222,30 @@ def export_lazy_colmap_rgb_stream(
     background: torch.Tensor,
     output_path: str,
     index_offset: int = 0,
+    color_correction=None,
+    raw_output_path: Optional[str] = None,
 ) -> None:
     """Render a metadata list with one decoded image/camera at a time."""
     render_path = os.path.join(output_path, "renders")
     gts_path = os.path.join(output_path, "gt")
     os.makedirs(render_path, exist_ok=True)
     os.makedirs(gts_path, exist_ok=True)
+    raw_render_path = None
+    raw_gts_path = None
+    if raw_output_path is not None:
+        raw_render_path = os.path.join(raw_output_path, "renders")
+        raw_gts_path = os.path.join(raw_output_path, "gt")
+        os.makedirs(raw_render_path, exist_ok=True)
+        os.makedirs(raw_gts_path, exist_ok=True)
     for local_index, record in tqdm(
         enumerate(records), total=len(records), desc="lazy stream RGB images"
     ):
         output_index = local_index + index_offset
         camera = _load_lazy_camera(dataset, record, output_index)
-        rendered = render(camera, gaussians, pipe, background, rgb_only=True)["render"]
+        raw_rendered = render(camera, gaussians, pipe, background, rgb_only=True)["render"]
+        rendered = apply_per_image_affine_color_correction(
+            color_correction, raw_rendered, camera.image_name
+        )
         gt = camera.original_image[0:3, :, :]
         save_img_u8(
             gt.permute(1, 2, 0).cpu().numpy(),
@@ -195,7 +255,16 @@ def export_lazy_colmap_rgb_stream(
             rendered.permute(1, 2, 0).cpu().numpy(),
             os.path.join(render_path, f"{output_index:05d}.png"),
         )
-        del rendered, camera
+        if raw_render_path is not None and raw_gts_path is not None:
+            save_img_u8(
+                raw_rendered.permute(1, 2, 0).cpu().numpy(),
+                os.path.join(raw_render_path, f"{output_index:05d}.png"),
+            )
+            save_img_u8(
+                gt.permute(1, 2, 0).cpu().numpy(),
+                os.path.join(raw_gts_path, f"{output_index:05d}.png"),
+            )
+        del raw_rendered, rendered, camera
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -209,6 +278,15 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--render_path", action="store_true")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument(
+        "--raw_output_dir",
+        type=str,
+        default=None,
+        help=(
+            "When exporting RGB with a learned color correction, also write the "
+            "unmodified Gaussian RGB and matching GT here from the same render pass."
+        ),
+    )
     parser.add_argument(
         "--train_view_start",
         type=int,
@@ -225,6 +303,15 @@ if __name__ == "__main__":
         "--rgb_only",
         action="store_true",
         help="Export RGB renders and ground truth only; omit depth visualization TIFFs.",
+    )
+    parser.add_argument(
+        "--disable_color_correction",
+        action="store_true",
+        help=(
+            "Do not apply a persisted per-image affine color correction during export. "
+            "This exposes the underlying Gaussian-only reconstruction for a causal "
+            "comparison with a no-color-correction run."
+        ),
     )
     parser.add_argument("--voxel_size", default=-1.0, type=float, help='Mesh: voxel size for TSDF')
     parser.add_argument("--depth_trunc", default=-1.0, type=float, help='Mesh: Max depth range for TSDF')
@@ -263,9 +350,22 @@ if __name__ == "__main__":
         gaussians.load_ply(point_cloud)
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        color_correction = None
+        if bool(getattr(args, "disable_color_correction", False)):
+            print("[INFO] Per-image affine color correction disabled for this export.")
+        else:
+            color_correction = load_checkpoint_color_correction(
+                args.model_path,
+                iteration,
+                background.device,
+                expected=bool(getattr(args, "use_color_correction", False)),
+            )
         train_dir = getattr(args, "output_dir", None) or os.path.join(
             args.model_path, "train", f"ours_{iteration}"
         )
+        raw_train_dir = getattr(args, "raw_output_dir", None)
+        if raw_train_dir is not None and os.path.abspath(raw_train_dir) == os.path.abspath(train_dir):
+            raise ValueError("--raw_output_dir must differ from --output_dir")
         records = _colmap_camera_metadata(dataset)
         start = int(getattr(args, "train_view_start", 0))
         train_view_end = getattr(args, "train_view_end", None)
@@ -286,6 +386,8 @@ if __name__ == "__main__":
             background=background,
             output_path=train_dir,
             index_offset=start,
+            color_correction=color_correction,
+            raw_output_path=raw_train_dir,
         )
         raise SystemExit(0)
 
@@ -295,10 +397,23 @@ if __name__ == "__main__":
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    color_correction = None
+    if bool(getattr(args, "disable_color_correction", False)):
+        print("[INFO] Per-image affine color correction disabled for this export.")
+    else:
+        color_correction = load_checkpoint_color_correction(
+            args.model_path,
+            scene.loaded_iter,
+            background.device,
+            expected=bool(getattr(args, "use_color_correction", False)),
+        )
     
     train_dir = getattr(args, "output_dir", None) or os.path.join(
         args.model_path, 'train', "ours_{}".format(scene.loaded_iter)
     )
+    raw_train_dir = getattr(args, "raw_output_dir", None)
+    if raw_train_dir is not None and os.path.abspath(raw_train_dir) == os.path.abspath(train_dir):
+        raise ValueError("--raw_output_dir must differ from --output_dir")
     test_dir = os.path.join(args.model_path, 'test', "ours_{}".format(scene.loaded_iter))
     gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)    
     
@@ -332,6 +447,8 @@ if __name__ == "__main__":
                 background=background,
                 output_path=train_dir,
                 index_offset=start,
+                color_correction=color_correction,
+                raw_output_path=raw_train_dir,
             )
         else:
             gaussExtractor.reconstruction(selected_train_cameras)

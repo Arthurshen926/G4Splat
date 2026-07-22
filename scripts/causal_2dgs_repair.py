@@ -320,16 +320,18 @@ class _LazyCameraStore(Mapping[str, Any]):
                 raise ValueError(
                     f"Unsupported COLMAP camera model {intrinsic.model}; expected PINHOLE or SIMPLE_PINHOLE"
                 )
-            width, height = _scaled_camera_resolution(
-                int(intrinsic.width), int(intrinsic.height), int(requested_resolution)
-            )
-            fov_x = float(focal2fov(focal_x, int(intrinsic.width)))
-            fov_y = float(focal2fov(focal_y, int(intrinsic.height)))
             R = np.transpose(qvec2rotmat(qvec))
             T = np.asarray(tvec, dtype=np.float64)
             image_path = images_root / Path(image_file).name
             if not image_path.is_file():
                 raise FileNotFoundError(f"COLMAP image missing from staged source: {image_path}")
+            with Image.open(image_path) as image:
+                staged_width, staged_height = image.size
+            width, height = _scaled_camera_resolution(
+                int(staged_width), int(staged_height), int(requested_resolution)
+            )
+            fov_x = float(focal2fov(focal_x, int(intrinsic.width)))
+            fov_y = float(focal2fov(focal_y, int(intrinsic.height)))
             image_name = image_path.stem
             if image_name in records:
                 raise ValueError(f"Duplicate staged camera image name: {image_name}")
@@ -3066,7 +3068,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resolution", type=int, default=2)
     parser.add_argument("--white-background", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--semantic-mask-indices", nargs="+", type=int, default=[0, 1, 2, 3])
+    parser.add_argument("--semantic-mask-indices", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--max-candidates-per-view", type=int, default=384)
     parser.add_argument("--max-clusters", type=int, default=12)
     parser.add_argument(

@@ -52,12 +52,24 @@ def reject_catastrophic_alignment_confidences(
     prior_depths,
     masks=None,
     *,
+    reference_depths=None,
     median_relative_error_threshold=0.75,
     bad_pixel_relative_error=0.25,
     bad_pixel_fraction_threshold=0.90,
     minimum_valid_pixels=64,
+    return_reference_metrics=False,
 ):
-    """Disable a chart only when alignment collapses its depth at global scale."""
+    """Disable a Chart only when it contradicts its alignment target.
+
+    ``prior_depths`` is the DepthAnything initialization.  A large change from
+    that initialization is not itself evidence of failure: the alignment loss
+    is explicitly trying to bring it toward the MASt3R observation.  When the
+    latter is supplied through ``reference_depths``, use it as the rejection
+    target and retain the prior-relative measurements as diagnostics only.
+
+    The legacy prior-only behaviour remains available for old archives that do
+    not contain a persisted MASt3R target.
+    """
     confidences = output_confs.clone()
     rejected = torch.zeros(
         output_depths.shape[0],
@@ -71,27 +83,80 @@ def reject_catastrophic_alignment_confidences(
         device=output_depths.device,
     )
     bad_fractions = torch.full_like(relative_medians, float("nan"))
+    reference_relative_medians = torch.full_like(relative_medians, float("nan"))
+    reference_bad_fractions = torch.full_like(relative_medians, float("nan"))
+
+    if reference_depths is not None:
+        if reference_depths.shape != output_depths.shape:
+            raise ValueError(
+                "reference_depths must match output_depths, got "
+                f"{tuple(reference_depths.shape)} and {tuple(output_depths.shape)}"
+            )
+        reference_depths = reference_depths.to(
+            device=output_depths.device, dtype=output_depths.dtype
+        )
 
     for chart_index in range(output_depths.shape[0]):
         aligned = output_depths[chart_index]
         prior = prior_depths[chart_index]
-        valid = torch.isfinite(aligned) & torch.isfinite(prior) & (aligned > 0) & (prior > 0)
+        # A DAV2 prior is useful for its diagnostic, but it is not part of the
+        # MASt3R-target validity contract.  In particular, a missing/invalid
+        # prior must not make a Chart invisible to the reference-based safety
+        # check below.
+        valid = torch.isfinite(aligned) & (aligned > 0)
         if masks is not None:
             valid &= masks[chart_index].to(device=valid.device, dtype=torch.bool)
-        if int(valid.sum()) < minimum_valid_pixels:
-            continue
-        relative_error = (aligned[valid] - prior[valid]).abs() / prior[valid].clamp_min(1e-6)
-        median_error = relative_error.median()
-        bad_fraction = (relative_error > bad_pixel_relative_error).float().mean()
-        relative_medians[chart_index] = median_error
-        bad_fractions[chart_index] = bad_fraction
-        if (
-            median_error > median_relative_error_threshold
-            and bad_fraction > bad_pixel_fraction_threshold
-        ):
-            confidences[chart_index].zero_()
-            rejected[chart_index] = True
+        prior_valid = valid & torch.isfinite(prior) & (prior > 0)
+        if int(prior_valid.sum()) >= minimum_valid_pixels:
+            relative_error = (
+                (aligned[prior_valid] - prior[prior_valid]).abs()
+                / prior[prior_valid].clamp_min(1e-6)
+            )
+            median_error = relative_error.median()
+            bad_fraction = (relative_error > bad_pixel_relative_error).float().mean()
+            relative_medians[chart_index] = median_error
+            bad_fractions[chart_index] = bad_fraction
+            if (
+                reference_depths is None
+                and median_error > median_relative_error_threshold
+                and bad_fraction > bad_pixel_fraction_threshold
+            ):
+                confidences[chart_index].zero_()
+                rejected[chart_index] = True
 
+        if reference_depths is not None:
+            reference = reference_depths[chart_index]
+            reference_valid = valid & torch.isfinite(reference) & (reference > 0)
+            if int(reference_valid.sum()) < minimum_valid_pixels:
+                # The subsequent hard gate treats this as insufficient support;
+                # do not invent a prior-change failure label here.
+                continue
+            reference_relative_error = (
+                (aligned[reference_valid] - reference[reference_valid]).abs()
+                / reference[reference_valid].clamp_min(1e-6)
+            )
+            reference_median = reference_relative_error.median()
+            reference_bad_fraction = (
+                reference_relative_error > bad_pixel_relative_error
+            ).float().mean()
+            reference_relative_medians[chart_index] = reference_median
+            reference_bad_fractions[chart_index] = reference_bad_fraction
+            if (
+                reference_median > median_relative_error_threshold
+                and reference_bad_fraction > bad_pixel_fraction_threshold
+            ):
+                confidences[chart_index].zero_()
+                rejected[chart_index] = True
+
+    if return_reference_metrics:
+        return (
+            confidences,
+            rejected,
+            relative_medians,
+            bad_fractions,
+            reference_relative_medians,
+            reference_bad_fractions,
+        )
     return confidences, rejected, relative_medians, bad_fractions
 
 
@@ -101,6 +166,7 @@ def align_charts_in_parallel(
     scene_pm,
     # Data parameters
     reference_data,
+    reference_depths_for_audit=None,
     masks=None,
     rendering_size=1600,
     target_scale=5.,
@@ -140,6 +206,7 @@ def align_charts_in_parallel(
     total_variation_on_depth_encodings_weight=5.0,
     projection_chunk_size=262_144,
     matching_pixel_stride=1,
+    matching_checkpoint_chunks=False,
     chart_encoding_norm_chunk_rows=0,
     encodings_lr=1e-2,
     mlp_lr=1e-3,
@@ -260,6 +327,7 @@ def align_charts_in_parallel(
         total_variation_on_depth_encodings_weight=total_variation_on_depth_encodings_weight,
         projection_chunk_size=projection_chunk_size,
         matching_pixel_stride=matching_pixel_stride,
+        matching_checkpoint_chunks=matching_checkpoint_chunks,
         chart_encoding_norm_chunk_rows=chart_encoding_norm_chunk_rows,
         encodings_lr=encodings_lr,
         mlp_lr=mlp_lr,
@@ -296,18 +364,34 @@ def align_charts_in_parallel(
         rejected_alignment_charts,
         alignment_relative_medians,
         alignment_bad_fractions,
+        alignment_reference_relative_medians,
+        alignment_reference_bad_fractions,
     ) = reject_catastrophic_alignment_confidences(
         output_confs,
         output_depths,
         initial_depths,
         masks,
+        reference_depths=reference_depths_for_audit,
+        # The internal safeguard catches a genuine global departure from the
+        # MASt3R target.  The stricter per-chart .50/.50 decision remains in
+        # gate_aligned_charts.py, where support and coverage are audited.
+        median_relative_error_threshold=0.75,
+        bad_pixel_fraction_threshold=0.90,
+        return_reference_metrics=True,
     )
     for chart_index in torch.nonzero(rejected_alignment_charts).flatten().tolist():
+        if reference_depths_for_audit is None:
+            basis = "prior"
+            median = alignment_relative_medians[chart_index].item()
+            bad_fraction = alignment_bad_fractions[chart_index].item()
+        else:
+            basis = "MASt3R reference"
+            median = alignment_reference_relative_medians[chart_index].item()
+            bad_fraction = alignment_reference_bad_fractions[chart_index].item()
         print(
             "[WARN] Rejecting catastrophic aligned chart "
-            f"{chart_index}: median relative depth error="
-            f"{alignment_relative_medians[chart_index].item():.3f}, "
-            f"bad-pixel fraction={alignment_bad_fractions[chart_index].item():.3f}."
+            f"{chart_index} relative to {basis}: median relative depth error="
+            f"{median:.3f}, bad-pixel fraction={bad_fraction:.3f}."
         )
     
     if save_charts_data:
@@ -321,17 +405,34 @@ def align_charts_in_parallel(
         charts_scale_factor = scale_factor
 
         # Save the charts data with numpy
-        np.savez(
-            save_path,
-            prior_depths=charts_prior_depths.cpu().numpy(),
-            depths=charts_depths.cpu().numpy(),
-            pts=charts_pts.cpu().numpy(),
-            confs=charts_confs.cpu().numpy(),
-            scale_factor=charts_scale_factor,
-            alignment_chart_valid=(~rejected_alignment_charts).cpu().numpy(),
-            alignment_prior_relative_median=alignment_relative_medians.cpu().numpy(),
-            alignment_prior_gt25_fraction=alignment_bad_fractions.cpu().numpy(),
-        )
+        payload = {
+            "prior_depths": charts_prior_depths.cpu().numpy(),
+            "depths": charts_depths.cpu().numpy(),
+            "pts": charts_pts.cpu().numpy(),
+            "confs": charts_confs.cpu().numpy(),
+            "scale_factor": charts_scale_factor,
+            "alignment_chart_valid": (~rejected_alignment_charts).cpu().numpy(),
+            "alignment_prior_relative_median": alignment_relative_medians.cpu().numpy(),
+            "alignment_prior_gt25_fraction": alignment_bad_fractions.cpu().numpy(),
+            "alignment_reference_relative_median": alignment_reference_relative_medians.cpu().numpy(),
+            "alignment_reference_gt25_fraction": alignment_reference_bad_fractions.cpu().numpy(),
+        }
+        if reference_depths_for_audit is not None:
+            if reference_depths_for_audit.shape != charts_depths.shape:
+                raise ValueError(
+                    "reference_depths_for_audit must match chart depths, got "
+                    f"{tuple(reference_depths_for_audit.shape)} and {tuple(charts_depths.shape)}"
+                )
+            payload["reference_depths"] = reference_depths_for_audit.detach().cpu().numpy()
+            payload["alignment_reference_mask"] = (
+                torch.ones_like(charts_depths, dtype=torch.bool)
+                if masks is None
+                else masks.to(device=charts_depths.device, dtype=torch.bool)
+            ).cpu().numpy()
+            payload["alignment_rejection_basis"] = np.asarray("mast3r_reference_depths")
+        else:
+            payload["alignment_rejection_basis"] = np.asarray("depthanything_prior_legacy")
+        np.savez(save_path, **payload)
     
     if use_learnable_confidence:
         if return_training_losses:

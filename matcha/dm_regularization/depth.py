@@ -148,6 +148,7 @@ def compute_depth_order_loss(
     log_space:bool=False,
     log_scale:float=20.,
     reduction:str="mean",
+    valid_mask:torch.Tensor=None,
     debug:bool=False,
 ):
     """Compute a loss encouraging pixels in 'depth' to have the same relative depth order as in 'prior_depth'.
@@ -160,12 +161,25 @@ def compute_depth_order_loss(
         max_pixel_shift_ratio (float, optional): The maximum pixel shift ratio. Defaults to 0.05, i.e. 5% of the image size.
         normalize_loss (bool, optional): Whether to normalize the loss. Defaults to True.
         reduction (str, optional): The reduction to apply to the loss. Can be "mean", "sum" or "none". Defaults to "mean".
+        valid_mask (torch.Tensor, optional): A per-pixel confidence/support map.
+            When supplied, a depth-order pair contributes only if both its
+            source and its randomly shifted target are supported and have
+            finite positive depths.  This matters at semantic boundaries:
+            masking only the source pixel would otherwise still compare a
+            valid facade pixel against sky, foliage, or an unobserved hole.
     
     Returns:
         torch.Tensor: A scalar tensor.
             If reduction is "none", returns a tensor with same shape as depth containing the pixel-wise depth order loss.
     """
-    height, width = depth.squeeze().shape
+    depth_map = depth.squeeze()
+    prior_depth_map = prior_depth.squeeze()
+    if depth_map.shape != prior_depth_map.shape:
+        raise ValueError(
+            "depth and prior_depth must have matching spatial shape, got "
+            f"{tuple(depth_map.shape)} and {tuple(prior_depth_map.shape)}"
+        )
+    height, width = depth_map.shape
     pixel_coords = torch.stack(torch.meshgrid(
         torch.linspace(0, height - 1, height, dtype=torch.long, device=depth.device),
         torch.linspace(0, width - 1, width, dtype=torch.long, device=depth.device),
@@ -184,11 +198,11 @@ def compute_depth_order_loss(
     )
 
     # Get depth values at shifted pixel coordinates
-    shifted_depth = depth.squeeze()[
+    shifted_depth = depth_map[
         shifted_pixel_coords[:, 0], 
         shifted_pixel_coords[:, 1]
     ].reshape(depth.shape)
-    shifted_prior_depth = prior_depth.squeeze()[
+    shifted_prior_depth = prior_depth_map[
         shifted_pixel_coords[:, 0], 
         shifted_pixel_coords[:, 1]
     ].reshape(depth.shape)
@@ -201,14 +215,56 @@ def compute_depth_order_loss(
     depth_order_loss = - (diff * prior_diff).clamp(max=0)
     if log_space:
         depth_order_loss = torch.log(1. + log_scale * depth_order_loss)
+
+    pair_weight = None
+    if valid_mask is not None:
+        support = valid_mask.squeeze().to(device=depth.device, dtype=depth.dtype)
+        if support.shape != depth_map.shape:
+            raise ValueError(
+                "valid_mask must match depth spatial shape, got "
+                f"{tuple(support.shape)} and {tuple(depth_map.shape)}"
+            )
+        # Keep soft support weights when provided, but never let invalid
+        # numerical depths leak NaNs through a nominally zero-weight pair.
+        support = torch.nan_to_num(support, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        source_valid = (
+            torch.isfinite(depth_map)
+            & torch.isfinite(prior_depth_map)
+            & (depth_map > 0)
+            & (prior_depth_map > 0)
+            & (support > 0)
+        )
+        shifted_support = support[
+            shifted_pixel_coords[:, 0], shifted_pixel_coords[:, 1]
+        ].reshape(depth_map.shape)
+        shifted_depth_valid = torch.isfinite(shifted_depth.squeeze()) & (shifted_depth.squeeze() > 0)
+        shifted_prior_valid = (
+            torch.isfinite(shifted_prior_depth.squeeze())
+            & (shifted_prior_depth.squeeze() > 0)
+        )
+        pair_valid = source_valid & shifted_depth_valid & shifted_prior_valid & (shifted_support > 0)
+        pair_weight_map = support * shifted_support * pair_valid.to(dtype=support.dtype)
+        pair_weight = pair_weight_map.reshape(depth.shape)
+        depth_order_loss = torch.nan_to_num(depth_order_loss, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Reduce the loss
     if reduction == "mean":
-        depth_order_loss = depth_order_loss.mean()
+        if pair_weight is None:
+            depth_order_loss = depth_order_loss.mean()
+        else:
+            denominator = pair_weight.sum()
+            depth_order_loss = (depth_order_loss * pair_weight).sum() / denominator.clamp_min(
+                torch.finfo(depth_order_loss.dtype).eps
+            )
     elif reduction == "sum":
-        depth_order_loss = depth_order_loss.sum()
+        depth_order_loss = (
+            depth_order_loss.sum()
+            if pair_weight is None
+            else (depth_order_loss * pair_weight).sum()
+        )
     elif reduction == "none":
-        pass
+        if pair_weight is not None:
+            depth_order_loss = depth_order_loss * pair_weight
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
     
@@ -219,5 +275,6 @@ def compute_depth_order_loss(
             "prior_diff": prior_diff,
             "shifted_depth": shifted_depth,
             "shifted_prior_depth": shifted_prior_depth,
+            "pair_weight": pair_weight,
         }
     return depth_order_loss

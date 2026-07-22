@@ -130,6 +130,74 @@ def audit_coverage(
     sequence_pass = all(
         item["p95"] <= max_sequence_p95 for item in target["per_sequence"].values()
     )
+    # Global target-pose coverage may borrow a Chart from another traversal.
+    # That is useful for appearance but does not prove that a temporal corridor
+    # has an independently-baselined geometry pair.  Mirror the selector's
+    # explicit same-sequence contract after the hard depth gate.
+    sequence_mode = str(coverage_config.get("sequence_coverage_mode", "off"))
+    pre_gate_min_sequence_support = int(
+        coverage_config.get("min_views_per_sequence", 0)
+    )
+    min_sequence_support = int(
+        coverage_config.get(
+            "post_gate_min_views_per_sequence",
+            pre_gate_min_sequence_support,
+        )
+    )
+    sequence_gate_failure_budget = int(
+        coverage_config.get("sequence_gate_failure_budget", 0)
+    )
+    sequence_support = []
+    if sequence_mode not in {"off", "soft", "strict"}:
+        raise ValueError(f"Unknown sequence coverage mode in selection: {sequence_mode}")
+    if pre_gate_min_sequence_support < 0 or min_sequence_support < 0:
+        raise ValueError("Selection has a negative same-sequence support count")
+    if sequence_gate_failure_budget < 0:
+        raise ValueError("Selection has a negative same-sequence gate-failure budget")
+    if sequence_mode != "off" and pre_gate_min_sequence_support > 0:
+        target_by_sequence: dict[str, list[int]] = {}
+        for index, name in enumerate(image_names):
+            target_by_sequence.setdefault(name.split("__", 1)[0], []).append(index)
+        for sequence, targets in sorted(target_by_sequence.items()):
+            # A shorter capture could not satisfy the pre-gate reserve
+            # contract in the first place, so keep the selector's explicit
+            # exception rather than silently turning it into a post-gate
+            # failure.  For every applicable temporal corridor, however, the
+            # surviving requirement is the post-gate count, not the broader
+            # primary-reserve count.
+            applicable = len(targets) >= pre_gate_min_sequence_support
+            supports = [
+                index
+                for index in active_indices
+                if image_names[index].split("__", 1)[0] == sequence
+            ]
+            baseline_ok = any(
+                float(np.linalg.norm(normalized_centers[first] - normalized_centers[second]))
+                >= min_baseline
+                for offset, first in enumerate(supports)
+                for second in supports[offset + 1 :]
+            )
+            sequence_support.append(
+                {
+                    "sequence": sequence,
+                    "target_count": len(targets),
+                    "applicable": applicable,
+                    "required_count": min_sequence_support if applicable else 0,
+                    "active_count": len(supports),
+                    "active_names": [image_names[index] for index in supports],
+                    "baseline_satisfied": baseline_ok if applicable and min_sequence_support >= 2 else True,
+                    "passed": (
+                        not applicable
+                        or (
+                            len(supports) >= min_sequence_support
+                            and (min_sequence_support < 2 or baseline_ok)
+                        )
+                    ),
+                }
+            )
+    strict_sequence_support_pass = all(
+        record["passed"] for record in sequence_support if record["applicable"]
+    )
     quality_constraints = selection.get("quality_aware_selection", {}).get("constraints", {})
     configured_reference_support = int(
         min_reference_support
@@ -214,6 +282,9 @@ def audit_coverage(
         "all_clusters_supported": all(item["passed"] for item in clusters),
         "target_max_pose_distance": target["all_targets"]["max"] <= max_target_pose_distance,
         "sequence_p95": sequence_pass,
+        "same_sequence_static_support": (
+            strict_sequence_support_pass if sequence_mode == "strict" else True
+        ),
         "retained_reference_coverage": all(item["passed"] for item in reference_records),
         "retained_reference_same_sequence": all(
             item["same_sequence"] for item in reference_records
@@ -240,9 +311,14 @@ def audit_coverage(
             "max_reference_pose_distance": max_reference_pose_distance,
             "require_exact_references": require_exact_references,
             "min_reference_support_requested": configured_reference_support,
+            "sequence_coverage_mode": sequence_mode,
+            "pre_gate_min_views_per_sequence": pre_gate_min_sequence_support,
+            "min_views_per_sequence": min_sequence_support,
+            "sequence_gate_failure_budget": sequence_gate_failure_budget,
         },
         "clusters": clusters,
         "target_coverage": target,
+        "same_sequence_support": sequence_support,
         "reference_coverage": reference_records,
     }
 

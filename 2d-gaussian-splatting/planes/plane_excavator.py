@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 sys.path.append(os.getcwd())
@@ -13,12 +15,17 @@ import numpy as np
 import cv2
 from sklearn.cluster import KMeans
 import argparse
+import json
 from PIL import Image
 
 from mask_generator import setup_sam, infer_masks
 from tools import to_world_space, remove_small_isolated_areas, merge_normal_clusters
 sys.path.append(os.path.join(os.getcwd(), '2d-gaussian-splatting'))
 from utils.general_utils import seed_everything
+try:
+    from .semantic_support import minimum_plane_area, plane_support_mask
+except ImportError:  # Script entry point: 2d-gaussian-splatting/planes is sys.path[0].
+    from semantic_support import minimum_plane_area, plane_support_mask
 
 def normals_cluster(normals: np.ndarray, img_shape: tuple, n_init_clusters: int = 8, n_clusters: int = 6, min_size_ratio: float = 0.004):
     """
@@ -100,7 +107,7 @@ class PlaneExcavator:
         self.n_normal_clusters = config.n_normal_clusters
         self.num_sam_prompts = config.num_sam_prompts
         self.img_shape = (img_height, img_width)  # Currently only support images of the same size
-        self.min_plane_size = self.img_shape[0] * self.img_shape[1] * config.min_size_ratio
+        self.min_size_ratio = float(config.min_size_ratio)
         self.device = device
 
         self.sam_model = setup_sam(device=self.device)
@@ -124,12 +131,21 @@ class PlaneExcavator:
             else:
                 raise ValueError(f'normal_model_type {normal_model_type} is not supported')
 
-    def _normals_cluster(self, normals: np.ndarray):
+    def _normals_cluster(
+        self,
+        normals: np.ndarray,
+        support_mask: np.ndarray,
+        min_plane_size: int,
+    ):
         """
         Cluster the surface normals.
         """
         flat_normals = normals.reshape(-1, 3)
-        valid = np.isfinite(flat_normals).all(axis=1) & (np.linalg.norm(flat_normals, axis=1) > 1e-6)
+        valid = (
+            np.isfinite(flat_normals).all(axis=1)
+            & (np.linalg.norm(flat_normals, axis=1) > 1e-6)
+            & support_mask.reshape(-1)
+        )
         if not np.any(valid):
             return []
         unique_count = len(np.unique(np.round(flat_normals[valid], decimals=5), axis=0))
@@ -159,7 +175,10 @@ class PlaneExcavator:
         normal_masks = []
         for i in range(num_clusters):
             mask = (pred==sorted_topk[count_valid_cluster])
-            mask_clean = remove_small_isolated_areas((mask>0).reshape(*self.img_shape)*255, min_size=self.min_plane_size).reshape(-1)
+            mask_clean = remove_small_isolated_areas(
+                (mask > 0).reshape(*self.img_shape) * 255,
+                min_size=min_plane_size,
+            ).reshape(-1)
             mask[mask_clean==0] = 0
 
             num_labels, labels = cv2.connectedComponents((mask*255).reshape(self.img_shape).astype(np.uint8))
@@ -168,7 +187,13 @@ class PlaneExcavator:
             count_valid_cluster += 1
         return normal_masks
 
-    def __call__(self, img: np.ndarray, normals: np.ndarray = None, vis: bool = False):
+    def __call__(
+        self,
+        img: np.ndarray,
+        normals: np.ndarray = None,
+        vis: bool = False,
+        semantic_keep: np.ndarray | None = None,
+    ):
         """
         img: np.ndarray, shape: (H, W, 3)
             The input image, in the form of a numpy array.
@@ -184,7 +209,16 @@ class PlaneExcavator:
             normals = normals / 255.0            # 0-1
             normals = (0.5 - normals) * 2       # -1-1
 
-        normal_clusters = self._normals_cluster(normals)
+        support_mask = plane_support_mask(semantic_keep, self.img_shape)
+        min_plane_size = minimum_plane_area(
+            support_mask,
+            min_size_ratio=self.min_size_ratio,
+        )
+        normal_clusters = self._normals_cluster(
+            normals,
+            support_mask,
+            min_plane_size,
+        )
 
         # Generate masks
         normalized_prompts = torch.rand(self.num_sam_prompts, 2, device=self.device) * 2 - 1
@@ -196,9 +230,9 @@ class PlaneExcavator:
         count = 0
         for mask in masks:
             for normal_mask in normal_clusters:
-                intersect = mask & normal_mask
+                intersect = mask & normal_mask & support_mask
                 size = np.sum(intersect)
-                if size < self.min_plane_size:
+                if size < min_plane_size:
                     continue
                 count += 1
                 seg_mask[intersect] = count
@@ -212,7 +246,7 @@ class PlaneExcavator:
         for i in range(np.min([100, count])):
             mask = (seg_mask == i + 1)
             area = mask.sum()
-            if area < self.min_plane_size:
+            if area < min_plane_size:
                 continue
 
             avg_normal = np.mean(normals[mask], axis=0)
@@ -239,6 +273,8 @@ class PlaneExcavator:
                 "seg_mask": new_seg_mask,
                 "normal": masks_avg_normals,
                 "areas": masks_areas,
+                "semantic_support_fraction": float(support_mask.mean()),
+                "min_plane_size": int(min_plane_size),
             }
         )
 
@@ -290,6 +326,7 @@ if __name__ == "__main__":
         print('NOTE: use normal estimator for plane extraction')
 
     print('********** start plane extraction **********')
+    semantic_audit = []
 
     for idx, (rgb_file, normal_file) in enumerate(zip(rgb_list, normal_list)):
         rgb_path = os.path.join(data_path, rgb_file)
@@ -297,20 +334,50 @@ if __name__ == "__main__":
         rgb = Image.open(rgb_path)
         rgb = np.array(rgb)
         normal = np.load(normal_path)
+        semantic_keep_path = os.path.join(data_path, f'semantic_keep_frame{idx:06d}.npy')
+        semantic_keep = None
+        if os.path.isfile(semantic_keep_path):
+            semantic_keep = np.load(semantic_keep_path) > 0
+            if semantic_keep.shape != (img_height, img_width):
+                raise ValueError(
+                    'Semantic plane-support shape does not match chart image: '
+                    f'frame={idx}, mask={semantic_keep.shape}, image={(img_height, img_width)}'
+                )
 
         print(f'********** processing frame {idx:06d} **********')
 
         with torch.no_grad():
             if args.use_normal_estimator:
-                output = plane_excavator(rgb, normals=None, vis=True)
+                output = plane_excavator(
+                    rgb,
+                    normals=None,
+                    vis=True,
+                    semantic_keep=semantic_keep,
+                )
             else:
-                output = plane_excavator(rgb, normals=normal, vis=True)
+                output = plane_excavator(
+                    rgb,
+                    normals=normal,
+                    vis=True,
+                    semantic_keep=semantic_keep,
+                )
 
         # save plane mask results
         plane_mask = output['seg_mask']
         npy_save_path = os.path.join(data_path, f'plane_mask_frame{idx:06d}.npy')
         np.save(npy_save_path, plane_mask)
         print(f'save to {npy_save_path}')
+        semantic_audit.append({
+            'frame_index': idx,
+            'semantic_support_source': (
+                os.path.basename(semantic_keep_path)
+                if semantic_keep is not None
+                else 'implicit_all_image_legacy'
+            ),
+            'semantic_support_fraction': output['semantic_support_fraction'],
+            'min_plane_size': output['min_plane_size'],
+            'plane_instance_count': int(0 if output['areas'] is None else len(output['areas'])),
+        })
 
         # for visualization
         # normal_map = output['vis']['pred_norm']
@@ -342,3 +409,15 @@ if __name__ == "__main__":
         del output, plane_mask
         torch.cuda.empty_cache()
         gc.collect()
+
+    with open(os.path.join(data_path, 'plane_semantic_support_audit.json'), 'w') as handle:
+        json.dump(
+            {
+                'schema_version': 1,
+                'min_size_ratio': config.min_size_ratio,
+                'policy': 'semantic_structural_support_relative_plane_area',
+                'frames': semantic_audit,
+            },
+            handle,
+            indent=2,
+        )

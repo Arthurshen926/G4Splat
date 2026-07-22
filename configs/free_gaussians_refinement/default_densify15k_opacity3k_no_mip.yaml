@@ -1,0 +1,12 @@
+# Strict chained standard-protocol control: relative to
+# ``default_densify15k_opacity3k.yaml``, disable only the optional MIP filter.
+# This isolates renderer filtering after capacity and opacity-reset timing have
+# already been matched to the released ULF-Loc/STDLoc 2DGS schedule.
+type: '2dgs'
+iterations: 7000
+densify_until_iter: 15000
+opacity_reset_interval: 3000
+depth_ratio: 0.5
+normal_consistency_from: 3500
+distortion_from: 1500
+use_mip_filter: false

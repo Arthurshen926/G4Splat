@@ -24,14 +24,49 @@ def test_masked_strong_alignment_keeps_matching_and_bounds_projection_memory():
 
     assert config["alignment"]["use_matching_loss"] is True
     assert config["alignment"]["projection_chunk_size"] <= 65536
+    assert config["alignment"]["matching_checkpoint_chunks"] is True
     assert config["alignment"]["use_normal_loss"] is True
     assert config["alignment"]["use_curvature_loss"] is True
     assert config["masking"]["use_masks_for_alignment"] is True
     assert "projection_chunk_size" in inspect.signature(ParallelAligner.optimize).parameters
     assert "projection_chunk_size" in inspect.signature(align_charts_in_parallel).parameters
+    assert "matching_checkpoint_chunks" in inspect.signature(ParallelAligner.optimize).parameters
+    assert "matching_checkpoint_chunks" in inspect.signature(align_charts_in_parallel).parameters
     assert config["alignment"]["chart_encoding_norm_chunk_rows"] > 0
     assert "chart_encoding_norm_chunk_rows" in inspect.signature(ParallelAligner.optimize).parameters
     assert "chart_encoding_norm_chunk_rows" in inspect.signature(align_charts_in_parallel).parameters
+
+
+def test_fullmatch_control_changes_only_matching_source_stride():
+    lowmem = yaml.safe_load(
+        Path("configs/charts_alignment/semantic_masked_strong_lowmem.yaml").read_text()
+    )
+    fullmatch = yaml.safe_load(
+        Path("configs/charts_alignment/semantic_masked_strong_fullmatch_lowmem.yaml").read_text()
+    )
+
+    lowmem_stride = lowmem["alignment"].pop("matching_pixel_stride")
+    fullmatch_stride = fullmatch["alignment"].pop("matching_pixel_stride")
+    assert lowmem_stride == 2
+    assert fullmatch_stride == 1
+    assert fullmatch == lowmem
+
+
+def test_nomatching_control_changes_only_crossview_matching_term():
+    baseline = yaml.safe_load(
+        Path("configs/charts_alignment/semantic_masked_strong_lowmem.yaml").read_text()
+    )
+    control = yaml.safe_load(
+        Path(
+            "configs/charts_alignment/semantic_masked_strong_nomatching_lowmem.yaml"
+        ).read_text()
+    )
+
+    assert baseline["alignment"]["use_matching_loss"] is True
+    assert control["alignment"]["use_matching_loss"] is False
+    baseline["alignment"].pop("use_matching_loss")
+    control["alignment"].pop("use_matching_loss")
+    assert control == baseline
 
 
 def test_chunked_chart_encoding_norm_has_dense_objective_gradient():
@@ -110,3 +145,73 @@ def test_catastrophic_whole_chart_depth_collapse_is_disabled():
     assert medians[0] < 0.2
     assert medians[1] > 2.0
     assert bad_fractions[1] == 1.0
+
+
+def test_reference_target_prevents_rejecting_a_large_but_correct_dav2_correction():
+    prior = torch.ones((1, 2, 2))
+    reference = torch.full_like(prior, 4.0)
+    aligned = reference.clone()
+    confidence = torch.ones_like(aligned)
+
+    (
+        filtered,
+        rejected,
+        prior_medians,
+        _,
+        reference_medians,
+        _,
+    ) = reject_catastrophic_alignment_confidences(
+        confidence,
+        aligned,
+        prior,
+        reference_depths=reference,
+        minimum_valid_pixels=1,
+        return_reference_metrics=True,
+    )
+
+    assert not rejected.item()
+    assert prior_medians.item() > 2.0
+    assert reference_medians.item() == 0.0
+    assert torch.equal(filtered, confidence)
+
+
+def test_reference_target_rejects_a_global_departure_from_mast3r_observation():
+    prior = torch.ones((1, 2, 2))
+    reference = torch.ones_like(prior)
+    aligned = torch.full_like(prior, 4.0)
+    confidence = torch.ones_like(aligned)
+
+    filtered, rejected, *_ = reject_catastrophic_alignment_confidences(
+        confidence,
+        aligned,
+        prior,
+        reference_depths=reference,
+        minimum_valid_pixels=1,
+        return_reference_metrics=True,
+    )
+
+    assert rejected.item()
+    assert torch.count_nonzero(filtered) == 0
+
+
+def test_reference_safety_check_does_not_depend_on_dav2_prior_validity():
+    prior = torch.zeros((1, 2, 2))
+    reference = torch.ones_like(prior)
+    aligned = torch.full_like(prior, 4.0)
+    confidence = torch.ones_like(aligned)
+
+    filtered, rejected, prior_medians, _, reference_medians, _ = (
+        reject_catastrophic_alignment_confidences(
+            confidence,
+            aligned,
+            prior,
+            reference_depths=reference,
+            minimum_valid_pixels=1,
+            return_reference_metrics=True,
+        )
+    )
+
+    assert rejected.item()
+    assert torch.count_nonzero(filtered) == 0
+    assert torch.isnan(prior_medians).item()
+    assert reference_medians.item() > 2.0

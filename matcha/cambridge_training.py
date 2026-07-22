@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -34,6 +35,67 @@ class PerImageAffineColorCorrection(torch.nn.Module):
 
     def identity_regularization(self) -> torch.Tensor:
         return self.log_scales.square().mean() + self.biases.square().mean()
+
+
+def save_per_image_affine_color_correction(
+    correction: PerImageAffineColorCorrection,
+    path: str | Path,
+) -> None:
+    """Persist the train-camera affine model beside a Gaussian checkpoint.
+
+    The affine parameters participate directly in the RGB objective.  Saving
+    only the Gaussian PLY would otherwise make a later train-view render use
+    a different image model than the optimization that produced the PLY.
+    """
+    image_names = [
+        name
+        for name, _ in sorted(
+            correction.image_name_to_index.items(), key=lambda item: item[1]
+        )
+    ]
+    state_dict = {
+        name: value.detach().cpu()
+        for name, value in correction.state_dict().items()
+    }
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "version": 1,
+            "image_names": image_names,
+            "state_dict": state_dict,
+        },
+        destination,
+    )
+
+
+def load_per_image_affine_color_correction(
+    path: str | Path,
+    *,
+    device: torch.device | str,
+) -> PerImageAffineColorCorrection:
+    """Load a persisted affine model with its image-name contract intact."""
+    payload = torch.load(Path(path), map_location="cpu")
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(f"Unsupported affine color-correction state: {path}")
+    image_names = payload.get("image_names")
+    state_dict = payload.get("state_dict")
+    if not isinstance(image_names, list) or not image_names or not isinstance(state_dict, dict):
+        raise RuntimeError(f"Malformed affine color-correction state: {path}")
+    correction = PerImageAffineColorCorrection(image_names)
+    correction.load_state_dict(state_dict, strict=True)
+    return correction.to(device).eval()
+
+
+def apply_per_image_affine_color_correction(
+    correction: Optional[PerImageAffineColorCorrection],
+    image: torch.Tensor,
+    image_name: str,
+) -> torch.Tensor:
+    """Apply the learned camera correction, or identity for a novel camera."""
+    if correction is None or str(image_name) not in correction.image_name_to_index:
+        return image
+    return correction(image, image_name)
 
 
 def prepare_loss_mask(mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -117,6 +179,44 @@ def compute_rgb_loss(
     return rgb_loss, (1.0 - lambda_dssim) * rgb_loss + lambda_dssim * dssim
 
 
+def ulfloc_masked_supervision(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    object_mask: torch.Tensor,
+    sky_mask: torch.Tensor,
+    distortion_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reproduce ULF-Loc's legacy Cambridge RGB pixel protocol exactly.
+
+    ULF-Loc does not simply discard every semantic-invalid pixel.  It masks
+    the rendered/target image by ``object & distortion`` and then writes a
+    white target where the sky channel is false.  Keeping this slightly odd
+    ordering explicit is useful for an honest standard-protocol control: a
+    generic AND mask is a *different* training objective.
+
+    The returned mask is the object/distortion keep mask and is also what the
+    original 2DGS branch applied to its normal and distortion maps.
+    """
+    if image.shape != target.shape:
+        raise RuntimeError(
+            f"Image/target shape mismatch: {tuple(image.shape)} vs {tuple(target.shape)}"
+        )
+    object_keep = prepare_loss_mask(object_mask, image)[0] > 0.5
+    sky_keep = prepare_loss_mask(sky_mask, image)[0] > 0.5
+    distortion_keep = prepare_loss_mask(distortion_mask, image)[0] > 0.5
+    rgb_keep = object_keep & distortion_keep
+    weight = rgb_keep.to(dtype=image.dtype)[None]
+    masked_image = image * weight
+    masked_target = target * weight
+    # This is deliberately after object/distortion masking, matching the
+    # upstream ULF-Loc code path rather than a more conventional semantic AND.
+    masked_target = torch.where(
+        sky_keep[None], masked_target, torch.ones_like(masked_target)
+    )
+    return masked_image, masked_target, rgb_keep
+
+
 def compute_masked_depth_order_loss(
     *,
     mask: Optional[torch.Tensor] = None,
@@ -124,8 +224,11 @@ def compute_masked_depth_order_loss(
 ) -> torch.Tensor:
     if mask is None:
         return compute_depth_order_loss(reduction="mean", **kwargs)
-    loss_map = compute_depth_order_loss(reduction="none", **kwargs)
-    return masked_mean(loss_map, mask)
+    # The order residual compares a pixel with a randomly shifted neighbour.
+    # Suppressing only the source pixel still lets invalid sky/tree/hole
+    # neighbours exert a geometric force.  Delegate the paired-support
+    # normalization to the primitive so both endpoints must be valid.
+    return compute_depth_order_loss(reduction="mean", valid_mask=mask, **kwargs)
 
 
 def combine_boolean_masks(*masks: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -152,6 +255,298 @@ def geometry_iteration(
     if dense_only_from_iter >= 0 and iteration > dense_only_from_iter:
         return False
     return iteration % max(int(every_n), 1) == 0
+
+
+def densification_stats_from_view(
+    *,
+    policy: str,
+    use_dense_supervision: bool,
+    is_geometry_view: bool,
+) -> bool:
+    """Whether a rendered view may update 2DGS topology statistics.
+
+    A Chart view is deliberately oversampled early to provide its depth and
+    plane losses.  The stock 2DGS densifier, however, also consumes that
+    view's screen-space radii and position gradients.  Thus merely correcting
+    the RGB loss expectation does *not* stop a small Chart set from receiving
+    far more split/prune evidence than the remaining real cameras.
+
+    ``dense_only`` keeps the geometry loss on Chart iterations but routes
+    topology allocation through the uniform all-real dense camera stream.
+    It is intentionally a no-op for a Chart-only run: without a dense pool,
+    suppressing all topology statistics would make the control ill-defined.
+    ``legacy_current`` preserves historical behavior exactly.
+    """
+    if policy == "legacy_current":
+        return True
+    if policy == "dense_only":
+        return not (use_dense_supervision and is_geometry_view)
+    raise ValueError(
+        "densification view policy must be 'legacy_current' or 'dense_only', "
+        f"got {policy!r}"
+    )
+
+
+def opacity_reset_due(
+    iteration: int,
+    *,
+    opacity_reset_interval: int,
+    densify_from_iter: int,
+    densify_until_iter: int,
+    white_background: bool,
+    continue_after_densify: bool,
+) -> bool:
+    """Return whether an opacity reset is due under a declared schedule.
+
+    Stock 2DGS and the released ULF/STDLoc loops place this operation inside
+    the densification window.  Preserve that behavior by default.  A causal
+    control can opt into continuing resets after the window in order to hold
+    the reset timeline fixed while varying only topology allocation.
+    """
+    if iteration >= densify_until_iter and not continue_after_densify:
+        return False
+    return (
+        iteration % opacity_reset_interval == 0
+        or (white_background and iteration == densify_from_iter)
+    )
+
+
+def scale_chart_geometry_priors(
+    losses: tuple[torch.Tensor, ...], *, weight: float
+) -> tuple[torch.Tensor, ...]:
+    """Apply the one explicit weight shared by Chart-exclusive priors.
+
+    A Chart iteration contains the same RGB observation as a real dense
+    camera, but it additionally contributes aligned-depth, normal, curvature,
+    depth-order, and anisotropy priors.  A zero-weight ablation must remove
+    only those extra residuals while preserving the camera schedule, RGB
+    importance weighting, and topology updates.  Keeping this operation in a
+    small helper makes that causal contract testable.
+    """
+    if weight < 0.0:
+        raise ValueError("chart geometry prior weight must be non-negative")
+    return tuple(loss * float(weight) for loss in losses)
+
+
+def rgb_sampling_importance_weights(
+    *,
+    policy: str,
+    total_iterations: int,
+    dense_view_count: int,
+    chart_view_count: int,
+    use_dense_supervision: bool,
+    geometry_view_every_n_iter: int,
+    dense_only_from_iter: int,
+) -> tuple[float, float]:
+    """Return RGB importance weights for chart and non-chart real cameras.
+
+    The legacy refinement loop samples a Chart camera whenever it needs a
+    chart-depth prior, then samples a camera from the full dense set on all
+    other iterations.  Since the Chart cameras are also members of the dense
+    set, this makes their RGB observations much more frequent than every other
+    real training image.  That changes the RGB reconstruction objective even
+    when every train image is technically present.
+
+    ``all_train_importance`` retains the geometry schedule but weights RGB
+    observations by ``uniform_camera_probability / actual_sampling_probability``.
+    Its expectation is therefore the simple uniform all-train RGB objective
+    used by the standard ULF-Loc/2DGS controls.  Geometry priors are deliberately
+    not reweighted: their Chart concentration is the causal intervention.
+    """
+    if policy == "legacy_interleaved":
+        return 1.0, 1.0
+    if policy != "all_train_importance":
+        raise ValueError(
+            "rgb sampling policy must be 'legacy_interleaved' or "
+            f"'all_train_importance', got {policy!r}"
+        )
+    if not use_dense_supervision:
+        return 1.0, 1.0
+    if total_iterations <= 0:
+        raise ValueError("total_iterations must be positive")
+    if dense_view_count <= 0:
+        raise ValueError("dense_view_count must be positive with dense supervision")
+    if chart_view_count <= 0:
+        return 1.0, 1.0
+    if chart_view_count > dense_view_count:
+        raise ValueError("chart_view_count cannot exceed dense_view_count")
+
+    chart_iterations = sum(
+        geometry_iteration(
+            iteration,
+            use_dense_supervision=use_dense_supervision,
+            every_n=geometry_view_every_n_iter,
+            dense_only_from_iter=dense_only_from_iter,
+        )
+        for iteration in range(1, total_iterations + 1)
+    )
+    chart_fraction = chart_iterations / float(total_iterations)
+    dense_fraction = 1.0 - chart_fraction
+    if dense_fraction <= 0.0:
+        raise ValueError(
+            "all_train_importance requires at least one dense-camera iteration; "
+            "the current geometry schedule samples only Charts"
+        )
+
+    target_probability = 1.0 / float(dense_view_count)
+    chart_probability = (
+        chart_fraction / float(chart_view_count)
+        + dense_fraction / float(dense_view_count)
+    )
+    non_chart_probability = dense_fraction / float(dense_view_count)
+    return (
+        float(target_probability / chart_probability),
+        float(target_probability / non_chart_probability),
+    )
+
+
+def resolve_active_chart_indices(
+    chart_count: int,
+    *,
+    alignment_gate_valid: Optional[torch.Tensor] = None,
+    quality_selection_active: Optional[torch.Tensor] = None,
+) -> list[int]:
+    """Return Charts that remain eligible for geometric work.
+
+    The alignment gate and post-gate quality selector intentionally preserve
+    tensor/camera order so later tools can audit their provenance.  That does
+    *not* mean an excluded Chart is still a valid geometry-sampling target:
+    drawing it merely spends a geometry iteration on zeroed depth maps.  Keep
+    the immutable camera order, but make the sampling set the intersection of
+    every available hard eligibility flag.
+    """
+    if chart_count <= 0:
+        raise ValueError("chart_count must be positive")
+
+    active = torch.ones(chart_count, dtype=torch.bool)
+    for label, flag in (
+        ("alignment_gate_valid", alignment_gate_valid),
+        ("quality_selection_active", quality_selection_active),
+    ):
+        if flag is None:
+            continue
+        values = torch.as_tensor(flag).detach().reshape(-1).to(device="cpu")
+        if values.numel() != chart_count:
+            raise RuntimeError(
+                f"{label} has {values.numel()} entries, expected {chart_count} Charts"
+            )
+        if values.dtype == torch.bool:
+            valid = values
+        else:
+            valid = torch.isfinite(values) & (values > 0.5)
+        active &= valid.to(dtype=torch.bool)
+
+    indices = torch.nonzero(active, as_tuple=False).flatten().tolist()
+    if not indices:
+        raise RuntimeError("No active Charts remain after gate/quality filtering")
+    return [int(index) for index in indices]
+
+
+def geometry_chart_sampling_indices(
+    chart_count: int,
+    *,
+    active_chart_indices: Iterable[int],
+    policy: str,
+) -> list[int]:
+    """Choose input-chart slots eligible for the geometry scheduler.
+
+    ``legacy_all_input`` is retained only as a strict ablation.  It reproduces
+    the historical behavior that sampled every aligned camera, including
+    Charts whose geometry had already been zeroed.  ``active_only`` is the
+    correctness path: every scheduled real Chart has passed all hard filters.
+    """
+    if chart_count <= 0:
+        raise ValueError("chart_count must be positive")
+    active = sorted({int(index) for index in active_chart_indices})
+    if any(index < 0 or index >= chart_count for index in active):
+        raise RuntimeError("active_chart_indices contains an out-of-range Chart")
+    if not active:
+        raise RuntimeError("active_chart_indices must not be empty")
+    if policy == "legacy_all_input":
+        return list(range(chart_count))
+    if policy == "active_only":
+        return active
+    raise ValueError(
+        "chart geometry sampling policy must be 'legacy_all_input' or "
+        f"'active_only', got {policy!r}"
+    )
+
+
+def validate_chart_camera_order(
+    chart_scene_path: str | Path,
+    chart_camera_names: Iterable[str],
+    *,
+    chart_tensor_count: int,
+) -> list[str]:
+    """Verify that saved chart tensors and 2DGS cameras have identical order.
+
+    MASt3R alignment serializes per-chart depth/point tensors in the order of
+    ``cameras.json``.  The 2DGS COLMAP reader independently sorts cameras by
+    filename.  Those orders happen to agree for the current automatic
+    Cambridge selector, but treating that coincidence as an interface is
+    unsafe: a manually ordered Chart set would silently attach each depth
+    prior to a different image.  Fail before initialization rather than
+    optimizing corrupted geometry.
+    """
+    scene_path = Path(chart_scene_path)
+    cameras_path = scene_path / "cameras.json"
+    if not cameras_path.is_file():
+        raise FileNotFoundError(
+            "Chart geometry requires the MASt3R camera-order manifest: "
+            f"{cameras_path}"
+        )
+    try:
+        payload = json.loads(cameras_path.read_text(encoding="utf-8"))
+        filepaths = payload["filepaths"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Could not read MASt3R chart camera order from {cameras_path}"
+        ) from error
+    if not isinstance(filepaths, list):
+        raise RuntimeError(
+            f"MASt3R camera manifest has non-list filepaths: {cameras_path}"
+        )
+
+    expected = [Path(str(name)).stem for name in filepaths]
+    actual = [Path(str(name)).stem for name in chart_camera_names]
+    if len(expected) != chart_tensor_count:
+        raise RuntimeError(
+            "Chart tensor count does not match MASt3R camera manifest: "
+            f"tensors={chart_tensor_count}, cameras={len(expected)}"
+        )
+    if len(actual) != chart_tensor_count:
+        raise RuntimeError(
+            "2DGS chart camera count does not match aligned chart tensors: "
+            f"cameras={len(actual)}, tensors={chart_tensor_count}"
+        )
+    if expected != actual:
+        mismatch = next(
+            index
+            for index, (saved_name, loaded_name) in enumerate(zip(expected, actual))
+            if saved_name != loaded_name
+        )
+        raise RuntimeError(
+            "Chart tensor/camera order mismatch at index "
+            f"{mismatch}: MASt3R saved {expected[mismatch]!r}, but 2DGS loaded "
+            f"{actual[mismatch]!r}. Reorder the Chart scene or regenerate it with "
+            "a canonical filename order."
+        )
+    return expected
+
+
+def preliminary_uses_dense_supervision(
+    *,
+    dense_supervision: bool,
+    dense_final_only: bool,
+) -> bool:
+    """Whether the initial 7k refinement may sample all real dense cameras.
+
+    This is deliberately separate from ``geometry_iteration``: before a
+    dense dataset is passed to the refinement process there is no dense camera
+    pool at all.  Keeping the decision here prevents a screen-only control
+    from silently re-enabling dense RGB through a later command wrapper.
+    """
+    return bool(dense_supervision and not dense_final_only)
 
 
 def rgb_supervision_weight(

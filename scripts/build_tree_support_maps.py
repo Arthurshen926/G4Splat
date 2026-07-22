@@ -138,9 +138,14 @@ def main() -> None:
         output_path = args.output / f"{Path(source_image.name).stem}.npy"
         np.save(output_path, support.astype(np.float16))
         tree_pixels = int(tree_masks[source_index].sum())
+        source_tree_depth_valid_pixels = int(source_valid.sum())
         output_records.append({
             "image_name": source_image.name,
             "tree_fraction": float(tree_masks[source_index].mean()),
+            "source_tree_depth_valid_pixels": source_tree_depth_valid_pixels,
+            "source_tree_depth_valid_fraction": float(
+                source_tree_depth_valid_pixels / max(tree_pixels, 1)
+            ),
             "canonical_fraction_of_tree": float((support > 0).sum() / max(tree_pixels, 1)),
             "mean_support_on_tree": float(support[tree_masks[source_index]].mean()) if tree_pixels else 0.0,
             "neighbors": [images[int(index)].name for index in neighbor_indices],
@@ -151,12 +156,22 @@ def main() -> None:
         "neighbors": args.neighbors,
         "min_support_views": args.min_support_views,
         "relative_depth_threshold": args.relative_depth_threshold,
+        "mean_source_tree_depth_valid_fraction": float(np.mean([
+            row["source_tree_depth_valid_fraction"] for row in output_records
+        ])),
+        "zero_source_tree_depth_views": [
+            row["image_name"] for row in output_records
+            if row["source_tree_depth_valid_pixels"] == 0
+        ],
         "records": output_records,
     }
     (args.output / "tree_support_report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({
         "views": len(output_records),
         "mean_tree_fraction": float(np.mean([row["tree_fraction"] for row in output_records])),
+        "mean_source_tree_depth_valid_fraction": report[
+            "mean_source_tree_depth_valid_fraction"
+        ],
         "mean_canonical_fraction_of_tree": float(np.mean([row["canonical_fraction_of_tree"] for row in output_records])),
         "output": str(args.output),
     }, indent=2))

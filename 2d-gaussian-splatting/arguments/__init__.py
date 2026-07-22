@@ -10,6 +10,7 @@
 #
 
 from argparse import ArgumentParser, Namespace
+from pathlib import Path, PosixPath, WindowsPath
 import sys
 import os
 
@@ -110,7 +111,22 @@ def get_combined_args(parser : ArgumentParser):
     except TypeError:
         print("Config file not found at")
         pass
-    args_cfgfile = eval(cfgfile_string)
+    # ``cfg_args`` predates a structured serialization format and is stored as
+    # an ``argparse.Namespace`` expression.  Some modern runners add a
+    # ``pathlib.Path`` argument (for example a diagnostic target list), which
+    # serializes as ``PosixPath(...)``.  Keep legacy checkpoints renderable by
+    # accepting the pathlib constructors explicitly instead of failing before
+    # a model is even loaded.
+    args_cfgfile = eval(
+        cfgfile_string,
+        {
+            "__builtins__": {},
+            "Namespace": Namespace,
+            "Path": Path,
+            "PosixPath": PosixPath,
+            "WindowsPath": WindowsPath,
+        },
+    )
 
     merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():

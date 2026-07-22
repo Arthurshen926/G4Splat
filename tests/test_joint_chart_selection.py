@@ -50,6 +50,55 @@ def test_joint_selection_blocks_all_feedback_and_does_not_pin_accepted(tmp_path:
     assert result["alignment_feedback_history"][-1]["mode"] == "joint_full_set_reselection"
 
 
+def test_joint_reselection_carries_the_same_sequence_support_contract(tmp_path: Path):
+    scene = tmp_path / "scene"
+    (scene / "images").mkdir(parents=True)
+    sparse = scene / "sparse" / "0"
+    sparse.mkdir(parents=True)
+    names = [
+        *[f"seq1__frame{i:05d}.png" for i in range(4)],
+        *[f"seq2__frame{i:05d}.png" for i in range(4)],
+    ]
+    for name in names:
+        (scene / "images" / name).touch()
+    lines = ["# Image list"]
+    for index, name in enumerate(names, start=1):
+        lines.extend([f"{index} 1 0 0 0 {-float(index)} 0 0 1 {name}", ""])
+    (sparse / "images.txt").write_text("\n".join(lines))
+    selection = {
+        "scene_path": str(scene),
+        "n_images": 4,
+        "image_names": names[:4],
+        "candidate_pool_names": names,
+        "candidate_reliability": {
+            "weight": 0.03,
+            "scores": {name: 0.5 for name in names},
+            "selected_scores": {name: 0.5 for name in names[:4]},
+        },
+        "coverage": {
+            "view_clusters": 1,
+            "min_views_per_cluster": 1,
+            "min_baseline_ratio": 0.01,
+            "min_global_pose_distance": 0.0,
+            "max_borrowed_support_distance": 1.0,
+            "candidate_reliability_weight": 0.03,
+            "sequence_coverage_mode": "strict",
+            "min_views_per_sequence": 2,
+            "post_gate_min_views_per_sequence": 1,
+            "sequence_gate_failure_budget": 1,
+        },
+    }
+    reports = [{"records": [{"image_name": names[0], "rejected": True}]}]
+
+    result = build_joint_selection(selection, reports, scene, n_images=4)
+
+    assert names[0] not in result["image_names"]
+    sequence_records = result["coverage"]["sequences"]
+    assert {record["sequence"] for record in sequence_records} == {"seq1", "seq2"}
+    assert all(record["selected_count"] >= 2 for record in sequence_records)
+    assert all(record["baseline_satisfied"] for record in sequence_records)
+
+
 def test_joint_selection_preserves_exact_reference_before_cross_sequence_pose_match(tmp_path: Path):
     scene = tmp_path / "scene"
     (scene / "images").mkdir(parents=True)

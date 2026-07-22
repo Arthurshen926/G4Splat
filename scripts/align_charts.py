@@ -3,6 +3,9 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import random
+
+import numpy as np
 import torch
 import yaml
 
@@ -37,14 +40,28 @@ if __name__ == '__main__':
     parser.add_argument("--cambridge_mask_pickle", type=str, default=None)
     parser.add_argument("--cambridge_mask_dataset_path", type=str, default=None)
     parser.add_argument("--cambridge_mask_indices", nargs="*", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for Chart encodings and deformation initialization.",
+    )
     
     args = parser.parse_args()
     
     # Set console
     CONSOLE = Console(width=120)
     
-    # Set device
+    # Set device and pin the random initialization used by Chart encodings and
+    # deformation layers.  This is required for a camera-front-end ablation to
+    # be a true single-variable comparison.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
+    CONSOLE.print(f"[INFO] Chart-alignment seed: {args.seed}")
     
     # Set output path
     if args.output_path is None:
@@ -143,6 +160,11 @@ if __name__ == '__main__':
         scene_pm,
         # Data parameters
         reference_data,
+        # Persist the MASt3R target used by the alignment loss.  The downstream
+        # gate must judge whether a deformation agrees with this target, rather
+        # than treating every useful correction away from the DAV2 prior as a
+        # failure.
+        reference_depths_for_audit=reference_data,
         masks=alignment_masks,
         rendering_size=pm_config['max_img_size'],
         target_scale=scene_config['target_scale'],

@@ -439,10 +439,13 @@ class JointSelector:
         pair_scores: np.ndarray,
         reference_matrix: Optional[np.ndarray] = None,
         reference_names: Optional[list[str]] = None,
+        sequence_matrix: Optional[np.ndarray] = None,
+        sequence_names: Optional[list[str]] = None,
         *,
         min_support: int,
         min_baseline: float,
         min_reference_support: int = 1,
+        min_sequence_support: int = 0,
     ) -> None:
         self.reliabilities = reliabilities
         self.cells = cells
@@ -459,11 +462,26 @@ class JointSelector:
         self.reference_names = list(reference_names or [])
         if self.reference_matrix.shape != (len(self.reference_names), len(reliabilities)):
             raise ValueError("reference matrix must have shape [n_references, n_charts]")
+        self.sequence_matrix = (
+            sequence_matrix
+            if sequence_matrix is not None
+            else np.zeros((0, len(reliabilities)), dtype=bool)
+        )
+        self.sequence_names = list(sequence_names or [])
+        if self.sequence_matrix.shape != (len(self.sequence_names), len(reliabilities)):
+            raise ValueError("sequence matrix must have shape [n_sequences, n_charts]")
         self.min_support = int(min_support)
         self.min_baseline = float(min_baseline)
         if min_reference_support < 1:
             raise ValueError("min_reference_support must be positive")
         self.min_reference_support = int(min_reference_support)
+        if min_sequence_support < 0:
+            raise ValueError("min_sequence_support must be non-negative")
+        self.min_sequence_support = int(min_sequence_support)
+        if self.min_sequence_support > 0 and not self.sequence_names:
+            raise ValueError(
+                "min_sequence_support requires one or more same-sequence support groups"
+            )
         # A retained MAtCha camera is an anchor, not merely a point that needs
         # one nearby replacement.  Ask for redundant hard-gated support where
         # the source actually offers it, but never make a sparse trajectory
@@ -478,25 +496,55 @@ class JointSelector:
             float(np.quantile(target_distances, 0.90)), 1e-6
         )
 
-    def constraints(self, selected: Iterable[int]) -> tuple[bool, dict[str, list[dict[str, Any]]]]:
-        chosen = list(selected)
+    def _baseline_satisfied(self, support_indices: list[int]) -> bool:
+        return any(
+            float(np.linalg.norm(self.centers[first] - self.centers[second]))
+            >= self.min_baseline
+            for offset, first in enumerate(support_indices)
+            for second in support_indices[offset + 1 :]
+        )
+
+    def _support_diagnostics(
+        self,
+        selected: list[int],
+        matrix: np.ndarray,
+        labels: list[Any],
+        *,
+        label_key: str,
+        required_support: int,
+    ) -> list[dict[str, Any]]:
         diagnostics = []
-        for cluster, support in enumerate(self.support_matrix):
-            support_indices = [index for index in chosen if support[index]]
-            baseline = any(
-                float(np.linalg.norm(self.centers[first] - self.centers[second]))
-                >= self.min_baseline
-                for offset, first in enumerate(support_indices)
-                for second in support_indices[offset + 1 :]
-            )
+        for group, support in enumerate(matrix):
+            support_indices = [index for index in selected if support[index]]
+            baseline = self._baseline_satisfied(support_indices)
             diagnostics.append(
                 {
-                    "cluster": cluster,
+                    label_key: labels[group],
+                    "required_support_count": required_support,
                     "support_count": len(support_indices),
                     "support_indices": support_indices,
                     "baseline_satisfied": baseline,
+                    "passed": len(support_indices) >= required_support and baseline,
                 }
             )
+        return diagnostics
+
+    def constraints(self, selected: Iterable[int]) -> tuple[bool, dict[str, list[dict[str, Any]]]]:
+        chosen = list(selected)
+        diagnostics = self._support_diagnostics(
+            chosen,
+            self.support_matrix,
+            list(range(len(self.support_matrix))),
+            label_key="cluster",
+            required_support=self.min_support,
+        )
+        sequence_diagnostics = self._support_diagnostics(
+            chosen,
+            self.sequence_matrix,
+            self.sequence_names,
+            label_key="sequence",
+            required_support=self.min_sequence_support,
+        )
         reference_diagnostics = []
         for reference_index, support in enumerate(self.reference_matrix):
             support_indices = [index for index in chosen if support[index]]
@@ -512,11 +560,16 @@ class JointSelector:
                     "passed": len(support_indices) >= required_count,
                 }
             )
-        passed = all(
-            value["support_count"] >= self.min_support and value["baseline_satisfied"]
-            for value in diagnostics
-        ) and all(value["passed"] for value in reference_diagnostics)
-        return passed, {"clusters": diagnostics, "references": reference_diagnostics}
+        passed = (
+            all(value["passed"] for value in diagnostics)
+            and all(value["passed"] for value in sequence_diagnostics)
+            and all(value["passed"] for value in reference_diagnostics)
+        )
+        return passed, {
+            "clusters": diagnostics,
+            "sequences": sequence_diagnostics,
+            "references": reference_diagnostics,
+        }
 
     def objective(self, selected: Iterable[int]) -> dict[str, float]:
         chosen = list(selected)
@@ -578,25 +631,24 @@ class JointSelector:
 
     def _constraint_bonus(self, selected: list[int], candidate: int) -> float:
         bonus = 0.0
-        for support in self.support_matrix:
-            if not support[candidate]:
-                continue
-            current = [index for index in selected if support[index]]
-            if len(current) < self.min_support:
-                bonus += 2.0
-            has_baseline = any(
-                float(np.linalg.norm(self.centers[first] - self.centers[second]))
-                >= self.min_baseline
-                for offset, first in enumerate(current)
-                for second in current[offset + 1 :]
-            )
-            adds_baseline = any(
-                float(np.linalg.norm(self.centers[candidate] - self.centers[other]))
-                >= self.min_baseline
-                for other in current
-            )
-            if current and not has_baseline and adds_baseline:
-                bonus += 1.0
+        support_groups = [(self.support_matrix, self.min_support)]
+        if self.min_sequence_support > 0:
+            support_groups.append((self.sequence_matrix, self.min_sequence_support))
+        for matrix, required_support in support_groups:
+            for support in matrix:
+                if not support[candidate]:
+                    continue
+                current = [index for index in selected if support[index]]
+                if len(current) < required_support:
+                    bonus += 2.0
+                has_baseline = self._baseline_satisfied(current)
+                adds_baseline = any(
+                    float(np.linalg.norm(self.centers[candidate] - self.centers[other]))
+                    >= self.min_baseline
+                    for other in current
+                )
+                if current and not has_baseline and adds_baseline:
+                    bonus += 1.0
         for reference_index, support in enumerate(self.reference_matrix):
             current_count = sum(bool(support[index]) for index in selected)
             if (
@@ -606,20 +658,108 @@ class JointSelector:
                 bonus += 2.0
         return bonus
 
+    def _seed_pose_constraints(self, count: int) -> list[int]:
+        """Construct a feasible pose/trajectory seed before optimizing quality.
+
+        The old all-in-one greedy loop could spend its fixed budget on very
+        high-quality charts that each helped an under-supported pose cell, but
+        never formed the *baseline-separated pair* required by that cell.  It
+        then reported an infeasible 24-chart request even when the active
+        hard-gated pool contained a valid pair for every cell.  Seed one
+        admissible pair per cell first; pairs are deliberately scored for
+        cross-cell reuse, so this preserves room for the later quality/3-D
+        coverage objective rather than relaxing any constraint.
+        """
+        selected: list[int] = []
+        support_groups: list[tuple[np.ndarray, list[Any], int, str]] = [
+            (
+                self.support_matrix,
+                list(range(len(self.support_matrix))),
+                self.min_support,
+                "pose cluster",
+            )
+        ]
+        if self.min_sequence_support > 0:
+            support_groups.append(
+                (
+                    self.sequence_matrix,
+                    self.sequence_names,
+                    self.min_sequence_support,
+                    "same-sequence trajectory",
+                )
+            )
+        for matrix, labels, required_support, group_label in support_groups:
+            for group, support in enumerate(matrix):
+                candidates = np.flatnonzero(support).astype(np.int64).tolist()
+                label = labels[group]
+                pairs = [
+                    (first, second)
+                    for offset, first in enumerate(candidates)
+                    for second in candidates[offset + 1 :]
+                    if float(np.linalg.norm(self.centers[first] - self.centers[second]))
+                    >= self.min_baseline
+                ]
+                if not pairs:
+                    raise RuntimeError(
+                        "Hard-gated Chart pool has no baseline-separated support pair "
+                        f"for {group_label} {label}; do not relax the gate, replace its candidates."
+                    )
+
+                def pair_key(pair: tuple[int, int]) -> tuple[float, float, float, int, int]:
+                    first, second = pair
+                    added = int(first not in selected) + int(second not in selected)
+                    # A pair that covers more pose cells can satisfy future
+                    # constraints too. Prefer reuse before raw quality so this is
+                    # a feasibility seed, not a hidden quality objective.
+                    shared_cells = float(
+                        (self.support_matrix[:, first] & self.support_matrix[:, second]).sum()
+                    )
+                    if self.min_sequence_support > 0:
+                        shared_cells += float(
+                            (self.sequence_matrix[:, first] & self.sequence_matrix[:, second]).sum()
+                        )
+                    quality = float(self.reliabilities[first] + self.reliabilities[second])
+                    return (-float(added), shared_cells, quality, -first, -second)
+
+                first, second = max(pairs, key=pair_key)
+                for index in (first, second):
+                    if index not in selected:
+                        selected.append(index)
+
+                # The current Cambridge policy asks for two support views. Keep
+                # this general for future configurations that request more.
+                while sum(bool(support[index]) for index in selected) < required_support:
+                    remaining = [index for index in candidates if index not in selected]
+                    if not remaining:
+                        raise RuntimeError(
+                            f"Hard-gated Chart pool has fewer than {required_support} "
+                            f"support views for {group_label} {label}."
+                        )
+                    selected.append(
+                        max(remaining, key=lambda index: (self.reliabilities[index], -index))
+                    )
+
+                if len(selected) > count:
+                    raise RuntimeError(
+                        "Pose/trajectory-support seed needs "
+                        f"{len(selected)} Charts, exceeding requested count {count}."
+                    )
+        return sorted(selected)
+
     def select(self, count: int, local_swap_rounds: int = 4) -> tuple[list[int], dict[str, Any]]:
         if count > len(self.reliabilities):
             raise ValueError(f"Requested {count} charts but only {len(self.reliabilities)} passed the hard gate")
-        selected: list[int] = []
+        selected = self._seed_pose_constraints(count)
         # First satisfy the exact constraints audited downstream.  A view can
-        # support multiple pose cells, so this needs fewer than 2*clusters in
-        # practice and leaves room for quality/coverage choices.
+        # support multiple pose cells, so the feasibility seed leaves room for
+        # reference-anchor constraints and the quality/coverage objective.
         while True:
             valid, _ = self.constraints(selected)
             if valid:
                 break
             if len(selected) >= count:
                 raise RuntimeError(
-                    f"Could not satisfy pose support/baseline constraints within {count} charts"
+                    f"Could not satisfy pose/trajectory support/baseline constraints within {count} charts"
                 )
             candidates = [index for index in range(len(self.reliabilities)) if index not in selected]
             scores = self._candidate_scores(selected, candidates)
@@ -867,6 +1007,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-dataset-path", type=Path)
     parser.add_argument("--mask-indices", nargs="*", type=int, default=[0, 1, 2])
     parser.add_argument("--counts", nargs="*", type=int, default=[24, 28, 32])
+    parser.add_argument(
+        "--min-pose-support",
+        type=int,
+        default=None,
+        help=(
+            "Override the original candidate-set support requirement for the "
+            "post-gate joint selection.  This must be explicit when the broad "
+            "candidate set carries additional gate-reserve views."
+        ),
+    )
+    parser.add_argument(
+        "--min-sequence-support",
+        type=int,
+        default=None,
+        help=(
+            "Require this many baseline-separated Charts for every applicable "
+            "trajectory sequence after the hard gate. Defaults to the source "
+            "selection's post-gate same-sequence requirement. Set 0 only for "
+            "an explicit legacy/soft-coverage ablation."
+        ),
+    )
     parser.add_argument("--neighbors", type=int, default=6)
     parser.add_argument(
         "--neighbor-selection",
@@ -902,6 +1063,10 @@ def main() -> None:
         raise ValueError("coverage voxel bins must be at least 2")
     if args.min_reference_support < 1:
         raise ValueError("--min-reference-support must be positive")
+    if args.min_pose_support is not None and args.min_pose_support < 1:
+        raise ValueError("--min-pose-support must be positive")
+    if args.min_sequence_support is not None and args.min_sequence_support < 0:
+        raise ValueError("--min-sequence-support must be non-negative")
     requested_counts = sorted(set(int(value) for value in args.counts))
     if not requested_counts or min(requested_counts) <= 0:
         raise ValueError("--counts must contain one or more positive integers")
@@ -1099,8 +1264,68 @@ def main() -> None:
 
     coverage_config = base_selection.get("coverage", {})
     n_clusters = int(coverage_config.get("view_clusters", 8))
-    min_support = int(coverage_config.get("min_views_per_cluster", 2))
+    min_support = int(
+        args.min_pose_support
+        if args.min_pose_support is not None
+        else coverage_config.get("min_views_per_cluster", 2)
+    )
+    min_support_source = (
+        "explicit_post_gate_override"
+        if args.min_pose_support is not None
+        else "base_candidate_selection_coverage"
+    )
     min_baseline = float(coverage_config.get("min_baseline_ratio", 0.02))
+    sequence_coverage_mode = str(coverage_config.get("sequence_coverage_mode", "off"))
+    if args.min_sequence_support is not None:
+        min_sequence_support = int(args.min_sequence_support)
+        min_sequence_support_source = "explicit_post_gate_override"
+    elif sequence_coverage_mode == "off":
+        min_sequence_support = 0
+        min_sequence_support_source = "base_selection_disabled"
+    else:
+        min_sequence_support = int(
+            coverage_config.get("post_gate_min_views_per_sequence", 0)
+        )
+        min_sequence_support_source = "base_candidate_selection_coverage"
+    sequence_names: list[str] = []
+    sequence_rows: list[np.ndarray] = []
+    if min_sequence_support > 0:
+        base_sequence_records = coverage_config.get("sequences")
+        if not isinstance(base_sequence_records, list) or not base_sequence_records:
+            raise RuntimeError(
+                "The source Chart selection requires same-sequence post-gate support "
+                "but has no sequence coverage audit. Re-select the broad Chart set; "
+                "do not silently drop the trajectory constraint."
+            )
+        for record in base_sequence_records:
+            if not isinstance(record, dict) or record.get("applicable", True) is False:
+                continue
+            sequence = record.get("sequence")
+            if not isinstance(sequence, str) or not sequence:
+                raise RuntimeError("Source sequence coverage audit contains an invalid sequence name")
+            if sequence in sequence_names:
+                raise RuntimeError(f"Source sequence coverage audit duplicates {sequence}")
+            support = np.asarray(
+                [name.split("__", 1)[0] == sequence for name in names], dtype=bool
+            )
+            if int(support.sum()) < min_sequence_support:
+                raise RuntimeError(
+                    "Hard-gated Chart pool cannot preserve the source same-sequence "
+                    f"requirement for {sequence}: active={int(support.sum())}, "
+                    f"required={min_sequence_support}. Do not relax the quality selector; "
+                    "replace/re-align its broad Chart candidates."
+                )
+            sequence_names.append(sequence)
+            sequence_rows.append(support)
+        if not sequence_rows:
+            raise RuntimeError(
+                "The source Chart selection has no applicable same-sequence support groups"
+            )
+    sequence_matrix = (
+        np.stack(sequence_rows)
+        if sequence_rows
+        else np.zeros((0, len(names)), dtype=bool)
+    )
     max_borrowed = float(coverage_config.get("max_borrowed_support_distance", 0.32))
     anchors = _farthest_point_indices(all_features, n_clusters)
     anchor_features = all_features[np.asarray(anchors)]
@@ -1130,16 +1355,19 @@ def main() -> None:
         pair_matrix,
         reference_matrix=reference_matrix,
         reference_names=reference_names,
+        sequence_matrix=sequence_matrix,
+        sequence_names=sequence_names,
         min_support=min_support,
         min_baseline=min_baseline,
         min_reference_support=args.min_reference_support,
+        min_sequence_support=min_sequence_support,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     quality_path = args.output_dir / "chart_quality_scores.json"
     quality_payload = {
-        "version": 2,
-        "method": "hard_gate_then_quality_crossview_normal_3d_coverage",
+        "version": 3,
+        "method": "hard_gate_then_quality_crossview_normal_3d_coverage_sequence_support",
         "scene_path": str(target_scene_path),
         "chart_source_scene_path": str(scene_path),
         "hard_gate_report": str(args.gate_report.resolve()),
@@ -1152,6 +1380,12 @@ def main() -> None:
         "min_reference_support_requested": args.min_reference_support,
         "reference_count": len(reference_names),
         "active_chart_count": len(names),
+        "min_pose_support": min_support,
+        "min_pose_support_source": min_support_source,
+        "sequence_coverage_mode": sequence_coverage_mode,
+        "min_sequence_support": min_sequence_support,
+        "min_sequence_support_source": min_sequence_support_source,
+        "applicable_sequences": sequence_names,
         "pair_count": len(pair_summary),
         "pair_stride": args.pair_stride,
         "neighbor_selection": args.neighbor_selection,
@@ -1203,7 +1437,7 @@ def main() -> None:
             "audit_active_from_selection": True,
             "quality_score_path": str(quality_path),
             "quality_aware_selection": {
-                "version": 2,
+                "version": 3,
                 "joint_objective": "0.35 quality + 0.35 weighted_3d_coverage + 0.20 pose_coverage + 0.10 crossview_pair",
                 "hard_gate_active_count": len(names),
                 "selected_chart_indices": selected_scene_indices,
@@ -1216,6 +1450,10 @@ def main() -> None:
                 "constraints": {
                     "view_clusters": n_clusters,
                     "min_views_per_cluster": min_support,
+                    "min_views_per_cluster_source": min_support_source,
+                    "min_views_per_sequence": min_sequence_support,
+                    "min_views_per_sequence_source": min_sequence_support_source,
+                    "sequence_coverage_mode": sequence_coverage_mode,
                     "min_baseline_ratio": min_baseline,
                     "max_borrowed_support_distance": max_borrowed,
                     "min_reference_support_requested": args.min_reference_support,

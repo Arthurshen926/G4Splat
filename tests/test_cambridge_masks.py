@@ -47,6 +47,24 @@ def test_mask_lookup_caches_combined_resized_cpu_mask(tmp_path):
     assert len(lookup._resized_mask_cache) == 1
 
 
+def test_mask_lookup_supports_external_adapter_staged_keyed_pickle(tmp_path):
+    """The clean external adapter intentionally rekeys masks to COLMAP names."""
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "name_mapping.json").write_text(
+        json.dumps({"seq1__frame00001.png": "seq1/frame00001.png"})
+    )
+    masks = tuple(torch.ones((2, 2), dtype=torch.bool) for _ in range(3))
+    mask_pickle = tmp_path / "masks.pkl"
+    with mask_pickle.open("wb") as handle:
+        pickle.dump({"seq1__frame00001.png": masks}, handle)
+
+    lookup = CambridgeMaskLookup(dataset, mask_pickle, mask_indices=[0, 1, 2])
+
+    assert lookup.source_name_for("seq1__frame00001") == "seq1__frame00001.png"
+    assert lookup.get_mask("seq1__frame00001", (2, 2), torch.device("cpu")).all()
+
+
 def test_mask_lookup_decodes_staged_name_missing_from_subset_mapping(tmp_path):
     dataset = tmp_path / "dataset"
     dataset.mkdir()
@@ -120,3 +138,51 @@ def test_tree_weights_preserve_building_and_soft_weight_tree(tmp_path):
     assert torch.isclose(rgb[1, 1], torch.tensor(0.75))
     assert torch.isclose(geometry[1, 1], torch.tensor(0.30))
     assert planar[1, 1] == 0.0
+
+    audit = weights.support_coverage_audit(["seq1__frame00001.png"])
+    assert audit["nonzero_map_count"] == 1
+    assert audit["zero_support_map_count"] == 0
+    assert audit["nonzero_map_coverage_fraction"] == 1.0
+    assert audit["mean_support_value_across_present_maps"] == 1.0
+    assert audit["max_support_value_across_present_maps"] == 1.0
+    assert audit["explicit_map_behavior"] == "all_explicit_maps_have_nonzero_support"
+
+
+def test_tree_support_coverage_distinguishes_missing_evidence_from_zero_support(tmp_path):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "name_mapping.json").write_text(json.dumps({
+        "seq1__frame00001.png": "seq1/frame00001.png",
+        "seq1__frame00002.png": "seq1/frame00002.png",
+    }))
+    masks = tuple(torch.ones((2, 2), dtype=torch.bool) for _ in range(4))
+    mask_pickle = tmp_path / "masks.pkl"
+    with mask_pickle.open("wb") as handle:
+        pickle.dump({
+            "seq1/frame00001.png": masks,
+            "seq1/frame00002.png": masks,
+        }, handle)
+    support_dir = tmp_path / "support"
+    support_dir.mkdir()
+    import numpy as np
+    np.save(support_dir / "seq1__frame00001.npy", np.zeros((2, 2), dtype=np.float32))
+
+    weights = CambridgeTreeWeightLookup(
+        CambridgeMaskLookup(dataset, mask_pickle, mask_indices=[0, 1, 2]),
+        support_dir=support_dir,
+    )
+    audit = weights.support_coverage_audit([
+        "seq1__frame00001.png", "seq1__frame00002.png"
+    ])
+
+    assert audit["present_map_count"] == 1
+    assert audit["missing_map_count"] == 1
+    assert audit["map_coverage_fraction"] == 0.5
+    assert audit["nonzero_map_count"] == 0
+    assert audit["zero_support_map_count"] == 1
+    assert audit["nonzero_map_coverage_fraction"] == 0.0
+    assert audit["mean_support_value_across_present_maps"] == 0.0
+    assert audit["max_support_value_across_present_maps"] == 0.0
+    assert audit["explicit_map_behavior"] == "all_explicit_maps_zero_support_tree_floor"
+    assert audit["missing_view_examples"] == ["seq1__frame00002.png"]
+    assert audit["missing_map_behavior"] == "zero_support_tree_floor_not_canonical_evidence"

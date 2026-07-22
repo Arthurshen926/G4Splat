@@ -24,14 +24,23 @@ def load_charts_data(path: str, device:str='cuda'):
     if not path.endswith('.npz'):
         path = path + '.npz'
         
-    data = np.load(path)
-    
-    # Convert all arrays to torch tensors
+    # Chart archives now include provenance such as
+    # ``alignment_rejection_basis``.  Geometry tensors belong on the selected
+    # torch device; string metadata must remain a NumPy value rather than
+    # being passed through ``torch.from_numpy`` (which rejects ``numpy.str_``).
+    # Keeping metadata in the returned dictionary also makes a strict
+    # MASt3R-reference archive self-describing downstream.
     output = {}
-    for key in data.files:
-        if data[key] is not None:
-            output[key] = torch.from_numpy(data[key]).to(device)
-            
+    with np.load(path) as data:
+        for key in data.files:
+            value = data[key]
+            if value is None:
+                continue
+            if value.dtype.kind in "biufc":
+                output[key] = torch.from_numpy(value).to(device)
+            else:
+                output[key] = value.copy()
+
     return output
 
 

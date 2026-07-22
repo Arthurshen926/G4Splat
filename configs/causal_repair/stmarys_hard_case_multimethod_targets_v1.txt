@@ -1,0 +1,6 @@
+# Real St Mary's Church training views for cross-method hard-case diagnosis.
+# These remain part of the 1,487-view reconstruction input and are not held out.
+seq4/frame00249.png
+seq4/frame00250.png
+seq14/frame00032.png
+seq12/frame00097.png

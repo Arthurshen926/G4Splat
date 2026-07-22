@@ -8,6 +8,8 @@ import shutil
 import shlex
 import numpy as np
 
+from matcha.cambridge_training import preliminary_uses_dense_supervision
+
 
 def prefer_conda_runtime_libraries():
     """Let compiled CUDA extensions use the C++ runtime they were built against."""
@@ -70,9 +72,40 @@ if __name__ == '__main__':
     
     # SfM config
     parser.add_argument('--sfm_config', type=str, default='unposed', help='Config for SfM. Should be "unposed" or "posed".')
+    parser.add_argument(
+        '--strict_calibrated_poses',
+        action='store_true',
+        help=(
+            'Keep calibrated camera translation and scale fixed during MASt3R '
+            'global alignment instead of using the legacy post-alignment restore mode.'
+        ),
+    )
+    parser.add_argument(
+        '--per_view_calibrated_intrinsics',
+        action='store_true',
+        help=(
+            'Keep calibrated focal/principal-point values per Chart camera during '
+            'MASt3R alignment rather than using the historical shared intrinsics.'
+        ),
+    )
+    parser.add_argument(
+        '--mast3r-sparse-export-stride',
+        type=int,
+        default=1,
+        help=(
+            'Regular pixel stride for MASt3R diagnostic sparse export only; '
+            'full pointmaps used by Chart alignment are never downsampled.'
+        ),
+    )
     
     # Chart alignment config
     parser.add_argument('--alignment_config', type=str, default='default', help='Config for charts alignment')
+    parser.add_argument(
+        '--chart-alignment-seed',
+        type=int,
+        default=0,
+        help='Fixed seed for Chart alignment; use the same value for paired front-end ablations.',
+    )
     parser.add_argument('--depth_model', type=str, default="depthanythingv2")
     parser.add_argument('--depthanythingv2_checkpoint_dir', type=str, default='./Depth-Anything-V2/checkpoints/')
     parser.add_argument('--depthanything_encoder', type=str, default='vitl')
@@ -133,6 +166,43 @@ if __name__ == '__main__':
     parser.add_argument('--tree_sky_feather', type=int, default=4)
     parser.add_argument('--tree_boundary_feather', type=int, default=6)
     parser.add_argument('--rgb_loss_type', choices=['l1', 'charbonnier'], default='l1')
+    parser.add_argument(
+        '--rgb-supervision-profile',
+        choices=['g4_tree_masked', 'full_rgb', 'ulfloc_legacy'],
+        default='g4_tree_masked',
+        help=(
+            'RGB pixel protocol. full_rgb changes only RGB supervision to all '
+            'pixels; ulfloc_legacy changes only RGB supervision to the standard '
+            'ULF-Loc object/distortion/sky ordering.'
+        ),
+    )
+    parser.add_argument(
+        '--rgb-sampling-policy',
+        choices=['legacy_interleaved', 'all_train_importance'],
+        default='all_train_importance',
+        help=(
+            'Keep legacy Chart RGB oversampling or importance-correct RGB loss '
+            'to the uniform all-real-train camera objective.'
+        ),
+    )
+    parser.add_argument(
+        '--chart-geometry-sampling-policy',
+        choices=['legacy_all_input', 'active_only'],
+        default='active_only',
+        help=(
+            'Sample every aligned Chart only for a legacy ablation, or restrict '
+            'geometry iterations to gate/quality-active Charts.'
+        ),
+    )
+    parser.add_argument(
+        '--densification-view-policy',
+        choices=['legacy_current', 'dense_only'],
+        default='legacy_current',
+        help=(
+            'Whether Chart geometry renders also update 2DGS split/prune statistics, '
+            'or whether topology allocation is restricted to all-real dense views.'
+        ),
+    )
     parser.add_argument('--use_color_correction', action='store_true')
     parser.add_argument('--color_correction_lr', type=float, default=1e-3)
     parser.add_argument('--color_correction_reg', type=float, default=1e-2)
@@ -199,6 +269,17 @@ if __name__ == '__main__':
     parser.add_argument('--pseudo_geometry_weight', type=float, default=0.25)
     parser.add_argument('--pseudo_geometry_final_weight', type=float, default=0.02)
     parser.add_argument('--pseudo_geometry_decay_until', type=int, default=7000)
+    parser.add_argument(
+        '--chart-geometry-prior-weight',
+        '--chart_geometry_prior_weight',
+        dest='chart_geometry_prior_weight',
+        type=float,
+        default=1.0,
+        help=(
+            'Multiplier for Chart-exclusive geometry priors in a strict causal '
+            'ablation. The underscore spelling remains a backward-compatible alias.'
+        ),
+    )
     parser.add_argument(
         '--artifact_mask_see3d',
         action='store_true',
@@ -356,6 +437,8 @@ if __name__ == '__main__':
         image_idx_list = args.image_idx
     
     # Defining commands
+    if args.mast3r_sparse_export_stride < 1:
+        raise ValueError('--mast3r-sparse-export-stride must be at least one')
     sfm_command = " ".join([
         "python", "scripts/run_sfm.py",
         "--source_path", args.source_path,
@@ -365,6 +448,9 @@ if __name__ == '__main__':
         "--n_images" if n_images is not None else "", str(n_images) if n_images is not None else "",
         "--image_idx" if image_idx_list is not None else "", " ".join([str(i) for i in image_idx_list]) if image_idx_list is not None else "",
         "--randomize_images" if args.randomize_images else "",
+        "--sparse-export-stride", str(args.mast3r_sparse_export_stride),
+        "--strict_calibrated_poses" if args.strict_calibrated_poses else "",
+        "--per_view_calibrated_intrinsics" if args.per_view_calibrated_intrinsics else "",
     ])
     
     # Charts seed the entire geometry pipeline, so canonical trees must be
@@ -392,6 +478,7 @@ if __name__ == '__main__':
         "--mast3r_scene", mast3r_scene_path,
         "--output_path", aligned_charts_path,
         "--config", args.alignment_config,
+        "--seed", str(args.chart_alignment_seed),
         "--depth_model", args.depth_model,
         "--depthanythingv2_checkpoint_dir", args.depthanythingv2_checkpoint_dir,
         "--depthanything_encoder", args.depthanything_encoder,
@@ -403,6 +490,24 @@ if __name__ == '__main__':
         " ".join(str(index) for index in alignment_mask_indices)
         if alignment_mask_pickle else "",
     ])
+    pointmap_coordinate_audit_command = None
+    if args.strict_calibrated_poses:
+        pointmap_coordinate_audit_command = " ".join([
+            "python", "scripts/audit_mast3r_pointmaps.py",
+            "--mast3r-root", mast3r_scene_path,
+            "--output", os.path.join(mast3r_scene_path, "pointmap_coordinate_audit_raw"),
+            "--mask-pickle" if alignment_mask_pickle else "",
+            alignment_mask_pickle or "",
+            "--mask-dataset-path" if alignment_mask_pickle else "",
+            alignment_mask_dataset_path if alignment_mask_pickle else "",
+            "--mask-indices" if alignment_mask_pickle else "",
+            " ".join(str(index) for index in alignment_mask_indices)
+            if alignment_mask_pickle else "",
+            "--require-coordinate-contract",
+            "--audit-sparse-export",
+            "--require-sparse-export-coordinate-contract",
+            "--require-sparse-export-track-contract",
+        ])
     aligned_chart_gate_command = None
     if args.gate_aligned_chart_conflicts:
         aligned_chart_gate_command = " ".join([
@@ -418,6 +523,7 @@ if __name__ == '__main__':
             "--max-relative-p90", str(args.aligned_chart_max_relative_p90),
             "--max-gt25-fraction", str(args.aligned_chart_max_gt25_fraction),
             "--min-valid-fraction", str(args.aligned_chart_min_valid_fraction),
+            "--require-reference-depths",
         ])
     tree_support_command = None
     if args.cambridge_tree_mask_pickle and args.cambridge_tree_support_dir:
@@ -511,6 +617,11 @@ if __name__ == '__main__':
             "--tree_sky_feather", str(args.tree_sky_feather),
             "--tree_boundary_feather", str(args.tree_boundary_feather),
             "--rgb_loss_type", args.rgb_loss_type,
+            "--rgb-supervision-profile", args.rgb_supervision_profile,
+            "--rgb-sampling-policy", args.rgb_sampling_policy,
+            "--chart-geometry-sampling-policy", args.chart_geometry_sampling_policy,
+            "--densification-view-policy", args.densification_view_policy,
+            "--chart-geometry-prior-weight", str(args.chart_geometry_prior_weight),
             "--use_color_correction" if args.use_color_correction else "",
             "--color_correction_lr", str(args.color_correction_lr),
             "--color_correction_reg", str(args.color_correction_reg),
@@ -657,8 +768,9 @@ if __name__ == '__main__':
 
     t1 = time.time()
     
-    preliminary_uses_dense = args.dense_supervision and (
-        not args.dense_final_only or args.stop_after_initial_refinement
+    preliminary_uses_dense = preliminary_uses_dense_supervision(
+        dense_supervision=args.dense_supervision,
+        dense_final_only=args.dense_final_only,
     )
     if (
         args.continue_after_initial_refinement
@@ -724,6 +836,8 @@ if __name__ == '__main__':
                 print('[INFO] Reusing completed MASt3R SfM artifacts.')
             else:
                 run_command_safe(sfm_command)
+            if pointmap_coordinate_audit_command is not None:
+                run_command_safe(pointmap_coordinate_audit_command)
             if not args.continue_after_alignment:
                 run_command_safe(align_charts_command)
             reuse_existing_alignment_gate = False

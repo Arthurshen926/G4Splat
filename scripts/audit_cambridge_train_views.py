@@ -26,6 +26,7 @@ from view_quality_control import (  # noqa: E402
     pose_integrity_metrics,
     qvec_to_rotmat,
 )
+from view_quality_control.provenance import audit_input_provenance  # noqa: E402
 
 
 def camera_center_and_direction(image) -> tuple[np.ndarray, np.ndarray]:
@@ -337,6 +338,18 @@ def main() -> None:
         "dataset": str(args.dataset),
         "mask_pickle": str(args.mask_pickle),
         "quality_mask_indices": args.quality_mask_indices,
+        "input_provenance": audit_input_provenance(
+            args.dataset,
+            args.mask_pickle,
+            quality_mask_indices=args.quality_mask_indices,
+            thing_mask_index=args.thing_mask_index,
+            sky_mask_index=args.sky_mask_index,
+            tree_mask_index=args.tree_mask_index,
+            pose_clusters=args.pose_clusters,
+            neighbor_count=args.neighbor_count,
+            max_image_width=args.max_image_width,
+            max_reject_fraction=args.max_reject_fraction,
+        ),
         "summary": summary,
         "records": classified,
     }

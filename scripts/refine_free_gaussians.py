@@ -11,8 +11,49 @@ import yaml
 from rich.console import Console
 
 
+def _jsonable_argument(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_argument(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_argument(item) for key, item in value.items()}
+    return value
+
+
+def write_refinement_manifest(args, config: dict, command: list[str]) -> Path:
+    """Record every effective refinement input before the subprocess starts.
+
+    A Gaussian refinement has enough interacting options that a directory name
+    alone cannot establish a single-variable ablation.  The manifest is
+    intentionally written before launch, so a failed/partial run still has a
+    complete declaration of its intended intervention.
+    """
+    output_path = Path(args.output_path).resolve()
+    payload = {
+        "version": 1,
+        "mast3r_scene": str(Path(args.mast3r_scene).resolve()),
+        "output_path": str(output_path),
+        "free_gaussians_config": args.config,
+        "effective_iterations": int(args.iterations or config["iterations"]),
+        "config": _jsonable_argument(config),
+        "arguments": _jsonable_argument(vars(args)),
+        "command": [str(argument) for argument in command],
+    }
+    manifest_path = output_path / "refinement_manifest.json"
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+    return manifest_path
+
+
 def apply_screen_manifest_dense_defaults(args):
-    """Keep a 7k screen representative even when its parent used dense_final_only."""
+    """Recover explicit screen settings without overriding its dense policy.
+
+    New Cambridge manifests always record ``dense_final_only``.  A Chart-only
+    screen must stay Chart-only all the way into train_with_refine_depth;
+    otherwise the apparent Chart-vs-dense ablation has no intervention.
+    Legacy manifests did not record this field, so retain their historical
+    dense recovery only for backwards compatibility.
+    """
     if args.output_path is None:
         return args
     manifest_path = Path(args.output_path).resolve().parent / "cambridge_g4_manifest.json"
@@ -34,7 +75,34 @@ def apply_screen_manifest_dense_defaults(args):
             "[INFO] screen7k manifest enabled affine color correction: "
             f"lr={args.color_correction_lr}, reg={args.color_correction_reg}"
         )
+    manifest_sampling_policy = manifest_config.get("chart_geometry_sampling_policy")
+    if manifest_sampling_policy is not None:
+        if manifest_sampling_policy not in {"legacy_all_input", "active_only"}:
+            raise RuntimeError(
+                "screen7k manifest has an invalid chart geometry sampling policy: "
+                f"{manifest_sampling_policy!r}"
+            )
+        args.chart_geometry_sampling_policy = manifest_sampling_policy
+        print(
+            "[INFO] screen7k manifest chart geometry scheduler: "
+            f"{args.chart_geometry_sampling_policy}"
+        )
+    manifest_densification_policy = manifest_config.get("densification_view_policy")
+    if manifest_densification_policy is not None:
+        if manifest_densification_policy not in {"legacy_current", "dense_only"}:
+            raise RuntimeError(
+                "screen7k manifest has an invalid densification view policy: "
+                f"{manifest_densification_policy!r}"
+            )
+        args.densification_view_policy = manifest_densification_policy
+        print(
+            "[INFO] screen7k manifest densification statistics policy: "
+            f"{args.densification_view_policy}"
+        )
     if args.dense_data_path is not None:
+        return args
+    if manifest_config.get("dense_final_only") is True:
+        print("[INFO] screen7k manifest requests chart-only preliminary supervision.")
         return args
     dense_dataset = manifest.get("dense_dataset")
     if not dense_dataset:
@@ -67,6 +135,24 @@ if __name__ == '__main__':
     # Config
     parser.add_argument('-c', '--config', type=str, default='default')
     parser.add_argument('--iterations', type=int, default=None)
+    parser.add_argument(
+        '--continue-opacity-resets-after-densify',
+        action='store_true',
+        help=(
+            'Experimental causal-control switch: preserve the configured opacity '
+            'reset cadence after densification ends.'
+        ),
+    )
+    parser.add_argument(
+        '--opacity-cull', '--opacity_cull',
+        dest='opacity_cull',
+        type=float,
+        default=None,
+        help=(
+            'Optional 2DGS opacity pruning threshold.  Leave unset to retain '
+            'the model default; set explicitly for a strict protocol ablation.'
+        ),
+    )
     parser.add_argument('--non-position-lr-decay-from', type=int, default=-1)
     parser.add_argument('--non-position-lr-final-mult', type=float, default=1.0)
 
@@ -101,6 +187,45 @@ if __name__ == '__main__':
     parser.add_argument('--tree_boundary_feather', type=int, default=6)
     parser.add_argument('--rgb_loss_type', choices=['l1', 'charbonnier'], default='l1')
     parser.add_argument('--rgb_charbonnier_eps', type=float, default=1e-3)
+    parser.add_argument(
+        '--rgb-supervision-profile',
+        choices=['g4_tree_masked', 'full_rgb', 'ulfloc_legacy'],
+        default='g4_tree_masked',
+        help=(
+            'RGB pixel protocol; full_rgb changes RGB pixels only to all-pixel '
+            'supervision, while ulfloc_legacy is an explicit ULF-Loc protocol ablation.'
+        ),
+    )
+    parser.add_argument(
+        '--rgb-sampling-policy',
+        choices=['legacy_interleaved', 'all_train_importance'],
+        default='all_train_importance',
+        help='Keep legacy Chart RGB oversampling or importance-correct it to all real train cameras.',
+    )
+    parser.add_argument(
+        '--chart-geometry-sampling-policy',
+        choices=['legacy_all_input', 'active_only'],
+        default='active_only',
+        help='Sample all aligned Charts only for a legacy ablation, or only gate/quality-active Charts.',
+    )
+    parser.add_argument(
+        '--densification-view-policy',
+        choices=['legacy_current', 'dense_only'],
+        default='legacy_current',
+        help=(
+            'Choose whether Chart geometry views also feed 2DGS split/prune statistics, '
+            'or reserve topology statistics for the dense all-real camera stream.'
+        ),
+    )
+    parser.add_argument(
+        '--chart-geometry-prior-weight',
+        type=float,
+        default=1.0,
+        help=(
+            'Common multiplier for Chart-exclusive geometric priors; zero keeps '
+            'the same Chart schedule while disabling only those priors.'
+        ),
+    )
     parser.add_argument('--use_color_correction', action='store_true')
     parser.add_argument('--color_correction_lr', type=float, default=1e-3)
     parser.add_argument('--color_correction_reg', type=float, default=1e-2)
@@ -169,6 +294,8 @@ if __name__ == '__main__':
             "--white_background" if args.white_background else "",
             "--densify_until_iter", str(config['densify_until_iter']),
             "--opacity_reset_interval", str(config['opacity_reset_interval']),
+            "--continue-opacity-resets-after-densify"
+            if args.continue_opacity_resets_after_densify else "",
             "--depth_ratio", str(config['depth_ratio']),
             "--use_mip_filter" if config['use_mip_filter'] else "",
             "--normal_consistency_from", str(config['normal_consistency_from']),
@@ -184,6 +311,11 @@ if __name__ == '__main__':
             "--downweight_input_view_color_loss" if args.downweight_input_view_color_loss else "",
             "--rgb_loss_type", args.rgb_loss_type,
             "--rgb_charbonnier_eps", str(args.rgb_charbonnier_eps),
+            "--rgb-supervision-profile", args.rgb_supervision_profile,
+            "--rgb-sampling-policy", args.rgb_sampling_policy,
+            "--chart-geometry-sampling-policy", args.chart_geometry_sampling_policy,
+            "--densification-view-policy", args.densification_view_policy,
+            "--chart-geometry-prior-weight", str(args.chart_geometry_prior_weight),
             "--use_color_correction" if args.use_color_correction else "",
             "--color_correction_lr", str(args.color_correction_lr),
             "--color_correction_reg", str(args.color_correction_reg),
@@ -209,6 +341,8 @@ if __name__ == '__main__':
             "--warmstart_diffuse_only" if args.warmstart_diffuse_only else "",
             "--warmstart_clamp_dc" if args.warmstart_clamp_dc else "",
         ]
+        if args.opacity_cull is not None:
+            command.extend(["--opacity_cull", str(args.opacity_cull)])
         if args.dense_data_path is not None:
             command.extend(["--dense_data_path", args.dense_data_path])
         if args.dense_depth_cache is not None:
@@ -252,6 +386,9 @@ if __name__ == '__main__':
         command = [argument for argument in command if argument]
     else:
         raise ValueError('refine depth path is required')
+
+    manifest_path = write_refinement_manifest(args, config, command)
+    CONSOLE.print(f"[INFO] Wrote refinement manifest: {manifest_path}")
     
     # Run command
     CONSOLE.print(f"[INFO] Running command:\n{' '.join(command)}")

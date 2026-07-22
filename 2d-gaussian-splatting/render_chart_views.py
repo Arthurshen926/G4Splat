@@ -16,7 +16,7 @@ from utils.general_utils import safe_state
 from matcha.dm_scene.charts import load_charts_data, build_priors_from_charts_data, depths_to_points_parallel
 from matcha.dm_utils.rendering import depth2normal_parallel
 from matcha.cambridge_masks import CambridgeMaskLookup, stack_masks_for_image_names
-from matcha.cambridge_training import sanitize_chart_geometry
+from matcha.cambridge_training import sanitize_chart_geometry, validate_chart_camera_order
 from guidance.cam_utils import build_visibility_masks
 
 import cv2
@@ -154,6 +154,13 @@ if __name__ == "__main__":
     # vis charts data
     charts_data_path = os.path.join(args.source_path, 'charts_data.npz')
     charts_data = load_charts_data(charts_data_path)
+    if "depths" not in charts_data or charts_data["depths"].ndim < 1:
+        raise RuntimeError("Aligned charts_data is missing a camera-indexed depths tensor")
+    validate_chart_camera_order(
+        args.source_path,
+        [view.image_name for view in train_viewpoints],
+        chart_tensor_count=int(charts_data["depths"].shape[0]),
+    )
     mask_config = resolve_cambridge_mask_config(args)
     original_geometry_masks = None
     if mask_config is not None:

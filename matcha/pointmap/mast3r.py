@@ -11,6 +11,7 @@ from matcha.dm_utils.dust3r_image import load_images
 
 # Custom imports
 from .base import PointMap
+from .ordering import pointmap_paths_for_camera_filepaths
 from matcha.dm_scene.cameras import CamerasWrapper, create_gs_cameras_from_pointmap
 from matcha.dm_utils.model import freeze_model
 
@@ -229,8 +230,10 @@ def get_pointmap_with_mast3r(
     
     # Load the pointmap files
     pointmaps_dir = os.path.join(mast3r_scene_source_path, 'pointmaps')
-    all_pointmaps_files = sorted([os.path.join(pointmaps_dir, f) for f in os.listdir(pointmaps_dir) if f.endswith('.json')])
-    pointmaps_files = [all_pointmaps_files[i * (len(all_pointmaps_files) // (n_images_in_pointmap - 1))] for i in range(n_images_in_pointmap)]
+    pointmaps_files = pointmap_paths_for_camera_filepaths(
+        [cameras['filepaths'][i] for i in image_indices],
+        pointmaps_dir,
+    )
     print(f"Loading {len(pointmaps_files)} pointmaps from {mast3r_scene_source_path}...")
     scene = {'rgb': [], 'points': [], 'confs': [],}
     for pointmap_file in pointmaps_files:

@@ -29,6 +29,8 @@ from dust3r.demo import get_args_parser as dust3r_get_args_parser
 
 import cv2
 from matcha.dm_utils.dataset_readers import read_intrinsics_binary, read_extrinsics_binary, qvec2rotmat, read_intrinsics_text, read_extrinsics_text
+from matcha.pointmap.pose_contract import calibrated_pose_contract
+from matcha.pointmap.calibration import rectification_is_identity
 # from colmap.read_write_model import read_cameras_binary, read_images_binary, read_points3D_binary
 from colmap.read_write_model import Camera, Image, Point3D,  write_cameras_binary, write_images_binary, write_points3D_binary, write_points3D_text, rotmat2qvec
 from colmap.read_write_model import write_cameras_text, write_images_text, write_points3D_text
@@ -67,6 +69,23 @@ if __name__ == "__main__":
     parser.add_argument('--fix_principal_point', action='store_true', help='Fix camera principal point.')
     parser.add_argument('--fix_rotation', action='store_true', help='Fix camera rotation.')
     parser.add_argument('--fix_translation', action='store_true', help='Fix camera translation.')
+    parser.add_argument(
+        '--strict_calibrated_poses',
+        action='store_true',
+        help=(
+            'When calibrated poses are supplied, keep translation and global '
+            'scale fixed during MASt3R global alignment.  This is distinct '
+            'from the historical --fix_translation post-alignment restore mode.'
+        ),
+    )
+    parser.add_argument(
+        '--per_view_calibrated_intrinsics',
+        action='store_true',
+        help=(
+            'Keep one calibrated focal/principal-point pair per camera during '
+            'MASt3R alignment instead of collapsing them to a shared value.'
+        ),
+    )
     
     # Data parameters
     parser.add_argument('--n_images', type=int, default=10, help='Number of images to use for optimization, sampled with constant spacing.')
@@ -85,6 +104,15 @@ if __name__ == "__main__":
 
     # Post processing    
     parser.add_argument('--output_conf_thr', type=float, default=.1, help='Confidence threshold for COLMAP format outputs.')
+    parser.add_argument(
+        '--sparse_export_stride',
+        type=int,
+        default=1,
+        help=(
+            'Regular pixel stride used only for the optional COLMAP sparse export. '
+            'Full-resolution pointmaps remain unchanged and are what Chart alignment consumes.'
+        ),
+    )
     parser.add_argument('--align_camera_locations', action='store_true', help='Align camera locations.')
 
     args = parser.parse_args()
@@ -98,6 +126,12 @@ if __name__ == "__main__":
     # and images should be located in the scene_path/images subdirectory.
     scene_path = args.scene_path
     use_calibrated_poses = args.use_calibrated_poses
+    strict_calibrated_poses = bool(args.strict_calibrated_poses)
+    per_view_calibrated_intrinsics = bool(args.per_view_calibrated_intrinsics)
+    if strict_calibrated_poses and not use_calibrated_poses:
+        raise ValueError('--strict_calibrated_poses requires --use_calibrated_poses')
+    if per_view_calibrated_intrinsics and not use_calibrated_poses:
+        raise ValueError('--per_view_calibrated_intrinsics requires --use_calibrated_poses')
     dir_content = os.listdir(scene_path)
     use_subdir = True
     n_all_images = 0
@@ -246,8 +280,13 @@ if __name__ == "__main__":
     winsize = min(args.max_window_size, n_images)  # 0 < winsize <= n_images
     refid = min(n_images - 1, args.max_refid)  # 1 <= refid <= n_images - 1
     
-    # shared_intrinsics = True if not use_calibrated_poses else False
-    shared_intrinsics = True
+    # In a calibrated pose experiment, ``--fix_focal`` must mean the focal of
+    # *each* source camera is fixed.  A shared parameter otherwise replaces
+    # every source focal with a confidence-weighted average before freezing it,
+    # which also shifts the camera-center reparameterization used by sparse GA.
+    # Preserve the historical shared path as an explicit control for a paired
+    # ablation; it remains suitable for unposed reconstruction.
+    shared_intrinsics = not per_view_calibrated_intrinsics
     cam_size = 0.2
     mask_sky = False
     clean_depth = True
@@ -256,6 +295,10 @@ if __name__ == "__main__":
     fix_pp = args.fix_principal_point
     fix_rotation = args.fix_rotation
     fix_translation = args.fix_translation
+    if strict_calibrated_poses:
+        print('[INFO] Strict calibrated-pose mode: global alignment will not optimize translation or scale.')
+    if per_view_calibrated_intrinsics:
+        print('[INFO] Per-view calibrated intrinsics: no shared focal/principal-point collapse.')
 
     lr1 = 0.07
     niter1 = args.n_coarse_iterations
@@ -266,6 +309,9 @@ if __name__ == "__main__":
     TSDF_thresh = args.TSDF_thresh
 
     output_conf_thr = args.output_conf_thr
+    sparse_export_stride = int(args.sparse_export_stride)
+    if sparse_export_stride < 1:
+        raise ValueError('--sparse_export_stride must be at least one')
 
     current_scene_state = None
     gradio_delete_cache = False  # TODO: Check if this is correct
@@ -442,6 +488,10 @@ if __name__ == "__main__":
         print("[INFO] Using calibrated poses.")
         intrinsics = np.stack([src_intrinsics[img_name] for img_name in image_names], axis=0)
         extrinsics = np.stack([src_extrinsics[img_name] for img_name in image_names], axis=0)
+        # ``output_dir/images`` begins as a source-image copy.  Update this
+        # mapping only when a selected image is truly rectified below so the
+        # all-view camera export always describes the pixels on disk.
+        output_intrinsics = dict(src_intrinsics)
         calibrated_img_sizes = []
 
         print_debug('original intrinsics')
@@ -531,10 +581,23 @@ if __name__ == "__main__":
             
             print_debug(f"Source image has shape: {src_img.shape}")
             print_debug(f"Final image has shape: {new_img.shape}")
-            # cv2.imwrite(f'{output_dir}/images/{img_fname}', new_img)
+            rectified_path = f'{output_dir}/images/{img_fname}'
+            if rectification_is_identity(
+                src_K,
+                tar_K,
+                source_shape=src_img.shape[:2],
+                target_shape=new_img.shape[:2],
+            ):
+                # Preserve exact source pixels for an identity map.  This is
+                # particularly important for controlled Cambridge ablations.
+                output_intrinsics[img_fname] = src_K.copy()
+            else:
+                if not cv2.imwrite(rectified_path, new_img):
+                    raise IOError(f'Failed to write rectified calibrated image: {rectified_path}')
+                output_intrinsics[img_fname] = tar_K.copy()
 
             intrinsics[idx_img] = tar_K
-            filelist[idx_img] = f'{output_dir}/images/{img_fname}'
+            filelist[idx_img] = rectified_path
         imgs = load_images(filelist, size=image_size, verbose=not silent)
         print_debug(f'Images have shape: {imgs[0]["img"].shape}')
 
@@ -646,8 +709,12 @@ if __name__ == "__main__":
         'opt_pp': True if not fix_pp else False,
         'opt_focal': True if not fix_focal else False,
         'opt_quat': True if not fix_rotation else False,
-        'opt_tran': True, # if not fix_translation else False, # For now, this does not work well.
-        'opt_size': True, # if not fix_translation else False, # Instead, we do post alignment.
+        # Keep the legacy posed pipeline untouched unless this explicit
+        # ablation is requested.  Historically --fix_translation only
+        # restored calibrated camera centers after an unconstrained solve,
+        # which can leave the dense point maps in a different frame.
+        'opt_tran': not strict_calibrated_poses,
+        'opt_size': not strict_calibrated_poses,
     }
     if use_calibrated_poses:
         for idx_img, img_path in enumerate(filelist):
@@ -683,6 +750,33 @@ if __name__ == "__main__":
     focals = scene.get_focals().cpu()
     pps = scene.get_principal_points().cpu()
     cams2world = scene.get_im_poses().cpu()
+
+    # ``sparse_ga`` represents a camera center through a depth/focal-dependent
+    # kinematic chain.  Therefore ``opt_tran=False`` is not a sufficient
+    # guarantee that the effective cameras remained equal to calibration.  Log
+    # this contract *before* the historical output-side alignment/restoration
+    # block below can conceal such a disagreement.
+    if strict_calibrated_poses:
+        calibrated_cams2world = np.stack(
+            [np.linalg.inv(src_extrinsics[img_name]) for img_name in image_names],
+            axis=0,
+        )
+        pose_contract = calibrated_pose_contract(
+            cams2world.numpy(),
+            calibrated_cams2world,
+            image_names,
+        )
+        pose_contract["stage"] = "post_sparse_ga_pre_output_pose_alignment"
+        pose_contract_path = os.path.join(output_dir, 'calibrated_pose_contract.json')
+        with open(pose_contract_path, 'w', encoding='utf-8') as f:
+            json.dump(pose_contract, f, indent=2)
+            f.write('\n')
+        print(
+            '[INFO] Calibrated-pose contract before output restoration: '
+            f"passed={pose_contract['passed']}; "
+            f"relative-center-p90={pose_contract['relative_center_error']['p90']:.3e}; "
+            f"rotation-max={pose_contract['rotation_error_deg']['max']:.3e} deg."
+        )
 
     # 3D pointcloud from depthmap, poses and intrinsics
     if TSDF_thresh > 0:
@@ -760,6 +854,7 @@ if __name__ == "__main__":
     points3d_id_ofs = 1
     all_xyzs = []
     all_rgbs = []
+    sparse_export_records = []
     for idx_img in range(len(imgs)):
         camera_id = idx_img + 1
 
@@ -794,17 +889,40 @@ if __name__ == "__main__":
 
         # points
         pixels = np.mgrid[:width_resized, :height_resized].T.reshape(-1, 2)
+        # The following COLMAP files are a diagnostic/export sidecar.  The
+        # actual Chart aligner loads cameras.json plus the *full* pointmaps
+        # written below, so serializing every one of the 512x512 pixels as an
+        # individual Python Point3D provides no extra geometry to the solver.
+        # Keep a deterministic regular lattice, including image boundaries, so
+        # coordinate and compact-track contracts are still audited across the
+        # entire image domain.  Stride one preserves the historical export.
+        export_pixels = np.ones(len(pixels), dtype=bool)
+        if sparse_export_stride > 1:
+            export_pixels = (
+                ((pixels[:, 0] % sparse_export_stride) == 0)
+                | (pixels[:, 0] == width_resized - 1)
+            ) & (
+                ((pixels[:, 1] % sparse_export_stride) == 0)
+                | (pixels[:, 1] == height_resized - 1)
+            )
         pixels_original = pixels * np.array([scale_w, scale_h])
         point3d_ids = []
         xys = []
         img_original = cv2.imread(imgs[idx_img]['instance'],1)[...,::-1]
         # TODO: avoid slow for-loop
         for idx_pt2d, (xyz, pt2d) in enumerate(zip(pts3d[idx_img], pixels_original)):
+            if not export_pixels[idx_pt2d]:
+                continue
             pixel_conf = confs[idx_img][pixels[idx_pt2d][1], pixels[idx_pt2d][0]]
             if pixel_conf < output_conf_thr: # ignore points with low confidence
                 continue
 
             point3d_id = points3d_id_ofs + idx_pt2d
+            # ``Point3D.point2D_idxs`` indexes the compact ``Image.xys``
+            # array, not the original dense MASt3R pixel grid.  Confidence
+            # filtering above makes ``idx_pt2d`` invalid whenever an earlier
+            # pixel was skipped.
+            point2d_index = len(point3d_ids)
             xys.append(pt2d)
             point3d_ids.append(point3d_id)
 
@@ -812,7 +930,7 @@ if __name__ == "__main__":
             error = np.array(2., dtype=np.float64) # TODO: use actual reprojection error?
 
             image_ids = np.array([camera_id,], dtype=np.int64)
-            point2D_idxs=np.array([idx_pt2d,], dtype=np.int64)
+            point2D_idxs=np.array([point2d_index,], dtype=np.int64)
 
             points3d_colmap[point3d_id] = Point3D(
                 id=point3d_id,
@@ -835,6 +953,12 @@ if __name__ == "__main__":
             np.array(xys, dtype=np.float64), # xys
             np.array(point3d_ids, dtype=np.int64) # point3D_ids
         )
+        sparse_export_records.append({
+            'image_name': imgs[idx_img]['instance'].split('/')[-1],
+            'image_size': [int(width_resized), int(height_resized)],
+            'candidate_lattice_pixels': int(export_pixels.sum()),
+            'exported_points': int(len(point3d_ids)),
+        })
 
     os.makedirs(f'{output_dir}/sparse/0', exist_ok=True)
     write_cameras_binary(cameras_colmap, f'{output_dir}/sparse/0/cameras.bin')
@@ -844,6 +968,21 @@ if __name__ == "__main__":
         write_cameras_text(cameras_colmap, f'{output_dir}/sparse/0/cameras.txt')
         write_images_text(images_colmap, f'{output_dir}/sparse/0/images.txt')
         write_points3D_text(points3d_colmap, f'{output_dir}/sparse/0/points3D.txt')
+    with open(f'{output_dir}/sparse/0/export_manifest.json', 'w') as f:
+        json.dump({
+            'schema_version': 1,
+            'point_source': 'mast3r_dense_pointmaps',
+            'sampling': 'regular_pixel_lattice_with_image_boundaries',
+            'sparse_export_stride': sparse_export_stride,
+            'output_confidence_threshold': float(output_conf_thr),
+            'chart_count': len(sparse_export_records),
+            'point_count': int(len(points3d_colmap)),
+            'charts': sparse_export_records,
+            'contract': (
+                'This export is a bounded diagnostic sidecar. Full-resolution '
+                'pointmaps and cameras.json remain the Chart-alignment source of truth.'
+            ),
+        }, f, indent=2)
 
     if use_calibrated_poses:
         # save eval cameras
@@ -861,7 +1000,7 @@ if __name__ == "__main__":
             img_original = cv2.imread(img_path, 0)
             height_original, width_original = img_original.shape[:2]
 
-            K = src_intrinsics[img_name]
+            K = output_intrinsics[img_name]
             w2c = src_extrinsics[img_name]
 
             # camera intrinsics
@@ -918,7 +1057,7 @@ if __name__ == "__main__":
             img_original = cv2.imread(img_path, 0)
             height_original, width_original = img_original.shape[:2]
 
-            K = src_intrinsics[img_name]
+            K = output_intrinsics[img_name]
             w2c = src_extrinsics[img_name]
 
             dense_cameras_colmap[camera_id] = Camera(
