@@ -15,6 +15,7 @@ from scripts.run_cambridge_g4splat import scene_paths
 from scripts.run_cambridge_outdoor_mainline import (
     MAINLINE_POLICY_VERSION,
     _completed_sfm_can_resume_alignment,
+    _mainline_runtime_env,
     _train_with_mainline_contract,
     _reuse_compatible_frontend,
     _serialized_config,
@@ -232,6 +233,14 @@ def test_mainline_restarts_alignment_from_completed_fixed_camera_sfm(tmp_path):
     assert _completed_sfm_can_resume_alignment(screen_output)
     (sparse / "images.bin").unlink()
     assert not _completed_sfm_can_resume_alignment(screen_output)
+
+
+def test_mainline_runtime_does_not_inject_unsupported_allocator(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    env = _mainline_runtime_env(2)
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in env
 
 
 def test_mainline_contract_enables_block_balanced_real_view_sampling(tmp_path):

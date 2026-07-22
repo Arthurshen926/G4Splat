@@ -300,19 +300,25 @@ def _run_heldout_evaluation(
     )
 
 
-def run_mainline(args: argparse.Namespace) -> None:
-    config = build_mainline_config(args)
+def _mainline_runtime_env(gpu: int) -> dict[str, str]:
+    """Build the child-process environment without pinning allocator internals."""
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     conda_lib = str(Path(sys.prefix) / "lib")
     entries = [entry for entry in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if entry]
     if conda_lib not in entries:
         env["LD_LIBRARY_PATH"] = os.pathsep.join([conda_lib, *entries])
     env.setdefault("PYTHONUNBUFFERED", "1")
-    # Large Chart batches allocate many similarly sized reprojection tensors.
-    # This does not change the objective, but avoids avoidable allocator
-    # fragmentation when a restart must reuse the exact same frontend.
-    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # Do not inject a version-specific CUDA allocator setting here.  The
+    # pinned torch==2.0.1 runtime rejects ``expandable_segments`` at CUDA
+    # initialization; the Chart terminal writeback is memory-bounded in code
+    # instead, so this remains portable across the supported runtime.
+    return env
+
+
+def run_mainline(args: argparse.Namespace) -> None:
+    config = build_mainline_config(args)
+    env = _mainline_runtime_env(args.gpu)
 
     if args.dry_run:
         print(json.dumps({
