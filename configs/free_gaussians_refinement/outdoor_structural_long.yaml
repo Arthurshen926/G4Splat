@@ -1,0 +1,12 @@
+type: '2dgs'
+# Continue from the screened structural map.  A bounded second topology window
+# allows real-view residuals to add detail, then freezes geometry for the long
+# appearance-focused refinement.
+iterations: 40000
+densify_until_iter: 7000
+opacity_reset_interval: 7000
+opacity_cull: 0.005
+depth_ratio: 0.5
+normal_consistency_from: 3500
+distortion_from: 1500
+use_mip_filter: true

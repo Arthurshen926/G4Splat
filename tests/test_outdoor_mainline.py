@@ -15,6 +15,7 @@ from scripts.run_cambridge_g4splat import scene_paths
 from scripts.run_cambridge_outdoor_mainline import (
     MAINLINE_POLICY_VERSION,
     _completed_sfm_can_resume_alignment,
+    _hydrate_schedule_compatible_frontend,
     _mainline_runtime_env,
     _train_with_mainline_contract,
     _reuse_compatible_frontend,
@@ -251,6 +252,9 @@ def test_mainline_config_freezes_cameras_and_real_view_topology(tmp_path):
     assert config.per_view_calibrated_intrinsics is True
     assert config.densification_view_policy == "dense_only"
     assert config.min_global_plane_views == 3
+    assert config.warp_downsample_pixel_grid_size == 4
+    assert config.screen_free_gaussians_config == "outdoor_structural7k"
+    assert config.final_free_gaussians_config == "outdoor_structural_long"
     assert config.joint_chart_count is None
     assert config.scene_aligned_see3d_cameras is False
     assert config.preserve_visible_see3d_render is False
@@ -292,6 +296,57 @@ def test_mainline_reuses_pre_switch_frontend_without_reenabling_see3d(tmp_path):
     assert reused.screen_output == frontend
     assert config.disable_see3d is True
     assert config.scene_aligned_see3d_cameras is False
+
+
+def test_mainline_hydrates_schedule_compatible_frontend_without_reusing_screen_state(tmp_path):
+    args = SimpleNamespace(
+        datasets_root=tmp_path / "datasets",
+        mask_root=tmp_path / "masks",
+        output_root=tmp_path / "output",
+        depth_checkpoint_dir=tmp_path / "depth",
+        run_tag="test",
+        broad_charts=56,
+        min_charts=24,
+        view_clusters=8,
+        final_iterations=40_000,
+        final_non_position_lr_decay_from=30_000,
+        final_non_position_lr_final_mult=0.1,
+    )
+    config = build_mainline_config(args)
+    paths = scene_paths("StMarysChurch", config)
+    source = (
+        config.output_root
+        / "runs"
+        / "StMarysChurch_g4_qc_n56_strictclean_planeonly_legacy_screen7k_v3"
+    )
+    recorded = _serialized_config(config)
+    recorded.update({
+        "screen_free_gaussians_config": "default",
+        "final_free_gaussians_config": "long",
+        "warp_downsample_pixel_grid_size": 2,
+        "final_iterations": 30_000,
+    })
+    mast3r = source / "mast3r_sfm"
+    (mast3r / "inverse_depth_fusion").mkdir(parents=True)
+    (mast3r / "aligned_chart_conflict_gate.json").write_text("{}")
+    (mast3r / "inverse_depth_fusion" / "inverse_depth_fusion_manifest.json").write_text("{}")
+    (mast3r / "charts_data.npz").touch()
+    (mast3r / "charts_data.pre_quality_selection.npz").touch()
+    (mast3r / "quality_aware_chart_filter.json").write_text("{}")
+    (source / "free_gaussians" / "point_cloud").mkdir(parents=True)
+    (source / "outdoor_mainline_manifest.json").write_text(json.dumps({
+        "policy_version": MAINLINE_POLICY_VERSION,
+        "config": recorded,
+    }))
+
+    _hydrate_schedule_compatible_frontend("StMarysChurch", config, paths)
+
+    copied = paths.screen_output / "mast3r_sfm"
+    assert (copied / "aligned_chart_conflict_gate.json").is_file()
+    assert (copied / "charts_data.npz").is_file()
+    assert not (copied / "charts_data.pre_quality_selection.npz").exists()
+    assert not (copied / "quality_aware_chart_filter.json").exists()
+    assert not (paths.screen_output / "free_gaussians").exists()
 
 
 def test_mainline_restarts_alignment_from_completed_fixed_camera_sfm(tmp_path):

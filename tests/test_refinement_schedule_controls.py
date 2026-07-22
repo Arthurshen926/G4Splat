@@ -46,7 +46,10 @@ def test_standard_normal_schedule_control_changes_only_activation_time():
 def test_refinement_wrapper_can_make_opacity_culling_an_explicit_variable():
     source = Path("scripts/refine_free_gaussians.py").read_text()
     assert "'--opacity-cull', '--opacity_cull'" in source
-    assert 'command.extend(["--opacity_cull", str(args.opacity_cull)])' in source
+    # A command-line override remains available, while a named refinement
+    # profile can now declare its own safe default for an outdoor run.
+    assert "effective_opacity_cull =" in source
+    assert 'command.extend(["--opacity_cull", str(effective_opacity_cull)])' in source
 
 
 def test_refinement_explicitly_clears_inherited_mip_state_for_no_mip_controls():

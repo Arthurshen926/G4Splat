@@ -301,6 +301,16 @@ if __name__ == '__main__':
     config_path = os.path.join('configs/free_gaussians_refinement', args.config + '.yaml')
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    config_opacity_cull = config.get("opacity_cull")
+    if config_opacity_cull is not None:
+        config_opacity_cull = float(config_opacity_cull)
+        if not 0.0 <= config_opacity_cull < 1.0:
+            raise ValueError("config opacity_cull must be in [0, 1)")
+    effective_opacity_cull = (
+        float(args.opacity_cull)
+        if args.opacity_cull is not None
+        else config_opacity_cull
+    )
         
     # Define command
     if args.refine_depth_path is not None:
@@ -367,8 +377,8 @@ if __name__ == '__main__':
             "--warmstart_diffuse_only" if args.warmstart_diffuse_only else "",
             "--warmstart_clamp_dc" if args.warmstart_clamp_dc else "",
         ]
-        if args.opacity_cull is not None:
-            command.extend(["--opacity_cull", str(args.opacity_cull)])
+        if effective_opacity_cull is not None:
+            command.extend(["--opacity_cull", str(effective_opacity_cull)])
         if args.dense_data_path is not None:
             command.extend(["--dense_data_path", args.dense_data_path])
         if args.dense_depth_cache is not None:

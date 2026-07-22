@@ -49,6 +49,26 @@ from scripts.run_cambridge_g4splat import (
 MAINLINE_POLICY_VERSION = "cambridge-outdoor-structural-mainline-v1"
 
 
+# These parameters change only the 2DGS optimization after the fixed-camera
+# frontend has completed.  They must not force another MASt3R alignment,
+# structural selection, or inverse-depth fusion run.  In particular, an
+# outdoor capacity fix should be able to reuse the audited real-image geometry
+# without also reusing a failed screen model.
+_FRONTEND_SCHEDULE_ONLY_CONFIG_FIELDS = {
+    "screen_free_gaussians_config",
+    "final_free_gaussians_config",
+    "warp_downsample_pixel_grid_size",
+    "final_iterations",
+    "final_non_position_lr_decay_from",
+    "final_non_position_lr_final_mult",
+}
+
+_FRONTEND_LEGACY_GENERATION_FIELDS = {
+    "scene_aligned_see3d_cameras",
+    "preserve_visible_see3d_render",
+}
+
+
 def build_mainline_config(args: argparse.Namespace) -> CambridgeG4Config:
     """Return the non-ablative defaults prescribed by the outdoor design."""
     return CambridgeG4Config(
@@ -76,6 +96,15 @@ def build_mainline_config(args: argparse.Namespace) -> CambridgeG4Config:
         # for final facade coverage.
         chart_sequence_coverage_mode="soft",
         min_global_plane_views=3,
+        # A 2 px warped grid makes this outdoor scene start with several
+        # million far-field splats.  At the legacy 0.05 opacity cull, the
+        # white-background reset then deletes distant, Mip-filtered facade
+        # support before it can receive real-view statistics.  Use a bounded
+        # 4 px structural bootstrap and profiles that preserve low-opacity
+        # distant evidence through the initial screen.
+        warp_downsample_pixel_grid_size=4,
+        screen_free_gaussians_config="outdoor_structural7k",
+        final_free_gaussians_config="outdoor_structural_long",
         final_iterations=args.final_iterations,
         final_non_position_lr_decay_from=args.final_non_position_lr_decay_from,
         final_non_position_lr_final_mult=args.final_non_position_lr_final_mult,
@@ -120,7 +149,7 @@ def _reuse_compatible_frontend(
     if not runs_root.is_dir():
         return paths
     expected = _serialized_config(config)
-    ignored = {"scene_aligned_see3d_cameras", "preserve_visible_see3d_render"}
+    ignored = _FRONTEND_LEGACY_GENERATION_FIELDS
     pattern = (
         f"{scene}_g4_qc_n{config.requested_charts}_strictclean_planeonly_"
         "*_screen7k_v3/outdoor_mainline_manifest.json"
@@ -152,6 +181,81 @@ def _reuse_compatible_frontend(
             flush=True,
         )
     return replace(paths, screen_output=selected)
+
+
+def _hydrate_schedule_compatible_frontend(
+    scene: str,
+    config: CambridgeG4Config,
+    paths: Any,
+) -> None:
+    """Copy only immutable frontend artifacts from a schedule-compatible run.
+
+    ``_reuse_compatible_frontend`` intentionally aliases an exact frontend
+    output for the legacy See3D-identity migration.  A changed screen schedule
+    needs a *new* output directory, otherwise an old 7k PLY would be skipped
+    as if it had been trained with the new capacity policy.  This helper copies
+    the MASt3R/plane/fusion artifacts only, deliberately omitting mutable
+    active-selection state and every Gaussian-training artifact.
+    """
+    target_mast3r = paths.screen_output / "mast3r_sfm"
+    if target_mast3r.exists():
+        return
+
+    runs_root = config.output_root / "runs"
+    if not runs_root.is_dir():
+        return
+    expected = _serialized_config(config)
+    ignored = _FRONTEND_LEGACY_GENERATION_FIELDS | _FRONTEND_SCHEDULE_ONLY_CONFIG_FIELDS
+    pattern = (
+        f"{scene}_g4_qc_n{config.requested_charts}_strictclean_planeonly_"
+        "*_screen7k_v3/outdoor_mainline_manifest.json"
+    )
+    compatible: list[Path] = []
+    for manifest_path in runs_root.glob(pattern):
+        source = manifest_path.parent
+        if source == paths.screen_output:
+            continue
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        recorded = payload.get("config")
+        source_mast3r = source / "mast3r_sfm"
+        if (
+            payload.get("policy_version") != MAINLINE_POLICY_VERSION
+            or not isinstance(recorded, dict)
+            or not (source_mast3r / "aligned_chart_conflict_gate.json").is_file()
+            or not (source_mast3r / "inverse_depth_fusion" / "inverse_depth_fusion_manifest.json").is_file()
+        ):
+            continue
+        if all(
+            recorded.get(key) == value
+            for key, value in expected.items()
+            if key not in ignored
+        ):
+            compatible.append(source)
+    if not compatible:
+        return
+
+    source = max(compatible, key=lambda path: path.stat().st_mtime)
+    paths.screen_output.mkdir(parents=True, exist_ok=True)
+    # ``apply_active_chart_selection`` records the target absolute path and
+    # creates a backup before hard-writing the subset.  Do not import those
+    # two mutable files from the source run; the selected geometry is otherwise
+    # read-only during the screen and full training stages.
+    shutil.copytree(
+        source / "mast3r_sfm",
+        target_mast3r,
+        ignore=shutil.ignore_patterns(
+            "charts_data.pre_quality_selection.npz",
+            "quality_aware_chart_filter.json",
+        ),
+    )
+    print(
+        "[INFO] Hydrated immutable fixed-camera frontend for the new training "
+        f"schedule: {source} -> {paths.screen_output}",
+        flush=True,
+    )
 
 
 def _completed_sfm_can_resume_alignment(screen_output: Path) -> bool:
@@ -332,6 +436,7 @@ def run_mainline(args: argparse.Namespace) -> None:
 
     paths = scene_paths(args.scene, config)
     paths = _reuse_compatible_frontend(args.scene, config, paths)
+    _hydrate_schedule_compatible_frontend(args.scene, config, paths)
     validate_scene(args.scene, paths)
     if paths.tree_mask_pickle is None:
         raise FileNotFoundError(

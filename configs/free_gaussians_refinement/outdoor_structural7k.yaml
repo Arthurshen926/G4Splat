@@ -1,0 +1,17 @@
+type: '2dgs'
+# The screen starts from the fused inverse-depth bootstrap.  Keep topology
+# active only through the structural phase, then hold capacity fixed while
+# normal consistency refines the selected real-view surfaces.
+iterations: 7000
+densify_until_iter: 3500
+# The white-background reset at 500 is sufficient for this screen.  Setting
+# the interval to the topology boundary prevents a second reset/prune cycle
+# from erasing distant Mip-filtered facade splats.
+opacity_reset_interval: 3500
+# Remote splats have attenuated effective opacity under Mip filtering.  This
+# threshold preserves them while still removing truly negligible primitives.
+opacity_cull: 0.005
+depth_ratio: 0.5
+normal_consistency_from: 3500
+distortion_from: 1500
+use_mip_filter: true

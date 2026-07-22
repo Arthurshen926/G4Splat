@@ -169,6 +169,10 @@ class CambridgeG4Config:
     # fixed constant.  Keep it in the run identity so a later full pass never
     # silently treats a differently densified screen PLY as the same gate.
     screen_free_gaussians_config: str = "default"
+    # Keep the final refinement schedule explicit too.  The outdoor mainline
+    # needs to be able to use a capacity-safe continuation without silently
+    # inheriting the legacy generic ``long`` profile.
+    final_free_gaussians_config: str = "long"
     final_iterations: int = 30_000
     final_non_position_lr_decay_from: int = 30_000
     final_non_position_lr_final_mult: float = 0.10
@@ -874,7 +878,7 @@ def train_command(
         "--free_gaussians_config",
         config.screen_free_gaussians_config,
         "--final_free_gaussians_config",
-        "long",
+        config.final_free_gaussians_config,
         "--final_free_gaussians_iterations",
         str(config.final_iterations),
         "--final_non_position_lr_decay_from",

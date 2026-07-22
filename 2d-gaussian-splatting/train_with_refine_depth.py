@@ -606,6 +606,7 @@ def training(
         "continue_after_densify": bool(continue_opacity_resets_after_densify),
         "densify_until_iter": int(opt.densify_until_iter),
         "opacity_reset_interval": int(opt.opacity_reset_interval),
+        "opacity_cull": float(opt.opacity_cull),
         "iterations": opacity_reset_iterations,
     }
     scheduler_audit_path = os.path.join(dataset.model_path, "chart_geometry_scheduler.json")
