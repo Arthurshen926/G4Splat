@@ -22,6 +22,11 @@ def test_plane_minimum_area_scales_with_semantic_structural_support():
         plane_support_mask(None, image_shape),
         min_size_ratio=0.01,
     ) == 100
+    assert minimum_plane_area(
+        support,
+        min_size_ratio=0.01,
+        min_pixels=64,
+    ) == 64
 
 
 def test_plane_semantic_support_is_a_hard_shape_checked_gate():

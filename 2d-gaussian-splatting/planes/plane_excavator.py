@@ -93,6 +93,8 @@ class PlaneExcavatorConfig():
 
     min_size_ratio: float = 0.004 # 0.4%
     """The minimum size of a desired plane segment, as a ratio of the total number of pixels in the image."""
+    min_size_pixels: int = 1
+    """Absolute lower bound for a local plane segment after semantic gating."""
     n_init_normal_clusters: int = 8
     """The number of clusters to form as well as the number of centroids to generate when use KMeans to cluster the surface normals."""
     n_normal_clusters: int = 6
@@ -108,6 +110,7 @@ class PlaneExcavator:
         self.num_sam_prompts = config.num_sam_prompts
         self.img_shape = (img_height, img_width)  # Currently only support images of the same size
         self.min_size_ratio = float(config.min_size_ratio)
+        self.min_size_pixels = int(config.min_size_pixels)
         self.device = device
 
         self.sam_model = setup_sam(device=self.device)
@@ -213,6 +216,7 @@ class PlaneExcavator:
         min_plane_size = minimum_plane_area(
             support_mask,
             min_size_ratio=self.min_size_ratio,
+            min_pixels=self.min_size_pixels,
         )
         normal_clusters = self._normals_cluster(
             normals,
@@ -302,6 +306,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--plane_root_path", type=str, required=True)
     parser.add_argument("--use_normal_estimator", action='store_true')
+    parser.add_argument("--min-size-ratio", type=float, default=0.01)
+    parser.add_argument("--min-plane-pixels", type=int, default=1)
+    parser.add_argument("--normal-clusters", type=int, default=6)
     args = parser.parse_args()
 
     seed_everything()
@@ -319,7 +326,11 @@ if __name__ == "__main__":
     normal_list.sort()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = PlaneExcavatorConfig(min_size_ratio=0.01)
+    config = PlaneExcavatorConfig(
+        min_size_ratio=args.min_size_ratio,
+        min_size_pixels=args.min_plane_pixels,
+        n_normal_clusters=args.normal_clusters,
+    )
     plane_excavator = PlaneExcavator(config, device, img_height, img_width, use_normal_estimator=args.use_normal_estimator)
 
     if args.use_normal_estimator:
@@ -415,6 +426,8 @@ if __name__ == "__main__":
             {
                 'schema_version': 1,
                 'min_size_ratio': config.min_size_ratio,
+                'min_size_pixels': config.min_size_pixels,
+                'normal_clusters': config.n_normal_clusters,
                 'policy': 'semantic_structural_support_relative_plane_area',
                 'frames': semantic_audit,
             },

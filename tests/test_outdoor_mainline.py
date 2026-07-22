@@ -229,3 +229,5 @@ def test_mainline_contract_enables_block_balanced_real_view_sampling(tmp_path):
 
     assert command[command.index("--dense-view-sampling-policy") + 1] == "spatial_block_balanced"
     assert command[command.index("--dense-view-block-bins") + 1] == "4"
+    assert command[command.index("--plane-min-size-ratio") + 1] == "0.004"
+    assert command[command.index("--plane-min-pixels") + 1] == "64"

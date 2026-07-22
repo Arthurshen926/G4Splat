@@ -57,7 +57,9 @@ statistics with spatial-block-balanced real-camera sampling, leave
 map as explicit unknown/neutral evidence instead of zero support.  The
 structural geometry loss consumes the fused inverse-depth variance and source
 bitmask: plane/Chart evidence is primary and mono-only evidence is a weak
-fallback.
+fallback.  Plane proposals are semantic-gated, retain multiple normal modes,
+and use a `64`-pixel absolute lower bound in addition to their relative
+structural-support threshold.
 
 The prior `18.756 / .830 / .0821` number is retained as a train-fit diagnostic
 baseline only.  The mainline writes a separate held-out trajectory result, so

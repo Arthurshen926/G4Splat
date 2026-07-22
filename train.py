@@ -335,6 +335,24 @@ if __name__ == '__main__':
         default=2,
         help='Require cross-view support before a fused plane rewrites Chart depth.',
     )
+    parser.add_argument(
+        '--plane-min-size-ratio',
+        type=float,
+        default=0.01,
+        help='Relative minimum plane area measured over semantic structural support.',
+    )
+    parser.add_argument(
+        '--plane-min-pixels',
+        type=int,
+        default=1,
+        help='Absolute minimum local plane area after semantic gating.',
+    )
+    parser.add_argument(
+        '--plane-normal-clusters',
+        type=int,
+        default=6,
+        help='Number of normal modes retained for local plane proposals.',
+    )
     parser.add_argument('--downweight_input_view_color_loss', action='store_true',
         help='Also reduce color loss weight for input views; See3D views are always reduced')
     parser.add_argument('--use_mesh_filter', action='store_true', help='Use mesh filter')
@@ -416,6 +434,12 @@ if __name__ == '__main__':
     ))
     if continuation_modes > 1:
         raise ValueError('Only one continuation mode may be selected')
+    if not 0.0 < args.plane_min_size_ratio <= 1.0:
+        raise ValueError('--plane-min-size-ratio must be in (0, 1]')
+    if args.plane_min_pixels < 1:
+        raise ValueError('--plane-min-pixels must be positive')
+    if args.plane_normal_clusters < 1:
+        raise ValueError('--plane-normal-clusters must be positive')
     
     # Set output paths
     if args.output_path is None:
@@ -760,6 +784,9 @@ if __name__ == '__main__':
     generate_2Dplane_command = " ".join([
         "python", "2d-gaussian-splatting/planes/plane_excavator.py",
         "--plane_root_path", plane_root_path,
+        "--min-size-ratio", str(args.plane_min_size_ratio),
+        "--min-plane-pixels", str(args.plane_min_pixels),
+        "--normal-clusters", str(args.plane_normal_clusters),
     ])
 
     plane_safety_gate_command = " ".join([

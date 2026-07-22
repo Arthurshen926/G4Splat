@@ -33,18 +33,22 @@ def minimum_plane_area(
     support_mask: np.ndarray,
     *,
     min_size_ratio: float,
+    min_pixels: int = 1,
 ) -> int:
     """Scale the local plane-area threshold by usable structural pixels.
 
     A 1%-of-full-image rule silently removes a small distant facade whenever
     foliage or sky occupies most of an outdoor frame.  The correct reference
     measure is the structural semantic support that is allowed to enter plane
-    fitting.  At least one pixel is retained as a defensive lower bound; later
-    normal/SAM and multi-view gates still decide whether it is a real plane.
+    fitting.  ``min_pixels`` supplies an explicit absolute lower bound for
+    outdoor runs, preventing a tiny residual support island from becoming a
+    one-pixel plane candidate.
     """
     if not 0.0 < float(min_size_ratio) <= 1.0:
         raise ValueError("min_size_ratio must be in (0, 1]")
+    if int(min_pixels) < 1:
+        raise ValueError("min_pixels must be positive")
     support = np.asarray(support_mask, dtype=bool)
     if support.ndim != 2:
         raise ValueError(f"plane support mask must be 2D, got {support.shape}")
-    return max(1, int(math.ceil(float(support.sum()) * float(min_size_ratio))))
+    return max(int(min_pixels), int(math.ceil(float(support.sum()) * float(min_size_ratio))))
