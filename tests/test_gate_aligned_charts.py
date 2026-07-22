@@ -1,6 +1,9 @@
+import json
+from pathlib import Path
+
 import numpy as np
 
-from scripts.gate_aligned_charts import gate_charts
+from scripts.gate_aligned_charts import gate_charts, resolve_absolute_caps
 
 
 def test_gate_charts_zeroes_only_extreme_depth_conflicts():
@@ -84,6 +87,31 @@ def test_gate_charts_hard_filters_joint_absolute_outliers():
     assert gated["confs"][0, 0, 1] == -2
     assert gated["depths"][0, 0, 0] == 0
     assert gated["pts"][0, 0, 1, 0] == 0
+
+
+def test_outdoor_manifest_disables_implicit_absolute_gate_cap(tmp_path):
+    mast3r_scene = tmp_path / "run" / "mast3r_sfm"
+    mast3r_scene.mkdir(parents=True)
+    (mast3r_scene.parent / "outdoor_mainline_manifest.json").write_text(json.dumps({
+        "policy_version": "cambridge-outdoor-structural-mainline-v1",
+        "depth_policy": "inverse_depth_fusion_v1",
+    }))
+
+    depth_cap, point_cap, policy = resolve_absolute_caps(
+        mast3r_scene,
+        max_abs_depth=None,
+        max_abs_point=None,
+    )
+    legacy_depth_cap, legacy_point_cap, legacy_policy = resolve_absolute_caps(
+        Path(tmp_path / "legacy" / "mast3r_sfm"),
+        max_abs_depth=None,
+        max_abs_point=None,
+    )
+
+    assert (depth_cap, point_cap) == (None, None)
+    assert policy == "outdoor_manifest_no_implicit_cap"
+    assert (legacy_depth_cap, legacy_point_cap) == (50.0, 50.0)
+    assert legacy_policy == "legacy_default_absolute_cap"
 
 
 def test_gate_uses_persisted_mast3r_target_not_depthanything_change_magnitude():

@@ -29,8 +29,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-relative-p90", type=float, default=0.50)
     parser.add_argument("--max-gt25-fraction", type=float, default=0.50)
     parser.add_argument("--min-valid-fraction", type=float, default=0.05)
-    parser.add_argument("--max-abs-depth", type=float, default=50.0)
-    parser.add_argument("--max-abs-point", type=float, default=50.0)
+    parser.add_argument(
+        "--max-abs-depth",
+        type=float,
+        default=None,
+        help="Optional absolute legacy depth cap; inferred from the run policy when omitted.",
+    )
+    parser.add_argument(
+        "--max-abs-point",
+        type=float,
+        default=None,
+        help="Optional absolute legacy point-norm cap; inferred from the run policy when omitted.",
+    )
     parser.add_argument(
         "--require-reference-depths",
         action="store_true",
@@ -51,6 +61,39 @@ def _resize_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
         (shape[1], shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
+
+
+def resolve_absolute_caps(
+    mast3r_scene: Path,
+    *,
+    max_abs_depth: float | None,
+    max_abs_point: float | None,
+) -> tuple[float | None, float | None, str]:
+    """Keep legacy safety caps, but never impose them on outdoor inverse depth.
+
+    The gate runs as a separate process spawned by both old and new runners.
+    Reading the immutable mainline manifest avoids relying on an easy-to-forget
+    flag in that hand-off while preserving the original 50-unit behavior for
+    legacy experiments.
+    """
+    manifest_path = Path(mast3r_scene).parent / "outdoor_mainline_manifest.json"
+    outdoor = False
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            outdoor = (
+                manifest.get("policy_version") == "cambridge-outdoor-structural-mainline-v1"
+                and manifest.get("depth_policy") == "inverse_depth_fusion_v1"
+            )
+        except (OSError, json.JSONDecodeError):
+            outdoor = False
+    if outdoor:
+        return max_abs_depth, max_abs_point, "outdoor_manifest_no_implicit_cap"
+    return (
+        50.0 if max_abs_depth is None else max_abs_depth,
+        50.0 if max_abs_point is None else max_abs_point,
+        "legacy_default_absolute_cap",
+    )
 
 
 def gate_charts(
@@ -225,6 +268,11 @@ def gate_charts(
 
 def main() -> None:
     args = parse_args()
+    max_abs_depth, max_abs_point, cap_policy = resolve_absolute_caps(
+        args.mast3r_scene,
+        max_abs_depth=args.max_abs_depth,
+        max_abs_point=args.max_abs_point,
+    )
     charts_path = args.mast3r_scene / "charts_data.npz"
     backup_path = args.mast3r_scene / "charts_data.pre_conflict_gate.npz"
     source_path = backup_path if backup_path.exists() else charts_path
@@ -266,8 +314,8 @@ def main() -> None:
         max_relative_p90=args.max_relative_p90,
         max_gt25_fraction=args.max_gt25_fraction,
         min_valid_fraction=args.min_valid_fraction,
-        max_abs_depth=args.max_abs_depth,
-        max_abs_point=args.max_abs_point,
+        max_abs_depth=max_abs_depth,
+        max_abs_point=max_abs_point,
     )
     temporary = charts_path.with_suffix(".gated.tmp.npz")
     np.savez_compressed(temporary, **gated)
@@ -287,8 +335,9 @@ def main() -> None:
             "max_relative_p90": args.max_relative_p90,
             "max_gt25_fraction": args.max_gt25_fraction,
             "min_valid_fraction": args.min_valid_fraction,
-            "max_abs_depth": args.max_abs_depth,
-            "max_abs_point": args.max_abs_point,
+            "max_abs_depth": max_abs_depth,
+            "max_abs_point": max_abs_point,
+            "absolute_cap_policy": cap_policy,
             "require_reference_depths": bool(args.require_reference_depths),
         },
         "rejected_count": sum(record["rejected"] for record in records),
