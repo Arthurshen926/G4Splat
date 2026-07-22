@@ -154,6 +154,21 @@ def _reuse_compatible_frontend(
     return replace(paths, screen_output=selected)
 
 
+def _completed_sfm_can_resume_alignment(screen_output: Path) -> bool:
+    """Whether a failed frontend can safely restart at Chart alignment.
+
+    MASt3R's fixed-camera recovery is the expensive immutable part of the
+    frontend.  A missing alignment gate after these two artifacts exist means
+    the run failed downstream, so rerunning SfM would be redundant and risks
+    changing no task-relevant inputs.
+    """
+    mast3r_scene = screen_output / "mast3r_sfm"
+    return (
+        (mast3r_scene / "sparse" / "0" / "images.bin").is_file()
+        and (mast3r_scene / "pointmaps").is_dir()
+    )
+
+
 def _train_with_mainline_contract(command: list[str], *, semantic_manifest: Path, fused_depth: Path | None = None) -> list[str]:
     result = [
         *command,
@@ -341,11 +356,19 @@ def run_mainline(args: argparse.Namespace) -> None:
     selection = prepare_selection(paths, config, env, False, args.force_selection)
     gate_report = paths.screen_output / "mast3r_sfm" / "aligned_chart_conflict_gate.json"
     if not gate_report.is_file():
+        resume_after_sfm = _completed_sfm_can_resume_alignment(paths.screen_output)
+        if resume_after_sfm:
+            print(
+                "[INFO] Reusing completed fixed-camera MASt3R artifacts; "
+                "restarting at Chart alignment.",
+                flush=True,
+            )
         frontend_command = train_command(
             paths,
             config,
             selection,
             screen_only=True,
+            continue_after_sfm=resume_after_sfm,
             stop_after_alignment_gate=True,
         )
         _write_mainline_manifest(

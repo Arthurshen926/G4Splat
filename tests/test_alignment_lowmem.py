@@ -1,5 +1,6 @@
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import yaml
@@ -15,6 +16,78 @@ from matcha.dm_trainers.charts_alignment import (
     reject_catastrophic_alignment_confidences,
     restore_unaligned_geometry,
 )
+
+
+class _RecordingChartsEncoding(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.row_heights: list[int] = []
+
+    def forward(self, uv: torch.Tensor) -> torch.Tensor:
+        self.row_heights.append(int(uv.shape[1]))
+        return torch.cat((uv, uv.sum(dim=-1, keepdim=True)), dim=-1)
+
+
+class _VectorDeformation(torch.nn.Module):
+    output_dim = 3
+    output_range_min = -1.0
+    output_range_max = 1.0
+
+    def forward(self, encodings: torch.Tensor, additional_input=None) -> torch.Tensor:
+        return encodings
+
+
+class _ScalarDeformation(torch.nn.Module):
+    output_dim = 1
+    output_range_min = -1.0
+    output_range_max = 1.0
+
+    def forward(self, encodings: torch.Tensor, additional_input=None) -> torch.Tensor:
+        return encodings[..., :1]
+
+
+class _ToyDepthEncoding(torch.nn.Module):
+    def forward(self, depth_coords: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (depth_coords, depth_coords.square(), depth_coords * 0.5), dim=-1
+        )
+
+
+def _toy_aligner_for_materialization() -> ParallelAligner:
+    """Build just enough state to exercise the terminal no-grad export."""
+    aligner = ParallelAligner.__new__(ParallelAligner)
+    torch.nn.Module.__init__(aligner)
+    aligner.n_pm, aligner.pm_h, aligner.pm_w = 2, 5, 4
+    uv = torch.stack(
+        torch.meshgrid(torch.linspace(-1.0, 1.0, 5), torch.linspace(-1.0, 1.0, 4)),
+        dim=-1,
+    ).repeat(2, 1, 1, 1)
+    aligner._pts_uv = uv
+    aligner._verts = torch.arange(2 * 5 * 4 * 3, dtype=torch.float32).reshape(2, 5, 4, 3)
+    aligner._deformed_verts = torch.empty_like(aligner._verts)
+    aligner._rays = None
+    aligner.charts_encoding_params = SimpleNamespace(encoding_dim=3)
+    aligner.charts_encoding = _RecordingChartsEncoding()
+    aligner.deformation = _VectorDeformation()
+    aligner.weight_encodings_with_confidence = False
+    aligner.use_learnable_depth_encoding = False
+    aligner.use_meta_mlp = False
+    aligner.use_lora_mlp = False
+    aligner.predict_in_disparity_space = False
+    return aligner
+
+
+def _toy_aligner_with_depth_confidence_and_rays() -> ParallelAligner:
+    aligner = _toy_aligner_for_materialization()
+    aligner.deformation = _ScalarDeformation()
+    aligner.use_learnable_depth_encoding = True
+    aligner.learnable_depth_encoding_mode = "add"
+    aligner.depth_coords = torch.linspace(0.0, 1.0, 20).repeat(2, 1)
+    aligner.depth_encoding = _ToyDepthEncoding()
+    aligner.weight_encodings_with_confidence = True
+    aligner._confidence = torch.linspace(-0.2, 0.3, 40).reshape(2, 5, 4)
+    aligner._rays = torch.arange(2 * 5 * 4 * 3, dtype=torch.float32).reshape(2, 20, 3) + 1.0
+    return aligner
 
 
 def test_masked_strong_alignment_keeps_matching_and_bounds_projection_memory():
@@ -88,6 +161,29 @@ def test_chunked_chart_encoding_norm_has_dense_objective_gradient():
 
     assert abs(chunked_value - float(dense_loss.detach())) < 1e-7
     assert torch.allclose(charts.encodings.grad, dense_gradient, atol=1e-7, rtol=1e-6)
+
+
+def test_terminal_chart_materialization_streams_rows_without_changing_vertices():
+    aligner = _toy_aligner_for_materialization()
+    expected = aligner._verts + aligner.verts_deformations.reshape(2, 5, 4, 3)
+    aligner.charts_encoding.row_heights.clear()
+
+    aligner.materialize_deformed_verts(chunk_rows=2)
+
+    assert aligner.charts_encoding.row_heights == [2, 2, 1]
+    assert torch.allclose(aligner._deformed_verts, expected)
+    assert "materialize_deformed_verts" in inspect.getsource(ParallelAligner.optimize)
+
+
+def test_terminal_chart_materialization_preserves_depth_confidence_and_ray_paths():
+    aligner = _toy_aligner_with_depth_confidence_and_rays()
+    expected = aligner._verts + aligner.verts_deformations.reshape(2, 5, 4, 3)
+    aligner.charts_encoding.row_heights.clear()
+
+    aligner.materialize_deformed_verts(chunk_rows=3)
+
+    assert aligner.charts_encoding.row_heights == [3, 2]
+    assert torch.allclose(aligner._deformed_verts, expected)
 
 
 def test_alignment_masked_mean_does_not_dilute_loss_with_excluded_sky():

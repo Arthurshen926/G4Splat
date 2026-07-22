@@ -14,6 +14,7 @@ from matcha.cambridge_training import build_spatial_camera_blocks, fused_inverse
 from scripts.run_cambridge_g4splat import scene_paths
 from scripts.run_cambridge_outdoor_mainline import (
     MAINLINE_POLICY_VERSION,
+    _completed_sfm_can_resume_alignment,
     _train_with_mainline_contract,
     _reuse_compatible_frontend,
     _serialized_config,
@@ -219,6 +220,18 @@ def test_mainline_reuses_pre_switch_frontend_without_reenabling_see3d(tmp_path):
     assert reused.screen_output == frontend
     assert config.disable_see3d is True
     assert config.scene_aligned_see3d_cameras is False
+
+
+def test_mainline_restarts_alignment_from_completed_fixed_camera_sfm(tmp_path):
+    screen_output = tmp_path / "screen"
+    sparse = screen_output / "mast3r_sfm" / "sparse" / "0"
+    sparse.mkdir(parents=True)
+    (sparse / "images.bin").touch()
+    (screen_output / "mast3r_sfm" / "pointmaps").mkdir()
+
+    assert _completed_sfm_can_resume_alignment(screen_output)
+    (sparse / "images.bin").unlink()
+    assert not _completed_sfm_can_resume_alignment(screen_output)
 
 
 def test_mainline_contract_enables_block_balanced_real_view_sampling(tmp_path):

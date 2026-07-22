@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import numpy as np
 import torch
 from torch.nn.functional import normalize as torch_normalize
@@ -345,26 +345,41 @@ class ParallelAligner(torch.nn.Module):
     def device(self):
         return self._verts.device
     
-    @property
-    def verts_deformations(self):
-        # Compute encodings
-        _charts_encoding_dim = self.charts_encoding_params.encoding_dim        
-        encodings = self.charts_encoding(self._pts_uv).reshape(self.n_pm, -1, _charts_encoding_dim)  # (n_depth, n_verts_per_chart, charts_encoding_dim)
-        
-        # Weight encodings with confidence if needed
+    def _verts_deformations_for_uv(
+        self,
+        pts_uv: torch.Tensor,
+        *,
+        point_start: int = 0,
+        point_stop: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Evaluate a full or row-chunked deformation field."""
+        if pts_uv.ndim != 4 or pts_uv.shape[0] != self.n_pm or pts_uv.shape[-1] != 2:
+            raise ValueError("pts_uv must have shape (charts, height, width, 2)")
+        if point_stop is None:
+            point_stop = self.pm_h * self.pm_w
+        point_start = int(point_start)
+        point_stop = int(point_stop)
+        expected_points = int(pts_uv.shape[1] * pts_uv.shape[2])
+        if point_stop - point_start != expected_points:
+            raise ValueError("point span must match the supplied Chart pixel grid")
+
+        _charts_encoding_dim = self.charts_encoding_params.encoding_dim
+        encodings = self.charts_encoding(pts_uv).reshape(
+            self.n_pm, -1, _charts_encoding_dim
+        )
+
         if self.weight_encodings_with_confidence:
-            if True:
-                conf_weights = (self.confidence.detach() - 1.).view(self.n_pm, -1, 1)  # (n_depth, n_verts_per_chart, 1)
-                conf_weights = 1. - torch.exp(-conf_weights**2 / 2)  # TODO: Changed
-            else:
-                conf_weights = confidence_to_weight(self.confidence.detach().view(self.n_pm, -1, 1))
-                
-            encodings = encodings * conf_weights
-            
-        # Compute and add depth encoding if needed
+            confidence_minus_one = torch.exp(
+                self._confidence.reshape(self.n_pm, -1)[:, point_start:point_stop]
+            ).detach()
+            conf_weights = 1. - torch.exp(-confidence_minus_one.square() / 2)
+            encodings = encodings * conf_weights.unsqueeze(-1)
+
         additional_input = None
-        if self.use_learnable_depth_encoding:            
-            depth_encodings = self.depth_encoding(self.depth_coords).reshape(self.n_pm, -1, _charts_encoding_dim)  # (n_depth, n_verts_per_chart, charts_encoding_dim)
+        if self.use_learnable_depth_encoding:
+            depth_encodings = self.depth_encoding(
+                self.depth_coords[:, point_start:point_stop]
+            ).reshape(self.n_pm, -1, _charts_encoding_dim)
             if not (self.use_meta_mlp or self.use_lora_mlp):
                 if self.learnable_depth_encoding_mode == 'add':
                     encodings = encodings + depth_encodings
@@ -379,31 +394,57 @@ class ParallelAligner(torch.nn.Module):
                 else:
                     raise ValueError(f"learnable_depth_encoding_mode must be either 'add', 'replace', \
                                         or 'concatenate', and not {self.learnable_depth_encoding_mode}.")
-            
-        # Compute deformations
+
         if self.use_meta_mlp or self.use_lora_mlp:
             deformations = self.deformation(encodings, cond=depth_encodings)
         else:
-            deformations = self.deformation(encodings, additional_input=additional_input)  # (n_depth, n_verts_per_chart, 3 or 1)
-        
-        # If we are predicting deformations along rays, we need to multiply the deformations by the ray directions
-        # Moreover, if we are predicting in disparity space, we need to scale the deformations by the distance to the camera center
+            deformations = self.deformation(encodings, additional_input=additional_input)
+
         predict_deformations_along_rays = self.deformation.output_dim == 1
         if predict_deformations_along_rays or self.predict_in_disparity_space:
             if self._rays is None:
                 raise ValueError("Rays must be provided if we are predicting deformations along rays or in disparity space.")
+            rays = self._rays[:, point_start:point_stop]
         if predict_deformations_along_rays:
             if self.predict_in_disparity_space:
                 mlp_output_scale = (self.deformation.output_range_max - self.deformation.output_range_min) / 2
-                deformations = deformations / mlp_output_scale * self._rays
+                deformations = deformations / mlp_output_scale * rays
             else:
-                deformations = deformations * torch_normalize(self._rays, dim=-1)
-        else:
-            if self.predict_in_disparity_space:
-                mlp_output_scale = (self.deformation.output_range_max - self.deformation.output_range_min) / 2
-                deformations = deformations / mlp_output_scale * self._rays.norm(dim=-1, keepdim=True)
-                
+                deformations = deformations * torch_normalize(rays, dim=-1)
+        elif self.predict_in_disparity_space:
+            mlp_output_scale = (self.deformation.output_range_max - self.deformation.output_range_min) / 2
+            deformations = deformations / mlp_output_scale * rays.norm(dim=-1, keepdim=True)
+
         return deformations
+
+    @property
+    def verts_deformations(self):
+        return self._verts_deformations_for_uv(self._pts_uv)
+
+    @torch.no_grad()
+    def materialize_deformed_verts(self, *, chunk_rows: int = 64) -> None:
+        """Stream the terminal Chart deformation writeback by spatial rows."""
+        chunk_rows = int(chunk_rows)
+        if chunk_rows < 0:
+            raise ValueError("chunk_rows must be non-negative")
+        if chunk_rows == 0:
+            chunk_rows = self.pm_h
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        for row_start in range(0, self.pm_h, chunk_rows):
+            row_stop = min(self.pm_h, row_start + chunk_rows)
+            point_start = row_start * self.pm_w
+            point_stop = row_stop * self.pm_w
+            deformations = self._verts_deformations_for_uv(
+                self._pts_uv[:, row_start:row_stop],
+                point_start=point_start,
+                point_stop=point_stop,
+            )
+            self._deformed_verts[:, row_start:row_stop].copy_(
+                self._verts[:, row_start:row_stop]
+                + deformations.reshape(self.n_pm, row_stop - row_start, self.pm_w, 3)
+            )
+            del deformations
     
     @property
     def verts(self):
@@ -899,8 +940,7 @@ class ParallelAligner(torch.nn.Module):
                                 if param.requires_grad:
                                     print(f"      > {name}")
                                     print(f"         > Max: {param.max().item()}   Min: {param.min().item()}   Mean: {param.mean().item()}   Std: {param.std().item()}")
-        with torch.no_grad():
-            self._deformed_verts[...] = self.verts.clone()
+        self.materialize_deformed_verts()
         progress_bar.close()
         if verbose:
             print("Optimization done.")
