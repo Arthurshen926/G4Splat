@@ -1,7 +1,8 @@
 type: '2dgs'
-# Continue from the screened structural map.  A bounded second topology window
-# allows real-view residuals to add detail, then freezes geometry for the long
-# appearance-focused refinement.
+# Historical 7k -> 40k continuation: this configuration keeps topology fixed
+# after the screened structural map.  It does *not* allocate real-view
+# residual Gaussians; use outdoor_protected_residual48k for the additive,
+# baseline-preserving continuation stage.
 iterations: 40000
 densify_until_iter: 7000
 opacity_reset_interval: 7000

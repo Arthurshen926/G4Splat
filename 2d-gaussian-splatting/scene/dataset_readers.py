@@ -13,7 +13,7 @@ import os
 import sys
 sys.path.append(os.getcwd())
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -37,6 +37,14 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    # Keep the calibrated pinhole model as data, rather than round-tripping it
+    # through a symmetric FoV.  ``None`` is retained for legacy Blender and
+    # third-party callers that only have FoV metadata.
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx: Optional[float] = None
+    cy: Optional[float] = None
+    zfar: Optional[float] = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -87,12 +95,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         T = np.array(extr.tvec)
 
         if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
+            focal_length_x = float(intr.params[0])
+            focal_length_y = focal_length_x
+            principal_x = float(intr.params[1])
+            principal_y = float(intr.params[2])
+            FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
+            focal_length_x = float(intr.params[0])
+            focal_length_y = float(intr.params[1])
+            principal_x = float(intr.params[2])
+            principal_y = float(intr.params[3])
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -102,11 +115,62 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_info = CameraInfo(
+            uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+            image_path=image_path, image_name=image_name, width=width, height=height,
+            fx=focal_length_x, fy=focal_length_y,
+            cx=principal_x, cy=principal_y,
+        )
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
+
+
+def assign_adaptive_camera_zfar(
+    cam_infos: list[CameraInfo],
+    points: Optional[np.ndarray],
+    *,
+    quantile: float = 0.995,
+    margin: float = 1.25,
+    minimum: float = 1.0,
+    max_points: int = 50_000,
+) -> list[CameraInfo]:
+    """Derive a conservative per-camera far plane from sparse scene support.
+
+    A fixed ``zfar=100`` silently clips an outdoor scene after changes in
+    reconstruction scale, while a huge universal value weakens depth
+    precision.  Sparse COLMAP support is already in the same fixed camera
+    coordinate system, so use its robust positive-z quantile.  Cameras with
+    no visible support retain the renderer's legacy fallback by leaving
+    ``zfar`` unset.
+    """
+    if points is None:
+        return cam_infos
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or not len(points):
+        return cam_infos
+    if max_points < 1:
+        raise ValueError("max_points must be positive")
+    # The same all-train Cambridge scene is instantiated for RGB sampling and
+    # evaluation as well as for the compact Chart set.  A deterministic,
+    # evenly-spaced sparse sample retains robust high-depth quantiles while
+    # avoiding an O(cameras * all_sparse_points) startup cost for 1k+ views.
+    if len(points) > max_points:
+        sample_indices = np.linspace(0, len(points) - 1, num=max_points, dtype=np.int64)
+        points = points[sample_indices]
+    result: list[CameraInfo] = []
+    for camera in cam_infos:
+        # ``CameraInfo.R`` is stored transposed for the CUDA row-vector
+        # convention; row points therefore transform as ``P @ R + T``.
+        camera_depth = points @ np.asarray(camera.R, dtype=np.float64) + np.asarray(camera.T, dtype=np.float64)
+        positive_z = camera_depth[:, 2]
+        positive_z = positive_z[np.isfinite(positive_z) & (positive_z > 1e-4)]
+        if positive_z.size:
+            zfar = max(float(minimum), float(np.quantile(positive_z, quantile)) * float(margin))
+            result.append(camera._replace(zfar=zfar))
+        else:
+            result.append(camera)
+    return result
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -210,6 +274,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     except:
         pcd = None
 
+    cam_infos = assign_adaptive_camera_zfar(
+        cam_infos,
+        None if pcd is None else pcd.points,
+    )
+    train_cam_infos = cam_infos
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -255,7 +325,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            fx=fov2focal(FovX, image.size[0]), fy=fov2focal(FovY, image.size[1]),
+                            cx=image.size[0] / 2.0, cy=image.size[1] / 2.0))
             
     return cam_infos
 

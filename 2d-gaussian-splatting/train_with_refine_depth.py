@@ -12,6 +12,7 @@
 import os
 import sys
 import json
+import argparse
 from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(os.getcwd(), '2d-gaussian-splatting'))
@@ -21,6 +22,7 @@ import gc
 import copy
 import torch
 import torch.nn.functional as F
+from collections import Counter
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -54,13 +56,16 @@ from matcha.cambridge_training import (
     fused_inverse_depth_nll,
     geometry_chart_sampling_indices,
     geometry_iteration,
+    geometry_prior_schedule_weight,
     linear_weight,
     apply_per_image_affine_color_correction,
+    load_per_image_affine_color_correction,
     load_depth_cache,
     masked_mean,
     opacity_reset_due,
     PerImageAffineColorCorrection,
     rgb_sampling_importance_weights,
+    rgb_sampling_importance_weights_by_camera,
     resolve_active_chart_indices,
     rgb_supervision_weight,
     scale_chart_geometry_priors,
@@ -126,6 +131,8 @@ def training(
     continue_opacity_resets_after_densify=False,
     chart_geometry_prior_weight=1.0,
     dense_depth_cache=None, geometry_view_every_n_iter=5, dense_only_from_iter=3000,
+    geometry_schedule="persistent", geometry_phase1_until=12_000,
+    geometry_phase2_until=25_000, geometry_final_weight_floor=0.2,
     dense_view_sampling_policy="uniform", dense_view_block_bins=4,
     pseudo_rgb_weight=0.01, pseudo_geometry_weight=0.25,
     pseudo_geometry_final_weight=0.02, pseudo_geometry_decay_until=7000,
@@ -147,6 +154,13 @@ def training(
     warmstart_max_opacity=1.0, warmstart_max_scale=0.0,
     warmstart_max_position_delta=0.0, warmstart_diffuse_only=False,
     warmstart_clamp_dc=False,
+    warmstart_preserve_topology=True,
+    warmstart_allow_residual_densification=False,
+    warmstart_residual_densification_mode="clone_only",
+    warmstart_residual_densify_max_per_event=5_000,
+    warmstart_residual_clone_opacity=0.02,
+    warmstart_freeze_baseline=False,
+    warmstart_residual_lr_restart=False,
 ):
     
     save_log_images = False
@@ -156,6 +170,11 @@ def training(
     gaussian_points_iterations = []
     
     first_iter = 0
+    # RGB importance weights must be conditioned on the iterations that this
+    # process will actually execute.  A 7k -> 40k checkpoint continuation
+    # begins at iteration 7001, not at the bootstrap, so its Chart/dense
+    # sampler mixture differs from a fresh 40k run.
+    sampling_start_iteration = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     
@@ -194,6 +213,16 @@ def training(
     print(f"[INFO] Cambridge RGB supervision profile: {rgb_supervision_profile}")
     if chart_geometry_prior_weight < 0.0:
         raise ValueError("--chart-geometry-prior-weight must be non-negative")
+    if geometry_schedule not in {"legacy_cutoff", "persistent"}:
+        raise ValueError("--geometry-schedule must be legacy_cutoff or persistent")
+    if geometry_phase1_until < 1 or geometry_phase2_until < geometry_phase1_until:
+        raise ValueError("geometry phase bounds must satisfy 1 <= phase1 <= phase2")
+    if not 0.0 <= geometry_final_weight_floor <= 1.0:
+        raise ValueError("--geometry-final-weight-floor must lie in [0, 1]")
+    if warmstart_residual_densification_mode not in {"clone_only", "split_only"}:
+        raise ValueError(
+            "--warmstart-residual-densification-mode must be clone_only or split_only"
+        )
     print(
         "[INFO] Chart-exclusive geometry-prior weight: "
         f"{chart_geometry_prior_weight}."
@@ -331,6 +360,31 @@ def training(
         gc.collect()
         torch.cuda.empty_cache()
 
+    # Keep the *realized* sampler trace separate from its analytic schedule.
+    # The latter proves the intended expectation; the former catches an
+    # implementation drift such as a broken block cycle or an accidental
+    # Chart-only topology stream in an actual reconstruction run.
+    dense_camera_block_by_name = {
+        dense_viewpoint_cams[camera_index].image_name: int(block_index)
+        for block_index, block in enumerate(dense_view_blocks)
+        for camera_index in block
+    }
+    runtime_real_camera_names = sorted(
+        camera.image_name
+        for camera in (dense_viewpoint_cams if use_dense_supervision else input_cams)
+    )
+    runtime_rgb_samples = Counter()
+    runtime_rgb_weighted_mass = Counter()
+    runtime_rgb_samples_by_sequence = Counter()
+    runtime_rgb_weighted_mass_by_sequence = Counter()
+    runtime_rgb_samples_by_block = Counter()
+    runtime_rgb_weighted_mass_by_block = Counter()
+    runtime_geometry_samples = Counter()
+    runtime_dense_samples = Counter()
+    runtime_topology_samples = Counter()
+    runtime_topology_samples_by_block = Counter()
+    runtime_topology_samples_by_sequence = Counter()
+
     # A chart-only support directory used to be silently interpreted as zero
     # canonical support for every remaining dense camera.  Preserve that
     # conservative numerical fallback for reproducibility, but make the
@@ -379,9 +433,16 @@ def training(
     else:
         see3d_gs_cameras_list = []
     
+    geometry_schedule_description = (
+        f"persistent phases <= {geometry_phase1_until} / <= {geometry_phase2_until} / later "
+        f"at every {geometry_view_every_n_iter}/{geometry_view_every_n_iter * 2}/"
+        f"{geometry_view_every_n_iter * 4} iter(s), floor={geometry_final_weight_floor}"
+        if geometry_schedule == "persistent"
+        else f"legacy cutoff at iteration {dense_only_from_iter} every {geometry_view_every_n_iter} iter(s)"
+    )
     print(
-        f"[INFO] Plane/chart views every {geometry_view_every_n_iter} iteration(s) through "
-        f"iteration {dense_only_from_iter}; dense supervision enabled={use_dense_supervision}."
+        f"[INFO] Plane/chart geometry schedule: {geometry_schedule_description}; "
+        f"dense supervision enabled={use_dense_supervision}."
     )
     
     # ===================================================================================
@@ -484,11 +545,31 @@ def training(
         use_dense_supervision=use_dense_supervision,
         geometry_view_every_n_iter=geometry_view_every_n_iter,
         dense_only_from_iter=dense_only_from_iter,
+        geometry_schedule=geometry_schedule,
+        geometry_phase1_until=geometry_phase1_until,
+        geometry_phase2_until=geometry_phase2_until,
+    )
+    dense_camera_names = [camera.image_name for camera in dense_viewpoint_cams]
+    rgb_sampling_weight_by_dense_name = rgb_sampling_importance_weights_by_camera(
+        policy=rgb_sampling_policy,
+        total_iterations=opt.iterations,
+        dense_camera_names=dense_camera_names,
+        chart_camera_names=input_chart_names,
+        use_dense_supervision=use_dense_supervision,
+        geometry_view_every_n_iter=geometry_view_every_n_iter,
+        dense_only_from_iter=dense_only_from_iter,
+        dense_view_sampling_policy=dense_view_sampling_policy,
+        dense_view_blocks=dense_view_blocks,
+        geometry_schedule=geometry_schedule,
+        geometry_phase1_until=geometry_phase1_until,
+        geometry_phase2_until=geometry_phase2_until,
     )
     print(
         "[INFO] RGB sampling policy: "
         f"{rgb_sampling_policy}; chart_weight={chart_rgb_sampling_weight:.6f}, "
-        f"non_chart_weight={non_chart_rgb_sampling_weight:.6f}."
+        f"non_chart_weight={non_chart_rgb_sampling_weight:.6f}; exact per-camera "
+        f"range={min(rgb_sampling_weight_by_dense_name.values(), default=1.0):.6f}-"
+        f"{max(rgb_sampling_weight_by_dense_name.values(), default=1.0):.6f}."
     )
     geometry_iteration_count = sum(
         geometry_iteration(
@@ -496,6 +577,9 @@ def training(
             use_dense_supervision=use_dense_supervision,
             every_n=geometry_view_every_n_iter,
             dense_only_from_iter=dense_only_from_iter,
+            geometry_schedule=geometry_schedule,
+            phase1_until=geometry_phase1_until,
+            phase2_until=geometry_phase2_until,
         )
         for iteration in range(1, opt.iterations + 1)
     )
@@ -514,6 +598,9 @@ def training(
             use_dense_supervision=use_dense_supervision,
             every_n=geometry_view_every_n_iter,
             dense_only_from_iter=dense_only_from_iter,
+            geometry_schedule=geometry_schedule,
+            phase1_until=geometry_phase1_until,
+            phase2_until=geometry_phase2_until,
         )
         for iteration in range(1, topology_last_iteration + 1)
     )
@@ -564,12 +651,19 @@ def training(
     scheduler_audit["rgb_sampling"] = {
         "policy": rgb_sampling_policy,
         "dense_camera_count": len(dense_viewpoint_cams),
+        "sampling_start_iteration": sampling_start_iteration,
+        "executed_iteration_count": int(opt.iterations) - sampling_start_iteration,
         "geometry_iteration_count": geometry_iteration_count,
         "total_iteration_count": int(opt.iterations),
         "geometry_view_every_n_iter": int(geometry_view_every_n_iter),
         "dense_only_from_iter": int(dense_only_from_iter),
+        "geometry_schedule": geometry_schedule,
+        "geometry_phase1_until": int(geometry_phase1_until),
+        "geometry_phase2_until": int(geometry_phase2_until),
+        "geometry_final_weight_floor": float(geometry_final_weight_floor),
         "chart_importance_weight": chart_rgb_sampling_weight,
         "non_chart_importance_weight": non_chart_rgb_sampling_weight,
+        "per_camera_importance_weight": rgb_sampling_weight_by_dense_name,
         "all_scheduled_chart_names_present_in_dense_set": (
             not use_dense_supervision or not missing_dense_chart_names
         ),
@@ -583,6 +677,11 @@ def training(
             "one_random_real_camera_per_occupied_block_per_cycle"
             if dense_view_sampling_policy == "spatial_block_balanced"
             else "uniform_without_replacement_over_all_real_cameras_per_cycle"
+        ),
+        "rgb_objective_correction": (
+            "exact_per_camera_importance_weight_from_chart_dense_mixture"
+            if rgb_sampling_policy == "all_train_importance"
+            else "legacy_unweighted"
         ),
     }
     scheduler_audit["densification_stats"] = {
@@ -794,21 +893,29 @@ def training(
             "chart geometry losses remain alignment-supported only."
         )
     warmstart_requested = init_ply is not None
+    checkpoint_continuation_requested = checkpoint is not None
+    if warmstart_requested and checkpoint_continuation_requested:
+        raise ValueError("Use either --init_ply or --start_checkpoint, not both")
     _images = (
         []
-        if warmstart_requested
+        if warmstart_requested or checkpoint_continuation_requested
         else [cam.original_image.cuda().permute(1, 2, 0) for cam in scene.getTrainCameras()]
     )
-    # A warm start does not need to rebuild and immediately discard the real-chart
-    # initialization. Only warp-sample pseudo holes that will be appended later.
-    use_warp_downsample = warmstart_requested or (
+    # A warm start is already a complete structural model.  Never route it
+    # through the old warp-downsample bootstrap: that path was responsible for
+    # replacing a 7k PLY with a smaller reinitialised topology.
+    use_warp_downsample = (
+        not warmstart_requested
+        and not checkpoint_continuation_requested
+        and (
         use_downsample_gaussians and downsample_gaussians_type == "warp"
+        )
     )
     voxel_max_init_gs_input_view_num = 50
     warp_max_init_gs_input_view_num = None
     max_init_gs_input_view_num = (
         0
-        if warmstart_requested
+        if warmstart_requested or checkpoint_continuation_requested
         else (
             warp_max_init_gs_input_view_num
             if use_warp_downsample
@@ -843,7 +950,11 @@ def training(
     warp_init_views = list(init_input_views)
     warp_init_valid_masks = [initialization_valid_masks[i] for i in init_view_ids]
     
-    use_pseudo_initialization = see3d_view_num > 0 and pseudo_initialization_mode != "none"
+    use_pseudo_initialization = (
+        not checkpoint_continuation_requested
+        and see3d_view_num > 0
+        and pseudo_initialization_mode != "none"
+    )
     if use_pseudo_initialization:
         see3d_view_depths = pa_depths[input_view_num:]
         _images = (
@@ -910,7 +1021,9 @@ def training(
                 )
 
     warmstart_reseed_params = None
-    if warmstart_requested and not use_pseudo_initialization:
+    if checkpoint_continuation_requested:
+        print("[INFO] Full checkpoint continuation requested; skipping Gaussian reinitialization.")
+    elif warmstart_requested and not use_pseudo_initialization:
         print("[INFO] Warm-start has no pseudo views to reseed; skipping initialization.")
     elif use_warp_downsample:
         _means, _scales, _quaternions, _colors = get_gaussian_parameters_by_warp_from_depths(
@@ -974,7 +1087,7 @@ def training(
     if warmstart_requested and use_pseudo_initialization:
         warmstart_reseed_params = (_means, _scales, _quaternions, _colors)
         print(f"Warm-start reseed candidates: {len(_means)}")
-    elif not warmstart_requested:
+    elif not warmstart_requested and not checkpoint_continuation_requested:
         print(f"Final number of gaussians: {len(_means)}")
         gaussians.create_from_parameters(
             _means, _scales, _quaternions, _colors, gaussians.spatial_lr_scale
@@ -985,6 +1098,7 @@ def training(
     torch.cuda.empty_cache()
 
     warmstart_baseline_count = 0
+    warmstart_reseed_count = 0
     if init_ply is not None:
         init_ply = os.path.abspath(os.path.expanduser(init_ply))
         if not os.path.isfile(init_ply):
@@ -1012,6 +1126,7 @@ def training(
                     reseed_colors,
                     initial_opacity=0.05,
                 )
+                warmstart_reseed_count = int(reseed_count)
                 print(
                     f"[INFO] Appended {reseed_count} low-opacity See3D hole Gaussians "
                     f"with pixel stride {warmstart_reseed_pixel_stride}."
@@ -1026,14 +1141,185 @@ def training(
     
     gaussians.training_setup(opt)
     if checkpoint:
+        checkpoint = os.path.abspath(os.path.expanduser(checkpoint))
+        if not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"Continuation checkpoint does not exist: {checkpoint}")
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        first_iter = int(first_iter)
+        sampling_start_iteration = first_iter
+        warmstart_baseline_count = len(gaussians.get_xyz)
+        # Recondition the all-real RGB importance correction on the remaining
+        # continuation range.  Using the fresh-run 0..40k mixture here would
+        # misweight every camera after a checkpoint because the persistent
+        # geometry cadence changes across phases.
+        chart_rgb_sampling_weight, non_chart_rgb_sampling_weight = (
+            rgb_sampling_importance_weights(
+                policy=rgb_sampling_policy,
+                total_iterations=opt.iterations,
+                dense_view_count=len(dense_viewpoint_cams),
+                chart_view_count=len(geometry_input_chart_indices),
+                use_dense_supervision=use_dense_supervision,
+                geometry_view_every_n_iter=geometry_view_every_n_iter,
+                dense_only_from_iter=dense_only_from_iter,
+                geometry_schedule=geometry_schedule,
+                geometry_phase1_until=geometry_phase1_until,
+                geometry_phase2_until=geometry_phase2_until,
+                start_iteration=sampling_start_iteration,
+            )
+        )
+        rgb_sampling_weight_by_dense_name = rgb_sampling_importance_weights_by_camera(
+            policy=rgb_sampling_policy,
+            total_iterations=opt.iterations,
+            dense_camera_names=dense_camera_names,
+            chart_camera_names=input_chart_names,
+            use_dense_supervision=use_dense_supervision,
+            geometry_view_every_n_iter=geometry_view_every_n_iter,
+            dense_only_from_iter=dense_only_from_iter,
+            dense_view_sampling_policy=dense_view_sampling_policy,
+            dense_view_blocks=dense_view_blocks,
+            geometry_schedule=geometry_schedule,
+            geometry_phase1_until=geometry_phase1_until,
+            geometry_phase2_until=geometry_phase2_until,
+            start_iteration=sampling_start_iteration,
+        )
+        geometry_iteration_count = sum(
+            geometry_iteration(
+                iteration,
+                use_dense_supervision=use_dense_supervision,
+                every_n=geometry_view_every_n_iter,
+                dense_only_from_iter=dense_only_from_iter,
+                geometry_schedule=geometry_schedule,
+                phase1_until=geometry_phase1_until,
+                phase2_until=geometry_phase2_until,
+            )
+            for iteration in range(sampling_start_iteration + 1, opt.iterations + 1)
+        )
+        scheduler_audit["rgb_sampling"].update({
+            "sampling_start_iteration": sampling_start_iteration,
+            "executed_iteration_count": int(opt.iterations) - sampling_start_iteration,
+            "geometry_iteration_count": geometry_iteration_count,
+            "chart_importance_weight": chart_rgb_sampling_weight,
+            "non_chart_importance_weight": non_chart_rgb_sampling_weight,
+            "per_camera_importance_weight": rgb_sampling_weight_by_dense_name,
+        })
+        print(
+            "[INFO] Reconditioned RGB sampling weights for checkpoint continuation: "
+            f"iterations {sampling_start_iteration + 1}-{opt.iterations}; "
+            f"chart_weight={chart_rgb_sampling_weight:.6f}, "
+            f"non_chart_weight={non_chart_rgb_sampling_weight:.6f}."
+        )
     if freeze_init_ply:
         if warmstart_baseline_count <= 0:
             raise ValueError("--freeze_init_ply requires --init_ply")
         # restore() replaces the optimized tensors, so install hooks and capture
         # the suffix anchors only after a checkpoint has been restored.
         gaussians.freeze_prefix_gradients(warmstart_baseline_count)
+
+    warmstart_topology_protected = bool(
+        (warmstart_requested and warmstart_preserve_topology and not freeze_init_ply)
+        or checkpoint_continuation_requested
+    )
+    warmstart_residual_densification_active = bool(
+        warmstart_topology_protected and warmstart_allow_residual_densification
+    )
+    if warmstart_allow_residual_densification and not warmstart_topology_protected:
+        raise ValueError(
+            "--warmstart-allow-residual-densification requires a protected "
+            "--init_ply or --start_checkpoint continuation"
+        )
+    if warmstart_residual_densification_active:
+        if warmstart_residual_densify_max_per_event <= 0:
+            raise ValueError(
+                "--warmstart-residual-densify-max-per-event must be positive "
+                "when residual densification is enabled"
+            )
+        if not 0.0 < warmstart_residual_clone_opacity < 1.0:
+            raise ValueError(
+                "--warmstart-residual-clone-opacity must lie strictly between 0 and 1"
+            )
+        # Checkpoints retain historic gradient accumulators.  A residual stage
+        # must allocate only from observations made after continuation, rather
+        # than replaying stale Chart-only allocation evidence at its first event.
+        gaussians.xyz_gradient_accum = torch.zeros_like(gaussians.xyz_gradient_accum)
+        gaussians.denom = torch.zeros_like(gaussians.denom)
+        gaussians.max_radii2D = torch.zeros_like(gaussians.max_radii2D)
+    if warmstart_freeze_baseline and not (
+        checkpoint_continuation_requested and warmstart_residual_densification_active
+    ):
+        raise ValueError(
+            "--warmstart-freeze-baseline requires a checkpoint residual continuation"
+        )
+    if warmstart_residual_lr_restart and not (
+        checkpoint_continuation_requested
+        and warmstart_residual_densification_active
+        and warmstart_freeze_baseline
+    ):
+        raise ValueError(
+            "--warmstart-residual-lr-restart requires a frozen checkpoint residual continuation"
+        )
+    warmstart_audit = {
+        "schema_version": "warmstart-topology-audit-v3",
+        "init_ply": init_ply,
+        "continuation_checkpoint": checkpoint if checkpoint_continuation_requested else None,
+        "continuation_kind": (
+            "checkpoint" if checkpoint_continuation_requested
+            else ("ply" if warmstart_requested else "none")
+        ),
+        "baseline_gaussian_count": int(warmstart_baseline_count),
+        "reseed_gaussian_count": int(warmstart_reseed_count),
+        "initial_total_gaussian_count": int(len(gaussians.get_xyz)),
+        "preserve_topology": warmstart_topology_protected,
+        "freeze_init_ply": bool(freeze_init_ply),
+        "topology_operations": {
+            "densify_and_prune": "disabled" if warmstart_topology_protected else "enabled",
+            "additive_residual_clone": (
+                "enabled"
+                if warmstart_residual_densification_active
+                and warmstart_residual_densification_mode == "clone_only"
+                else "disabled"
+            ),
+            "additive_residual_split": (
+                "enabled"
+                if warmstart_residual_densification_active
+                and warmstart_residual_densification_mode == "split_only"
+                else "disabled"
+            ),
+            "opacity_reset": "disabled" if warmstart_topology_protected else "enabled",
+        },
+        "baseline_parameter_updates": (
+            "frozen" if warmstart_freeze_baseline else "enabled"
+        ),
+        "residual_learning_rate_schedule": (
+            "restarted_at_continuation" if warmstart_residual_lr_restart else "global_iteration"
+        ),
+        "residual_densification": {
+            "enabled": warmstart_residual_densification_active,
+            "mode": (
+                "bounded_additive_" + warmstart_residual_densification_mode
+                if warmstart_residual_densification_active
+                else "disabled"
+            ),
+            "max_new_points_per_event": int(warmstart_residual_densify_max_per_event),
+            "clone_opacity_ceiling": float(warmstart_residual_clone_opacity),
+            "events": [],
+            "total_gaussians_added": 0,
+        },
+    }
+    if warmstart_requested or checkpoint_continuation_requested:
+        print(
+            "[INFO] Existing-topology protection: "
+            f"{warmstart_topology_protected}; initial={warmstart_audit['initial_total_gaussian_count']} "
+            f"(baseline={warmstart_baseline_count}, reseed={warmstart_reseed_count})."
+        )
+    if warmstart_residual_densification_active:
+        print(
+            "[INFO] Protected residual topology stage: additive "
+            f"{warmstart_residual_densification_mode}; "
+            f"max/event={warmstart_residual_densify_max_per_event}, "
+            f"opacity<={warmstart_residual_clone_opacity}.",
+            flush=True,
+        )
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -1180,7 +1466,53 @@ def training(
     if use_color_correction:
         real_image_names = [camera.image_name for camera in input_cams]
         real_image_names.extend(camera.image_name for camera in dense_viewpoint_cams)
-        color_correction = PerImageAffineColorCorrection(real_image_names).cuda()
+        continuation_color_path = None
+        if checkpoint_continuation_requested:
+            # A genuine checkpoint continuation must restore the appearance
+            # state from the checkpoint's *own* model directory.  The former
+            # code only looked under the new output path, forcing callers to
+            # pre-copy a sidecar file and making an incomplete continuation
+            # silently start with identity affine parameters.
+            checkpoint_model_dir = os.path.dirname(checkpoint)
+            candidate_paths = [
+                os.path.join(
+                    checkpoint_model_dir,
+                    "point_cloud",
+                    f"iteration_{first_iter}",
+                    "color_correction.pth",
+                ),
+                # Keep support for an explicit sidecar staged at the new
+                # output path by older launchers, but never require it.
+                os.path.join(
+                    dataset.model_path,
+                    "point_cloud",
+                    f"iteration_{first_iter}",
+                    "color_correction.pth",
+                ),
+            ]
+            for candidate in dict.fromkeys(candidate_paths):
+                if not os.path.isfile(candidate):
+                    continue
+                restored = load_per_image_affine_color_correction(
+                    candidate, device="cuda"
+                )
+                expected_names = set(dict.fromkeys(real_image_names))
+                restored_names = set(restored.image_name_to_index)
+                if restored_names != expected_names:
+                    raise RuntimeError(
+                        "Continuation color-correction camera contract differs from "
+                        f"the current real RGB set: checkpoint={len(restored_names)}, "
+                        f"current={len(expected_names)}"
+                    )
+                color_correction = restored.train()
+                continuation_color_path = candidate
+                print(
+                    "[INFO] Restored per-image affine color correction from "
+                    + candidate
+                )
+                break
+        if color_correction is None:
+            color_correction = PerImageAffineColorCorrection(real_image_names).cuda()
         color_correction_optimizer = torch.optim.Adam(
             color_correction.parameters(),
             lr=color_correction_lr,
@@ -1190,6 +1522,8 @@ def training(
             f"{len(color_correction.image_name_to_index)} real image(s), "
             f"lr={color_correction_lr}, reg={color_correction_reg}."
         )
+        if continuation_color_path is not None:
+            warmstart_audit["color_correction_checkpoint"] = continuation_color_path
 
     # Set the MIP state explicitly in both directions.  ``load_ply`` restores
     # an embedded filter when a warm-start PLY contains one; only setting this
@@ -1199,6 +1533,14 @@ def training(
     if use_mip_filter:
         print("[INFO] Using mip filter during training.")
         gaussians.compute_mip_filter(cameras=dense_viewpoint_cams if use_dense_supervision else total_views_list)
+    if warmstart_freeze_baseline:
+        gaussians.freeze_prefix_gradients(warmstart_baseline_count)
+        warmstart_audit["baseline_optimizer_state"] = {
+            "prefix_momentum": "cleared",
+            "cleared_fields_by_group": getattr(
+                gaussians, "_frozen_prefix_optimizer_state", {}
+            ),
+        }
 
     dense_depth_priors = None
     if use_dense_supervision and dense_regul != "none":
@@ -1255,7 +1597,12 @@ def training(
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        learning_rate_iteration = (
+            iteration - sampling_start_iteration
+            if warmstart_residual_lr_restart
+            else iteration
+        )
+        gaussians.update_learning_rate(learning_rate_iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -1266,6 +1613,9 @@ def training(
             use_dense_supervision=use_dense_supervision,
             every_n=geometry_view_every_n_iter,
             dense_only_from_iter=dense_only_from_iter,
+            geometry_schedule=geometry_schedule,
+            phase1_until=geometry_phase1_until,
+            phase2_until=geometry_phase2_until,
         )
         if use_geometry_view:
             if not viewpoint_idx_stack:
@@ -1298,14 +1648,36 @@ def training(
             is_pseudo_view = False
             current_geometry_mask = None
 
-        is_input_chart_view = (
-            not is_pseudo_view and viewpoint_cam.image_name in input_chart_names
-        )
+        # Correct the *actual* RGB sampler.  In spatial block balancing a
+        # non-Chart camera's probability depends on its block population, so
+        # a chart/non-chart scalar alone would bias the all-real objective.
         rgb_sampling_weight = (
-            chart_rgb_sampling_weight
-            if is_input_chart_view
-            else non_chart_rgb_sampling_weight
+            1.0
+            if is_pseudo_view
+            else rgb_sampling_weight_by_dense_name.get(
+                viewpoint_cam.image_name,
+                1.0,
+            )
         )
+        if not is_pseudo_view:
+            sampled_name = viewpoint_cam.image_name
+            sampled_sequence = sampled_name.split("__", 1)[0]
+            sampled_block = dense_camera_block_by_name.get(sampled_name)
+            runtime_rgb_samples[sampled_name] += 1
+            runtime_rgb_weighted_mass[sampled_name] += float(rgb_sampling_weight)
+            runtime_rgb_samples_by_sequence[sampled_sequence] += 1
+            runtime_rgb_weighted_mass_by_sequence[sampled_sequence] += float(
+                rgb_sampling_weight
+            )
+            if sampled_block is not None:
+                runtime_rgb_samples_by_block[sampled_block] += 1
+                runtime_rgb_weighted_mass_by_block[sampled_block] += float(
+                    rgb_sampling_weight
+                )
+            if use_geometry_view:
+                runtime_geometry_samples[sampled_name] += 1
+            else:
+                runtime_dense_samples[sampled_name] += 1
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -1583,7 +1955,16 @@ def training(
                     curv_prior_loss,
                     anisotropy_loss,
                 ),
-                weight=chart_geometry_prior_weight,
+                weight=(
+                    chart_geometry_prior_weight
+                    * geometry_prior_schedule_weight(
+                        iteration,
+                        geometry_schedule=geometry_schedule,
+                        phase1_until=geometry_phase1_until,
+                        phase2_until=geometry_phase2_until,
+                        final_weight_floor=geometry_final_weight_floor,
+                    )
+                ),
             )
             total_regularization_loss = (
                 depth_prior_loss
@@ -1728,13 +2109,28 @@ def training(
 
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            topology_densification_active = (
+                iteration < opt.densify_until_iter
+                and (
+                    not warmstart_topology_protected
+                    or warmstart_residual_densification_active
+                )
+            )
+            if topology_densification_active:
                 update_densification_stats = densification_stats_from_view(
                     policy=densification_view_policy,
                     use_dense_supervision=use_dense_supervision,
                     is_geometry_view=use_geometry_view,
                 )
                 if update_densification_stats:
+                    if not is_pseudo_view:
+                        topology_name = viewpoint_cam.image_name
+                        topology_sequence = topology_name.split("__", 1)[0]
+                        topology_block = dense_camera_block_by_name.get(topology_name)
+                        runtime_topology_samples[topology_name] += 1
+                        runtime_topology_samples_by_sequence[topology_sequence] += 1
+                        if topology_block is not None:
+                            runtime_topology_samples_by_block[topology_block] += 1
                     gaussians.max_radii2D[visibility_filter] = torch.max(
                         gaussians.max_radii2D[visibility_filter],
                         radii[visibility_filter],
@@ -1745,20 +2141,64 @@ def training(
                     )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
-                    if gaussians.use_mip_filter:
+                    if warmstart_residual_densification_active:
+                        residual_grads = gaussians.xyz_gradient_accum / gaussians.denom
+                        if warmstart_residual_densification_mode == "clone_only":
+                            added_count = gaussians.densify_and_clone_limited(
+                                residual_grads,
+                                opt.densify_grad_threshold,
+                                scene.cameras_extent,
+                                warmstart_residual_densify_max_per_event,
+                                opacity_ceiling=warmstart_residual_clone_opacity,
+                            )
+                        else:
+                            added_count = gaussians.densify_and_split_limited(
+                                residual_grads,
+                                opt.densify_grad_threshold,
+                                scene.cameras_extent,
+                                warmstart_residual_densify_max_per_event,
+                                opacity_ceiling=warmstart_residual_clone_opacity,
+                            )
+                        residual_audit = warmstart_audit["residual_densification"]
+                        residual_audit["events"].append(
+                            {
+                                "iteration": int(iteration),
+                                "mode": warmstart_residual_densification_mode,
+                                "added_gaussian_count": int(added_count),
+                                "total_gaussian_count": int(len(gaussians.get_xyz)),
+                            }
+                        )
+                        residual_audit["total_gaussians_added"] += int(added_count)
+                        print(
+                            "[INFO] Protected residual densification at "
+                            f"iteration {iteration} ({warmstart_residual_densification_mode}): "
+                            f"+{added_count}, "
+                            f"total={len(gaussians.get_xyz)}.",
+                            flush=True,
+                        )
+                    else:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            opt.opacity_cull,
+                            scene.cameras_extent,
+                            size_threshold,
+                        )
+                    if gaussians.use_mip_filter and not warmstart_residual_densification_active:
                         gaussians.compute_mip_filter(
                             cameras=dense_viewpoint_cams if use_dense_supervision else total_views_list
                         )
                 
-            if opacity_reset_due(
+            if (
+                not warmstart_topology_protected
+                and opacity_reset_due(
                 iteration,
                 opacity_reset_interval=int(opt.opacity_reset_interval),
                 densify_from_iter=int(opt.densify_from_iter),
                 densify_until_iter=int(opt.densify_until_iter),
                 white_background=bool(dataset.white_background),
                 continue_after_densify=bool(continue_opacity_resets_after_densify),
+                )
             ):
                 gaussians.reset_opacity()
                     
@@ -1816,6 +2256,68 @@ def training(
                     # raise e
                     network_gui.conn = None
 
+    def _counter_payload(counter, *, names=None):
+        if names is None:
+            items = counter.items()
+        else:
+            items = ((name, counter[name]) for name in names)
+        return {
+            str(key): value
+            for key, value in sorted(items, key=lambda item: str(item[0]))
+        }
+
+    # Rewrite the scheduler audit with empirical counts once training is
+    # complete.  It deliberately includes zero-count real cameras: omitting
+    # them would make a failed block cycle indistinguishable from a camera
+    # that was merely not listed in the report.
+    scheduler_audit["runtime_sampling"] = {
+        "contract": "actual_rendered_real_view_counts_and_importance_weighted_rgb_mass",
+        "sampling_start_iteration": sampling_start_iteration,
+        "executed_iteration_count": int(opt.iterations) - sampling_start_iteration,
+        "rgb": {
+            "actual_sample_count_by_camera": _counter_payload(
+                runtime_rgb_samples, names=runtime_real_camera_names
+            ),
+            "effective_weighted_mass_by_camera": _counter_payload(
+                runtime_rgb_weighted_mass, names=runtime_real_camera_names
+            ),
+            "actual_sample_count_by_block": _counter_payload(runtime_rgb_samples_by_block),
+            "effective_weighted_mass_by_block": _counter_payload(
+                runtime_rgb_weighted_mass_by_block
+            ),
+            "actual_sample_count_by_sequence": _counter_payload(
+                runtime_rgb_samples_by_sequence
+            ),
+            "effective_weighted_mass_by_sequence": _counter_payload(
+                runtime_rgb_weighted_mass_by_sequence
+            ),
+        },
+        "geometry": {
+            "actual_sample_count_by_camera": _counter_payload(
+                runtime_geometry_samples, names=runtime_real_camera_names
+            ),
+        },
+        "dense": {
+            "actual_sample_count_by_camera": _counter_payload(
+                runtime_dense_samples, names=runtime_real_camera_names
+            ),
+        },
+        "topology": {
+            "actual_stats_sample_count_by_camera": _counter_payload(
+                runtime_topology_samples, names=runtime_real_camera_names
+            ),
+            "actual_stats_sample_count_by_block": _counter_payload(
+                runtime_topology_samples_by_block
+            ),
+            "actual_stats_sample_count_by_sequence": _counter_payload(
+                runtime_topology_samples_by_sequence
+            ),
+        },
+    }
+    with open(scheduler_audit_path, "w", encoding="utf-8") as handle:
+        json.dump(scheduler_audit, handle, indent=2)
+        handle.write("\n")
+
     if len(gaussian_points_count) > 0:
         plt.figure(figsize=(12, 6))
         plt.plot(gaussian_points_iterations, gaussian_points_count)
@@ -1825,6 +2327,28 @@ def training(
         plt.grid(True)
         plt.savefig(f"{dataset.model_path}/gaussian_points_count.png")
         plt.close()
+    if warmstart_requested or checkpoint_continuation_requested:
+        final_count = int(len(gaussians.get_xyz))
+        warmstart_audit.update(
+            {
+                "final_total_gaussian_count": final_count,
+                "net_gaussian_count_change": final_count - warmstart_audit["initial_total_gaussian_count"],
+                "baseline_gaussians_removed": max(
+                    0,
+                    warmstart_baseline_count - final_count,
+                ),
+            }
+        )
+        audit_path = os.path.join(dataset.model_path, "continuation_topology_audit.json")
+        with open(audit_path, "w", encoding="utf-8") as handle:
+            json.dump(warmstart_audit, handle, indent=2)
+            handle.write("\n")
+        if warmstart_topology_protected and final_count < warmstart_baseline_count:
+            raise RuntimeError(
+                "Warm-start topology protection lost baseline Gaussians; inspect audit "
+                + audit_path
+            )
+        print(f"[INFO] Continuation topology audit: {audit_path}")
     print("Training complete.")
 
 def prepare_output_and_logger(args):    
@@ -2045,6 +2569,18 @@ if __name__ == "__main__":
     parser.add_argument("--geometry_view_every_n_iter", type=int, default=5)
     parser.add_argument("--dense_only_from_iter", type=int, default=3000)
     parser.add_argument(
+        "--geometry-schedule",
+        choices=["legacy_cutoff", "persistent"],
+        default="persistent",
+        help=(
+            "Persistent keeps Chart geometry active with decreasing cadence after "
+            "the bootstrap; legacy_cutoff reproduces dense_only_from_iter behavior."
+        ),
+    )
+    parser.add_argument("--geometry-phase1-until", type=int, default=12_000)
+    parser.add_argument("--geometry-phase2-until", type=int, default=25_000)
+    parser.add_argument("--geometry-final-weight-floor", type=float, default=0.2)
+    parser.add_argument(
         "--dense-view-sampling-policy",
         choices=["uniform", "spatial_block_balanced"],
         default="uniform",
@@ -2107,6 +2643,60 @@ if __name__ == "__main__":
     parser.add_argument("--warmstart_max_position_delta", type=float, default=0.0)
     parser.add_argument("--warmstart_diffuse_only", action="store_true")
     parser.add_argument("--warmstart_clamp_dc", action="store_true")
+    parser.add_argument(
+        "--warmstart-preserve-topology",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Preserve every Gaussian in an init PLY by disabling prune/reset and "
+            "topology rewrites during warm-start refinement."
+        ),
+    )
+    parser.add_argument(
+        "--warmstart-allow-residual-densification",
+        action="store_true",
+        help=(
+            "For a protected continuation only, append bounded low-opacity residual "
+            "primitives from post-continuation gradients; never prune or reset baseline points."
+        ),
+    )
+    parser.add_argument(
+        "--warmstart-residual-densification-mode",
+        choices=["clone_only", "split_only"],
+        default="clone_only",
+        help=(
+            "Use small-parent clones or compact children of large parents for a "
+            "protected residual topology stage."
+        ),
+    )
+    parser.add_argument(
+        "--warmstart-residual-densify-max-per-event",
+        type=int,
+        default=5_000,
+        help="Maximum residual Gaussians appended at one protected densification event.",
+    )
+    parser.add_argument(
+        "--warmstart-residual-clone-opacity",
+        type=float,
+        default=0.02,
+        help="Upper bound on initial opacity of a protected residual primitive.",
+    )
+    parser.add_argument(
+        "--warmstart-freeze-baseline",
+        action="store_true",
+        help=(
+            "Freeze the checkpoint prefix parameters so only later residual "
+            "Gaussians are optimized."
+        ),
+    )
+    parser.add_argument(
+        "--warmstart-residual-lr-restart",
+        action="store_true",
+        help=(
+            "Restart the Gaussian learning-rate clock at a frozen checkpoint "
+            "continuation so appended residual primitives can move."
+        ),
+    )
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=None)  # 6009
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
@@ -2168,6 +2758,8 @@ if __name__ == "__main__":
         args.continue_opacity_resets_after_densify,
         args.chart_geometry_prior_weight,
         args.dense_depth_cache, args.geometry_view_every_n_iter, args.dense_only_from_iter,
+        args.geometry_schedule, args.geometry_phase1_until,
+        args.geometry_phase2_until, args.geometry_final_weight_floor,
         args.dense_view_sampling_policy, args.dense_view_block_bins,
         args.pseudo_rgb_weight, args.pseudo_geometry_weight,
         args.pseudo_geometry_final_weight, args.pseudo_geometry_decay_until,
@@ -2189,6 +2781,13 @@ if __name__ == "__main__":
         args.warmstart_max_opacity, args.warmstart_max_scale,
         args.warmstart_max_position_delta, args.warmstart_diffuse_only,
         args.warmstart_clamp_dc,
+        args.warmstart_preserve_topology,
+        args.warmstart_allow_residual_densification,
+        args.warmstart_residual_densification_mode,
+        args.warmstart_residual_densify_max_per_event,
+        args.warmstart_residual_clone_opacity,
+        args.warmstart_freeze_baseline,
+        args.warmstart_residual_lr_restart,
     )
 
     # All done

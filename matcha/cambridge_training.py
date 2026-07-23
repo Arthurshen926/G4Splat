@@ -389,12 +389,57 @@ def geometry_iteration(
     use_dense_supervision: bool,
     every_n: int,
     dense_only_from_iter: int,
+    geometry_schedule: str = "legacy_cutoff",
+    phase1_until: int = 12_000,
+    phase2_until: int = 25_000,
 ) -> bool:
     if not use_dense_supervision:
         return True
-    if dense_only_from_iter >= 0 and iteration > dense_only_from_iter:
-        return False
-    return iteration % max(int(every_n), 1) == 0
+    if geometry_schedule == "legacy_cutoff":
+        if dense_only_from_iter >= 0 and iteration > dense_only_from_iter:
+            return False
+        return iteration % max(int(every_n), 1) == 0
+    if geometry_schedule != "persistent":
+        raise ValueError(
+            "geometry_schedule must be 'legacy_cutoff' or 'persistent', "
+            f"got {geometry_schedule!r}"
+        )
+    if phase1_until < 1 or phase2_until < phase1_until:
+        raise ValueError("persistent geometry phase bounds must satisfy 1 <= phase1 <= phase2")
+    if iteration <= phase1_until:
+        frequency = max(int(every_n), 1)
+    elif iteration <= phase2_until:
+        frequency = max(int(every_n) * 2, 1)
+    else:
+        frequency = max(int(every_n) * 4, 1)
+    return iteration % frequency == 0
+
+
+def geometry_prior_schedule_weight(
+    iteration: int,
+    *,
+    geometry_schedule: str,
+    phase1_until: int = 12_000,
+    phase2_until: int = 25_000,
+    final_weight_floor: float = 0.2,
+) -> float:
+    """Keep Chart geometry active through the long real-view refinement.
+
+    The first phase is deliberately strongest, then its cadence and residual
+    magnitude taper without reaching zero.  This prevents depth/normal
+    supervision from disappearing after the screen bootstrap.
+    """
+    if not 0.0 <= final_weight_floor <= 1.0:
+        raise ValueError("final geometry weight floor must lie in [0, 1]")
+    if geometry_schedule == "legacy_cutoff":
+        return 1.0
+    if geometry_schedule != "persistent":
+        raise ValueError(f"Unknown geometry schedule {geometry_schedule!r}")
+    if iteration <= phase1_until:
+        return 1.0
+    if iteration <= phase2_until:
+        return max(0.5, final_weight_floor)
+    return final_weight_floor
 
 
 def densification_stats_from_view(
@@ -477,6 +522,10 @@ def rgb_sampling_importance_weights(
     use_dense_supervision: bool,
     geometry_view_every_n_iter: int,
     dense_only_from_iter: int,
+    geometry_schedule: str = "legacy_cutoff",
+    geometry_phase1_until: int = 12_000,
+    geometry_phase2_until: int = 25_000,
+    start_iteration: int = 0,
 ) -> tuple[float, float]:
     """Return RGB importance weights for chart and non-chart real cameras.
 
@@ -511,16 +560,22 @@ def rgb_sampling_importance_weights(
     if chart_view_count > dense_view_count:
         raise ValueError("chart_view_count cannot exceed dense_view_count")
 
+    if not 0 <= int(start_iteration) < int(total_iterations):
+        raise ValueError("start_iteration must lie in [0, total_iterations)")
     chart_iterations = sum(
         geometry_iteration(
             iteration,
             use_dense_supervision=use_dense_supervision,
             every_n=geometry_view_every_n_iter,
             dense_only_from_iter=dense_only_from_iter,
+            geometry_schedule=geometry_schedule,
+            phase1_until=geometry_phase1_until,
+            phase2_until=geometry_phase2_until,
         )
-        for iteration in range(1, total_iterations + 1)
+        for iteration in range(int(start_iteration) + 1, total_iterations + 1)
     )
-    chart_fraction = chart_iterations / float(total_iterations)
+    executed_iterations = int(total_iterations) - int(start_iteration)
+    chart_fraction = chart_iterations / float(executed_iterations)
     dense_fraction = 1.0 - chart_fraction
     if dense_fraction <= 0.0:
         raise ValueError(
@@ -538,6 +593,87 @@ def rgb_sampling_importance_weights(
         float(target_probability / chart_probability),
         float(target_probability / non_chart_probability),
     )
+
+
+def rgb_sampling_importance_weights_by_camera(
+    *,
+    policy: str,
+    total_iterations: int,
+    dense_camera_names: list[str],
+    chart_camera_names: set[str],
+    use_dense_supervision: bool,
+    geometry_view_every_n_iter: int,
+    dense_only_from_iter: int,
+    dense_view_sampling_policy: str,
+    dense_view_blocks: list[list[int]] | None = None,
+    geometry_schedule: str = "legacy_cutoff",
+    geometry_phase1_until: int = 12_000,
+    geometry_phase2_until: int = 25_000,
+    start_iteration: int = 0,
+) -> dict[str, float]:
+    """Return per-real-camera RGB importance weights for the actual sampler.
+
+    Spatial block balancing changes a camera's sampling probability according
+    to its block population.  A single Chart/non-Chart scalar cannot correct
+    that objective, so this helper uses the exact mixture of Chart geometry
+    and dense/topology sampling streams.
+    """
+    names = list(dense_camera_names)
+    if policy == "legacy_interleaved" or not use_dense_supervision:
+        return {name: 1.0 for name in names}
+    if policy != "all_train_importance":
+        raise ValueError(f"Unknown RGB sampling policy {policy!r}")
+    if total_iterations <= 0 or not names:
+        raise ValueError("all_train_importance requires positive iterations and dense cameras")
+    if not chart_camera_names:
+        return {name: 1.0 for name in names}
+    unknown_charts = chart_camera_names - set(names)
+    if unknown_charts:
+        raise ValueError(f"Chart cameras are absent from dense RGB set: {sorted(unknown_charts)[:3]}")
+    if not 0 <= int(start_iteration) < int(total_iterations):
+        raise ValueError("start_iteration must lie in [0, total_iterations)")
+    geometry_count = sum(
+        geometry_iteration(
+            iteration,
+            use_dense_supervision=use_dense_supervision,
+            every_n=geometry_view_every_n_iter,
+            dense_only_from_iter=dense_only_from_iter,
+            geometry_schedule=geometry_schedule,
+            phase1_until=geometry_phase1_until,
+            phase2_until=geometry_phase2_until,
+        )
+        for iteration in range(int(start_iteration) + 1, total_iterations + 1)
+    )
+    executed_iterations = int(total_iterations) - int(start_iteration)
+    geometry_fraction = geometry_count / float(executed_iterations)
+    dense_fraction = 1.0 - geometry_fraction
+    if dense_fraction <= 0.0:
+        raise ValueError("all_train_importance requires at least one dense RGB iteration")
+    if dense_view_sampling_policy == "uniform":
+        dense_probability = {name: 1.0 / len(names) for name in names}
+    elif dense_view_sampling_policy == "spatial_block_balanced":
+        if not dense_view_blocks:
+            raise ValueError("spatial_block_balanced requires non-empty dense_view_blocks")
+        dense_probability = {}
+        for block in dense_view_blocks:
+            if not block:
+                continue
+            for index in block:
+                dense_probability[names[index]] = 1.0 / (len(dense_view_blocks) * len(block))
+        if set(dense_probability) != set(names):
+            raise ValueError("spatial block sampler must assign every dense camera exactly once")
+    else:
+        raise ValueError(f"Unknown dense view sampling policy {dense_view_sampling_policy!r}")
+
+    target_probability = 1.0 / len(names)
+    chart_probability = 1.0 / len(chart_camera_names)
+    result: dict[str, float] = {}
+    for name in names:
+        actual_probability = dense_fraction * dense_probability[name]
+        if name in chart_camera_names:
+            actual_probability += geometry_fraction * chart_probability
+        result[name] = float(target_probability / actual_probability)
+    return result
 
 
 def resolve_active_chart_indices(

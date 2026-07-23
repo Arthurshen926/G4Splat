@@ -130,34 +130,73 @@ def getWorld2View2(R, t, translate=torch.tensor([0.0, 0.0, 0.0]), scale=1.0):
     return Rt
 
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
-    if isinstance(fovX, torch.Tensor):
-        tanHalfFovX = torch.tan((fovX / 2))
-    else:
-        tanHalfFovX = math.tan((fovX / 2))
-    
-    if isinstance(fovY, torch.Tensor):
-        tanHalfFovY = torch.tan((fovY / 2))
-    else:
-        tanHalfFovY = math.tan((fovY / 2))
-    
+def getProjectionMatrix(
+    znear, zfar, fovX, fovY, *,
+    fx=None, fy=None, cx=None, cy=None, image_width=None, image_height=None,
+):
+    """Projection with an exact optional COLMAP pinhole contract.
 
-    top = tanHalfFovY * znear
-    bottom = -top
-    right = tanHalfFovX * znear
-    left = -right
-
-    if isinstance(fovX, torch.Tensor):
-        P = torch.zeros(4, 4, device=fovX.device)
+    The centered FoV route remains for compatibility; calibrated callers pass
+    K so non-central principal points survive MASt3R, plane rays and 2DGS.
+    """
+    use_intrinsics = all(value is not None for value in (fx, fy, cx, cy, image_width, image_height))
+    if use_intrinsics:
+        tensor_value = next(
+            (value for value in (fx, fy, cx, cy, image_width, image_height) if isinstance(value, torch.Tensor)),
+            None,
+        )
+        if tensor_value is not None:
+            device = tensor_value.device
+            dtype = tensor_value.dtype
+            _fx = torch.as_tensor(fx, device=device, dtype=dtype)
+            _fy = torch.as_tensor(fy, device=device, dtype=dtype)
+            _cx = torch.as_tensor(cx, device=device, dtype=dtype)
+            _cy = torch.as_tensor(cy, device=device, dtype=dtype)
+            _width = torch.as_tensor(image_width, device=device, dtype=dtype)
+            _height = torch.as_tensor(image_height, device=device, dtype=dtype)
+            if bool((_fx <= 0).item()) or bool((_fy <= 0).item()) or bool((_width <= 0).item()) or bool((_height <= 0).item()):
+                raise ValueError("Pinhole intrinsics and image dimensions must be positive")
+            scale_x = 2.0 * _fx / _width
+            scale_y = 2.0 * _fy / _height
+            offset_x = 2.0 * _cx / _width - 1.0
+            offset_y = 2.0 * _cy / _height - 1.0
+            P = torch.zeros(4, 4, device=device, dtype=dtype)
+        else:
+            if float(fx) <= 0.0 or float(fy) <= 0.0 or float(image_width) <= 0.0 or float(image_height) <= 0.0:
+                raise ValueError("Pinhole intrinsics and image dimensions must be positive")
+            scale_x = 2.0 * float(fx) / float(image_width)
+            scale_y = 2.0 * float(fy) / float(image_height)
+            offset_x = 2.0 * float(cx) / float(image_width) - 1.0
+            offset_y = 2.0 * float(cy) / float(image_height) - 1.0
+            P = torch.zeros(4, 4)
     else:
-        P = torch.zeros(4, 4)
+        if isinstance(fovX, torch.Tensor):
+            tanHalfFovX = torch.tan((fovX / 2))
+        else:
+            tanHalfFovX = math.tan((fovX / 2))
+        if isinstance(fovY, torch.Tensor):
+            tanHalfFovY = torch.tan((fovY / 2))
+        else:
+            tanHalfFovY = math.tan((fovY / 2))
+        top = tanHalfFovY * znear
+        bottom = -top
+        right = tanHalfFovX * znear
+        left = -right
+        scale_x = 2.0 * znear / (right - left)
+        scale_y = 2.0 * znear / (top - bottom)
+        offset_x = (right + left) / (right - left)
+        offset_y = (top + bottom) / (top - bottom)
+        if isinstance(fovX, torch.Tensor):
+            P = torch.zeros(4, 4, device=fovX.device)
+        else:
+            P = torch.zeros(4, 4)
 
     z_sign = 1.0
 
-    P[0, 0] = 2.0 * znear / (right - left)
-    P[1, 1] = 2.0 * znear / (top - bottom)
-    P[0, 2] = (right + left) / (right - left)
-    P[1, 2] = (top + bottom) / (top - bottom)
+    P[0, 0] = scale_x
+    P[1, 1] = scale_y
+    P[0, 2] = offset_x
+    P[1, 2] = offset_y
     P[3, 2] = z_sign
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)

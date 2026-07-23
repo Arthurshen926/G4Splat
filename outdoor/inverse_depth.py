@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 
-INVERSE_DEPTH_FUSION_VERSION = "outdoor-inverse-depth-fusion-v1"
+INVERSE_DEPTH_FUSION_VERSION = "outdoor-inverse-depth-fusion-v2"
 
 
 def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -29,12 +29,36 @@ def _normalise_confidence(confidence: np.ndarray) -> np.ndarray:
     return np.clip(confidence / high, 0.0, 1.0).astype(np.float32)
 
 
+def _resize_bool(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    value = np.asarray(array, dtype=bool)
+    if value.shape == (height, width):
+        return value
+    image = Image.fromarray(value.astype(np.uint8) * 255)
+    return np.asarray(
+        image.resize((width, height), Image.Resampling.NEAREST), dtype=np.uint8
+    ) > 0
+
+
+def _resize_support_count(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    value = np.asarray(array, dtype=np.uint8)
+    if value.shape == (height, width):
+        return value
+    image = Image.fromarray(value)
+    return np.asarray(image.resize((width, height), Image.Resampling.NEAREST), dtype=np.uint8)
+
+
 def fuse_inverse_depth_sources(
     plane_depth: np.ndarray,
     plane_confidence: np.ndarray,
     chart_depth: np.ndarray | None,
     chart_confidence: np.ndarray | None,
     mono_depth: np.ndarray | None,
+    *,
+    plane_valid_mask: np.ndarray | None = None,
+    plane_support_view_count: np.ndarray | None = None,
+    chart_support_view_count: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Fuse bounded plane, aligned Chart and mono depth in inverse-depth space.
 
@@ -47,13 +71,35 @@ def fuse_inverse_depth_sources(
     if plane_depth.ndim != 2:
         raise ValueError("plane_depth must be two-dimensional")
     plane_confidence = _resize_float(np.asarray(plane_confidence, dtype=np.float32), shape)
-    sources: list[tuple[np.ndarray, np.ndarray, int]] = []
+    if plane_valid_mask is None:
+        # Compatibility for unit-level callers and explicitly old artifacts.
+        # The directory fusion path requires an explicit residual-plane mask.
+        plane_valid = np.isfinite(plane_depth) & (plane_depth > 0.0)
+    else:
+        plane_valid = _resize_bool(plane_valid_mask, shape)
+    if plane_support_view_count is None:
+        plane_support = np.where(plane_valid, 1, 0).astype(np.uint8)
+    else:
+        plane_support = _resize_support_count(plane_support_view_count, shape)
+        plane_support = np.where(plane_valid, plane_support, 0).astype(np.uint8)
+    sources: list[tuple[np.ndarray, np.ndarray, int, np.ndarray]] = []
 
-    plane_valid = np.isfinite(plane_depth) & (plane_depth > 0.0) & np.isfinite(plane_confidence)
+    plane_valid = plane_valid & np.isfinite(plane_depth) & (plane_depth > 0.0) & np.isfinite(plane_confidence)
     plane_weight = np.clip(plane_confidence, 0.0, 1.0) * plane_valid
-    sources.append((1.0 / np.maximum(plane_depth, 1e-6), plane_weight.astype(np.float32), 1))
+    sources.append((
+        1.0 / np.maximum(plane_depth, 1e-6),
+        plane_weight.astype(np.float32),
+        1,
+        plane_support,
+    ))
 
-    def add_optional(depth: np.ndarray | None, confidence: np.ndarray | None, bit: int, base_precision: float) -> None:
+    def add_optional(
+        depth: np.ndarray | None,
+        confidence: np.ndarray | None,
+        bit: int,
+        base_precision: float,
+        support_count: np.ndarray | None,
+    ) -> None:
         if depth is None:
             return
         value = _resize_float(np.asarray(depth, dtype=np.float32), shape)
@@ -66,22 +112,33 @@ def fuse_inverse_depth_sources(
         # it downweights the lower-priority source rather than hard overwriting
         # a distant building plane with monocular depth.
         weight = base_precision * confidence_value * valid
-        sources.append((1.0 / np.maximum(value, 1e-6), weight.astype(np.float32), bit))
+        if support_count is None:
+            support = np.where(valid, 1, 0).astype(np.uint8)
+        else:
+            support = _resize_support_count(support_count, shape)
+            support = np.where(valid, support, 0).astype(np.uint8)
+        sources.append((1.0 / np.maximum(value, 1e-6), weight.astype(np.float32), bit, support))
 
-    add_optional(chart_depth, chart_confidence, 2, 0.45)
-    add_optional(mono_depth, None, 4, 0.06)
+    add_optional(chart_depth, chart_confidence, 2, 0.45, chart_support_view_count)
+    # Monocular fallback is not independent multi-view evidence.
+    add_optional(mono_depth, None, 4, 0.06, np.zeros(shape, dtype=np.uint8))
 
     numerator = np.zeros(shape, dtype=np.float64)
     precision = np.zeros(shape, dtype=np.float64)
     source_bitmask = np.zeros(shape, dtype=np.uint8)
     support_view_count = np.zeros(shape, dtype=np.uint8)
     source_values: list[tuple[np.ndarray, np.ndarray]] = []
-    for rho, weight, bit in sources:
+    for rho, weight, bit, independent_support in sources:
         valid = weight > 0.0
         numerator += weight * rho
         precision += weight
         source_bitmask[valid] |= np.uint8(bit)
-        support_view_count[valid] += 1
+        # Source families are not independent camera observations.  A plane
+        # can already include the target Chart view, so report the strongest
+        # proven distinct-view support instead of double-counting plane+Chart.
+        support_view_count[valid] = np.maximum(
+            support_view_count[valid], independent_support[valid]
+        )
         source_values.append((rho, weight))
     valid = precision > 1e-8
     rho_mean = np.zeros(shape, dtype=np.float32)
@@ -128,6 +185,11 @@ def fuse_inverse_depth_directory(
     charts = np.load(charts_path)
     chart_depths = charts["depths"] if "depths" in charts.files else None
     chart_confs = charts["confs"] if "confs" in charts.files else None
+    chart_support_counts = None
+    for key in ("support_view_count", "support_view_counts", "chart_support_view_count"):
+        if key in charts.files:
+            chart_support_counts = charts[key]
+            break
     mono_depths = charts["prior_depths"] if "prior_depths" in charts.files else None
     count = int(chart_depths.shape[0]) if chart_depths is not None else 0
     if count <= 0:
@@ -135,21 +197,47 @@ def fuse_inverse_depth_directory(
     output.mkdir(parents=True, exist_ok=True)
     frame_summaries: list[dict[str, Any]] = []
     for index in range(count):
-        depth_path = plane_root / f"refine_depth_frame{index:06d}.tiff"
-        confidence_path = plane_root / f"confident_map_frame{index:06d}.png"
-        if not depth_path.is_file() or not confidence_path.is_file():
+        plane_depth_path = plane_root / f"plane_depth_frame{index:06d}.npy"
+        plane_mask_path = plane_root / f"plane_valid_mask_frame{index:06d}.npy"
+        plane_confidence_path = plane_root / f"plane_confidence_frame{index:06d}.npy"
+        plane_support_path = plane_root / f"plane_support_view_count_frame{index:06d}.npy"
+        if not all(path.is_file() for path in (
+            plane_depth_path, plane_mask_path, plane_confidence_path, plane_support_path,
+        )):
             raise FileNotFoundError(
-                "Plane refinement is incomplete; expected " + str(depth_path) + " and " + str(confidence_path)
+                "Plane residual source is incomplete; expected explicit plane_depth, "
+                "plane_valid_mask, plane_confidence, and plane_support_view_count for frame "
+                f"{index:06d}. Do not fuse a legacy mixed refine_depth map."
             )
-        plane_depth = np.asarray(Image.open(depth_path), dtype=np.float32)
-        plane_confidence = np.asarray(Image.open(confidence_path), dtype=np.float32) / 255.0
+        plane_depth = np.load(plane_depth_path).astype(np.float32, copy=False)
+        plane_mask = np.load(plane_mask_path).astype(bool, copy=False)
+        plane_confidence = np.load(plane_confidence_path).astype(np.float32, copy=False)
+        plane_support = np.load(plane_support_path).astype(np.uint8, copy=False)
         fused = fuse_inverse_depth_sources(
             plane_depth,
             plane_confidence,
             chart_depths[index] if chart_depths is not None else None,
             chart_confs[index] if chart_confs is not None else None,
             mono_depths[index] if mono_depths is not None else None,
+            plane_valid_mask=plane_mask,
+            plane_support_view_count=plane_support,
+            chart_support_view_count=(
+                chart_support_counts[index]
+                if chart_support_counts is not None
+                else None
+            ),
         )
+        plane_mask_resized = _resize_bool(plane_mask, fused["depth"].shape)
+        plane_bit = (fused["source_bitmask"] & np.uint8(1)) != 0
+        if np.any(plane_bit & ~plane_mask_resized):
+            raise RuntimeError(
+                f"Plane source provenance escaped its accepted residual mask in frame {index}"
+            )
+        plane_support_resized = _resize_support_count(plane_support, fused["depth"].shape)
+        if np.any(plane_mask_resized & (plane_support_resized == 0)):
+            raise RuntimeError(
+                f"Plane residual mask has zero independent support count in frame {index}"
+            )
         Image.fromarray(fused["depth"].astype(np.float32), mode="F").save(
             output / f"refine_depth_frame{index:06d}.tiff"
         )
@@ -165,6 +253,12 @@ def fuse_inverse_depth_directory(
                 "frame": index,
                 "valid_fraction": float(np.mean(fused["confidence"] > 0.0)),
                 "mean_confidence": float(np.mean(fused["confidence"])),
+                "accepted_plane_core_fraction": float(np.mean(plane_mask_resized)),
+                "fused_plane_bit_fraction": float(np.mean(plane_bit)),
+                "plane_support_view_count_values": [
+                    int(value)
+                    for value in np.unique(plane_support_resized[plane_mask_resized])
+                ],
                 "source_bitmask_values": [int(value) for value in np.unique(fused["source_bitmask"])],
             }
         )
@@ -172,8 +266,10 @@ def fuse_inverse_depth_directory(
         "schema_version": INVERSE_DEPTH_FUSION_VERSION,
         "mast3r_scene": str(mast3r_scene),
         "plane_root": str(plane_root),
-        "source_priority": ["bounded_plane", "aligned_chart", "calibrated_mono"],
+        "source_priority": ["bounded_plane_residual_core", "aligned_chart", "calibrated_mono"],
         "fusion_space": "inverse_depth",
+        "plane_source_contract": "explicit_residual_plane_depth_mask_confidence_support_v2",
+        "support_view_count_contract": "maximum_proven_distinct_camera_support_not_source_family_count",
         "fixed_absolute_depth_limit": None,
         "frame_count": count,
         "frames": frame_summaries,

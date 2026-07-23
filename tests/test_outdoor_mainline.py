@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from outdoor.inverse_depth import fuse_inverse_depth_sources
+from outdoor.inverse_depth import fuse_inverse_depth_directory, fuse_inverse_depth_sources
 from outdoor.structure_graph import build_structure_graph_from_samples, triangulation_angle_degrees
 from outdoor.structural_selection import select_structural_charts, validate_structural_selection
 from matcha.cambridge_training import build_spatial_camera_blocks, fused_inverse_depth_nll
@@ -67,6 +67,38 @@ def test_inverse_depth_fusion_retains_source_provenance_without_fixed_depth_cap(
     assert fused["source_bitmask"][0, 1] == 6
     assert fused["confidence"][0, 0] > fused["confidence"][0, 1]
     assert np.isfinite(fused["rho_variance"][0, 0])
+
+
+def test_inverse_depth_directory_requires_explicit_plane_residual_source(tmp_path):
+    mast3r = tmp_path / "mast3r"
+    plane_root = tmp_path / "planes"
+    output = tmp_path / "fused"
+    mast3r.mkdir()
+    plane_root.mkdir()
+    np.savez_compressed(
+        mast3r / "charts_data.npz",
+        depths=np.asarray([[[4.0, 4.0], [4.0, 4.0]]], dtype=np.float32),
+        confs=np.ones((1, 2, 2), dtype=np.float32),
+        prior_depths=np.full((1, 2, 2), 5.0, dtype=np.float32),
+    )
+    plane_depth = np.zeros((2, 2), dtype=np.float32)
+    plane_depth[0, 0] = 3.0
+    plane_mask = np.asarray([[True, False], [False, False]])
+    np.save(plane_root / "plane_depth_frame000000.npy", plane_depth)
+    np.save(plane_root / "plane_valid_mask_frame000000.npy", plane_mask)
+    np.save(plane_root / "plane_confidence_frame000000.npy", plane_mask.astype(np.float32))
+    np.save(plane_root / "plane_support_view_count_frame000000.npy", plane_mask.astype(np.uint8) * 3)
+
+    manifest = fuse_inverse_depth_directory(mast3r, plane_root, output)
+    bitmask = np.load(output / "source_bitmask_frame000000.npy")
+    support = np.load(output / "support_view_count_frame000000.npy")
+
+    assert manifest["plane_source_contract"].startswith("explicit_residual")
+    assert (bitmask[0, 0] & 1) == 1
+    assert (bitmask[0, 1] & 1) == 0
+    # Plane+Chart is not counted as two independent camera observations.
+    assert support[0, 0] == 3
+    assert support[0, 1] == 1
 
 
 def test_variance_aware_inverse_depth_loss_downweights_mono_only_evidence():
@@ -176,6 +208,10 @@ def test_structural_selector_stops_on_coverage_not_fixed_chart_count(tmp_path):
     assert selection["actual_n_images"] == 3
     assert validate_structural_selection(output, gate_path)["passed"]
     assert selection["structural_selection"]["diagnostics"]["structural_coverage"] >= 0.90
+    global_charts = json.loads((output.parent / "global_charts.json").read_text())
+    local_charts = json.loads((output.parent / "local_charts_by_block.json").read_text())
+    assert global_charts["image_names"] == selection["image_names"]
+    assert local_charts["blocks"]
 
 
 def test_structural_selector_preserves_disconnected_static_components(tmp_path):

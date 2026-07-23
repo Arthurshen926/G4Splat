@@ -470,6 +470,33 @@ def select_structural_charts(
     target_index = {name: index for index, name in enumerate(all_target_names)}
     selected_names = [names[index] for index in selected]
     selected_indices = [target_index[name] for name in selected_names]
+    # Persist the hierarchy explicitly.  The active Chart set remains the
+    # global structural backbone, while every spatial structure block exposes
+    # the subset that actually supports it.  This is intentionally advisory
+    # in the present single-2DGS trainer: it gives subsequent local geometry
+    # scheduling a truthful input without falsely claiming multiple models.
+    local_blocks: dict[str, dict[str, Any]] = {}
+    for block in range(len(block_weight)):
+        block_units = block_ids == block
+        local_selected = [
+            index for index in selected
+            if np.any(support[index, block_units] > 0.0)
+        ]
+        local_names = [names[index] for index in local_selected]
+        local_blocks[str(block)] = {
+            "block": int(block),
+            "structural_weight": float(block_weight[block]),
+            "unit_count": int(np.sum(block_units)),
+            "global_chart_count": len(selected),
+            "local_chart_count": len(local_names),
+            "image_names": local_names,
+            "image_idx": [target_index[name] for name in local_names],
+            "minimum_local_anchor_count": min(
+                int(min_block_views),
+                int(np.sum(np.any(support[:, block_units] > 0.0, axis=1))),
+            ),
+            "role": "block_supported_subset_of_global_structural_charts",
+        }
     base_payload: dict[str, Any] = {}
     if base_selection is not None:
         base_payload = json.loads(Path(base_selection).read_text(encoding="utf-8"))
@@ -502,10 +529,47 @@ def select_structural_charts(
             "selection_trace": trace,
             "diagnostics": diagnostics,
         },
+        "hierarchical_chart_outputs": {
+            "global_role": "active_training_geometry_backbone",
+            "local_role": "per_structure_block_support_subsets_advisory_for_single_2dgs_v2",
+            "global_chart_file": "global_charts.json",
+            "local_chart_file": "local_charts_by_block.json",
+        },
     }
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    global_output = output.parent / "global_charts.json"
+    global_output.write_text(
+        json.dumps(
+            {
+                "schema_version": "outdoor-global-charts-v1",
+                "selection_path": str(output.resolve()),
+                "role": "active_training_geometry_backbone",
+                "image_names": selected_names,
+                "image_idx": selected_indices,
+                "structural_coverage": diagnostics["structural_coverage"],
+                "triangulated_multiview_coverage": diagnostics["triangulated_multiview_coverage"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    local_output = output.parent / "local_charts_by_block.json"
+    local_output.write_text(
+        json.dumps(
+            {
+                "schema_version": "outdoor-local-charts-by-block-v1",
+                "selection_path": str(output.resolve()),
+                "role": "advisory_local_support_for_future_multi_branch_or_block_scheduler",
+                "blocks": local_blocks,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return payload
 
 

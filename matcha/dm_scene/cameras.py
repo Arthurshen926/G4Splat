@@ -102,10 +102,10 @@ def load_gs_cameras(
         # Intrinsics
         width = camera_transform['width']
         height = camera_transform['height']
-        fy = camera_transform['fy']
-        fx = camera_transform['fx']
-        fov_y = focal2fov(fy, height)
-        fov_x = focal2fov(fx, width)
+        fy = float(camera_transform['fy'])
+        fx = float(camera_transform['fx'])
+        cx = float(camera_transform.get('cx', width / 2.0))
+        cy = float(camera_transform.get('cy', height / 2.0))
         
         # GT data
         id = camera_transform['id']
@@ -131,10 +131,10 @@ def load_gs_cameras(
             resolution = round(orig_w/(downscale_factor)), round(orig_h/(downscale_factor))
             resized_image_rgb = PILtoTorch(image, resolution)
             gt_image = resized_image_rgb[:3, ...]
-            
-            image_height, image_width = None, None
+            image_height, image_width = resolution[1], resolution[0]
         else:
             gt_image = None
+            downscale_factor = 1
             if image_resolution in [1, 2, 4, 8]:
                 downscale_factor = image_resolution
                 # resolution = round(orig_w/(image_resolution)), round(orig_h/(image_resolution))
@@ -142,12 +142,22 @@ def load_gs_cameras(
                 additional_downscale_factor = max(height, width) / max_img_size
                 downscale_factor = additional_downscale_factor * downscale_factor
             image_height, image_width = round(height/downscale_factor), round(width/downscale_factor)
+
+        scale_x = float(image_width) / float(width)
+        scale_y = float(image_height) / float(height)
+        scaled_fx = fx * scale_x
+        scaled_fy = fy * scale_y
+        scaled_cx = cx * scale_x
+        scaled_cy = cy * scale_y
+        fov_y = focal2fov(scaled_fy, image_height)
+        fov_x = focal2fov(scaled_fx, image_width)
         
         gs_camera = GSCamera(
             colmap_id=id, image=gt_image, gt_alpha_mask=None,
             R=R, T=T, FoVx=fov_x, FoVy=fov_y,
             image_name=name, uid=id,
-            image_height=image_height, image_width=image_width,)
+            image_height=image_height, image_width=image_width,
+            fx=scaled_fx, fy=scaled_fy, cx=scaled_cx, cy=scaled_cy,)
         
         cam_list.append(gs_camera)
 
@@ -214,6 +224,8 @@ def create_gs_cameras_from_pointmap(
             'height': img.shape[0],
             'fx': focal_distance_x,# * scale_factor,
             'fy': focal_distance_y,# * scale_factor,
+            'cx': img.shape[1] / 2.0,
+            'cy': img.shape[0] / 2.0,
         }
         unsorted_camera_transforms.append(camera_transform)
         
@@ -257,8 +269,8 @@ def create_gs_cameras_from_pointmap(
         height = camera_transform['height']
         fy = camera_transform['fy']
         fx = camera_transform['fx']
-        fov_y = focal2fov(fy, height)
-        fov_x = focal2fov(fx, width)
+        cx = camera_transform.get('cx', width / 2.0)
+        cy = camera_transform.get('cy', height / 2.0)
         
         # GT data
         id = camera_transform['id']
@@ -267,9 +279,10 @@ def create_gs_cameras_from_pointmap(
         
         if load_gt_images:
             gt_image = torch.tensor(camera_transform['gt_image']).permute(2, 0, 1)
-            image_height, image_width = gt_image.shape[:2]
+            image_height, image_width = gt_image.shape[-2:]
         else:
             gt_image = None
+            downscale_factor = 1
             if image_resolution in [1, 2, 4, 8]:
                 downscale_factor = image_resolution
                 # resolution = round(orig_w/(image_resolution)), round(orig_h/(image_resolution))
@@ -277,12 +290,22 @@ def create_gs_cameras_from_pointmap(
                 additional_downscale_factor = max(height, width) / max_img_size
                 downscale_factor = additional_downscale_factor * downscale_factor
             image_height, image_width = round(height/downscale_factor), round(width/downscale_factor)
+
+        scale_x = float(image_width) / float(width)
+        scale_y = float(image_height) / float(height)
+        fx = float(fx) * scale_x
+        fy = float(fy) * scale_y
+        cx = float(cx) * scale_x
+        cy = float(cy) * scale_y
+        fov_y = focal2fov(fy, image_height)
+        fov_x = focal2fov(fx, image_width)
         
         gs_camera = GSCamera(
             colmap_id=id, image=gt_image, gt_alpha_mask=None,
             R=R, T=T, FoVx=fov_x, FoVy=fov_y,
             image_name=name, uid=id,
-            image_height=image_height, image_width=image_width,)
+            image_height=image_height, image_width=image_width,
+            fx=fx, fy=fy, cx=cx, cy=cy,)
         
         cam_list.append(gs_camera)
 
@@ -311,6 +334,11 @@ def rescale_cameras(
                 uid=gs_camera.uid,
                 image_height=gs_camera.image_height if no_original_image else None, 
                 image_width=gs_camera.image_width if no_original_image else None,
+                fx=gs_camera.focal_x,
+                fy=gs_camera.focal_y,
+                cx=gs_camera.cx,
+                cy=gs_camera.cy,
+                zfar=gs_camera.zfar,
             )
         )
     return CamerasWrapper(new_gs_cameras)
@@ -339,6 +367,7 @@ class GSCamera(torch.nn.Module):
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  image_height=None, image_width=None,
+                 fx=None, fy=None, cx=None, cy=None, zfar=None,
                  detach=True,
                  ):
         """
@@ -394,8 +423,6 @@ class GSCamera(torch.nn.Module):
             self.R0 = R.clone()
             self.T0 = T.clone()
         
-        self.FoVx = FoVx
-        self.FoVy = FoVy
         self.image_name = image_name
         
         if image is None:
@@ -415,18 +442,23 @@ class GSCamera(torch.nn.Module):
                 self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
         self.gt_alpha_mask = gt_alpha_mask
         
-        self.zfar = 100.0
+        self.focal_x = float(fx) if fx is not None else float(fov2focal(FoVx, self.image_width))
+        self.focal_y = float(fy) if fy is not None else float(fov2focal(FoVy, self.image_height))
+        self.cx = float(cx) if cx is not None else self.image_width / 2.0
+        self.cy = float(cy) if cy is not None else self.image_height / 2.0
+        self.FoVx = focal2fov(self.focal_x, self.image_width)
+        self.FoVy = focal2fov(self.focal_y, self.image_height)
+
+        self.zfar = float(zfar) if zfar is not None else 100.0
         self.znear = 0.01
 
         self.trans = torch.tensor(trans).to(self.data_device)
         self.scale = scale
         
-        self.prcppoint = torch.tensor([0.5, 0.5], dtype=torch.float32).to(self.data_device)
-        
-        tan_fovx = np.tan(self.FoVx / 2.)
-        tan_fovy = np.tan(self.FoVy / 2.)
-        self.focal_x = self.image_width / (2. * tan_fovx)
-        self.focal_y = self.image_height / (2. * tan_fovy)
+        self.prcppoint = torch.tensor(
+            [self.cx / self.image_width, self.cy / self.image_height],
+            dtype=torch.float32,
+        ).to(self.data_device)
         
     @property
     def device(self):
@@ -439,7 +471,11 @@ class GSCamera(torch.nn.Module):
     
     @property
     def projection_matrix(self):
-        return getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        return getProjectionMatrix(
+            znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy,
+            fx=self.focal_x, fy=self.focal_y, cx=self.cx, cy=self.cy,
+            image_width=self.image_width, image_height=self.image_height,
+        ).transpose(0, 1).to(self.data_device)
     
     @property
     def full_proj_transform(self):
@@ -561,12 +597,12 @@ def convert_camera_from_gs_to_pytorch3d(gs_cameras, device='cuda'):
     # TODO: Directly use the torch matrix, without converting into array.
     R = torch.Tensor(np.array([gs_camera.R.cpu().numpy() for gs_camera in gs_cameras])).to(device)
     T = torch.Tensor(np.array([gs_camera.T.cpu().numpy() for gs_camera in gs_cameras])).to(device)
-    fx = torch.Tensor(np.array([fov2focal(gs_camera.FoVx, gs_camera.image_width) for gs_camera in gs_cameras])).to(device)
-    fy = torch.Tensor(np.array([fov2focal(gs_camera.FoVy, gs_camera.image_height) for gs_camera in gs_cameras])).to(device)
+    fx = torch.Tensor(np.array([gs_camera.focal_x for gs_camera in gs_cameras])).to(device)
+    fy = torch.Tensor(np.array([gs_camera.focal_y for gs_camera in gs_cameras])).to(device)
     image_height = torch.tensor(np.array([gs_camera.image_height for gs_camera in gs_cameras]), dtype=torch.int).to(device)
     image_width = torch.tensor(np.array([gs_camera.image_width for gs_camera in gs_cameras]), dtype=torch.int).to(device)
-    cx = image_width / 2.  # torch.zeros_like(fx).to(device)
-    cy = image_height / 2.  # torch.zeros_like(fy).to(device)
+    cx = torch.Tensor(np.array([gs_camera.cx for gs_camera in gs_cameras])).to(device)
+    cy = torch.Tensor(np.array([gs_camera.cy for gs_camera in gs_cameras])).to(device)
     
     w2c = torch.zeros(N, 4, 4).to(device)
     w2c[:, :3, :3] = R.transpose(-1, -2)
@@ -582,12 +618,7 @@ def convert_camera_from_gs_to_pytorch3d(gs_cameras, device='cuda'):
 
     # Pytorch3d-compatible camera matrices
     # Intrinsics
-    image_size = torch.Tensor(
-        [image_width[0], image_height[0]],
-    )[
-        None
-    ].to(device)
-    # image_size = torch.cat([image_width.view(-1, 1), image_height.view(-1, 1)], dim=-1)
+    image_size = torch.cat([image_width.view(-1, 1), image_height.view(-1, 1)], dim=-1).float()
     
     scale = image_size.min(dim=1, keepdim=True)[0] / 2.0
     c0 = image_size / 2.0
@@ -717,6 +748,7 @@ def convert_camera_from_pytorch3d_to_gs(
             image_name=name, uid=cam_idx,
             image_height=image_height, 
             image_width=image_width,
+            fx=fx, fy=fy, cx=cx_inv.item(), cy=cy_inv.item(),
             )
         gs_cameras.append(camera)
 
@@ -765,12 +797,12 @@ class CamerasWrapper:
         N = len(gs_cameras)
         R = torch.Tensor(np.array([gs_camera.R.cpu().numpy() for gs_camera in gs_cameras])).to(device)
         T = torch.Tensor(np.array([gs_camera.T.cpu().numpy() for gs_camera in gs_cameras])).to(device)
-        self.fx = torch.Tensor(np.array([fov2focal(gs_camera.FoVx, gs_camera.image_width) for gs_camera in gs_cameras])).to(device)
-        self.fy = torch.Tensor(np.array([fov2focal(gs_camera.FoVy, gs_camera.image_height) for gs_camera in gs_cameras])).to(device)
+        self.fx = torch.Tensor(np.array([gs_camera.focal_x for gs_camera in gs_cameras])).to(device)
+        self.fy = torch.Tensor(np.array([gs_camera.focal_y for gs_camera in gs_cameras])).to(device)
         self.height = torch.tensor(np.array([gs_camera.image_height for gs_camera in gs_cameras]), dtype=torch.int).to(device)
         self.width = torch.tensor(np.array([gs_camera.image_width for gs_camera in gs_cameras]), dtype=torch.int).to(device)
-        self.cx = self.width / 2.  # torch.zeros_like(fx).to(device)
-        self.cy = self.height / 2.  # torch.zeros_like(fy).to(device)
+        self.cx = torch.Tensor(np.array([gs_camera.cx for gs_camera in gs_cameras])).to(device)
+        self.cy = torch.Tensor(np.array([gs_camera.cy for gs_camera in gs_cameras])).to(device)
         
         w2c = torch.zeros(N, 4, 4).to(device)
         w2c[:, :3, :3] = R.transpose(-1, -2)
@@ -1099,6 +1131,11 @@ def interpolate_between_cameras(camera1, camera2, t, use_image1_as_gt=False):
         data_device=camera1.data_device,
         image_height=camera1.image_height,
         image_width=camera1.image_width,
+        fx=camera1.focal_x,
+        fy=camera1.focal_y,
+        cx=camera1.cx,
+        cy=camera1.cy,
+        zfar=camera1.zfar,
     )
     
 

@@ -13,7 +13,7 @@ import torch
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
-from utils.graphics_utils import fov2focal
+from utils.graphics_utils import fov2focal, focal2fov
 
 WARNED = False
 
@@ -51,10 +51,41 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    # Intrinsics must be scaled with the image.  Reusing an FoV alone loses an
+    # off-centre principal point and makes Chart/plane/renderer rays disagree
+    # after a requested image resize.
+    scale_x = float(resolution[0]) / float(orig_w)
+    scale_y = float(resolution[1]) / float(orig_h)
+    source_fx = getattr(cam_info, "fx", None)
+    source_fy = getattr(cam_info, "fy", None)
+    source_cx = getattr(cam_info, "cx", None)
+    source_cy = getattr(cam_info, "cy", None)
+    fx = (
+        float(source_fx) * scale_x
+        if source_fx is not None
+        else fov2focal(cam_info.FovX, orig_w) * scale_x
+    )
+    fy = (
+        float(source_fy) * scale_y
+        if source_fy is not None
+        else fov2focal(cam_info.FovY, orig_h) * scale_y
+    )
+    cx = (
+        float(source_cx) * scale_x
+        if source_cx is not None
+        else float(resolution[0]) / 2.0
+    )
+    cy = (
+        float(source_cy) * scale_y
+        if source_cy is not None
+        else float(resolution[1]) / 2.0
+    )
+
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=focal2fov(fx, resolution[0]), FoVy=focal2fov(fy, resolution[1]),
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  fx=fx, fy=fy, cx=cx, cy=cy, zfar=getattr(cam_info, "zfar", None))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -74,14 +105,29 @@ def camera_to_JSON(id, camera : Camera):
     pos = W2C[:3, 3]
     rot = W2C[:3, :3]
     serializable_array_2d = [x.tolist() for x in rot]
+    width = getattr(camera, "image_width", None)
+    height = getattr(camera, "image_height", None)
+    if width is None:
+        width = camera.width
+    if height is None:
+        height = camera.height
+    focal_x = getattr(camera, "focal_x", None)
+    focal_y = getattr(camera, "focal_y", None)
+    if focal_x is None:
+        focal_x = fov2focal(camera.FovX, width)
+    if focal_y is None:
+        focal_y = fov2focal(camera.FovY, height)
     camera_entry = {
         'id' : id,
         'img_name' : camera.image_name,
-        'width' : camera.width,
-        'height' : camera.height,
+        'width' : width,
+        'height' : height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : float(focal_y),
+        'fx' : float(focal_x),
+        'cx' : float(getattr(camera, "cx", width / 2.0)),
+        'cy' : float(getattr(camera, "cy", height / 2.0)),
+        'zfar' : float(getattr(camera, "zfar", 100.0)),
     }
     return camera_entry

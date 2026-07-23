@@ -111,7 +111,15 @@ def build_task_semantic_manifest(
             "neutral_prior": neutral_tree_support,
             "unknown_is_not_zero_support": True,
         },
-        "representation_policy": "hybrid_surface_volume_sky_v1",
+        # This manifest describes task weights for the present single-2DGS
+        # implementation.  Do not label it as a hybrid surface/volume/sky
+        # representation until those independent fields actually exist.
+        "representation_policy": "fixed_camera_structural_chart_single_2dgs_v2",
+        "implementation_scope": {
+            "independent_semantic_fields": False,
+            "separate_surface_foliage_sky_models": False,
+            "tree_handling": "mask_and_support_weighting_only",
+        },
         "generation_policy": "none",
     }
     output = Path(output)

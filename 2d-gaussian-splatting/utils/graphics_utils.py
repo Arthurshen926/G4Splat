@@ -48,23 +48,55 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
-    tanHalfFovY = math.tan((fovY / 2))
-    tanHalfFovX = math.tan((fovX / 2))
+def getProjectionMatrix(
+    znear,
+    zfar,
+    fovX,
+    fovY,
+    *,
+    fx=None,
+    fy=None,
+    cx=None,
+    cy=None,
+    image_width=None,
+    image_height=None,
+):
+    """Return a row-vector projection matrix with optional exact pinhole K.
 
-    top = tanHalfFovY * znear
-    bottom = -top
-    right = tanHalfFovX * znear
-    left = -right
+    The historical FoV-only path remains centered and bit-compatible.  When
+    all K fields are supplied, the x/y NDC coordinates are
+    ``2 * (f * x / z + c) / size - 1``, preserving COLMAP's principal point
+    through rasterisation instead of pretending every camera is centered.
+    """
+    use_intrinsics = all(value is not None for value in (fx, fy, cx, cy, image_width, image_height))
+    if use_intrinsics:
+        if float(fx) <= 0.0 or float(fy) <= 0.0 or float(image_width) <= 0.0 or float(image_height) <= 0.0:
+            raise ValueError("Pinhole intrinsics and image dimensions must be positive")
+        scale_x = 2.0 * float(fx) / float(image_width)
+        scale_y = 2.0 * float(fy) / float(image_height)
+        offset_x = 2.0 * float(cx) / float(image_width) - 1.0
+        offset_y = 2.0 * float(cy) / float(image_height) - 1.0
+    else:
+        tanHalfFovY = math.tan((fovY / 2))
+        tanHalfFovX = math.tan((fovX / 2))
+
+        top = tanHalfFovY * znear
+        bottom = -top
+        right = tanHalfFovX * znear
+        left = -right
+        scale_x = 2.0 * znear / (right - left)
+        scale_y = 2.0 * znear / (top - bottom)
+        offset_x = (right + left) / (right - left)
+        offset_y = (top + bottom) / (top - bottom)
 
     P = torch.zeros(4, 4)
 
     z_sign = 1.0
 
-    P[0, 0] = 2.0 * znear / (right - left)
-    P[1, 1] = 2.0 * znear / (top - bottom)
-    P[0, 2] = (right + left) / (right - left)
-    P[1, 2] = (top + bottom) / (top - bottom)
+    P[0, 0] = scale_x
+    P[1, 1] = scale_y
+    P[0, 2] = offset_x
+    P[1, 2] = offset_y
     P[3, 2] = z_sign
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)

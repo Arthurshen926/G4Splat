@@ -14,10 +14,12 @@ from matcha.cambridge_training import (
     fused_geometry_validity_mask,
     geometry_chart_sampling_indices,
     geometry_iteration,
+    geometry_prior_schedule_weight,
     load_depth_cache,
     opacity_reset_due,
     preliminary_uses_dense_supervision,
     rgb_sampling_importance_weights,
+    rgb_sampling_importance_weights_by_camera,
     resolve_active_chart_indices,
     rgb_supervision_weight,
     scale_chart_geometry_priors,
@@ -200,6 +202,33 @@ def test_geometry_schedule_uses_chart_views_early_then_dense_only():
     assert geometry_iteration(3005, use_dense_supervision=False, every_n=5, dense_only_from_iter=3000)
 
 
+def test_persistent_geometry_schedule_never_hard_disables_chart_supervision():
+    assert geometry_iteration(
+        5,
+        use_dense_supervision=True,
+        every_n=5,
+        dense_only_from_iter=3000,
+        geometry_schedule="persistent",
+    )
+    assert geometry_iteration(
+        12_010,
+        use_dense_supervision=True,
+        every_n=5,
+        dense_only_from_iter=3000,
+        geometry_schedule="persistent",
+    )
+    assert geometry_iteration(
+        25_020,
+        use_dense_supervision=True,
+        every_n=5,
+        dense_only_from_iter=3000,
+        geometry_schedule="persistent",
+    )
+    assert geometry_prior_schedule_weight(
+        40_000, geometry_schedule="persistent", final_weight_floor=0.2
+    ) == 0.2
+
+
 def test_dense_only_densification_keeps_chart_geometry_but_not_chart_topology_stats():
     # The legacy path remains byte-for-byte semantically identical: every
     # rendered view contributes radii/gradient statistics.
@@ -363,6 +392,75 @@ def test_legacy_interleaved_keeps_unmodified_rgb_weights():
         downweight_input_view_color_loss=False,
         pseudo_rgb_weight=0.01,
     ) == 0.01
+
+
+def test_block_balanced_rgb_importance_uses_each_camera_probability():
+    names = ["chart.png", "small_block.png", "large_a.png", "large_b.png"]
+    weights = rgb_sampling_importance_weights_by_camera(
+        policy="all_train_importance",
+        total_iterations=10,
+        dense_camera_names=names,
+        chart_camera_names={"chart.png"},
+        use_dense_supervision=True,
+        geometry_view_every_n_iter=5,
+        dense_only_from_iter=10,
+        dense_view_sampling_policy="spatial_block_balanced",
+        dense_view_blocks=[[0, 1], [2, 3]],
+    )
+
+    # Both occupied blocks have two cameras here, so non-Chart RGB mass is
+    # equal.  The Chart's extra geometry samples are corrected separately.
+    assert weights["chart.png"] < weights["small_block.png"]
+    assert weights["small_block.png"] == weights["large_a.png"]
+    dense_fraction = 0.8
+    chart_probability = 0.2 + dense_fraction * 0.25
+    assert abs(chart_probability * weights["chart.png"] - 0.25) < 1e-9
+
+
+def test_checkpoint_continuation_reconditions_rgb_sampler_to_remaining_schedule():
+    names = ["chart.png", "other.png"]
+    fresh = rgb_sampling_importance_weights_by_camera(
+        policy="all_train_importance",
+        total_iterations=40_000,
+        dense_camera_names=names,
+        chart_camera_names={"chart.png"},
+        use_dense_supervision=True,
+        geometry_view_every_n_iter=5,
+        dense_only_from_iter=3000,
+        dense_view_sampling_policy="uniform",
+        geometry_schedule="persistent",
+    )
+    continued = rgb_sampling_importance_weights_by_camera(
+        policy="all_train_importance",
+        total_iterations=40_000,
+        start_iteration=7_000,
+        dense_camera_names=names,
+        chart_camera_names={"chart.png"},
+        use_dense_supervision=True,
+        geometry_view_every_n_iter=5,
+        dense_only_from_iter=3000,
+        dense_view_sampling_policy="uniform",
+        geometry_schedule="persistent",
+    )
+
+    # 7k->40k starts in the high-frequency first phase and later crosses two
+    # cadence changes, so using a fresh 0->40k mixture would be wrong.
+    assert continued["chart.png"] != fresh["chart.png"]
+    geometry_count = sum(
+        geometry_iteration(
+            iteration,
+            use_dense_supervision=True,
+            every_n=5,
+            dense_only_from_iter=3000,
+            geometry_schedule="persistent",
+        )
+        for iteration in range(7_001, 40_001)
+    )
+    geometry_fraction = geometry_count / 33_000
+    chart_probability = geometry_fraction + (1.0 - geometry_fraction) * 0.5
+    other_probability = (1.0 - geometry_fraction) * 0.5
+    assert abs(chart_probability * continued["chart.png"] - 0.5) < 1e-9
+    assert abs(other_probability * continued["other.png"] - 0.5) < 1e-9
 
 
 def test_active_chart_scheduler_intersects_gate_and_quality_flags():

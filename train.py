@@ -629,6 +629,7 @@ if __name__ == '__main__':
         use_dense_data,
         *,
         init_ply=None,
+        start_checkpoint=None,
         freeze_init_ply=False,
         iterations=None,
         non_position_lr_decay_from=-1,
@@ -726,6 +727,8 @@ if __name__ == '__main__':
             str(args.max_plane_abs_depth) if args.max_plane_abs_depth is not None else "",
             "--init_ply" if init_ply else "",
             init_ply or "",
+            "--start-checkpoint" if start_checkpoint else "",
+            start_checkpoint or "",
             "--freeze_init_ply" if freeze_init_ply else "",
         ])
 
@@ -1044,8 +1047,31 @@ if __name__ == '__main__':
                 'The final real-view refinement requires the initial 7k PLY: '
                 + initial_ply
             )
-        run_command_safe(
-            get_refine_free_gaussians_command(
+        continuation_checkpoint = os.path.join(
+            free_gaussians_path,
+            'chkpnt7000.pth',
+        )
+        if os.path.exists(continuation_checkpoint):
+            print(
+                '[INFO] Continuing full refinement from the complete 7k checkpoint: '
+                + continuation_checkpoint
+            )
+        else:
+            print(
+                '[WARNING] 7k continuation checkpoint is absent; falling back to protected PLY warm-start. '
+                'New screen runs automatically save chkpnt7000.pth.'
+            )
+        if os.path.exists(continuation_checkpoint):
+            final_refinement_command = get_refine_free_gaussians_command(
+                args.final_free_gaussians_config,
+                args.dense_supervision,
+                start_checkpoint=continuation_checkpoint,
+                iterations=args.final_free_gaussians_iterations,
+                non_position_lr_decay_from=args.final_non_position_lr_decay_from,
+                non_position_lr_final_mult=args.final_non_position_lr_final_mult,
+            )
+        else:
+            final_refinement_command = get_refine_free_gaussians_command(
                 args.final_free_gaussians_config,
                 args.dense_supervision,
                 init_ply=initial_ply,
@@ -1053,7 +1079,7 @@ if __name__ == '__main__':
                 non_position_lr_decay_from=args.final_non_position_lr_decay_from,
                 non_position_lr_final_mult=args.final_non_position_lr_final_mult,
             )
-        )
+        run_command_safe(final_refinement_command)
         if not args.skip_default_render_eval:
             run_command_safe(render_all_img_command)
         run_command_safe(tetra_command)

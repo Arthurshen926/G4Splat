@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from outdoor.inverse_depth import fuse_inverse_depth_directory
+from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION, fuse_inverse_depth_directory
 from outdoor.scene_contract import build_scene_contract
 from outdoor.structure_graph import build_static_structure_graph
 from outdoor.structural_selection import select_structural_charts, validate_structural_selection
@@ -47,7 +47,7 @@ from scripts.run_cambridge_g4splat import (
 )
 
 
-MAINLINE_POLICY_VERSION = "cambridge-outdoor-structural-mainline-v1"
+MAINLINE_POLICY_VERSION = "cambridge-outdoor-structural-mainline-v2"
 
 
 # These parameters change only the 2DGS optimization after the fixed-camera
@@ -56,6 +56,10 @@ MAINLINE_POLICY_VERSION = "cambridge-outdoor-structural-mainline-v1"
 # outdoor capacity fix should be able to reuse the audited real-image geometry
 # without also reusing a failed screen model.
 _FRONTEND_SCHEDULE_ONLY_CONFIG_FIELDS = {
+    # A run tag names a training result; it does not change fixed MASt3R
+    # cameras, aligned pointmaps, or the structural graph that can be safely
+    # hydrated into a corrected backend run.
+    "run_tag",
     "screen_free_gaussians_config",
     "final_free_gaussians_config",
     "warp_downsample_pixel_grid_size",
@@ -223,7 +227,11 @@ def _hydrate_schedule_compatible_frontend(
         recorded = payload.get("config")
         source_mast3r = source / "mast3r_sfm"
         if (
-            payload.get("policy_version") != MAINLINE_POLICY_VERSION
+            payload.get("policy_version")
+            not in {
+                "cambridge-outdoor-structural-mainline-v1",
+                MAINLINE_POLICY_VERSION,
+            }
             or not isinstance(recorded, dict)
             or not (source_mast3r / "aligned_chart_conflict_gate.json").is_file()
             or not (source_mast3r / "inverse_depth_fusion" / "inverse_depth_fusion_manifest.json").is_file()
@@ -331,12 +339,24 @@ def _write_mainline_manifest(
             for key, value in asdict(config).items()
         },
         "camera_policy": "calibrated_fixed",
-        "semantic_policy": "outdoor_task_specific_v1",
-        "chart_policy": "hierarchical_structure_v1",
-        "depth_policy": "inverse_depth_fusion_v1",
-        "representation_policy": "hybrid_surface_volume_sky_v1",
-        "densification_policy": "real_block_balanced_v1",
+        # Keep externally visible policy names aligned with the implementation.
+        # The task manifest makes mask/tree semantics explicit, but it does
+        # not yet instantiate independent building/ground/foliage fields;
+        # likewise, global/local Charts are a single-model geometry hierarchy,
+        # not separate local Gaussian models.
+        "semantic_policy": "task_semantic_mask_tree_proxy_v1",
+        "chart_policy": "global_backbone_local_advisory_charts_v1",
+        "depth_policy": "inverse_depth_fusion_v2_explicit_plane_residual",
+        "representation_policy": "fixed_camera_structural_chart_single_2dgs_v2",
+        "densification_policy": "real_block_balanced_topology_with_per_camera_rgb_correction_v2",
         "generation_policy": "none",
+        "implementation_scope": {
+            "independent_semantic_fields": False,
+            "separate_surface_foliage_sky_models": False,
+            "local_chart_models": False,
+            "global_charts": "active geometry backbone",
+            "local_charts": "per-block advisory support subsets",
+        },
         "evaluation_policy": "transductive_trainfit_with_disjointness_guard_v1",
         "scene_contract": str(scene_contract),
         "task_semantic_manifest": str(semantic_manifest),
@@ -586,7 +606,14 @@ def run_mainline(args: argparse.Namespace) -> None:
             min_angle_degrees=args.min_triangulation_angle_degrees,
         )
     structural_selection = mast3r_scene / "quality_aware_selection" / "structural_chart_selection.json"
-    if not structural_selection.is_file() or args.force_structural_selection:
+    global_chart_output = structural_selection.parent / "global_charts.json"
+    local_chart_output = structural_selection.parent / "local_charts_by_block.json"
+    if (
+        not structural_selection.is_file()
+        or not global_chart_output.is_file()
+        or not local_chart_output.is_file()
+        or args.force_structural_selection
+    ):
         select_structural_charts(
             structural_graph,
             gate_report,
@@ -625,8 +652,9 @@ def run_mainline(args: argparse.Namespace) -> None:
         return
 
     plane_root = mast3r_scene / "plane-refine-depths"
-    first_plane = plane_root / "refine_depth_frame000000.tiff"
-    if not first_plane.is_file():
+    first_plane = plane_root / "plane_depth_frame000000.npy"
+    plane_source_manifest = plane_root / "plane_residual_source_manifest.json"
+    if not first_plane.is_file() or not plane_source_manifest.is_file():
         plane_command = train_command(
             paths,
             config,
@@ -645,11 +673,23 @@ def run_mainline(args: argparse.Namespace) -> None:
             env=env,
             log_path=paths.screen_output / "logs" / "outdoor_plane_refinement.log",
         )
-    if not first_plane.is_file():
-        raise FileNotFoundError(f"Plane stage did not produce {first_plane}")
+    if not first_plane.is_file() or not plane_source_manifest.is_file():
+        raise FileNotFoundError(
+            "Plane stage did not produce the explicit residual source contract: "
+            f"{first_plane} and {plane_source_manifest}"
+        )
     fused_depth = mast3r_scene / "inverse_depth_fusion"
     fusion_manifest = fused_depth / "inverse_depth_fusion_manifest.json"
-    if not fusion_manifest.is_file():
+    fusion_current = False
+    if fusion_manifest.is_file():
+        try:
+            fusion_current = (
+                json.loads(fusion_manifest.read_text(encoding="utf-8")).get("schema_version")
+                == INVERSE_DEPTH_FUSION_VERSION
+            )
+        except json.JSONDecodeError:
+            fusion_current = False
+    if not fusion_current:
         fuse_inverse_depth_directory(mast3r_scene, plane_root, fused_depth)
     _write_mainline_manifest(
         paths.screen_output,

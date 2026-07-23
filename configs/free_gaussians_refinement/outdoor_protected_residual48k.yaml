@@ -1,0 +1,12 @@
+type: '2dgs'
+# This stage starts from a completed structural checkpoint.  It is not a
+# historical all-real-RGB initialization: existing Chart/plane Gaussians stay
+# intact and the caller explicitly enables bounded additive residual clones.
+iterations: 48000
+densify_until_iter: 47800
+opacity_reset_interval: 48000
+opacity_cull: 0.005
+depth_ratio: 0.5
+normal_consistency_from: 3500
+distortion_from: 1500
+use_mip_filter: true

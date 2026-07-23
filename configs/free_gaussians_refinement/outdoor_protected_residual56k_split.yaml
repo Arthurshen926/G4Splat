@@ -1,0 +1,13 @@
+type: '2dgs'
+# Second protected continuation for a Chart-led model that still has broad,
+# low-frequency coverage.  It starts from the immediately preceding checkpoint
+# and adds only compact children of high-gradient large Gaussians; it never
+# imports a historical all-real-RGB PLY or deletes the checkpoint baseline.
+iterations: 56000
+densify_until_iter: 55800
+opacity_reset_interval: 56000
+opacity_cull: 0.005
+depth_ratio: 0.5
+normal_consistency_from: 3500
+distortion_from: 1500
+use_mip_filter: true

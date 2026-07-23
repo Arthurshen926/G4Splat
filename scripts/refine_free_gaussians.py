@@ -136,6 +136,30 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--config', type=str, default='default')
     parser.add_argument('--iterations', type=int, default=None)
     parser.add_argument(
+        '--densify-from-iter',
+        type=int,
+        default=None,
+        help='Optional override for the first topology event; useful for a checkpoint residual stage.',
+    )
+    parser.add_argument(
+        '--densify-until-iter',
+        type=int,
+        default=None,
+        help='Optional override for the exclusive topology-window endpoint.',
+    )
+    parser.add_argument(
+        '--densification-interval',
+        type=int,
+        default=None,
+        help='Optional override for the native 2DGS topology event cadence.',
+    )
+    parser.add_argument(
+        '--opacity-reset-interval',
+        type=int,
+        default=None,
+        help='Optional override for opacity-reset cadence.',
+    )
+    parser.add_argument(
         '--continue-opacity-resets-after-densify',
         action='store_true',
         help=(
@@ -244,6 +268,14 @@ if __name__ == '__main__':
     parser.add_argument('--geometry_view_every_n_iter', type=int, default=5)
     parser.add_argument('--dense_only_from_iter', type=int, default=3000)
     parser.add_argument(
+        '--geometry-schedule',
+        choices=['legacy_cutoff', 'persistent'],
+        default='persistent',
+    )
+    parser.add_argument('--geometry-phase1-until', type=int, default=12_000)
+    parser.add_argument('--geometry-phase2-until', type=int, default=25_000)
+    parser.add_argument('--geometry-final-weight-floor', type=float, default=0.2)
+    parser.add_argument(
         '--dense-view-sampling-policy',
         choices=['uniform', 'spatial_block_balanced'],
         default='uniform',
@@ -271,6 +303,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--init_fill_unsupported_with_prior', action='store_true')
     parser.add_argument('--init_ply', type=str, default=None)
+    parser.add_argument('--start-checkpoint', type=str, default=None)
     parser.add_argument('--freeze_init_ply', action='store_true')
     parser.add_argument('--warmstart_reseed_pixel_stride', type=int, default=8)
     parser.add_argument('--warmstart_reseed_max_scale', type=float, default=0.05)
@@ -279,6 +312,34 @@ if __name__ == '__main__':
     parser.add_argument('--warmstart_max_position_delta', type=float, default=0.0)
     parser.add_argument('--warmstart_diffuse_only', action='store_true')
     parser.add_argument('--warmstart_clamp_dc', action='store_true')
+    parser.add_argument(
+        '--warmstart-preserve-topology',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        '--warmstart-allow-residual-densification',
+        action='store_true',
+        help=(
+            'For a protected checkpoint/PLY continuation, append bounded low-opacity '
+            'residual primitives while keeping prune and opacity reset disabled.'
+        ),
+    )
+    parser.add_argument(
+        '--warmstart-residual-densification-mode',
+        choices=['clone_only', 'split_only'],
+        default='clone_only',
+    )
+    parser.add_argument('--warmstart-residual-densify-max-per-event', type=int, default=5_000)
+    parser.add_argument('--warmstart-residual-clone-opacity', type=float, default=0.02)
+    parser.add_argument('--warmstart-freeze-baseline', action='store_true')
+    parser.add_argument('--warmstart-residual-lr-restart', action='store_true')
+    parser.add_argument(
+        '--save-continuation-checkpoint',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Save a full optimizer/state checkpoint at the final refinement iteration.',
+    )
     
     args = parser.parse_args()
     args = apply_screen_manifest_dense_defaults(args)
@@ -315,18 +376,33 @@ if __name__ == '__main__':
     # Define command
     if args.refine_depth_path is not None:
         print(f'refine depth path {args.refine_depth_path}, train gs use refine depth')
+        effective_iterations = int(args.iterations or config['iterations'])
+        effective_densify_until = int(
+            args.densify_until_iter
+            if args.densify_until_iter is not None
+            else config['densify_until_iter']
+        )
+        effective_opacity_reset_interval = int(
+            args.opacity_reset_interval
+            if args.opacity_reset_interval is not None
+            else config['opacity_reset_interval']
+        )
         command = [
             sys.executable, "2d-gaussian-splatting/train_with_refine_depth.py",
             "-s", args.mast3r_scene,
             "-m", args.output_path,
-            "--iterations", str(args.iterations or config['iterations']),
+            "--iterations", str(effective_iterations),
             "--non_position_lr_decay_from", str(args.non_position_lr_decay_from),
             "--non_position_lr_final_mult", str(args.non_position_lr_final_mult),
             "--data_device", args.data_device,
             "--resolution", str(args.resolution),
             "--white_background" if args.white_background else "",
-            "--densify_until_iter", str(config['densify_until_iter']),
-            "--opacity_reset_interval", str(config['opacity_reset_interval']),
+            "--densify_until_iter", str(effective_densify_until),
+            "--opacity_reset_interval", str(effective_opacity_reset_interval),
+            "--densify_from_iter" if args.densify_from_iter is not None else "",
+            str(args.densify_from_iter) if args.densify_from_iter is not None else "",
+            "--densification_interval" if args.densification_interval is not None else "",
+            str(args.densification_interval) if args.densification_interval is not None else "",
             "--continue-opacity-resets-after-densify"
             if args.continue_opacity_resets_after_densify else "",
             "--depth_ratio", str(config['depth_ratio']),
@@ -354,6 +430,10 @@ if __name__ == '__main__':
             "--color_correction_reg", str(args.color_correction_reg),
             "--geometry_view_every_n_iter", str(args.geometry_view_every_n_iter),
             "--dense_only_from_iter", str(args.dense_only_from_iter),
+            "--geometry-schedule", args.geometry_schedule,
+            "--geometry-phase1-until", str(args.geometry_phase1_until),
+            "--geometry-phase2-until", str(args.geometry_phase2_until),
+            "--geometry-final-weight-floor", str(args.geometry_final_weight_floor),
             "--dense-view-sampling-policy", args.dense_view_sampling_policy,
             "--dense-view-block-bins", str(args.dense_view_block_bins),
             "--pseudo_rgb_weight", str(args.pseudo_rgb_weight),
@@ -368,6 +448,8 @@ if __name__ == '__main__':
             "--semantic_alpha_weight", str(args.semantic_alpha_weight),
             "--init_ply" if args.init_ply else "",
             args.init_ply or "",
+            "--start_checkpoint" if args.start_checkpoint else "",
+            args.start_checkpoint or "",
             "--freeze_init_ply" if args.freeze_init_ply else "",
             "--warmstart_reseed_pixel_stride", str(args.warmstart_reseed_pixel_stride),
             "--warmstart_reseed_max_scale", str(args.warmstart_reseed_max_scale),
@@ -376,6 +458,20 @@ if __name__ == '__main__':
             "--warmstart_max_position_delta", str(args.warmstart_max_position_delta),
             "--warmstart_diffuse_only" if args.warmstart_diffuse_only else "",
             "--warmstart_clamp_dc" if args.warmstart_clamp_dc else "",
+            "--warmstart-preserve-topology"
+            if args.warmstart_preserve_topology else "--no-warmstart-preserve-topology",
+            "--warmstart-allow-residual-densification"
+            if args.warmstart_allow_residual_densification else "",
+            "--warmstart-residual-densification-mode",
+            args.warmstart_residual_densification_mode,
+            "--warmstart-residual-densify-max-per-event",
+            str(args.warmstart_residual_densify_max_per_event),
+            "--warmstart-residual-clone-opacity",
+            str(args.warmstart_residual_clone_opacity),
+            "--warmstart-freeze-baseline" if args.warmstart_freeze_baseline else "",
+            "--warmstart-residual-lr-restart" if args.warmstart_residual_lr_restart else "",
+            "--checkpoint_iterations" if args.save_continuation_checkpoint else "",
+            str(effective_iterations) if args.save_continuation_checkpoint else "",
         ]
         if effective_opacity_cull is not None:
             command.extend(["--opacity_cull", str(effective_opacity_cull)])

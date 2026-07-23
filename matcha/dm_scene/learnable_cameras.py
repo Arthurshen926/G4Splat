@@ -439,7 +439,16 @@ class GSCamera(torch.nn.Module):
     
     @property
     def projection_matrix(self):
-        return getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        # ``prcppoint`` stores the normalized principal point in this
+        # learnable-camera variant.  Feed it into the same calibrated
+        # projection contract as the fixed camera path.
+        return getProjectionMatrix(
+            znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy,
+            fx=self.focal_x, fy=self.focal_y,
+            cx=self.image_width * self.prcppoint[0],
+            cy=self.image_height * self.prcppoint[1],
+            image_width=self.image_width, image_height=self.image_height,
+        ).transpose(0, 1).to(self.data_device)
     
     @property
     def full_proj_transform(self):

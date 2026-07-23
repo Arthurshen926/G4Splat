@@ -19,7 +19,11 @@ from scene.colmap_loader import (
     read_intrinsics_binary,
     read_intrinsics_text,
 )
-from scene.dataset_readers import CameraInfo
+from scene.dataset_readers import (
+    CameraInfo,
+    assign_adaptive_camera_zfar,
+    fetchPly,
+)
 import os
 from tqdm import tqdm
 from os import makedirs
@@ -167,9 +171,13 @@ def _colmap_camera_metadata(dataset) -> list[SimpleNamespace]:
         intrinsic = intrinsics[extrinsic.camera_id]
         if intrinsic.model == "SIMPLE_PINHOLE":
             focal_x = focal_y = float(intrinsic.params[0])
+            principal_x = float(intrinsic.params[1])
+            principal_y = float(intrinsic.params[2])
         elif intrinsic.model == "PINHOLE":
             focal_x = float(intrinsic.params[0])
             focal_y = float(intrinsic.params[1])
+            principal_x = float(intrinsic.params[2])
+            principal_y = float(intrinsic.params[3])
         else:
             raise ValueError(
                 "Lazy RGB export supports the same undistorted COLMAP models "
@@ -187,9 +195,48 @@ def _colmap_camera_metadata(dataset) -> list[SimpleNamespace]:
                 image_name=image_path.stem,
                 width=int(intrinsic.width),
                 height=int(intrinsic.height),
+                fx=focal_x,
+                fy=focal_y,
+                cx=principal_x,
+                cy=principal_y,
             )
         )
-    return sorted(records, key=lambda item: item.image_name)
+    records = sorted(records, key=lambda item: item.image_name)
+
+    # Match the normal ``Scene`` path exactly: the renderer's per-camera far
+    # plane is derived from the all-train sparse support, rather than silently
+    # falling back to the legacy fixed value of 100 for every lazy export.
+    # ``assign_adaptive_camera_zfar`` only needs the pose and image geometry,
+    # so a metadata-only CameraInfo keeps this RGB-only path lazy with respect
+    # to the 1,487 source photographs.
+    support_ply = source_path / "sparse" / "0" / "points3D.ply"
+    try:
+        sparse_points = fetchPly(str(support_ply)).points
+    except Exception:
+        sparse_points = None
+    camera_infos = [
+        CameraInfo(
+            uid=record.uid,
+            R=record.R,
+            T=record.T,
+            FovY=record.FovY,
+            FovX=record.FovX,
+            image=None,
+            image_path=str(record.image_path),
+            image_name=record.image_name,
+            width=record.width,
+            height=record.height,
+            fx=record.fx,
+            fy=record.fy,
+            cx=record.cx,
+            cy=record.cy,
+        )
+        for record in records
+    ]
+    zfar_infos = assign_adaptive_camera_zfar(camera_infos, sparse_points)
+    for record, camera_info in zip(records, zfar_infos):
+        record.zfar = camera_info.zfar
+    return records
 
 
 def _load_lazy_camera(dataset, record: SimpleNamespace, index: int):
@@ -208,6 +255,11 @@ def _load_lazy_camera(dataset, record: SimpleNamespace, index: int):
         image_name=record.image_name,
         width=record.width,
         height=record.height,
+        fx=record.fx,
+        fy=record.fy,
+        cx=record.cx,
+        cy=record.cy,
+        zfar=record.zfar,
     )
     return loadCam(dataset, index, camera_info, 1.0)
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -22,6 +23,21 @@ def _read_depth(path: Path) -> np.ndarray:
 def _write_depth(path: Path, value: np.ndarray) -> None:
     if not cv2.imwrite(str(path), np.asarray(value, dtype=np.float32)):
         raise RuntimeError(f"Failed to write {path}")
+
+
+def current_refined_depth_paths(root: Path) -> list[Path]:
+    """Return only current six-digit frame depths, never prior gate backups."""
+    # A previous safety-gate run leaves recoverable
+    # ``*.pre_safety_gate.tiff`` backups beside the current depth files.  A
+    # hydrated frontend may retain those artifacts, but they do not have a
+    # visibility map and must not be interpreted as a second frame.
+    return sorted(
+        (
+            path for path in root.glob("refine_depth_frame*.tiff")
+            if re.fullmatch(r"refine_depth_frame\d{6}", path.stem)
+        ),
+        key=lambda path: int(path.stem.removeprefix("refine_depth_frame")),
+    )
 
 
 def gate_plane_depth(
@@ -103,7 +119,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     root = args.plane_root.expanduser().resolve()
-    refined_paths = sorted(root.glob("refine_depth_frame*.tiff"))
+    refined_paths = current_refined_depth_paths(root)
     if not refined_paths:
         raise FileNotFoundError(f"No refine_depth_frame*.tiff in {root}")
 

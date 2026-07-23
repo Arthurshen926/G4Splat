@@ -265,9 +265,13 @@ def compute_plane_aligned_depth(plane_normal, plane_center, camera, img_shape):
     device = plane_normal.device
     
     # Get camera parameters
-    fx = camera.focal_x
-    fy = camera.focal_y
-    K = torch.tensor([[fx, 0, W/2], [0, fy, H/2], [0, 0, 1]], device=device).float()  # Intrinsic matrix (3, 3)
+    fx = float(camera.focal_x)
+    fy = float(camera.focal_y)
+    # Do not silently recenter an off-axis COLMAP camera while rendering a
+    # plane.  The same K is consumed by MASt3R/chart rays and 2DGS.
+    cx = float(getattr(camera, "cx", W / 2.0))
+    cy = float(getattr(camera, "cy", H / 2.0))
+    K = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device=device).float()
     c2w = camera.world_view_transform.inverse().T  # Camera to world transform (4, 4)
     
     # Camera center in world coordinates
@@ -489,9 +493,17 @@ if __name__ == "__main__":
             "may rewrite aligned Chart depth."
         ),
     )
+    parser.add_argument(
+        "--plane_core_erosion",
+        type=int,
+        default=3,
+        help="Erosion radius (pixels) for plane-only depth constraints.",
+    )
     args = parser.parse_args()
     if args.min_global_plane_views < 1:
         raise ValueError("--min_global_plane_views must be at least one")
+    if args.plane_core_erosion < 0:
+        raise ValueError("--plane_core_erosion must be non-negative")
 
     print('NOTE: Using training views from data_path')
     # Initialize system state (RNG)
@@ -553,6 +565,16 @@ if __name__ == "__main__":
         depth_list.append(depth)
         mono_normal_world_list.append(mono_normal_world)
 
+    # Keep Chart depth as its own source.  A plane is a bounded residual
+    # constraint, not a full-frame replacement that can later be counted a
+    # second time as both plane and Chart evidence.
+    chart_depth_list = [depth.clone() for depth in depth_list]
+    plane_depth_list = [torch.zeros_like(depth) for depth in depth_list]
+    plane_valid_mask_list = [torch.zeros_like(depth, dtype=torch.bool) for depth in depth_list]
+    plane_confidence_list = [torch.zeros_like(depth, dtype=torch.float32) for depth in depth_list]
+    plane_support_view_count_list = [torch.zeros_like(depth, dtype=torch.uint8) for depth in depth_list]
+    plane_assignment_ids = [torch.full_like(depth, -1, dtype=torch.int32) for depth in depth_list]
+
     # load global 3Dplane ID dict
     global_3Dplane_ID_dict_path = os.path.join(data_path, 'global_3Dplane_ID_dict.json')
     with open(global_3Dplane_ID_dict_path, 'r') as f:
@@ -592,6 +614,7 @@ if __name__ == "__main__":
 
         global_3Dplane_pnts = []                                # save all points for this global 3D plane
         global_3Dplane_mono_normal_world = []
+        contributing_real_views = set()
         for view_id, plane_id in local_3Dplane_idx:
             view_points = view_points_list[view_id]
             rend_normal = rend_normal_list[view_id]
@@ -614,6 +637,8 @@ if __name__ == "__main__":
             max_plane_mask = cluster_masks[0]           # already sorted by area
             max_plane_points = valid_points[max_plane_mask]
             global_3Dplane_pnts.append(max_plane_points)
+            if view_id < input_view_num:
+                contributing_real_views.add(int(view_id))
 
             # # get mono normal max cluster center in world coordinate
             # mono_normal_world = mono_normal_world_list[view_id]
@@ -626,6 +651,15 @@ if __name__ == "__main__":
             global_3Dplane_mono_normal_world.append(cluster_centers[0])
 
         if len(global_3Dplane_pnts) == 0:
+            continue
+        if len(contributing_real_views) < args.min_global_plane_views:
+            # The membership graph may nominate a plane whose actual fitting
+            # support evaporates after visibility/normal checks.  Do not let
+            # its nominal membership count masquerade as independent evidence.
+            print(
+                f"[WARNING] Skip global plane {global_3Dplane_ID}: actual independent "
+                f"fit support={len(contributing_real_views)} < {args.min_global_plane_views}"
+            )
             continue
 
         # get prior normal
@@ -653,9 +687,40 @@ if __name__ == "__main__":
 
             aligned_depth, valid_intersection_points = compute_plane_aligned_depth(global_3Dplane_normal, global_3Dplane_center, train_viewpoints[view_id], depth_list[view_id].shape)
             
-            # replace depth use aligned depth in mask region
-            mask = torch.from_numpy(mask).to('cuda')
-            depth_list[view_id][mask] = aligned_depth[mask]
+            # Store only an eroded, visible plane core in a dedicated source
+            # map.  Whole-mask depth replacement made all Chart pixels appear
+            # plane-supported and caused plane/Chart duplicate fusion.
+            core_mask = mask & conf_map
+            if args.plane_core_erosion > 0:
+                kernel_size = 2 * args.plane_core_erosion + 1
+                core_mask = cv2.erode(
+                    core_mask.astype(np.uint8),
+                    np.ones((kernel_size, kernel_size), dtype=np.uint8),
+                    iterations=1,
+                ).astype(bool)
+            core_mask = torch.from_numpy(core_mask).to('cuda')
+            valid_core = (
+                core_mask
+                & torch.isfinite(aligned_depth)
+                & (aligned_depth > 0)
+            )
+            if not torch.any(valid_core):
+                continue
+            support_count = min(len(contributing_real_views), np.iinfo(np.uint8).max)
+            # Plane labels are normally disjoint.  If a rare overlap occurs,
+            # retain the candidate with more independent source views.
+            replace = valid_core & (
+                (plane_assignment_ids[view_id] < 0)
+                | (plane_support_view_count_list[view_id] < support_count)
+            )
+            plane_depth_list[view_id][replace] = aligned_depth[replace]
+            plane_valid_mask_list[view_id][replace] = True
+            plane_confidence_list[view_id][replace] = min(
+                1.0,
+                support_count / float(args.min_global_plane_views),
+            )
+            plane_support_view_count_list[view_id][replace] = support_count
+            plane_assignment_ids[view_id][replace] = global_3Dplane_ID
 
     # refine non-plane region for see3d views
     for view_id in range(len(train_viewpoints)):
@@ -663,7 +728,7 @@ if __name__ == "__main__":
         if view_id < input_view_num:
             continue
 
-        plane_refined_depth = depth_list[view_id]
+        plane_refined_depth = chart_depth_list[view_id]
         plane_region_mask = (plane_mask_list[view_id] > 0.5)
         plane_region_mask = torch.from_numpy(plane_region_mask).to('cuda')
         mono_depth_path = os.path.join(data_path, f"mono_depth_frame{view_id:06d}.tiff")
@@ -678,18 +743,63 @@ if __name__ == "__main__":
         non_plane_region_mask = ~plane_region_mask
         non_conf_region_mask = ~conf_map
         replace_region_mask = non_plane_region_mask & non_conf_region_mask
+        # Generated-view fallback is retained only for the legacy compatibility
+        # output; it is never exported as a plane source for inverse-depth
+        # fusion of real Chart cameras.
         depth_list[view_id][replace_region_mask] = mono_aligned_depth[replace_region_mask]
 
 
-    # save refine depth
+    plane_source_audit = {
+        "schema_version": "plane-residual-source-v2",
+        "plane_core_erosion_pixels": int(args.plane_core_erosion),
+        "minimum_independent_real_views": int(args.min_global_plane_views),
+        "plane_depth_is_separate_from_chart_depth": True,
+        "frames": [],
+    }
+    # Save Chart/plane sources independently.  ``refine_depth`` remains a
+    # compatibility alias for Chart depth, deliberately not a mixed source.
     for view_id in range(len(train_viewpoints)):
-        save_img_f32(depth_list[view_id].cpu().numpy(), os.path.join(data_path, f"refine_depth_frame{view_id:06d}.tiff"))
-        print(f'refine depth saved to {os.path.join(data_path, f"refine_depth_frame{view_id:06d}.tiff")}')
+        chart_depth = chart_depth_list[view_id] if view_id < input_view_num else depth_list[view_id]
+        chart_depth_np = chart_depth.cpu().numpy().astype(np.float32, copy=False)
+        save_img_f32(chart_depth_np, os.path.join(data_path, f"refine_depth_frame{view_id:06d}.tiff"))
+        save_img_f32(chart_depth_np, os.path.join(data_path, f"refined_chart_depth_frame{view_id:06d}.tiff"))
+        np.save(
+            os.path.join(data_path, f"plane_depth_frame{view_id:06d}.npy"),
+            plane_depth_list[view_id].cpu().numpy().astype(np.float32, copy=False),
+        )
+        np.save(
+            os.path.join(data_path, f"plane_valid_mask_frame{view_id:06d}.npy"),
+            plane_valid_mask_list[view_id].cpu().numpy().astype(np.bool_, copy=False),
+        )
+        np.save(
+            os.path.join(data_path, f"plane_confidence_frame{view_id:06d}.npy"),
+            plane_confidence_list[view_id].cpu().numpy().astype(np.float32, copy=False),
+        )
+        np.save(
+            os.path.join(data_path, f"plane_support_view_count_frame{view_id:06d}.npy"),
+            plane_support_view_count_list[view_id].cpu().numpy().astype(np.uint8, copy=False),
+        )
+        plane_pixels = plane_valid_mask_list[view_id].cpu().numpy()
+        source_support = plane_support_view_count_list[view_id].cpu().numpy()
+        if np.any(plane_pixels) and np.any(source_support[plane_pixels] < args.min_global_plane_views):
+            raise RuntimeError("Plane source contains a pixel below independent-view support threshold")
+        plane_source_audit["frames"].append(
+            {
+                "frame": int(view_id),
+                "plane_core_fraction": float(plane_pixels.mean()),
+                "actual_support_view_count_values": [
+                    int(value) for value in np.unique(source_support[plane_pixels])
+                ],
+            }
+        )
+        print(f'refined Chart and residual plane sources saved for frame {view_id:06d}')
     
         # save refine points
-        view_points = depths_to_points_parallel(depth_list[view_id], [train_viewpoints[view_id]])
+        view_points = depths_to_points_parallel(chart_depth, [train_viewpoints[view_id]])
         view_points = view_points.squeeze(0)
         save_tensor_as_pcd(view_points, os.path.join(data_path, f"refine_points_frame{view_id:06d}.ply"))
         print(f'refine points saved to {os.path.join(data_path, f"refine_points_frame{view_id:06d}.ply")}')
     
+    with open(os.path.join(data_path, "plane_residual_source_manifest.json"), "w") as handle:
+        json.dump(plane_source_audit, handle, indent=2)
     print('done')

@@ -251,12 +251,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         T = np.array(extr.tvec)
 
         if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
+            focal_length_x = float(intr.params[0])
+            focal_length_y = focal_length_x
+            principal_x = float(intr.params[1])
+            principal_y = float(intr.params[2])
+            FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
+            focal_length_x = float(intr.params[0])
+            focal_length_y = float(intr.params[1])
+            principal_x = float(intr.params[2])
+            principal_y = float(intr.params[3])
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -282,8 +287,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             'height' : height,
             'position': pos.tolist(),
             'rotation': serializable_array_2d,
-            'fy' : fov2focal(FovY, height),
-            'fx' : fov2focal(FovX, width)
+            'fy' : focal_length_y,
+            'fx' : focal_length_x,
+            'cx' : principal_x,
+            'cy' : principal_y,
         }
         cam_transforms.append(cam_transform)
     cam_transforms = sorted(cam_transforms.copy(), key = lambda x : x['img_name'])

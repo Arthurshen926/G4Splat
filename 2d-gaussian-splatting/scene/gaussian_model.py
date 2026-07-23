@@ -319,20 +319,92 @@ class GaussianModel:
         return len(means)
 
     def freeze_prefix_gradients(self, point_count):
-        """Freeze a loaded baseline prefix while allowing appended points to train."""
+        """Freeze a loaded baseline prefix while allowing appended points to train.
+
+        A zero gradient alone is not sufficient after a checkpoint restore:
+        Adam will still apply a non-zero update from the restored ``exp_avg``
+        buffer.  Clear the prefix state at the same time as installing the
+        gradient mask so a protected continuation is genuinely immutable.
+        """
         point_count = int(point_count)
         if point_count < 0 or point_count > len(self._xyz):
             raise ValueError(
                 f"Cannot freeze {point_count} of {len(self._xyz)} Gaussian points"
             )
+        self._frozen_prefix_count = point_count
+        self._refresh_prefix_gradient_hooks()
+        self._frozen_prefix_optimizer_state = self.clear_prefix_optimizer_state(
+            point_count
+        )
+        self._warmstart_suffix_initial_xyz = self._xyz[point_count:].detach().clone()
+        if hasattr(self, "mip_filter") and len(self.mip_filter) >= point_count:
+            self._frozen_prefix_mip_filter = self.mip_filter[:point_count].detach().clone()
+        print(
+            f"[INFO] Frozen {point_count} baseline Gaussians; "
+            f"{len(self._xyz) - point_count} appended Gaussians remain trainable."
+        )
+
+    @torch.no_grad()
+    def clear_prefix_optimizer_state(self, point_count=None):
+        """Zero checkpoint momentum for an immutable Gaussian prefix.
+
+        The model stores every Gaussian field as one concatenated parameter.
+        Consequently a parameter-level ``requires_grad=False`` cannot freeze
+        only the loaded prefix.  Gradient hooks block new gradients, while
+        this helper removes Adam's *old* per-row momentum.  It deliberately
+        leaves scalar optimizer bookkeeping (such as ``step``) and every
+        appended suffix row intact.
+        """
+        if point_count is None:
+            point_count = int(getattr(self, "_frozen_prefix_count", 0))
+        point_count = int(point_count)
+        if point_count <= 0 or self.optimizer is None:
+            return {}
+        if point_count > len(self._xyz):
+            raise ValueError(
+                f"Cannot clear optimizer state for {point_count} of {len(self._xyz)} points"
+            )
+
+        cleared = {}
+        for group in self.optimizer.param_groups:
+            if len(group["params"]) != 1:
+                raise RuntimeError("Expected one tensor per Gaussian optimizer group")
+            state = self.optimizer.state.get(group["params"][0])
+            if not state:
+                continue
+            fields = []
+            for field_name, value in state.items():
+                if not torch.is_tensor(value) or value.ndim == 0:
+                    continue
+                if value.shape[0] < point_count:
+                    raise RuntimeError(
+                        "Optimizer state is shorter than the frozen Gaussian prefix"
+                    )
+                value[:point_count].zero_()
+                fields.append(field_name)
+            if fields:
+                cleared[str(group.get("name", "unnamed"))] = fields
+        return cleared
+
+    def _refresh_prefix_gradient_hooks(self):
+        """Reinstall an existing baseline-freeze mask after a topology append.
+
+        Every append replaces optimizer tensors with fresh ``nn.Parameter``
+        instances.  Tensor hooks do not survive that replacement, so a
+        continuation that promises to keep its checkpoint baseline fixed must
+        explicitly restore the prefix mask after ``densification_postfix``.
+        """
+        point_count = int(getattr(self, "_frozen_prefix_count", 0))
+        if point_count <= 0:
+            return
+        if point_count > len(self._xyz):
+            raise RuntimeError(
+                "Frozen baseline is longer than the current Gaussian topology"
+            )
         handles = getattr(self, "_prefix_gradient_hook_handles", [])
         for handle in handles:
             handle.remove()
         self._prefix_gradient_hook_handles = []
-        self._frozen_prefix_count = point_count
-        self._warmstart_suffix_initial_xyz = self._xyz[point_count:].detach().clone()
-        if hasattr(self, "mip_filter") and len(self.mip_filter) >= point_count:
-            self._frozen_prefix_mip_filter = self.mip_filter[:point_count].detach().clone()
 
         for parameter in (
             self._xyz,
@@ -351,10 +423,6 @@ class GaussianModel:
             self._prefix_gradient_hook_handles.append(
                 parameter.register_hook(lambda gradient, mask=trainable: gradient * mask)
             )
-        print(
-            f"[INFO] Frozen {point_count} baseline Gaussians; "
-            f"{len(self._xyz) - point_count} appended Gaussians remain trainable."
-        )
 
     @torch.no_grad()
     def constrain_trainable_suffix(
@@ -594,8 +662,11 @@ class GaussianModel:
             x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
             z = torch.clamp(z, min=0.001)
             
-            x = x / z * camera.focal_x + camera.image_width / 2.0
-            y = y / z * camera.focal_y + camera.image_height / 2.0
+            # Mip support must use the same off-axis camera as rendering.
+            # Falling back to a centred principal point here changes which
+            # splats are filtered near an image border in calibrated scenes.
+            x = x / z * camera.focal_x + camera.cx
+            y = y / z * camera.focal_y + camera.cy
             
             # use similar tangent space filtering as in the paper
             in_screen = torch.logical_and(torch.logical_and(x >= -0.15 * camera.image_width, x <= camera.image_width * 1.15), torch.logical_and(y >= -0.15 * camera.image_height, y <= 1.15 * camera.image_height))
@@ -746,6 +817,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+        previous_point_count = self.get_xyz.shape[0]
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -764,6 +836,33 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # Normal densification temporarily disables the Mip filter and then
+        # recomputes it after split/prune.  Additive continuation deliberately
+        # never prunes its protected baseline, so it needs a shape-consistent
+        # filter immediately after appending points.  The caller may replace
+        # these inherited/zero values later, but rendering must never observe a
+        # filter whose length belongs to the pre-densification topology.
+        if self.use_mip_filter:
+            old_filter = getattr(self, "mip_filter", None)
+            if old_filter is None or len(old_filter) != previous_point_count:
+                old_filter = torch.zeros(
+                    (previous_point_count, 1),
+                    device=self._xyz.device,
+                    dtype=self._xyz.dtype,
+                )
+            extension = torch.zeros(
+                (self.get_xyz.shape[0] - previous_point_count, 1),
+                device=old_filter.device,
+                dtype=old_filter.dtype,
+            )
+            self.mip_filter = torch.cat([old_filter, extension], dim=0)
+        self._refresh_prefix_gradient_hooks()
+        # ``cat_tensors_to_optimizer`` retains old prefix momentum when it
+        # swaps parameter tensors.  Reassert the invariant after every
+        # additive append, even though the initial protected-stage clear makes
+        # this normally a no-op.
+        self.clear_prefix_optimizer_state()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -805,6 +904,155 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+
+    def densify_and_clone_limited(
+        self,
+        grads,
+        grad_threshold,
+        scene_extent,
+        max_new_points,
+        *,
+        opacity_ceiling=0.02,
+    ):
+        """Append a bounded, conservative residual clone set without pruning.
+
+        This is intentionally different from the native 2DGS
+        ``densify_and_prune`` path: it never removes or replaces a protected
+        checkpoint Gaussian.  It is used for continuation when a Chart-led
+        bootstrap lacks capacity in real camera views, not for a new-model
+        initialization.  New clones inherit their parent's Mip filter and are
+        opacity-capped so an append cannot double an established surface's
+        alpha in one step.
+        """
+        max_new_points = int(max_new_points)
+        if max_new_points <= 0:
+            return 0
+        if not 0.0 < float(opacity_ceiling) < 1.0:
+            raise ValueError("opacity_ceiling must lie strictly between 0 and 1")
+
+        grad_norm = torch.nan_to_num(torch.norm(grads, dim=-1), nan=0.0)
+        selected_pts_mask = grad_norm >= grad_threshold
+        selected_pts_mask = torch.logical_and(
+            selected_pts_mask,
+            torch.max(self.get_scaling, dim=1).values
+            <= self.percent_dense * scene_extent,
+        )
+        selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
+        if selected_indices.numel() == 0:
+            return 0
+        if selected_indices.numel() > max_new_points:
+            _, ranking = torch.topk(grad_norm[selected_indices], k=max_new_points)
+            selected_indices = selected_indices[ranking]
+
+        parent_mip_filter = None
+        if self.use_mip_filter and hasattr(self, "mip_filter"):
+            parent_mip_filter = self.mip_filter[selected_indices].detach().clone()
+
+        new_xyz = self._xyz[selected_indices]
+        new_features_dc = self._features_dc[selected_indices]
+        new_features_rest = self._features_rest[selected_indices]
+        opacity_limit = self.inverse_opacity_activation(
+            torch.full_like(self._opacity[selected_indices], float(opacity_ceiling))
+        )
+        new_opacities = torch.minimum(self._opacity[selected_indices], opacity_limit)
+        new_scaling = self._scaling[selected_indices]
+        new_rotation = self._rotation[selected_indices]
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+        )
+        if parent_mip_filter is not None:
+            self.mip_filter[-len(parent_mip_filter):] = parent_mip_filter
+        return int(selected_indices.numel())
+
+    def densify_and_split_limited(
+        self,
+        grads,
+        grad_threshold,
+        scene_extent,
+        max_new_points,
+        *,
+        children_per_parent=2,
+        opacity_ceiling=0.02,
+        max_parent_scale_fraction=0.1,
+    ):
+        """Append compact children for large, high-gradient Gaussians.
+
+        Unlike native ``densify_and_split``, this continuation primitive never
+        deletes the large parent.  It is for a protected model whose broad
+        Chart-led surfels still cover a real camera view but cannot express its
+        local facade/foliage detail.  Children receive a local randomized
+        offset and reduced scales, while their opacity is capped so the parent
+        remains the stable low-frequency explanation during refinement.
+        """
+        max_new_points = int(max_new_points)
+        children_per_parent = int(children_per_parent)
+        if max_new_points <= 0:
+            return 0
+        if children_per_parent < 1:
+            raise ValueError("children_per_parent must be positive")
+        if not 0.0 < float(opacity_ceiling) < 1.0:
+            raise ValueError("opacity_ceiling must lie strictly between 0 and 1")
+        if not 0.0 < float(max_parent_scale_fraction) <= 1.0:
+            raise ValueError("max_parent_scale_fraction must lie in (0, 1]")
+
+        # ``grads`` belongs to the topology at the start of a densification
+        # event.  Never let a stale, shorter gradient tensor silently address
+        # points appended by another residual primitive.
+        point_count = min(int(grads.shape[0]), int(self.get_xyz.shape[0]))
+        if point_count == 0:
+            return 0
+        grad_norm = torch.nan_to_num(torch.norm(grads[:point_count], dim=-1), nan=0.0)
+        parent_scales = torch.max(self.get_scaling[:point_count], dim=1).values
+        selected_pts_mask = torch.logical_and(grad_norm >= grad_threshold, parent_scales > self.percent_dense * scene_extent)
+        selected_pts_mask = torch.logical_and(
+            selected_pts_mask,
+            parent_scales <= float(max_parent_scale_fraction) * scene_extent,
+        )
+        selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
+        max_parents = max_new_points // children_per_parent
+        if selected_indices.numel() == 0 or max_parents <= 0:
+            return 0
+        if selected_indices.numel() > max_parents:
+            _, ranking = torch.topk(grad_norm[selected_indices], k=max_parents)
+            selected_indices = selected_indices[ranking]
+
+        repeated_indices = selected_indices.repeat_interleave(children_per_parent)
+        parent_scales = self.get_scaling[repeated_indices]
+        stds = torch.cat(
+            [parent_scales, torch.zeros_like(parent_scales[:, :1])], dim=-1
+        )
+        offsets = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rotations = build_rotation(self._rotation[repeated_indices])
+        new_xyz = torch.bmm(rotations, offsets.unsqueeze(-1)).squeeze(-1)
+        new_xyz = new_xyz + self.get_xyz[repeated_indices]
+        new_scaling = self.scaling_inverse_activation(
+            parent_scales / (0.8 * children_per_parent)
+        )
+        opacity_limit = self.inverse_opacity_activation(
+            torch.full_like(self._opacity[repeated_indices], float(opacity_ceiling))
+        )
+        new_opacities = torch.minimum(self._opacity[repeated_indices], opacity_limit)
+
+        parent_mip_filter = None
+        if self.use_mip_filter and hasattr(self, "mip_filter"):
+            parent_mip_filter = self.mip_filter[repeated_indices].detach().clone()
+        self.densification_postfix(
+            new_xyz,
+            self._features_dc[repeated_indices],
+            self._features_rest[repeated_indices],
+            new_opacities,
+            new_scaling,
+            self._rotation[repeated_indices],
+        )
+        if parent_mip_filter is not None:
+            self.mip_filter[-len(parent_mip_filter):] = parent_mip_filter
+        return int(repeated_indices.numel())
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         use_mip_filter = self.use_mip_filter

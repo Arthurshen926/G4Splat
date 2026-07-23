@@ -1,6 +1,6 @@
 import numpy as np
 
-from scripts.gate_plane_refinement import gate_plane_depth
+from scripts.gate_plane_refinement import current_refined_depth_paths, gate_plane_depth
 
 
 def test_plane_gate_falls_back_whole_chart_on_low_support():
@@ -44,3 +44,12 @@ def test_plane_gate_keeps_safe_changes_and_reverts_local_outlier():
     assert not record["chart_fallback"]
     assert output[5, 5] == aligned[5, 5]
     assert np.isclose(output[0, 0], refined[0, 0])
+
+
+def test_safety_gate_ignores_its_own_backup_tiffs(tmp_path):
+    current = tmp_path / "refine_depth_frame000007.tiff"
+    backup = tmp_path / "refine_depth_frame000007.pre_safety_gate.tiff"
+    current.touch()
+    backup.touch()
+
+    assert current_refined_depth_paths(tmp_path) == [current]
