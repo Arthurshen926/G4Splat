@@ -25,6 +25,7 @@ from scene.dataset_readers import (
     fetchPly,
 )
 import os
+import shutil
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
@@ -48,6 +49,10 @@ from typing import Optional
 from matcha.cambridge_training import (
     apply_per_image_affine_color_correction,
     load_per_image_affine_color_correction,
+)
+from outdoor.directional_sky import (
+    CanonicalDirectionalSky,
+    composite_white_background,
 )
 
 
@@ -73,6 +78,57 @@ def load_checkpoint_color_correction(
     return correction
 
 
+def load_checkpoint_directional_sky(
+    model_path: str,
+    iteration: int,
+    device: torch.device,
+):
+    state_path = (
+        Path(model_path)
+        / "point_cloud"
+        / f"iteration_{iteration}"
+        / "sky_model.pth"
+    )
+    if not state_path.is_file():
+        return None
+    sky = CanonicalDirectionalSky.load(state_path, device=device)
+    print(f"Loaded canonical directional sky from {state_path}")
+    return sky
+
+
+def render_rgb_with_optional_sky(
+    camera,
+    gaussians,
+    pipe,
+    background,
+    *,
+    directional_sky=None,
+):
+    if directional_sky is None:
+        return render(camera, gaussians, pipe, background, rgb_only=True)["render"]
+    if not torch.allclose(background, torch.ones_like(background)):
+        raise RuntimeError("Directional sky compositing requires a white renderer background")
+    package = render(camera, gaussians, pipe, background)
+    return composite_white_background(
+        package["render"], package["rend_alpha"], directional_sky(camera)
+    )
+
+
+def save_audit_png(image: np.ndarray, path: str) -> None:
+    """Write a lossless audit PNG with low compression for faster full-view export."""
+    save_img_u8(image, path, compress_level=1)
+
+
+def link_shared_ground_truth(source: str, destination: str) -> None:
+    """Reuse one encoded GT across paired raw/affine audit directories."""
+    destination_path = Path(destination)
+    destination_path.unlink(missing_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
+
+
 @torch.no_grad()
 def export_rgb_stream(
     viewpoint_stack,
@@ -83,6 +139,7 @@ def export_rgb_stream(
     output_path: str,
     index_offset: int = 0,
     color_correction=None,
+    directional_sky=None,
     raw_output_path: Optional[str] = None,
 ) -> None:
     """Render and write RGB one camera at a time.
@@ -110,32 +167,33 @@ def export_rgb_stream(
         desc="stream RGB images",
     ):
         output_index = index + index_offset
-        raw_rendered = render(
+        raw_rendered = render_rgb_with_optional_sky(
             viewpoint_cam,
             gaussians,
             pipe,
             background,
-            rgb_only=True,
-        )["render"]
+            directional_sky=directional_sky,
+        )
         rendered = apply_per_image_affine_color_correction(
             color_correction, raw_rendered, viewpoint_cam.image_name
         )
         gt = viewpoint_cam.original_image[0:3, :, :]
-        save_img_u8(
+        gt_path = os.path.join(gts_path, f"{output_index:05d}.png")
+        save_audit_png(
             gt.permute(1, 2, 0).cpu().numpy(),
-            os.path.join(gts_path, f"{output_index:05d}.png"),
+            gt_path,
         )
-        save_img_u8(
+        save_audit_png(
             rendered.permute(1, 2, 0).cpu().numpy(),
             os.path.join(render_path, f"{output_index:05d}.png"),
         )
         if raw_render_path is not None and raw_gts_path is not None:
-            save_img_u8(
+            save_audit_png(
                 raw_rendered.permute(1, 2, 0).cpu().numpy(),
                 os.path.join(raw_render_path, f"{output_index:05d}.png"),
             )
-            save_img_u8(
-                gt.permute(1, 2, 0).cpu().numpy(),
+            link_shared_ground_truth(
+                gt_path,
                 os.path.join(raw_gts_path, f"{output_index:05d}.png"),
             )
 
@@ -275,6 +333,7 @@ def export_lazy_colmap_rgb_stream(
     output_path: str,
     index_offset: int = 0,
     color_correction=None,
+    directional_sky=None,
     raw_output_path: Optional[str] = None,
 ) -> None:
     """Render a metadata list with one decoded image/camera at a time."""
@@ -294,26 +353,33 @@ def export_lazy_colmap_rgb_stream(
     ):
         output_index = local_index + index_offset
         camera = _load_lazy_camera(dataset, record, output_index)
-        raw_rendered = render(camera, gaussians, pipe, background, rgb_only=True)["render"]
+        raw_rendered = render_rgb_with_optional_sky(
+            camera,
+            gaussians,
+            pipe,
+            background,
+            directional_sky=directional_sky,
+        )
         rendered = apply_per_image_affine_color_correction(
             color_correction, raw_rendered, camera.image_name
         )
         gt = camera.original_image[0:3, :, :]
-        save_img_u8(
+        gt_path = os.path.join(gts_path, f"{output_index:05d}.png")
+        save_audit_png(
             gt.permute(1, 2, 0).cpu().numpy(),
-            os.path.join(gts_path, f"{output_index:05d}.png"),
+            gt_path,
         )
-        save_img_u8(
+        save_audit_png(
             rendered.permute(1, 2, 0).cpu().numpy(),
             os.path.join(render_path, f"{output_index:05d}.png"),
         )
         if raw_render_path is not None and raw_gts_path is not None:
-            save_img_u8(
+            save_audit_png(
                 raw_rendered.permute(1, 2, 0).cpu().numpy(),
                 os.path.join(raw_render_path, f"{output_index:05d}.png"),
             )
-            save_img_u8(
-                gt.permute(1, 2, 0).cpu().numpy(),
+            link_shared_ground_truth(
+                gt_path,
                 os.path.join(raw_gts_path, f"{output_index:05d}.png"),
             )
         del raw_rendered, rendered, camera
@@ -402,6 +468,9 @@ if __name__ == "__main__":
         gaussians.load_ply(point_cloud)
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        directional_sky = load_checkpoint_directional_sky(
+            args.model_path, iteration, background.device
+        )
         color_correction = None
         if bool(getattr(args, "disable_color_correction", False)):
             print("[INFO] Per-image affine color correction disabled for this export.")
@@ -439,6 +508,7 @@ if __name__ == "__main__":
             output_path=train_dir,
             index_offset=start,
             color_correction=color_correction,
+            directional_sky=directional_sky,
             raw_output_path=raw_train_dir,
         )
         raise SystemExit(0)
@@ -449,6 +519,9 @@ if __name__ == "__main__":
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    directional_sky = load_checkpoint_directional_sky(
+        args.model_path, scene.loaded_iter, background.device
+    )
     color_correction = None
     if bool(getattr(args, "disable_color_correction", False)):
         print("[INFO] Per-image affine color correction disabled for this export.")
@@ -500,6 +573,7 @@ if __name__ == "__main__":
                 output_path=train_dir,
                 index_offset=start,
                 color_correction=color_correction,
+                directional_sky=directional_sky,
                 raw_output_path=raw_train_dir,
             )
         else:

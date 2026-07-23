@@ -267,12 +267,12 @@ def create_videos(base_dir, input_dir, out_name, num_frames=480):
         writer.add_image(frame)
         idx += 1
 
-def save_img_u8(img, pth):
+def save_img_u8(img, pth, *, compress_level=6):
   """Save an image (probably RGB) in [0, 1] to disk as a uint8 PNG."""
   with open(pth, 'wb') as f:
     Image.fromarray(
         (np.clip(np.nan_to_num(img), 0., 1.) * 255.).astype(np.uint8)).save(
-            f, 'PNG')
+            f, 'PNG', compress_level=compress_level)
 
 
 def save_img_f32(depthmap, pth):

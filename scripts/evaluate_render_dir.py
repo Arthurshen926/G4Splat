@@ -46,7 +46,7 @@ def metrics(
     target: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
-    valid_ratio = 1.0
+    valid_ratio = prediction.new_tensor(1.0)
     if mask is not None:
         if tuple(mask.shape) != tuple(prediction.shape[-2:]):
             raise RuntimeError(
@@ -54,18 +54,24 @@ def metrics(
             )
         if not bool(mask.any()):
             raise RuntimeError("Semantic mask removed every pixel")
-        valid_ratio = float(mask.float().mean().cpu())
+        valid_ratio = mask.float().mean()
         prediction = prediction[:, mask]
         target = target[:, mask]
 
     residual = prediction - target
-    return {
-        "psnr": float(psnr(prediction, target).cpu()),
-        "ssim": float(global_ssim(prediction, target).cpu()),
-        "mae": float(residual.abs().mean().cpu()),
-        "rmse": float(residual.square().mean().sqrt().cpu()),
-        "valid_pixel_ratio": valid_ratio,
-    }
+    # Transfer all scalar statistics together.  A full Cambridge tree audit
+    # computes six metric strata per view; synchronising CUDA separately for
+    # every scalar otherwise dominates the 1,487-view evaluation.
+    values = torch.stack(
+        (
+            psnr(prediction, target),
+            global_ssim(prediction, target),
+            residual.abs().mean(),
+            residual.square().mean().sqrt(),
+            valid_ratio,
+        )
+    ).detach().cpu().tolist()
+    return dict(zip(("psnr", "ssim", "mae", "rmse", "valid_pixel_ratio"), values))
 
 
 def mean_metrics(items: list[dict[str, float]]) -> dict[str, float]:

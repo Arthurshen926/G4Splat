@@ -20,6 +20,7 @@ SPLIT_RESIDUAL_CONFIG = (
     / "outdoor_protected_residual56k_split.yaml"
 )
 PREFIX_AUDIT = REPO_ROOT / "scripts" / "audit_checkpoint_prefix_integrity.py"
+SEMANTIC_RESIDUAL = REPO_ROOT / "scripts" / "train_semantic_residual_2dgs.py"
 
 
 def _method_calls(path: Path, method_name: str) -> set[str]:
@@ -90,3 +91,30 @@ def test_checkpoint_prefix_audit_requires_exact_parameter_rows():
     assert "MODEL_FIELDS" in source
     assert "torch.equal(baseline, candidate[:count])" in source
     assert "Protected prefix changed during continuation" in source
+
+
+def test_semantic_residual_fork_has_no_global_prune_or_opacity_reset():
+    source = SEMANTIC_RESIDUAL.read_text()
+    main_calls = _method_calls(SEMANTIC_RESIDUAL, "main")
+
+    assert "densify_and_clone_limited" in main_calls
+    assert "densify_and_split_limited" in main_calls
+    assert "prune_points" not in main_calls
+    assert "densify_and_prune" not in main_calls
+    assert "reset_opacity" not in main_calls
+    assert "exact_full_state_restore_then_declared_schedule_fork" in source
+    assert '"true_volumetric_foliage": False' in source
+
+
+def test_gaussian_metadata_is_serialized_with_ply_and_training_capture():
+    source = GAUSSIAN_MODEL.read_text()
+
+    for field in (
+        "primitive_class",
+        "source_type",
+        "geometry_confidence",
+        "protected_flag",
+        "block_id",
+    ):
+        assert field in source
+    assert "if len(model_args) not in {12, 13}" in source

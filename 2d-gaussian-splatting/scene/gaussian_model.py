@@ -25,6 +25,12 @@ from utils.point_utils import depths_to_points
 from tqdm import tqdm
 
 class GaussianModel:
+    PRIMITIVE_STRUCTURAL = 0
+    PRIMITIVE_FOLIAGE = 1
+    PRIMITIVE_SKY = 2
+
+    SOURCE_SFM_OR_BASE = 0
+    SOURCE_CANOPY_RESIDUAL = 1
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -53,6 +59,13 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        # Non-optimised provenance fields.  They make protected residual
+        # continuations auditable without changing rasterizer inputs.
+        self._primitive_class = torch.empty(0, dtype=torch.int16)
+        self._source_type = torch.empty(0, dtype=torch.int16)
+        self._geometry_confidence = torch.empty(0)
+        self._protected_flag = torch.empty(0, dtype=torch.bool)
+        self._block_id = torch.empty(0, dtype=torch.int32)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -76,9 +89,21 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            {
+                "primitive_class": self._primitive_class,
+                "source_type": self._source_type,
+                "geometry_confidence": self._geometry_confidence,
+                "protected_flag": self._protected_flag,
+                "block_id": self._block_id,
+            },
         )
     
     def restore(self, model_args, training_args):
+        if len(model_args) not in {12, 13}:
+            raise RuntimeError(
+                f"Unsupported GaussianModel capture with {len(model_args)} fields"
+            )
+        metadata = model_args[12] if len(model_args) == 13 else None
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -90,11 +115,129 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = model_args[:12]
+        self._restore_point_metadata(metadata)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+
+    def _initialize_point_metadata(
+        self,
+        count,
+        *,
+        primitive_class=PRIMITIVE_STRUCTURAL,
+        source_type=SOURCE_SFM_OR_BASE,
+        geometry_confidence=1.0,
+        protected_flag=False,
+        block_id=-1,
+        device=None,
+    ):
+        count = int(count)
+        device = self._xyz.device if device is None else torch.device(device)
+        self._primitive_class = torch.full(
+            (count,), int(primitive_class), dtype=torch.int16, device=device
+        )
+        self._source_type = torch.full(
+            (count,), int(source_type), dtype=torch.int16, device=device
+        )
+        self._geometry_confidence = torch.full(
+            (count,), float(geometry_confidence), dtype=torch.float32, device=device
+        )
+        self._protected_flag = torch.full(
+            (count,), bool(protected_flag), dtype=torch.bool, device=device
+        )
+        self._block_id = torch.full(
+            (count,), int(block_id), dtype=torch.int32, device=device
+        )
+
+    def _restore_point_metadata(self, metadata):
+        point_count = int(len(self._xyz))
+        if metadata is None:
+            self._initialize_point_metadata(point_count, device=self._xyz.device)
+            return
+        required = {
+            "primitive_class",
+            "source_type",
+            "geometry_confidence",
+            "protected_flag",
+            "block_id",
+        }
+        missing = sorted(required - set(metadata))
+        if missing:
+            raise RuntimeError(f"Gaussian metadata is missing fields: {missing}")
+        fields = {
+            "_primitive_class": (metadata["primitive_class"], torch.int16),
+            "_source_type": (metadata["source_type"], torch.int16),
+            "_geometry_confidence": (metadata["geometry_confidence"], torch.float32),
+            "_protected_flag": (metadata["protected_flag"], torch.bool),
+            "_block_id": (metadata["block_id"], torch.int32),
+        }
+        for attribute, (value, dtype) in fields.items():
+            tensor = torch.as_tensor(value, device=self._xyz.device, dtype=dtype).reshape(-1)
+            if len(tensor) != point_count:
+                raise RuntimeError(
+                    f"Gaussian metadata {attribute} has {len(tensor)} rows for "
+                    f"{point_count} points"
+                )
+            setattr(self, attribute, tensor)
+
+    def _point_metadata_from_indices(self, indices, *, repeat=1, **overrides):
+        indices = indices.reshape(-1)
+        if int(repeat) > 1:
+            indices = indices.repeat_interleave(int(repeat))
+        metadata = {
+            "primitive_class": self._primitive_class[indices],
+            "source_type": self._source_type[indices],
+            "geometry_confidence": self._geometry_confidence[indices],
+            "protected_flag": self._protected_flag[indices],
+            "block_id": self._block_id[indices],
+        }
+        dtype_by_name = {
+            "primitive_class": torch.int16,
+            "source_type": torch.int16,
+            "geometry_confidence": torch.float32,
+            "protected_flag": torch.bool,
+            "block_id": torch.int32,
+        }
+        for name, value in overrides.items():
+            if value is not None:
+                metadata[name] = torch.full(
+                    (len(indices),),
+                    value,
+                    dtype=dtype_by_name[name],
+                    device=self._xyz.device,
+                )
+        return metadata
+
+    @property
+    def get_primitive_class(self):
+        return self._primitive_class
+
+    @property
+    def get_source_type(self):
+        return self._source_type
+
+    @property
+    def get_geometry_confidence(self):
+        return self._geometry_confidence
+
+    @property
+    def get_protected_flag(self):
+        return self._protected_flag
+
+    @property
+    def get_block_id(self):
+        return self._block_id
+
+    @torch.no_grad()
+    def mark_prefix_protected(self, point_count):
+        point_count = int(point_count)
+        if point_count < 0 or point_count > len(self._xyz):
+            raise ValueError(
+                f"Cannot protect {point_count} of {len(self._xyz)} Gaussian points"
+            )
+        self._protected_flag[:point_count] = True
 
     def freeze_params(self):
         """
@@ -221,6 +364,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._initialize_point_metadata(len(self._xyz), device=self._xyz.device)
         
     def create_from_parameters(self, _means, _scales, _quaternions, _colors, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale
@@ -244,6 +388,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._initialize_point_metadata(len(self._xyz), device=self._xyz.device)
 
     def append_from_parameters(
         self,
@@ -300,6 +445,40 @@ class GaussianModel:
         self._opacity = nn.Parameter(
             torch.cat([self._opacity.detach(), opacities], dim=0).requires_grad_(True)
         )
+        old_count = len(self._xyz) - len(means)
+        if len(self._primitive_class) != old_count:
+            self._initialize_point_metadata(old_count, device=self._xyz.device)
+        appended_metadata = {
+            "primitive_class": torch.full(
+                (len(means),), self.PRIMITIVE_STRUCTURAL,
+                dtype=torch.int16, device=self._xyz.device
+            ),
+            "source_type": torch.full(
+                (len(means),), self.SOURCE_SFM_OR_BASE,
+                dtype=torch.int16, device=self._xyz.device
+            ),
+            "geometry_confidence": torch.ones(
+                len(means), dtype=torch.float32, device=self._xyz.device
+            ),
+            "protected_flag": torch.zeros(
+                len(means), dtype=torch.bool, device=self._xyz.device
+            ),
+            "block_id": torch.full(
+                (len(means),), -1, dtype=torch.int32, device=self._xyz.device
+            ),
+        }
+        for name, attribute in (
+            ("primitive_class", "_primitive_class"),
+            ("source_type", "_source_type"),
+            ("geometry_confidence", "_geometry_confidence"),
+            ("protected_flag", "_protected_flag"),
+            ("block_id", "_block_id"),
+        ):
+            setattr(
+                self,
+                attribute,
+                torch.cat([getattr(self, attribute), appended_metadata[name]], dim=0),
+            )
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self._xyz.device)
 
         if self.use_mip_filter:
@@ -536,6 +715,15 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         if self.use_mip_filter:
             l.append('mip_filter')
+        l.extend(
+            [
+                "primitive_class",
+                "source_type",
+                "geometry_confidence",
+                "protected_flag",
+                "block_id",
+            ]
+        )
         return l
 
     def save_ply(self, path):
@@ -548,6 +736,16 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        metadata = np.stack(
+            [
+                self._primitive_class.detach().cpu().numpy(),
+                self._source_type.detach().cpu().numpy(),
+                self._geometry_confidence.detach().cpu().numpy(),
+                self._protected_flag.detach().cpu().numpy().astype(np.float32),
+                self._block_id.detach().cpu().numpy(),
+            ],
+            axis=1,
+        ).astype(np.float32)
         
         if self.use_mip_filter:
             mip_filter = self.mip_filter.detach().cpu().numpy()
@@ -556,9 +754,9 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         if self.use_mip_filter:
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, mip_filter), axis=1)
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, mip_filter, metadata), axis=1)
         else:
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, metadata), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -740,6 +938,41 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        property_names = {item.name for item in plydata.elements[0].properties}
+        if {
+            "primitive_class",
+            "source_type",
+            "geometry_confidence",
+            "protected_flag",
+            "block_id",
+        }.issubset(property_names):
+            self._primitive_class = torch.tensor(
+                np.asarray(plydata.elements[0]["primitive_class"]),
+                dtype=torch.int16,
+                device="cuda",
+            )
+            self._source_type = torch.tensor(
+                np.asarray(plydata.elements[0]["source_type"]),
+                dtype=torch.int16,
+                device="cuda",
+            )
+            self._geometry_confidence = torch.tensor(
+                np.asarray(plydata.elements[0]["geometry_confidence"]),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            self._protected_flag = torch.tensor(
+                np.asarray(plydata.elements[0]["protected_flag"]) > 0.5,
+                dtype=torch.bool,
+                device="cuda",
+            )
+            self._block_id = torch.tensor(
+                np.asarray(plydata.elements[0]["block_id"]),
+                dtype=torch.int32,
+                device="cuda",
+            )
+        else:
+            self._initialize_point_metadata(len(self._xyz), device=self._xyz.device)
         if use_mip_filter:
             self.mip_filter = torch.tensor(mip_filter, dtype=torch.float, device="cuda")
 
@@ -793,6 +1026,11 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self._primitive_class = self._primitive_class[valid_points_mask]
+        self._source_type = self._source_type[valid_points_mask]
+        self._geometry_confidence = self._geometry_confidence[valid_points_mask]
+        self._protected_flag = self._protected_flag[valid_points_mask]
+        self._block_id = self._block_id[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -816,7 +1054,17 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(
+        self,
+        new_xyz,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+        *,
+        metadata=None,
+    ):
         previous_point_count = self.get_xyz.shape[0]
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
@@ -832,6 +1080,49 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        new_count = int(len(new_xyz))
+        if metadata is None:
+            metadata = {
+                "primitive_class": torch.full(
+                    (new_count,), self.PRIMITIVE_STRUCTURAL,
+                    dtype=torch.int16, device=self._xyz.device
+                ),
+                "source_type": torch.full(
+                    (new_count,), self.SOURCE_SFM_OR_BASE,
+                    dtype=torch.int16, device=self._xyz.device
+                ),
+                "geometry_confidence": torch.ones(
+                    new_count, dtype=torch.float32, device=self._xyz.device
+                ),
+                "protected_flag": torch.zeros(
+                    new_count, dtype=torch.bool, device=self._xyz.device
+                ),
+                "block_id": torch.full(
+                    (new_count,), -1, dtype=torch.int32, device=self._xyz.device
+                ),
+            }
+        for name, attribute in (
+            ("primitive_class", "_primitive_class"),
+            ("source_type", "_source_type"),
+            ("geometry_confidence", "_geometry_confidence"),
+            ("protected_flag", "_protected_flag"),
+            ("block_id", "_block_id"),
+        ):
+            extension = torch.as_tensor(
+                metadata[name],
+                dtype=getattr(self, attribute).dtype,
+                device=self._xyz.device,
+            ).reshape(-1)
+            if len(extension) != new_count:
+                raise RuntimeError(
+                    f"Appended metadata {name} has {len(extension)} rows for "
+                    f"{new_count} new Gaussians"
+                )
+            setattr(
+                self,
+                attribute,
+                torch.cat([getattr(self, attribute), extension], dim=0),
+            )
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -885,7 +1176,16 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            metadata=self._point_metadata_from_indices(selected_indices, repeat=N),
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -903,7 +1203,16 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            metadata=self._point_metadata_from_indices(selected_indices),
+        )
 
     def densify_and_clone_limited(
         self,
@@ -913,6 +1222,12 @@ class GaussianModel:
         max_new_points,
         *,
         opacity_ceiling=0.02,
+        eligibility_mask=None,
+        primitive_class=None,
+        source_type=None,
+        geometry_confidence=None,
+        protected_flag=None,
+        block_id=None,
     ):
         """Append a bounded, conservative residual clone set without pruning.
 
@@ -937,6 +1252,17 @@ class GaussianModel:
             torch.max(self.get_scaling, dim=1).values
             <= self.percent_dense * scene_extent,
         )
+        if eligibility_mask is not None:
+            eligibility_mask = torch.as_tensor(
+                eligibility_mask, dtype=torch.bool, device=selected_pts_mask.device
+            ).reshape(-1)
+            if len(eligibility_mask) != len(selected_pts_mask):
+                raise ValueError(
+                    "eligibility_mask must have one value per Gaussian point"
+                )
+            selected_pts_mask = torch.logical_and(
+                selected_pts_mask, eligibility_mask
+            )
         selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
         if selected_indices.numel() == 0:
             return 0
@@ -965,6 +1291,14 @@ class GaussianModel:
             new_opacities,
             new_scaling,
             new_rotation,
+            metadata=self._point_metadata_from_indices(
+                selected_indices,
+                primitive_class=primitive_class,
+                source_type=source_type,
+                geometry_confidence=geometry_confidence,
+                protected_flag=protected_flag,
+                block_id=block_id,
+            ),
         )
         if parent_mip_filter is not None:
             self.mip_filter[-len(parent_mip_filter):] = parent_mip_filter
@@ -980,6 +1314,12 @@ class GaussianModel:
         children_per_parent=2,
         opacity_ceiling=0.02,
         max_parent_scale_fraction=0.1,
+        eligibility_mask=None,
+        primitive_class=None,
+        source_type=None,
+        geometry_confidence=None,
+        protected_flag=None,
+        block_id=None,
     ):
         """Append compact children for large, high-gradient Gaussians.
 
@@ -1014,6 +1354,17 @@ class GaussianModel:
             selected_pts_mask,
             parent_scales <= float(max_parent_scale_fraction) * scene_extent,
         )
+        if eligibility_mask is not None:
+            eligibility_mask = torch.as_tensor(
+                eligibility_mask, dtype=torch.bool, device=selected_pts_mask.device
+            ).reshape(-1)
+            if len(eligibility_mask) < point_count:
+                raise ValueError(
+                    "eligibility_mask must cover every Gaussian addressed by grads"
+                )
+            selected_pts_mask = torch.logical_and(
+                selected_pts_mask, eligibility_mask[:point_count]
+            )
         selected_indices = torch.nonzero(selected_pts_mask, as_tuple=False).flatten()
         max_parents = max_new_points // children_per_parent
         if selected_indices.numel() == 0 or max_parents <= 0:
@@ -1049,6 +1400,15 @@ class GaussianModel:
             new_opacities,
             new_scaling,
             self._rotation[repeated_indices],
+            metadata=self._point_metadata_from_indices(
+                selected_indices,
+                repeat=children_per_parent,
+                primitive_class=primitive_class,
+                source_type=source_type,
+                geometry_confidence=geometry_confidence,
+                protected_flag=protected_flag,
+                block_id=block_id,
+            ),
         )
         if parent_mip_filter is not None:
             self.mip_filter[-len(parent_mip_filter):] = parent_mip_filter
