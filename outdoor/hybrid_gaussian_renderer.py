@@ -136,6 +136,32 @@ class VolumetricFoliageModel(nn.Module):
         )
         return int(len(indices))
 
+    @torch.no_grad()
+    def initialize_from_volume_state(self, payload: dict) -> int:
+        """Initialize from independent SfM/visual-hull evidence."""
+        if len(self):
+            raise RuntimeError("Volumetric foliage is already initialized")
+        if payload.get("version") != "independent_sfm_semantic_canopy_volume_v1":
+            raise RuntimeError("Unsupported independent foliage volume state")
+        device, dtype = self.xyz.device, self.xyz.dtype
+        xyz = payload["centers"].to(device=device, dtype=dtype)
+        scales = payload["scales"].to(device=device, dtype=dtype).clamp_min(1e-6)
+        colors = payload["colors"].to(device=device, dtype=dtype).clamp(0, 1)
+        coefficients = (self.sh_degree + 1) ** 2
+        features = torch.zeros(
+            len(xyz), coefficients, 3, device=device, dtype=dtype
+        )
+        features[:, 0] = (colors - 0.5) / 0.28209479177387814
+        opacity = payload["opacities"].to(device=device, dtype=dtype)
+        self._replace(
+            xyz=xyz,
+            log_scales=scales.log(),
+            quaternions=payload["quaternions"].to(device=device, dtype=dtype),
+            opacity_logits=torch.logit(opacity.clamp(1e-6, 1 - 1e-6)),
+            features=features,
+        )
+        return int(len(xyz))
+
     def _replace(self, **values: torch.Tensor) -> None:
         for name, value in values.items():
             setattr(self, name, nn.Parameter(value.requires_grad_(True)))

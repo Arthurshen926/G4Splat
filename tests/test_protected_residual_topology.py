@@ -104,6 +104,10 @@ def test_semantic_residual_fork_has_no_global_prune_or_opacity_reset():
     assert "reset_opacity" not in main_calls
     assert "exact_full_state_restore_then_declared_schedule_fork" in source
     assert '"true_volumetric_foliage": False' in source
+    assert "normalized_norm = norm / projected_area" in source
+    assert "torch.where(" in source
+    assert "sequence_count >= int(args.minimum_support_sequences)" in source
+    assert "maximum_baseline >= float(args.minimum_support_baseline)" in source
 
 
 def test_gaussian_metadata_is_serialized_with_ply_and_training_capture():

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from matcha.cambridge_masks import CambridgeMaskLookup
 
 
-TASK_FIELD_VERSION = "cambridge_runtime_task_fields_v1"
+TASK_FIELD_VERSION = "cambridge_runtime_task_fields_v2"
 
 
 def _soft_boundary(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -29,6 +29,19 @@ def _soft_boundary(mask: torch.Tensor, radius: int) -> torch.Tensor:
     dilated = F.max_pool2d(value, kernel_size=kernel, stride=1, padding=radius)
     eroded = -F.max_pool2d(-value, kernel_size=kernel, stride=1, padding=radius)
     return (dilated - eroded)[0, 0].clamp(0.0, 1.0)
+
+
+def _scale_aware_radius(mask: torch.Tensor, base_radius: int) -> int:
+    """Resolution/foreground-scale-aware fallback without invented depth."""
+    if base_radius <= 0 or not bool(mask.any()):
+        return 0
+    height, width = mask.shape
+    equivalent_radius = torch.sqrt(
+        mask.float().sum() / torch.pi
+    ).item()
+    resolution_scale = ((height * width) / (540.0 * 960.0)) ** 0.25
+    component_scale = max(0.5, min(2.0, (equivalent_radius / 120.0) ** 0.5))
+    return int(round(max(1.0, min(8.0, base_radius * resolution_scale * component_scale))))
 
 
 class OutdoorTaskFieldLookup:
@@ -113,9 +126,17 @@ class OutdoorTaskFieldLookup:
             * tree_keep.float()
         )
         uncertain_union = (p_transient + p_sky + p_canopy).clamp(0.0, 1.0)
-        p_boundary = _soft_boundary(
+        adaptive_radius = _scale_aware_radius(
             uncertain_union > 0.5, self.boundary_radius
         )
+        p_boundary = _soft_boundary(uncertain_union > 0.5, adaptive_radius)
+        canopy_radius = _scale_aware_radius(
+            p_canopy > 0.5, self.boundary_radius
+        )
+        p_canopy_boundary = _soft_boundary(
+            p_canopy > 0.5, canopy_radius
+        ) * p_canopy
+        p_canopy_core = p_canopy * (1.0 - p_canopy_boundary)
         distortion = distortion_keep.float()
 
         # Actual loss/task weights.  Building and ground are intentionally
@@ -148,7 +169,10 @@ class OutdoorTaskFieldLookup:
             "p_ground": p_rigid,
             "p_rigid": p_rigid,
             "p_trunk": torch.zeros_like(p_rigid),
+            "p_branch": torch.zeros_like(p_rigid),
             "p_canopy": p_canopy,
+            "p_canopy_core": p_canopy_core,
+            "p_canopy_boundary": p_canopy_boundary,
             "p_sky": p_sky,
             "p_transient": p_transient,
             "p_boundary_uncertain": p_boundary,
@@ -176,6 +200,14 @@ class OutdoorTaskFieldLookup:
                 "building": "rigid_proxy_not_semantic_segmentation",
                 "ground": "rigid_proxy_not_semantic_segmentation",
             },
-            "boundary_radius_pixels_at_training_resolution": self.boundary_radius,
+            "boundary_policy": {
+                "type": "resolution_and_foreground_scale_aware_global_fallback",
+                "base_radius_pixels_at_540x960": self.boundary_radius,
+                "range_pixels": [1, 8],
+                "limitation": (
+                    "independent component depth is unavailable; no metric-depth "
+                    "boundary scale is invented"
+                ),
+            },
             "max_cached_views": self.max_cached_views,
         }

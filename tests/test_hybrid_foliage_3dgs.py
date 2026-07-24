@@ -24,6 +24,23 @@ def test_surfel_residual_is_lifted_to_three_axis_volume():
     assert torch.equal(model.xyz[0], surfels.get_xyz[1])
 
 
+def test_independent_volume_state_does_not_use_legacy_surfel_geometry():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[1.0, 2.0, 3.0]]),
+        "scales": torch.tensor([[0.1, 0.2, 0.3]]),
+        "colors": torch.tensor([[0.2, 0.4, 0.6]]),
+        "opacities": torch.tensor([[0.02]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+
+    assert model.initialize_from_volume_state(payload) == 1
+    assert torch.equal(model.xyz.detach(), payload["centers"])
+    assert torch.allclose(model.scales.detach(), payload["scales"])
+    assert torch.allclose(model.opacities.detach(), payload["opacities"])
+
+
 def test_hybrid_contract_uses_one_rasterizer_and_no_fixed_branch_composite():
     root = Path(__file__).resolve().parents[1]
     renderer = (root / "outdoor/hybrid_gaussian_renderer.py").read_text()
@@ -33,6 +50,10 @@ def test_hybrid_contract_uses_one_rasterizer_and_no_fixed_branch_composite():
     assert '"fixed_order_branch_compositing": False' in trainer
     assert '"true_volumetric_foliage_3dgs": True' in trainer
     assert "historical_full_real_rgb_initialization" in trainer
+    assert "rejected_zero_step_identity.json" in trainer
+    assert "allow_structural_projection_mismatch" in trainer
+    assert "legacy foliage surfels must retire instead of being appended" in trainer
+    assert '"legacy_foliage_surfel_active": False' in trainer
 
 
 def test_legacy_canopy_repair_only_overrides_opacity():

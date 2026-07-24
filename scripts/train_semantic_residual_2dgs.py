@@ -40,6 +40,13 @@ from outdoor.directional_sky import (  # noqa: E402
     CanonicalDirectionalSky,
     composite_white_background,
 )
+from outdoor.render_contract import (  # noqa: E402
+    assert_render_contract,
+    capture_render_contract,
+    compare_render_contract,
+    declared_mip_filter,
+    directory_sha256,
+)
 from outdoor.task_fields import OutdoorTaskFieldLookup  # noqa: E402
 from scene import GaussianModel, Scene  # noqa: E402
 from scripts.train_standard_full_2dgs import (  # noqa: E402
@@ -100,6 +107,36 @@ def _record_distinct_view_hits(
     empty = slots[candidates] < 0
     first_empty = torch.argmax(empty.to(torch.int8), dim=1)
     slots[candidates, first_empty] = int(camera_index)
+
+
+@torch.no_grad()
+def _projected_center_mask(
+    xyz: torch.Tensor,
+    view,
+    pixel_mask: torch.Tensor,
+) -> torch.Tensor:
+    rotation = torch.as_tensor(view.R, device=xyz.device, dtype=xyz.dtype)
+    translation = torch.as_tensor(view.T, device=xyz.device, dtype=xyz.dtype)
+    camera = xyz @ rotation + translation
+    depth = camera[:, 2]
+    u = camera[:, 0] / depth.clamp_min(1e-6) * view.focal_x + view.cx
+    v = camera[:, 1] / depth.clamp_min(1e-6) * view.focal_y + view.cy
+    valid = (
+        (depth > view.znear)
+        & (depth < view.zfar)
+        & (u >= 0)
+        & (u < view.image_width)
+        & (v >= 0)
+        & (v < view.image_height)
+    )
+    rows = v.round().long().clamp(0, view.image_height - 1)
+    columns = u.round().long().clamp(0, view.image_width - 1)
+    return valid & (pixel_mask[rows, columns] > 0.5)
+
+
+def _sequence_label(image_name: str) -> str:
+    value = str(image_name)
+    return value.split("__", 1)[0].split("/", 1)[0]
 
 
 def _capture_protected_parameters(
@@ -194,6 +231,9 @@ def _parse_args():
     parser.add_argument("--minimum-persistent-views", type=int, default=3)
     parser.add_argument("--canopy-grad-hit-threshold", type=float, default=1e-10)
     parser.add_argument("--topology-grad-threshold", type=float, default=0.0)
+    parser.add_argument("--topology-grad-quantile", type=float, default=0.75)
+    parser.add_argument("--minimum-support-sequences", type=int, default=2)
+    parser.add_argument("--minimum-support-baseline", type=float, default=0.75)
     parser.add_argument("--max-new-gaussians", type=int, default=24_000)
     parser.add_argument("--max-new-per-event", type=int, default=12_000)
     parser.add_argument("--split-fraction", type=float, default=2.0 / 3.0)
@@ -216,6 +256,12 @@ def _parse_args():
         parser.error("--topology-interval must be positive")
     if args.minimum_persistent_views < 2:
         parser.error("--minimum-persistent-views must be at least 2")
+    if not 0.0 <= args.topology_grad_quantile <= 1.0:
+        parser.error("--topology-grad-quantile must be in [0, 1]")
+    if args.minimum_support_sequences < 1:
+        parser.error("--minimum-support-sequences must be positive")
+    if args.minimum_support_baseline < 0:
+        parser.error("--minimum-support-baseline must be non-negative")
     if args.max_new_gaussians < 0 or args.max_new_per_event < 0:
         parser.error("Gaussian append caps must be non-negative")
     if not 0.0 <= args.split_fraction <= 1.0:
@@ -339,6 +385,18 @@ def main() -> None:
         iterations=int(opt.iterations),
         seed=int(args.camera_schedule_seed),
     )
+    sequence_names = sorted({_sequence_label(view.image_name) for view in views})
+    sequence_to_code = {
+        name: index for index, name in enumerate(sequence_names)
+    }
+    camera_sequence_codes = torch.tensor(
+        [sequence_to_code[_sequence_label(view.image_name)] for view in views],
+        dtype=torch.int16,
+        device="cuda",
+    )
+    camera_centers = torch.stack(
+        [view.camera_center.detach().to(device="cuda") for view in views]
+    )
     task_fields = OutdoorTaskFieldLookup(
         source_path,
         args.tree_mask_pickle.resolve(),
@@ -351,7 +409,20 @@ def main() -> None:
     color_correction = PerImageAffineColorCorrection(train_names).cuda()
     color_optimizer = torch.optim.Adam(color_correction.parameters(), lr=1e-3)
     gaussians.restore(parent_payload["model_capture"], opt)
-    gaussians.set_mip_filter(False)
+    background = torch.ones(3, dtype=torch.float32, device="cuda")
+    identity_indices = sorted({0, len(views) // 2, len(views) - 1})
+    zero_step_before = capture_render_contract(
+        render, views, gaussians, pipe, background, identity_indices
+    )
+    mip_filter_audit = declared_mip_filter(parent_contract, gaussians)
+    zero_step_after = capture_render_contract(
+        render, views, gaussians, pipe, background, identity_indices
+    )
+    zero_step_identity = compare_render_contract(
+        zero_step_before, zero_step_after, atol=0.0, rtol=0.0
+    )
+    assert_render_contract(zero_step_identity)
+    del zero_step_before, zero_step_after
     _restore_color_correction_state(
         parent_payload,
         color_correction=color_correction,
@@ -372,7 +443,6 @@ def main() -> None:
 
     sky = CanonicalDirectionalSky(degree=args.sky_degree).cuda()
     sky_optimizer = torch.optim.Adam(sky.parameters(), lr=args.sky_lr)
-    background = torch.ones(3, dtype=torch.float32, device="cuda")
 
     implementation_files = _sha256_files(
         [
@@ -384,6 +454,10 @@ def main() -> None:
             SURFEL_ROOT / "gaussian_renderer" / "__init__.py",
             SURFEL_ROOT / "scene" / "gaussian_model.py",
         ]
+    )
+    rasterizer_implementation = directory_sha256(
+        SURFEL_ROOT / "submodules" / "diff-surfel-rasterization",
+        suffixes={".cu", ".h", ".cpp", ".py"},
     )
     post_resume_schedule = {
         "stage_iterations": int(opt.iterations),
@@ -401,9 +475,12 @@ def main() -> None:
             "start_stage_iteration": args.topology_start,
             "interval": args.topology_interval,
             "minimum_distinct_schedule_views": args.minimum_persistent_views,
+            "minimum_distinct_sequences": args.minimum_support_sequences,
+            "minimum_camera_center_baseline": args.minimum_support_baseline,
             "distinct_view_evidence": (
-                "exact_camera_id_slots_up_to_minimum_threshold"
+                "area_normalized_screen_gradient_proxy_at_canopy_projected_center"
             ),
+            "gradient_quantile_per_view": args.topology_grad_quantile,
             "canopy_grad_hit_threshold": args.canopy_grad_hit_threshold,
             "topology_grad_threshold": args.topology_grad_threshold,
             "total_append_cap": args.max_new_gaussians,
@@ -428,6 +505,9 @@ def main() -> None:
             "sample_transfer": "one_target_rgb_to_cuda_per_iteration",
             "protected_reference_snapshots": "cpu_chunked_bit_exact_audit",
         },
+        "zero_step_renderer_identity": zero_step_identity,
+        "mip_filter": mip_filter_audit,
+        "rasterizer_implementation": rasterizer_implementation,
         "active_components": {
             "protected_structural_2d_surfels": True,
             "class_conditioned_foliage_2d_surfels": True,
@@ -536,6 +616,9 @@ def main() -> None:
         loss.backward()
 
         with torch.no_grad():
+            normalized_gradient_threshold = float(
+                args.canopy_grad_hit_threshold
+            )
             if topology_gradient is not None:
                 norm = torch.nan_to_num(
                     torch.linalg.vector_norm(topology_gradient, dim=-1),
@@ -543,11 +626,37 @@ def main() -> None:
                     posinf=0.0,
                     neginf=0.0,
                 )
+                projected_area = (
+                    torch.pi
+                    * package["radii"].float().clamp_min(1.0).square()
+                )
+                normalized_norm = norm / projected_area
+                canopy_center = _projected_center_mask(
+                    gaussians.get_xyz[: len(norm)],
+                    view,
+                    fields["p_canopy"],
+                )
+                threshold_population = normalized_norm[
+                    package["visibility_filter"] & canopy_center
+                ]
+                if threshold_population.numel():
+                    robust_threshold = torch.quantile(
+                        threshold_population,
+                        float(args.topology_grad_quantile),
+                    )
+                    normalized_gradient_threshold = max(
+                        normalized_gradient_threshold,
+                        float(robust_threshold.item()),
+                        float(args.topology_grad_threshold),
+                    )
                 visible_hit = (
                     package["visibility_filter"]
-                    & (norm > float(args.canopy_grad_hit_threshold))
+                    & canopy_center
+                    & (normalized_norm >= normalized_gradient_threshold)
                 )
-                gradient_sum[: len(norm)] += norm
+                gradient_sum[: len(norm)] += torch.where(
+                    visible_hit, normalized_norm, torch.zeros_like(normalized_norm)
+                )
                 _record_distinct_view_hits(
                     distinct_view_slots[: len(norm)],
                     visible_hit,
@@ -570,8 +679,49 @@ def main() -> None:
                 and appended_total < args.max_new_gaussians
             )
             if should_allocate:
-                view_hits = (distinct_view_slots >= 0).sum(dim=1)
-                eligible = view_hits >= int(args.minimum_persistent_views)
+                valid_slots = distinct_view_slots >= 0
+                view_hits = valid_slots.sum(dim=1)
+                safe_slots = distinct_view_slots.clamp_min(0).long()
+                slot_sequences = camera_sequence_codes[safe_slots]
+                sequence_count = torch.zeros_like(view_hits)
+                for slot_index in range(distinct_view_slots.shape[1]):
+                    novel = valid_slots[:, slot_index]
+                    if slot_index:
+                        earlier_match = (
+                            valid_slots[:, :slot_index]
+                            & (
+                                slot_sequences[:, :slot_index]
+                                == slot_sequences[:, slot_index : slot_index + 1]
+                            )
+                        ).any(dim=1)
+                        novel = novel & ~earlier_match
+                    sequence_count += novel.to(sequence_count.dtype)
+                maximum_baseline = torch.zeros(
+                    len(distinct_view_slots), device="cuda"
+                )
+                for first in range(distinct_view_slots.shape[1]):
+                    for second in range(first + 1, distinct_view_slots.shape[1]):
+                        valid_pair = (
+                            valid_slots[:, first] & valid_slots[:, second]
+                        )
+                        pair_baseline = torch.linalg.vector_norm(
+                            camera_centers[safe_slots[:, first]]
+                            - camera_centers[safe_slots[:, second]],
+                            dim=1,
+                        )
+                        maximum_baseline = torch.maximum(
+                            maximum_baseline,
+                            torch.where(
+                                valid_pair,
+                                pair_baseline,
+                                torch.zeros_like(pair_baseline),
+                            ),
+                        )
+                eligible = (
+                    (view_hits >= int(args.minimum_persistent_views))
+                    & (sequence_count >= int(args.minimum_support_sequences))
+                    & (maximum_baseline >= float(args.minimum_support_baseline))
+                )
                 average_gradient = gradient_sum / view_hits.clamp_min(1).float()
                 event_cap = min(
                     int(args.max_new_per_event),
@@ -617,6 +767,8 @@ def main() -> None:
                     "global_iteration": parent_iteration + stage_iteration,
                     "eligible_persistent_gaussians": int(eligible.sum().item()),
                     "view_hits_max": int(view_hits.max().item()),
+                    "support_sequences_max": int(sequence_count.max().item()),
+                    "support_baseline_max": float(maximum_baseline.max().item()),
                     "clone_children": int(cloned),
                     "split_children": int(split),
                     "appended": appended,

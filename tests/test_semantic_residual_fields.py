@@ -61,6 +61,11 @@ def test_task_fields_keep_transient_sky_canopy_and_rigid_disjoint(tmp_path):
     assert fields["p_canopy"][1, 0] == 1
     assert fields["p_rigid"][1, 1] == 1
     assert fields["p_trunk"].count_nonzero() == 0
+    assert fields["p_branch"].count_nonzero() == 0
+    assert torch.equal(
+        fields["p_canopy_core"] + fields["p_canopy_boundary"],
+        fields["p_canopy"],
+    )
     assert fields["w_topology"][1, 0] == 1
     assert fields["w_topology"].sum() == 1
     assert fields["w_sky_rgb"].sum() == 1
@@ -71,6 +76,9 @@ def test_task_fields_explicitly_report_rigid_building_ground_proxies(tmp_path):
 
     assert audit["materialization"] == "deterministic_runtime_per_sample"
     assert audit["mask_channel_contract"]["trunk"] == "unavailable_zero"
+    assert audit["boundary_policy"]["type"].startswith(
+        "resolution_and_foreground_scale_aware"
+    )
     assert (
         audit["mask_channel_contract"]["building"]
         == "rigid_proxy_not_semantic_segmentation"

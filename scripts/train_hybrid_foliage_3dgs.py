@@ -20,7 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SURFEL_ROOT = REPO_ROOT / "2d-gaussian-splatting"
 sys.path[:0] = [str(REPO_ROOT), str(SURFEL_ROOT)]
 
-from arguments import ModelParams  # noqa: E402
+from arguments import ModelParams, PipelineParams  # noqa: E402
+from gaussian_renderer import render as render_2dgs  # noqa: E402
 from matcha.cambridge_training import (  # noqa: E402
     apply_per_image_affine_color_correction,
     load_per_image_affine_color_correction,
@@ -56,6 +57,7 @@ def _loss(prediction, target, weight, epsilon=1e-3):
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     model = ModelParams(parser)
+    pipeline = PipelineParams(parser)
     parser.set_defaults(
         iterations=800,
         data_device="cpu",
@@ -63,8 +65,9 @@ def _parse_args():
     )
     parser.add_argument("--iterations", type=int, default=800)
     parser.add_argument("--structural-ply", type=Path, required=True)
-    parser.add_argument("--residual-ply", type=Path, required=True)
-    parser.add_argument("--residual-result", type=Path, required=True)
+    parser.add_argument("--residual-ply", type=Path)
+    parser.add_argument("--residual-result", type=Path)
+    parser.add_argument("--foliage-seed-state", type=Path)
     parser.add_argument("--sky-model", type=Path, required=True)
     parser.add_argument("--color-correction", type=Path, required=True)
     parser.add_argument("--tree-mask-pickle", type=Path, required=True)
@@ -82,6 +85,11 @@ def _parse_args():
     parser.add_argument("--max-displacement", type=float, default=0.35)
     parser.add_argument("--eval-indices", default="408,409,410")
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--allow-structural-projection-mismatch",
+        action="store_true",
+        help="Experimental only: continue after thin-3D structural identity failure.",
+    )
     args = parser.parse_args()
     dataset = model.extract(args)
     if not dataset.source_path or not dataset.model_path:
@@ -90,7 +98,16 @@ def _parse_args():
         parser.error("--iterations must be positive")
     if not 0 < args.normal_scale_ratio <= 2:
         parser.error("--normal-scale-ratio must be in (0, 2]")
-    return args, dataset
+    independent = args.foliage_seed_state is not None
+    legacy = args.residual_ply is not None or args.residual_result is not None
+    if independent == legacy:
+        parser.error(
+            "Choose exactly one seed source: --foliage-seed-state or "
+            "--residual-ply plus --residual-result"
+        )
+    if legacy and (args.residual_ply is None or args.residual_result is None):
+        parser.error("--residual-ply and --residual-result must be supplied together")
+    return args, dataset, pipeline.extract(args)
 
 
 @torch.no_grad()
@@ -134,7 +151,7 @@ def _evaluate(
 
 
 def main():
-    args, dataset = _parse_args()
+    args, dataset, pipe = _parse_args()
     output = Path(dataset.model_path).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing non-empty output directory: {output}")
@@ -149,26 +166,102 @@ def main():
     structural = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, structural, shuffle=False)
     structural.load_ply(str(args.structural_ply.resolve()))
-    structural.set_mip_filter(False)
+    if args.foliage_seed_state is not None:
+        inherited_foliage = (
+            structural.get_primitive_class == GaussianModel.PRIMITIVE_FOLIAGE
+        )
+        if bool(inherited_foliage.any()):
+            raise RuntimeError(
+                "Independent foliage replacement requires a structural-only "
+                "parent; legacy foliage surfels must retire instead of being appended"
+            )
     views = scene.getTrainCameras()
     input_audit = _input_audit(Path(dataset.source_path).resolve(), views)
+    background = torch.ones(3, device="cuda")
+    empty_foliage = VolumetricFoliageModel(dataset.sh_degree).cuda()
+    projection_identity_rows = []
+    for index in sorted({0, len(views) // 2, len(views) - 1}):
+        native = render_2dgs(views[index], structural, pipe, background)
+        hybrid = render_hybrid(
+            views[index],
+            structural,
+            empty_foliage,
+            background=background,
+            structural_thickness_ratio=args.structural_thickness_ratio,
+        )
+        fields = {
+            "raw_rgb": (native["render"] - hybrid.render).abs(),
+            "alpha": (native["rend_alpha"] - hybrid.alpha).abs(),
+            "expected_depth": (native["rend_depth"] - hybrid.depth).abs(),
+        }
+        projection_identity_rows.append(
+            {
+                "index": index,
+                "image_name": views[index].image_name,
+                "fields": {
+                    name: {
+                        "max_abs": float(value.max().item()),
+                        "mean_abs": float(value.mean().item()),
+                    }
+                    for name, value in fields.items()
+                },
+            }
+        )
+    structural_projection_identity = {
+        "passed": all(
+            row["fields"]["raw_rgb"]["max_abs"] == 0.0
+            and row["fields"]["alpha"]["max_abs"] == 0.0
+            and row["fields"]["expected_depth"]["max_abs"] == 0.0
+            for row in projection_identity_rows
+        ),
+        "complete_parent_contract": False,
+        "missing_hybrid_outputs": ["median_depth", "native_2dgs_radii"],
+        "views": projection_identity_rows,
+    }
+    if (
+        not structural_projection_identity["passed"]
+        and not args.allow_structural_projection_mismatch
+    ):
+        (output / "rejected_zero_step_identity.json").write_text(
+            json.dumps(structural_projection_identity, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "Hybrid structural projection does not reproduce native 2DGS; "
+            "use --allow-structural-projection-mismatch only for a rejected experiment"
+        )
 
-    residual = GaussianModel(dataset.sh_degree)
-    residual.load_ply(str(args.residual_ply.resolve()))
-    result = json.loads(args.residual_result.read_text(encoding="utf-8"))
-    expected_foliage = int(result["class_counts"]["foliage"])
-    foliage_mask = (
-        residual.get_primitive_class == GaussianModel.PRIMITIVE_FOLIAGE
-    )
-    if int(foliage_mask.sum().item()) != expected_foliage:
-        raise RuntimeError("Residual PLY foliage count disagrees with result.json")
     foliage = VolumetricFoliageModel(dataset.sh_degree).cuda()
-    lifted = foliage.initialize_from_surfel_residual(
-        residual,
-        foliage_mask,
-        normal_scale_ratio=args.normal_scale_ratio,
-    )
-    del residual
+    if args.foliage_seed_state is not None:
+        try:
+            seed_payload = torch.load(
+                args.foliage_seed_state.resolve(),
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            seed_payload = torch.load(
+                args.foliage_seed_state.resolve(), map_location="cpu"
+            )
+        lifted = foliage.initialize_from_volume_state(seed_payload)
+        seed_provenance = "independent_sfm_semantic_canopy_volume"
+    else:
+        residual = GaussianModel(dataset.sh_degree)
+        residual.load_ply(str(args.residual_ply.resolve()))
+        result = json.loads(args.residual_result.read_text(encoding="utf-8"))
+        expected_foliage = int(result["class_counts"]["foliage"])
+        foliage_mask = (
+            residual.get_primitive_class == GaussianModel.PRIMITIVE_FOLIAGE
+        )
+        if int(foliage_mask.sum().item()) != expected_foliage:
+            raise RuntimeError("Residual PLY foliage count disagrees with result.json")
+        lifted = foliage.initialize_from_surfel_residual(
+            residual,
+            foliage_mask,
+            normal_scale_ratio=args.normal_scale_ratio,
+        )
+        seed_provenance = "legacy_68k_residual_surfel_lift"
+        del residual
     torch.cuda.empty_cache()
 
     sky = CanonicalDirectionalSky.load(args.sky_model.resolve(), device="cuda")
@@ -214,7 +307,6 @@ def main():
         ],
         eps=1e-15,
     )
-    background = torch.ones(3, device="cuda")
     eval_indices = [
         int(value) for value in args.eval_indices.split(",") if value.strip()
     ]
@@ -240,14 +332,25 @@ def main():
         "protocol": PROTOCOL,
         "run_role": "volumetric_foliage_candidate",
         "input": input_audit,
+        "zero_foliage_structural_projection_identity": (
+            structural_projection_identity
+        ),
         "parents": {
             "structural_ply": str(args.structural_ply.resolve()),
             "structural_ply_sha256": _file_digest(args.structural_ply.resolve()),
-            "persistent_residual_ply": str(args.residual_ply.resolve()),
-            "persistent_residual_ply_sha256": _file_digest(
-                args.residual_ply.resolve()
+            "foliage_seed_state": (
+                None
+                if args.foliage_seed_state is None
+                else str(args.foliage_seed_state.resolve())
             ),
-            "persistent_residual_result": str(args.residual_result.resolve()),
+            "foliage_seed_state_sha256": (
+                None
+                if args.foliage_seed_state is None
+                else _file_digest(args.foliage_seed_state.resolve())
+            ),
+            "persistent_residual_ply": (
+                None if args.residual_ply is None else str(args.residual_ply.resolve())
+            ),
         },
         "active_components": {
             "structural_parameters_inherited_from_2d_surfels": True,
@@ -261,9 +364,14 @@ def main():
         },
         "foliage": {
             "seed_count": lifted,
-            "seed_provenance": (
-                "68k append-only residual with at least three distinct real views"
+            "seed_provenance": seed_provenance,
+            "replacement_policy": (
+                "independent 3D volume replaces legacy foliage residual; "
+                "structural-only 2D parent is protected"
+                if args.foliage_seed_state is not None
+                else "legacy lift experiment only; never mainline eligible"
             ),
+            "legacy_foliage_surfel_active": False,
             "scale_dimensions": 3,
             "normal_scale_ratio": args.normal_scale_ratio,
             "topology": "frozen_during_3d_covariance_lift",
