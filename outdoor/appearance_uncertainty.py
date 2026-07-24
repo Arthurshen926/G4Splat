@@ -13,9 +13,10 @@ import torch
 from torch import nn
 
 from outdoor.directional_sky import CanonicalDirectionalSky, _eval_sh
+from outdoor.foliage_view_graph import sequence_id
 
 
-APPEARANCE_VERSION = "outdoor_low_rank_appearance_uncertainty_v1"
+APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v2"
 
 
 def _natural_key(value: str):
@@ -35,6 +36,8 @@ class OutdoorAppearanceUncertainty(nn.Module):
         rank: int = 4,
         sky_degree: int = 2,
         maximum_rgb_residual: float = 0.08,
+        spatial_grid_size: int = 24,
+        temporal_code_norm: float = 0.25,
         device: str | torch.device = "cuda",
     ):
         super().__init__()
@@ -48,6 +51,10 @@ class OutdoorAppearanceUncertainty(nn.Module):
         self.rank = int(rank)
         self.sky_degree = int(sky_degree)
         self.maximum_rgb_residual = float(maximum_rgb_residual)
+        self.spatial_grid_size = int(spatial_grid_size)
+        self.temporal_code_norm = float(temporal_code_norm)
+        if self.temporal_code_norm <= 0:
+            raise ValueError("temporal_code_norm must be positive")
         device = torch.device(device)
 
         generator = torch.Generator(device=device)
@@ -71,20 +78,44 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 device=device,
             )
         )
-        # Canopy and sky observation log-scales.  These describe aleatoric
-        # mismatch, not geometry confidence, and are tightly bounded in loss.
-        self.log_uncertainty = nn.Parameter(
-            torch.full((len(names), 2), -3.0, device=device)
+        # Low-resolution spatial fields decoded from the same sequence/time
+        # code.  They are shared bases, not unconstrained per-image pixels.
+        self.local_canopy_basis = nn.Parameter(
+            torch.zeros(
+                self.rank,
+                3,
+                self.spatial_grid_size,
+                self.spatial_grid_size,
+                device=device,
+            )
         )
-        order = sorted(range(len(names)), key=lambda i: _natural_key(names[i]))
+        self.spatial_uncertainty_basis = nn.Parameter(
+            torch.zeros(
+                self.rank,
+                2,
+                self.spatial_grid_size,
+                self.spatial_grid_size,
+                device=device,
+            )
+        )
+        self.uncertainty_base = nn.Parameter(
+            torch.full((2,), -3.0, device=device)
+        )
+        grouped: dict[str, list[int]] = {}
+        for index, name in enumerate(names):
+            grouped.setdefault(sequence_id(name), []).append(index)
+        pairs = []
+        for indices in grouped.values():
+            order = sorted(indices, key=lambda i: _natural_key(names[i]))
+            pairs.extend(zip(order[:-1], order[1:]))
         self.register_buffer(
             "temporal_pairs",
             torch.tensor(
-                list(zip(order[:-1], order[1:])),
+                pairs,
                 dtype=torch.long,
                 device=device,
             )
-            if len(order) > 1
+            if pairs
             else torch.empty(0, 2, dtype=torch.long, device=device),
         )
 
@@ -97,9 +128,43 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 "the canonical render, not an invented training code"
             ) from error
 
+    def temporal_code(self, image_name: str) -> torch.Tensor:
+        code = self.codes[self.image_index(image_name)]
+        # Low-rank deformation has a scale ambiguity between the per-frame
+        # code and the per-Gaussian basis.  Raw L2 regularization previously
+        # collapsed code norms to ~1e-2, leaving sub-micrometre "dynamic"
+        # motion.  Optimize direction with a fixed effective norm while the
+        # raw codes still receive within-sequence smoothness regularization.
+        denominator = code.detach().norm().clamp_min(1e-3)
+        return code * (self.temporal_code_norm / denominator)
+
+    def _spatial_fields(
+        self,
+        image_name: str,
+        shape: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        code = self.temporal_code(image_name)
+        local_rgb = torch.einsum(
+            "r,rchw->chw", code, self.local_canopy_basis
+        )
+        log_sigma = self.uncertainty_base[:, None, None] + torch.einsum(
+            "r,rchw->chw", code, self.spatial_uncertainty_basis
+        )
+        size = tuple(map(int, shape))
+        local_rgb = torch.nn.functional.interpolate(
+            local_rgb[None], size=size, mode="bilinear", align_corners=False
+        )[0]
+        log_sigma = torch.nn.functional.interpolate(
+            log_sigma[None], size=size, mode="bilinear", align_corners=False
+        )[0]
+        return (
+            self.maximum_rgb_residual * torch.tanh(local_rgb),
+            log_sigma.clamp(-4.5, -0.7).exp(),
+        )
+
     def forward(self, rgb, camera, task):
         image_index = self.image_index(camera.image_name)
-        code = self.codes[image_index]
+        code = self.temporal_code(camera.image_name)
         affine = code @ self.canopy_decoder
         scale = torch.exp(
             0.25 * torch.tanh(affine[:3])
@@ -109,6 +174,10 @@ class OutdoorAppearanceUncertainty(nn.Module):
         ).reshape(3, 1, 1)
         canopy = task["p_canopy"][None]
         conditioned = rgb + canopy * (rgb * (scale - 1.0) + bias)
+        local_canopy, _ = self._spatial_fields(
+            camera.image_name, (rgb.shape[-2], rgb.shape[-1])
+        )
+        conditioned = conditioned + canopy * local_canopy
 
         directions = CanonicalDirectionalSky.world_directions(
             camera, device=rgb.device, dtype=rgb.dtype
@@ -126,8 +195,10 @@ class OutdoorAppearanceUncertainty(nn.Module):
         return conditioned.clamp(0.0, 1.0)
 
     def heteroscedastic_loss(self, prediction, target, task, epsilon=1e-3):
-        image_index = self.image_index(task["image_name"])
-        sigma = self.log_uncertainty[image_index].clamp(-4.5, -1.0).exp()
+        _, sigma = self._spatial_fields(
+            task["image_name"],
+            (prediction.shape[-2], prediction.shape[-1]),
+        )
         robust = torch.sqrt((prediction - target).square() + epsilon**2).mean(0)
         canopy = task["p_canopy"] * (1.0 - task["p_transient"])
         sky = task["p_sky"] * (1.0 - task["p_transient"])
@@ -154,7 +225,9 @@ class OutdoorAppearanceUncertainty(nn.Module):
         value = value + 4.0 * self.codes.mean(dim=0).square().mean()
         value = value + self.canopy_decoder.square().mean()
         value = value + self.sky_basis.square().mean()
-        value = value + 0.05 * self.log_uncertainty.square().mean()
+        value = value + self.local_canopy_basis.square().mean()
+        value = value + self.spatial_uncertainty_basis.square().mean()
+        value = value + 0.05 * self.uncertainty_base.square().mean()
         if self.temporal_pairs.numel():
             first, second = self.temporal_pairs.unbind(-1)
             value = value + 0.25 * (
@@ -169,6 +242,8 @@ class OutdoorAppearanceUncertainty(nn.Module):
             "rank": self.rank,
             "sky_degree": self.sky_degree,
             "maximum_rgb_residual": self.maximum_rgb_residual,
+            "spatial_grid_size": self.spatial_grid_size,
+            "temporal_code_norm": self.temporal_code_norm,
             "state_dict": self.state_dict(),
         }
 
@@ -179,8 +254,15 @@ class OutdoorAppearanceUncertainty(nn.Module):
             "image_count": len(self.image_names),
             "canonical_render_available": True,
             "query_fallback": "canonical_only",
-            "canopy_model": "shared_low_rank_affine",
+            "canopy_model": "shared_low_rank_affine_plus_spatial_residual",
             "sky_model": "low_rank_directional_SH_temporal_residual",
-            "uncertainty_regions": ["canopy", "sky"],
+            "uncertainty_regions": ["spatial_canopy", "spatial_sky"],
+            "uncertainty_grid": [
+                self.spatial_grid_size,
+                self.spatial_grid_size,
+            ],
+            "temporal_regularization": "within_sequence_only",
+            "temporal_code_parameterization": "fixed_norm_direction",
+            "temporal_code_norm": self.temporal_code_norm,
             "per_pixel_free_parameters": False,
         }

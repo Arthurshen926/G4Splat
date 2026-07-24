@@ -64,15 +64,14 @@ class LegacyResponsibilityAudit:
 def _select_diverse_views(views, task_fields, *, count: int) -> list[int]:
     records = []
     for index, view in enumerate(views):
-        fields = task_fields.fields(
+        canopy = task_fields.canopy_fraction(
             view.image_name,
             (view.image_height, view.image_width),
-            torch.device("cpu"),
         )
         records.append(
             {
                 "index": index,
-                "canopy": float(fields["p_canopy"].mean().item()),
+                "canopy": canopy,
                 "sequence": sequence_id(view.image_name),
                 "center": view.camera_center.detach().cpu(),
             }

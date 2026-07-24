@@ -185,6 +185,18 @@ class OutdoorTaskFieldLookup:
             "w_topology": w_topology,
         }
 
+    def canopy_fraction(
+        self,
+        image_name: str,
+        shape: tuple[int, int],
+    ) -> float:
+        """Fast CPU ranking signal without materializing boundary fields."""
+        object_keep, sky_keep, _, tree_keep = self._keep_masks(
+            image_name, shape, torch.device("cpu")
+        )
+        canopy = (~tree_keep) & object_keep & sky_keep
+        return float(canopy.float().mean().item())
+
     def audit(self) -> dict:
         return {
             "version": TASK_FIELD_VERSION,

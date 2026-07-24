@@ -57,3 +57,42 @@ def test_unknown_query_must_use_canonical_render():
         assert "canonical render" in str(error)
     else:
         raise AssertionError("Unknown query unexpectedly received a train code")
+
+
+def test_temporal_pairs_do_not_cross_sequence_boundaries():
+    model = OutdoorAppearanceUncertainty(
+        ["seq1__frame00002", "seq2__frame00001", "seq1__frame00001"],
+        rank=2,
+        spatial_grid_size=4,
+        device="cpu",
+    )
+    pairs = {tuple(pair) for pair in model.temporal_pairs.cpu().tolist()}
+    assert pairs == {(2, 0)}
+
+
+def test_effective_temporal_code_has_non_collapsing_norm():
+    model = OutdoorAppearanceUncertainty(
+        ["seq1__frame00001"],
+        rank=2,
+        temporal_code_norm=0.25,
+        device="cpu",
+    )
+    with torch.no_grad():
+        model.codes[0] = torch.tensor([0.003, -0.004])
+    code = model.temporal_code("seq1__frame00001")
+    assert torch.isclose(code.norm(), torch.tensor(0.25), atol=1e-6)
+
+
+def test_spatial_uncertainty_is_a_dense_field():
+    model = OutdoorAppearanceUncertainty(
+        ["seq1__frame00001"],
+        rank=2,
+        spatial_grid_size=4,
+        device="cpu",
+    )
+    with torch.no_grad():
+        model.codes[0, 0] = 1.0
+        model.spatial_uncertainty_basis[0, 0, 0, 0] = 2.0
+    _, sigma = model._spatial_fields("seq1__frame00001", (12, 16))
+    assert sigma.shape == (2, 12, 16)
+    assert sigma[0].std().item() > 0
