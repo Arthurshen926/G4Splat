@@ -23,6 +23,7 @@ def render(
     bg_color: torch.Tensor,
     scaling_modifier=1.0,
     override_color=None,
+    opacity_override=None,
     rgb_only: bool = False,
 ):
     """
@@ -62,7 +63,12 @@ def render(
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = pc.get_opacity if opacity_override is None else opacity_override
+    if opacity.shape != pc.get_opacity.shape:
+        raise ValueError(
+            f"opacity_override has shape {opacity.shape}, expected "
+            f"{pc.get_opacity.shape}"
+        )
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
