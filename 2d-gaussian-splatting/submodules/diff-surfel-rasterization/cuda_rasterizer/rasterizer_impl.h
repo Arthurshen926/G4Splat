@@ -43,6 +43,31 @@ namespace CudaRasterizer
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 
+	// Storage used by the native mixed rasterizer. Surface and volume
+	// primitives share screen-space/depth/tile arrays so that a single
+	// radix sort produces the exact visibility order. Representation-
+	// specific data stays compact and is indexed with either the global
+	// surface id or (global id - surface_count).
+	struct MixedGeometryState
+	{
+		size_t scan_size;
+		float* depths;
+		int* internal_radii;
+		float2* means2D;
+		float* surface_transMat;
+		float3* surface_normals;
+		float* volume_cov3D;
+		float4* volume_conic;
+		uint32_t* point_offsets;
+		uint32_t* tiles_touched;
+		char* scanning_space;
+
+		static MixedGeometryState fromChunk(
+			char*& chunk,
+			size_t surface_count,
+			size_t volume_count);
+	};
+
 	struct ImageState
 	{
 		uint2* ranges;

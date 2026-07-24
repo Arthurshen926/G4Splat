@@ -37,6 +37,62 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool debug);
 
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeMixedGaussiansCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& surface_means3D,
+	const torch::Tensor& surface_scales,
+	const torch::Tensor& surface_rotations,
+	const torch::Tensor& volume_means3D,
+	const torch::Tensor& volume_scales,
+	const torch::Tensor& volume_rotations,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacities,
+	const float scale_modifier,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int image_height,
+	const int image_width,
+	const torch::Tensor& audit_fields,
+	const bool prefiltered,
+	const bool debug);
+
+std::tuple<
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor>
+RasterizeMixedGaussiansBackwardCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& surface_means3D,
+	const torch::Tensor& surface_scales,
+	const torch::Tensor& surface_rotations,
+	const torch::Tensor& volume_means3D,
+	const torch::Tensor& volume_scales,
+	const torch::Tensor& volume_rotations,
+	const torch::Tensor& colors,
+	const torch::Tensor& opacities,
+	const float scale_modifier,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const torch::Tensor& radii,
+	const torch::Tensor& dL_dout_color,
+	const torch::Tensor& dL_dout_others,
+	const torch::Tensor& geomBuffer,
+	const int rendered_count,
+	const torch::Tensor& binningBuffer,
+	const torch::Tensor& imageBuffer,
+	const bool debug);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,

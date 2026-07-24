@@ -66,6 +66,73 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* out_others);
+
+	// Native mixed representation path. The two preprocess launches write
+	// into one global screen/depth/radius/tile domain. mixed_render then
+	// consumes the single sorted list and interleaves 2D surfels and 3D EWA
+	// volumes during front-to-back alpha compositing.
+	void mixed_preprocess_surfaces(
+		int surface_count,
+		const float* means3D,
+		const glm::vec2* scales,
+		float scale_modifier,
+		const glm::vec4* rotations,
+		const float* opacities,
+		const float* viewmatrix,
+		const float* projmatrix,
+		int W, int H,
+		int* radii,
+		float2* means2D,
+		float* depths,
+		float* transMats,
+		float3* normals,
+		const dim3 grid,
+		uint32_t* tiles_touched,
+		bool prefiltered);
+
+	void mixed_preprocess_volumes(
+		int surface_count,
+		int volume_count,
+		const float* means3D,
+		const glm::vec3* scales,
+		float scale_modifier,
+		const glm::vec4* rotations,
+		const float* opacities,
+		const float* viewmatrix,
+		const float* projmatrix,
+		int W, int H,
+		float focal_x, float focal_y,
+		float tan_fovx, float tan_fovy,
+		int* radii,
+		float2* means2D,
+		float* depths,
+		float* cov3Ds,
+		float4* conic_opacity,
+		const dim3 grid,
+		uint32_t* tiles_touched,
+		bool prefiltered);
+
+	void mixed_render(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int surface_count,
+		int W, int H,
+		const float2* means2D,
+		const float* colors,
+		const float* opacities,
+		const float* surface_transMats,
+		const float3* surface_normals,
+		const float4* volume_conic,
+		const float* depths,
+		const float* audit_fields,
+		int audit_field_count,
+		float* primitive_responsibility,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float* bg_color,
+		float* out_color,
+		float* out_others);
 }
 
 

@@ -1,17 +1,15 @@
-"""Jointly depth-sorted structural surfels and volumetric foliage.
+"""Native jointly sorted structural surfels and volumetric foliage.
 
-The structural model remains the audited 2DGS parameterisation (two tangent
-scales).  For joint rasterisation it is embedded as a very thin 3D covariance.
-Foliage uses three independently trainable scales.  Both primitive families
-are passed to one gsplat call, so occlusion is resolved by one global depth
-sort rather than by a fixed post-render compositing order.
+Structural primitives retain the exact perspective-correct 2DGS ray/surfel
+projection. Foliage uses a true three-axis 3D EWA footprint. Both families
+emit into one CUDA tile list, share one center-depth radix sort, and are
+interleaved in the same front-to-back pixel loop.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib
-import sys
+import math
 
 import torch
 from torch import nn
@@ -21,13 +19,20 @@ class HybridRenderOutput:
     render: torch.Tensor
     alpha: torch.Tensor
     depth: torch.Tensor
+    median_depth: torch.Tensor
+    distortion: torch.Tensor
     radii: torch.Tensor
     means2d: torch.Tensor | None
     structural_count: int
+    responsibility: torch.Tensor | None = None
+    surface_alpha: torch.Tensor | None = None
+    volume_alpha: torch.Tensor | None = None
+    surface_depth: torch.Tensor | None = None
+    volume_depth: torch.Tensor | None = None
 
 
 class VolumetricFoliageModel(nn.Module):
-    """Small append-only 3DGS residual branch."""
+    """Independent volumetric 3DGS foliage branch."""
 
     def __init__(self, sh_degree: int, *, device: str | torch.device = "cuda"):
         super().__init__()
@@ -56,85 +61,6 @@ class VolumetricFoliageModel(nn.Module):
     @property
     def normalized_quaternions(self) -> torch.Tensor:
         return torch.nn.functional.normalize(self.quaternions, dim=-1)
-
-    @torch.no_grad()
-    def append_from_structural(
-        self,
-        structural,
-        indices: torch.Tensor,
-        *,
-        normal_scale_ratio: float = 0.65,
-        initial_opacity: float = 0.02,
-        jitter_fraction: float = 0.35,
-    ) -> int:
-        indices = indices.reshape(-1).long()
-        if indices.numel() == 0:
-            return 0
-        tangent_scales = structural.get_scaling[indices].detach()
-        base_scale = tangent_scales.mean(dim=-1, keepdim=True)
-        volume_scales = torch.cat(
-            [
-                tangent_scales,
-                base_scale * float(normal_scale_ratio),
-            ],
-            dim=-1,
-        ).clamp_min(1e-6)
-        rotation = structural.get_rotation[indices].detach()
-        # Jitter in all three local axes.  This breaks the inherited sheet
-        # degeneracy while keeping every seed near multi-view residual support.
-        noise_local = torch.randn_like(volume_scales) * volume_scales
-        rotation_matrix = _quaternion_to_rotation(rotation)
-        jitter = torch.bmm(
-            rotation_matrix, noise_local.unsqueeze(-1)
-        ).squeeze(-1) * float(jitter_fraction)
-        xyz = structural.get_xyz[indices].detach() + jitter
-        features = structural.get_features[indices].detach()
-        opacity = torch.full(
-            (len(indices), 1),
-            float(initial_opacity),
-            device=xyz.device,
-            dtype=xyz.dtype,
-        )
-        opacity_logits = torch.logit(opacity.clamp(1e-6, 1.0 - 1e-6))
-        self._replace(
-            xyz=torch.cat([self.xyz.detach(), xyz], dim=0),
-            log_scales=torch.cat(
-                [self.log_scales.detach(), volume_scales.log()], dim=0
-            ),
-            quaternions=torch.cat(
-                [self.quaternions.detach(), rotation], dim=0
-            ),
-            opacity_logits=torch.cat(
-                [self.opacity_logits.detach(), opacity_logits], dim=0
-            ),
-            features=torch.cat([self.features.detach(), features], dim=0),
-        )
-        return int(len(indices))
-
-    @torch.no_grad()
-    def initialize_from_surfel_residual(
-        self,
-        surfels,
-        mask: torch.Tensor,
-        *,
-        normal_scale_ratio: float = 0.65,
-    ) -> int:
-        """Lift audited persistent-residual surfels into three-axis 3DGS."""
-        if len(self):
-            raise RuntimeError("Volumetric foliage is already initialized")
-        indices = torch.nonzero(mask.reshape(-1), as_tuple=False).flatten()
-        tangent = surfels.get_scaling[indices].detach()
-        normal = (
-            tangent.mean(dim=-1, keepdim=True) * float(normal_scale_ratio)
-        ).clamp_min(1e-6)
-        self._replace(
-            xyz=surfels.get_xyz[indices].detach().clone(),
-            log_scales=torch.cat([tangent, normal], dim=-1).log(),
-            quaternions=surfels.get_rotation[indices].detach().clone(),
-            opacity_logits=surfels._opacity[indices].detach().clone(),
-            features=surfels.get_features[indices].detach().clone(),
-        )
-        return int(len(indices))
 
     @torch.no_grad()
     def initialize_from_volume_state(self, payload: dict) -> int:
@@ -193,25 +119,6 @@ class VolumetricFoliageModel(nn.Module):
         )
 
 
-def _quaternion_to_rotation(quaternion: torch.Tensor) -> torch.Tensor:
-    q = torch.nn.functional.normalize(quaternion, dim=-1)
-    w, x, y, z = q.unbind(-1)
-    return torch.stack(
-        [
-            1 - 2 * (y * y + z * z),
-            2 * (x * y - w * z),
-            2 * (x * z + w * y),
-            2 * (x * y + w * z),
-            1 - 2 * (x * x + z * z),
-            2 * (y * z - w * x),
-            2 * (x * z - w * y),
-            2 * (y * z + w * x),
-            1 - 2 * (x * x + y * y),
-        ],
-        dim=-1,
-    ).reshape(-1, 3, 3)
-
-
 def render_hybrid(
     camera,
     structural,
@@ -221,31 +128,16 @@ def render_hybrid(
     structural_thickness_ratio: float = 0.02,
     structural_scale_ceiling: float | None = None,
     radius_clip: float = 0.0,
+    surface_gate: torch.Tensor | None = None,
+    audit_fields: torch.Tensor | None = None,
 ) -> HybridRenderOutput:
-    """Rasterise both branches with one covariance projection and depth sort."""
-    try:
-        import gsplat
-
-        # Binary-less gsplat wheels JIT-build ``gsplat_cuda`` but then probe
-        # for ``gsplat.csrc`` again in every fresh process.  Reuse the cached
-        # extension when present; otherwise gsplat retains its normal JIT
-        # fallback and produces the actionable build error.
-        if "csrc" not in gsplat.__dict__:
-            from torch.utils.cpp_extension import _get_build_directory
-
-            build_directory = _get_build_directory("gsplat_cuda", verbose=False)
-            if build_directory not in sys.path:
-                sys.path.insert(0, build_directory)
-            try:
-                extension = importlib.import_module("gsplat_cuda")
-            except ImportError:
-                extension = None
-            if extension is not None:
-                gsplat.csrc = extension
-                sys.modules["gsplat.csrc"] = extension
-        rasterization = gsplat.rasterization
-    except ImportError as exc:  # pragma: no cover - environment contract
-        raise RuntimeError("Hybrid foliage requires gsplat") from exc
+    """Rasterise exact 2D surfels and 3D volumes with native mixed CUDA."""
+    del structural_thickness_ratio, radius_clip
+    from diff_surfel_rasterization import (
+        GaussianRasterizationSettings,
+        MixedGaussianRasterizer,
+    )
+    from utils.sh_utils import eval_sh
 
     structural_count = int(len(structural.get_xyz))
     structural_tangent = structural.get_scaling
@@ -253,65 +145,117 @@ def render_hybrid(
         structural_tangent = structural_tangent.clamp_max(
             float(structural_scale_ceiling)
         )
-    structural_thickness = (
-        structural_tangent.amin(dim=-1, keepdim=True)
-        * float(structural_thickness_ratio)
-    ).clamp_min(1e-6)
-    structural_scales = torch.cat(
-        [structural_tangent, structural_thickness], dim=-1
-    )
-    means = torch.cat([structural.get_xyz.detach(), foliage.xyz], dim=0)
-    scales = torch.cat([structural_scales.detach(), foliage.scales], dim=0)
-    quaternions = torch.cat(
-        [structural.get_rotation.detach(), foliage.normalized_quaternions],
-        dim=0,
-    )
+    surface_means = structural.get_xyz.detach()
+    surface_scales = structural_tangent.detach()
+    surface_rotations = structural.get_rotation.detach()
+    surface_base_opacity = structural.get_opacity.detach().reshape(-1)
+    if surface_gate is None:
+        surface_gate = torch.ones_like(surface_base_opacity)
+    if surface_gate.shape != surface_base_opacity.shape:
+        raise ValueError(
+            f"surface_gate has shape {tuple(surface_gate.shape)}, expected "
+            f"{tuple(surface_base_opacity.shape)}"
+        )
+    # Direct multiplicative gates initialize to an exactly representable 1.
+    # Clamping is intentionally outside the parameter state so the parent
+    # opacity remains immutable and bit-identical at zero step.
+    surface_opacity = surface_base_opacity * surface_gate.clamp(0.0, 1.0)
+    volume_means = foliage.xyz
+    volume_scales = foliage.scales
+    volume_rotations = foliage.normalized_quaternions
+
+    def sh_colors(
+        xyz: torch.Tensor,
+        features: torch.Tensor,
+        degree: int,
+    ) -> torch.Tensor:
+        if xyz.shape[0] == 0:
+            return xyz.new_empty((0, 3))
+        coefficients = features.transpose(1, 2).reshape(
+            -1, 3, features.shape[1]
+        )
+        direction = xyz - camera.camera_center.reshape(1, 3)
+        direction = torch.nn.functional.normalize(direction, dim=-1)
+        return torch.clamp_min(eval_sh(degree, coefficients, direction) + 0.5, 0)
+
+    degree = min(int(structural.active_sh_degree), int(foliage.sh_degree))
+    surface_colors = sh_colors(
+        surface_means,
+        structural.get_features.detach(),
+        degree,
+    ).detach()
+    volume_colors = sh_colors(volume_means, foliage.features, degree)
+    colors = torch.cat([surface_colors, volume_colors], dim=0)
     opacities = torch.cat(
-        [structural.get_opacity.detach().squeeze(-1), foliage.opacities],
+        [surface_opacity, foliage.opacities],
         dim=0,
+    ).reshape(-1, 1)
+
+    surface_means2D = torch.zeros_like(
+        surface_means, requires_grad=surface_gate.requires_grad
     )
-    features = torch.cat(
-        [structural.get_features.detach(), foliage.features], dim=0
+    volume_means2D = torch.zeros_like(volume_means, requires_grad=True)
+    try:
+        surface_means2D.retain_grad()
+        volume_means2D.retain_grad()
+    except RuntimeError:
+        pass
+    tanfovx = math.tan(float(camera.FoVx) * 0.5)
+    tanfovy = math.tan(float(camera.FoVy) * 0.5)
+    settings = GaussianRasterizationSettings(
+        image_height=int(camera.image_height),
+        image_width=int(camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=background,
+        scale_modifier=1.0,
+        viewmatrix=camera.world_view_transform,
+        projmatrix=camera.full_proj_transform,
+        sh_degree=degree,
+        campos=camera.camera_center,
+        prefiltered=False,
+        debug=False,
     )
-    viewmat = camera.world_view_transform.transpose(0, 1).unsqueeze(0)
-    intrinsics = torch.tensor(
-        [
-            [camera.focal_x, 0.0, camera.cx],
-            [0.0, camera.focal_y, camera.cy],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=means.dtype,
-        device=means.device,
-    ).unsqueeze(0)
-    rendered, alpha, meta = rasterization(
-        means=means,
-        quats=quaternions,
-        scales=scales,
-        opacities=opacities,
-        colors=features,
-        viewmats=viewmat,
-        Ks=intrinsics,
-        width=int(camera.image_width),
-        height=int(camera.image_height),
-        near_plane=float(camera.znear),
-        far_plane=float(camera.zfar),
-        radius_clip=float(radius_clip),
-        sh_degree=int(structural.active_sh_degree),
-        # gsplat 1.5.3's packed path drops the camera batch dimension before
-        # validating a non-None background.  The one-camera dense projection
-        # keeps exact white-background semantics and remains bounded here.
-        packed=False,
-        backgrounds=background.reshape(1, 3),
-        render_mode="RGB+ED",
+    rgb, radii, allmap, responsibility = MixedGaussianRasterizer(settings)(
+        surface_means,
+        surface_means2D,
+        surface_scales,
+        surface_rotations,
+        volume_means,
+        volume_means2D,
+        volume_scales,
+        volume_rotations,
+        colors,
+        opacities,
+        audit_fields,
     )
-    rgb = rendered[0, ..., :3].permute(2, 0, 1)
-    depth = rendered[0, ..., 3:4].permute(2, 0, 1)
-    alpha_chw = alpha[0].permute(2, 0, 1)
+    alpha_chw = allmap[1:2]
+    depth = torch.nan_to_num(
+        allmap[0:1] / alpha_chw.clamp_min(1e-8), 0.0, 0.0
+    )
+    median_depth = torch.nan_to_num(allmap[5:6], 0.0, 0.0)
+    surface_alpha = allmap[7:8]
+    volume_alpha = allmap[8:9]
+    surface_depth = torch.nan_to_num(
+        allmap[9:10] / surface_alpha.clamp_min(1e-8), 0.0, 0.0
+    )
+    volume_depth = torch.nan_to_num(
+        allmap[10:11] / volume_alpha.clamp_min(1e-8), 0.0, 0.0
+    )
     return HybridRenderOutput(
         render=rgb,
         alpha=alpha_chw,
         depth=depth,
-        radii=meta["radii"],
-        means2d=meta.get("means2d"),
+        median_depth=median_depth,
+        distortion=allmap[6:7],
+        radii=radii,
+        means2d=torch.cat([surface_means2D, volume_means2D], dim=0),
         structural_count=structural_count,
+        responsibility=(
+            responsibility if responsibility.numel() else None
+        ),
+        surface_alpha=surface_alpha,
+        volume_alpha=volume_alpha,
+        surface_depth=surface_depth,
+        volume_depth=volume_depth,
     )

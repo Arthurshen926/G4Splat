@@ -530,3 +530,638 @@ void FORWARD::preprocess(int P, int D, int M,
 		prefiltered
 		);
 }
+
+// --- Native mixed 2D surfel + 3D EWA path -------------------------------
+
+__device__ float3 mixedComputeCov2D(
+	const float3& mean,
+	float focal_x,
+	float focal_y,
+	float tan_fovx,
+	float tan_fovy,
+	const float* cov3D,
+	const float* viewmatrix)
+{
+	float3 t = transformPoint4x3(mean, viewmatrix);
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	glm::mat3 J = glm::mat3(
+		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
+		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+		0.0f, 0.0f, 0.0f);
+	glm::mat3 W = glm::mat3(
+		viewmatrix[0], viewmatrix[4], viewmatrix[8],
+		viewmatrix[1], viewmatrix[5], viewmatrix[9],
+		viewmatrix[2], viewmatrix[6], viewmatrix[10]);
+	glm::mat3 T = W * J;
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
+	glm::mat3 cov = glm::transpose(T) * glm::transpose(Vrk) * T;
+	cov[0][0] += 0.3f;
+	cov[1][1] += 0.3f;
+	return {
+		float(cov[0][0]),
+		float(cov[0][1]),
+		float(cov[1][1])
+	};
+}
+
+__device__ void mixedComputeCov3D(
+	const glm::vec3 scale,
+	float mod,
+	const glm::vec4 rot,
+	float* cov3D)
+{
+	glm::mat3 S = glm::mat3(1.0f);
+	S[0][0] = mod * scale.x;
+	S[1][1] = mod * scale.y;
+	S[2][2] = mod * scale.z;
+	const float r = rot.x;
+	const float x = rot.y;
+	const float y = rot.z;
+	const float z = rot.w;
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z),
+		2.f * (x * y - r * z),
+		2.f * (x * z + r * y),
+		2.f * (x * y + r * z),
+		1.f - 2.f * (x * x + z * z),
+		2.f * (y * z - r * x),
+		2.f * (x * z - r * y),
+		2.f * (y * z + r * x),
+		1.f - 2.f * (x * x + y * y));
+	glm::mat3 M = S * R;
+	glm::mat3 Sigma = glm::transpose(M) * M;
+	cov3D[0] = Sigma[0][0];
+	cov3D[1] = Sigma[0][1];
+	cov3D[2] = Sigma[0][2];
+	cov3D[3] = Sigma[1][1];
+	cov3D[4] = Sigma[1][2];
+	cov3D[5] = Sigma[2][2];
+}
+
+__global__ void mixedPreprocessSurfacesCUDA(
+	int surface_count,
+	const float* orig_points,
+	const glm::vec2* scales,
+	float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* viewmatrix,
+	const float* projmatrix,
+	int W,
+	int H,
+	int* radii,
+	float2* points_xy_image,
+	float* depths,
+	float* transMats,
+	float3* normals,
+	dim3 grid,
+	uint32_t* tiles_touched,
+	bool prefiltered)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx >= surface_count)
+		return;
+	radii[idx] = 0;
+	tiles_touched[idx] = 0;
+	float3 p_view;
+	if (!in_frustum(
+		idx,
+		orig_points,
+		viewmatrix,
+		projmatrix,
+		prefiltered,
+		p_view))
+		return;
+
+	glm::mat3 T;
+	float3 normal;
+	compute_transmat(
+		reinterpret_cast<const float3*>(orig_points)[idx],
+		scales[idx],
+		scale_modifier,
+		rotations[idx],
+		projmatrix,
+		viewmatrix,
+		W,
+		H,
+		T,
+		normal);
+#if DUAL_VISIABLE
+	const float cos = -sumf3(p_view * normal);
+	if (cos == 0)
+		return;
+	normal = (cos > 0 ? 1.0f : -1.0f) * normal;
+#endif
+#if TIGHTBBOX
+	const float cutoff =
+		sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001f));
+#else
+	const float cutoff = 3.0f;
+#endif
+	float2 point_image;
+	float2 extent;
+	if (!compute_aabb(T, cutoff, point_image, extent))
+		return;
+	const float radius = ceil(max(extent.x, extent.y));
+	uint2 rect_min;
+	uint2 rect_max;
+	getRect(point_image, radius, rect_min, rect_max, grid);
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+		return;
+
+	float3* T_ptr = reinterpret_cast<float3*>(transMats);
+	T_ptr[idx * 3 + 0] = {T[0][0], T[0][1], T[0][2]};
+	T_ptr[idx * 3 + 1] = {T[1][0], T[1][1], T[1][2]};
+	T_ptr[idx * 3 + 2] = {T[2][0], T[2][1], T[2][2]};
+	normals[idx] = normal;
+	depths[idx] = p_view.z;
+	radii[idx] = static_cast<int>(radius);
+	points_xy_image[idx] = point_image;
+	tiles_touched[idx] =
+		(rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+}
+
+__global__ void mixedPreprocessVolumesCUDA(
+	int surface_count,
+	int volume_count,
+	const float* orig_points,
+	const glm::vec3* scales,
+	float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* viewmatrix,
+	const float* projmatrix,
+	int W,
+	int H,
+	float tan_fovx,
+	float tan_fovy,
+	float focal_x,
+	float focal_y,
+	int* radii,
+	float2* points_xy_image,
+	float* depths,
+	float* cov3Ds,
+	float4* conic_opacity,
+	dim3 grid,
+	uint32_t* tiles_touched,
+	bool prefiltered)
+{
+	const int local_idx = cg::this_grid().thread_rank();
+	if (local_idx >= volume_count)
+		return;
+	const int idx = surface_count + local_idx;
+	radii[idx] = 0;
+	tiles_touched[idx] = 0;
+	float3 p_view;
+	if (!in_frustum(
+		local_idx,
+		orig_points,
+		viewmatrix,
+		projmatrix,
+		prefiltered,
+		p_view))
+		return;
+
+	const float3 p_orig =
+		reinterpret_cast<const float3*>(orig_points)[local_idx];
+	const float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	const float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	const float3 p_proj = {
+		p_hom.x * p_w,
+		p_hom.y * p_w,
+		p_hom.z * p_w
+	};
+
+	float* cov3D = cov3Ds + local_idx * 6;
+	mixedComputeCov3D(
+		scales[local_idx],
+		scale_modifier,
+		rotations[local_idx],
+		cov3D);
+	const float3 cov = mixedComputeCov2D(
+		p_orig,
+		focal_x,
+		focal_y,
+		tan_fovx,
+		tan_fovy,
+		cov3D,
+		viewmatrix);
+	const float det = cov.x * cov.z - cov.y * cov.y;
+	if (det == 0.0f)
+		return;
+	const float det_inv = 1.0f / det;
+	const float3 conic = {
+		cov.z * det_inv,
+		-cov.y * det_inv,
+		cov.x * det_inv
+	};
+	const float mid = 0.5f * (cov.x + cov.z);
+	const float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	const float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	const float radius = ceil(3.0f * sqrt(max(lambda1, lambda2)));
+	const float2 point_image = {
+		ndc2Pix(p_proj.x, W),
+		ndc2Pix(p_proj.y, H)
+	};
+	uint2 rect_min;
+	uint2 rect_max;
+	getRect(point_image, radius, rect_min, rect_max, grid);
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+		return;
+
+	depths[idx] = p_view.z;
+	radii[idx] = static_cast<int>(radius);
+	points_xy_image[idx] = point_image;
+	conic_opacity[local_idx] = {
+		conic.x,
+		conic.y,
+		conic.z,
+		opacities[local_idx]
+	};
+	tiles_touched[idx] =
+		(rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+}
+
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+mixedRenderCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int surface_count,
+	int W,
+	int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float* __restrict__ opacities,
+	const float* __restrict__ surface_transMats,
+	const float3* __restrict__ surface_normals,
+	const float4* __restrict__ volume_conic,
+	const float* __restrict__ depths,
+	const float* __restrict__ audit_fields,
+	int audit_field_count,
+	float* __restrict__ primitive_responsibility,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ out_color,
+	float* __restrict__ out_others)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = {
+		block.group_index().x * BLOCK_X,
+		block.group_index().y * BLOCK_Y
+	};
+	const uint2 pix = {
+		pix_min.x + block.thread_index().x,
+		pix_min.y + block.thread_index().y
+	};
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = {static_cast<float>(pix.x), static_cast<float>(pix.y)};
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+	const uint2 range =
+		ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds =
+		(range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_shape[BLOCK_SIZE];
+	__shared__ float3 collected_Tu[BLOCK_SIZE];
+	__shared__ float3 collected_Tv[BLOCK_SIZE];
+	__shared__ float3 collected_Tw[BLOCK_SIZE];
+	__shared__ float3 collected_normal[BLOCK_SIZE];
+
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	float C[CHANNELS] = {0};
+	float N[3] = {0};
+	float D = 0;
+	float M1 = 0;
+	float M2 = 0;
+	float distortion = 0;
+	float median_depth = 0;
+	float median_contributor = -1;
+	float surface_alpha = 0;
+	float volume_alpha = 0;
+	float surface_depth = 0;
+	float volume_depth = 0;
+
+	for (int round = 0; round < rounds; ++round, toDo -= BLOCK_SIZE)
+	{
+		if (__syncthreads_count(done) == BLOCK_SIZE)
+			break;
+		const int progress = round * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int id = point_list[range.x + progress];
+			const int lane = block.thread_rank();
+			collected_id[lane] = id;
+			collected_xy[lane] = points_xy_image[id];
+			if (id < surface_count)
+			{
+				collected_shape[lane] = {0, 0, 0, opacities[id]};
+				collected_Tu[lane] = {
+					surface_transMats[9 * id + 0],
+					surface_transMats[9 * id + 1],
+					surface_transMats[9 * id + 2]
+				};
+				collected_Tv[lane] = {
+					surface_transMats[9 * id + 3],
+					surface_transMats[9 * id + 4],
+					surface_transMats[9 * id + 5]
+				};
+				collected_Tw[lane] = {
+					surface_transMats[9 * id + 6],
+					surface_transMats[9 * id + 7],
+					surface_transMats[9 * id + 8]
+				};
+				collected_normal[lane] = surface_normals[id];
+			}
+			else
+			{
+				const int volume_id = id - surface_count;
+				const float4 conic = volume_conic[volume_id];
+				collected_shape[lane] = {
+					conic.x,
+					conic.y,
+					conic.z,
+					opacities[id]
+				};
+				collected_Tu[lane] = {0, 0, 0};
+				collected_Tv[lane] = {0, 0, 0};
+				collected_Tw[lane] = {0, 0, depths[id]};
+				collected_normal[lane] = {0, 0, 0};
+			}
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); ++j)
+		{
+			++contributor;
+			const int id = collected_id[j];
+			const float2 xy = collected_xy[j];
+			const float4 shape = collected_shape[j];
+			float power;
+			float depth;
+			if (id < surface_count)
+			{
+				const float3 Tu = collected_Tu[j];
+				const float3 Tv = collected_Tv[j];
+				const float3 Tw = collected_Tw[j];
+				const float3 k = pix.x * Tw - Tu;
+				const float3 l = pix.y * Tw - Tv;
+				const float3 p = cross(k, l);
+				if (p.z == 0.0f)
+					continue;
+				const float2 s = {p.x / p.z, p.y / p.z};
+				const float rho3d = s.x * s.x + s.y * s.y;
+				const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
+				const float rho2d =
+					FilterInvSquare * (d.x * d.x + d.y * d.y);
+				const float rho = min(rho3d, rho2d);
+				depth = rho3d <= rho2d
+					? s.x * Tw.x + s.y * Tw.y + Tw.z
+					: Tw.z;
+				power = -0.5f * rho;
+			}
+			else
+			{
+				const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
+				power = -0.5f *
+					(shape.x * d.x * d.x + shape.z * d.y * d.y)
+					- shape.y * d.x * d.y;
+				depth = depths[id];
+			}
+			if (depth < near_n || power > 0.0f)
+				continue;
+			const float alpha = min(0.99f, shape.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			const float test_T = T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+			const float w = alpha * T;
+			if (id < surface_count)
+			{
+				surface_alpha += w;
+				surface_depth += depth * w;
+			}
+			else
+			{
+				volume_alpha += w;
+				volume_depth += depth * w;
+			}
+			if (audit_field_count > 0)
+			{
+				const int stride = audit_field_count + 1;
+				atomicAdd(
+					&primitive_responsibility[id * stride],
+					w);
+				for (int field = 0; field < audit_field_count; ++field)
+				{
+					atomicAdd(
+						&primitive_responsibility[
+							id * stride + field + 1],
+						w * audit_fields[field * H * W + pix_id]);
+				}
+			}
+			const float A = 1.0f - T;
+			const float m =
+				far_n / (far_n - near_n) * (1.0f - near_n / depth);
+			distortion += (m * m * A + M2 - 2.0f * m * M1) * w;
+			D += depth * w;
+			M1 += m * w;
+			M2 += m * m * w;
+			if (T > 0.5f)
+			{
+				median_depth = depth;
+				median_contributor = contributor;
+			}
+			const float3 normal = collected_normal[j];
+			N[0] += normal.x * w;
+			N[1] += normal.y * w;
+			N[2] += normal.z * w;
+			for (int ch = 0; ch < CHANNELS; ++ch)
+				C[ch] += features[id * CHANNELS + ch] * w;
+			T = test_T;
+			last_contributor = contributor;
+		}
+	}
+
+	if (inside)
+	{
+		final_T[pix_id] = T;
+		n_contrib[pix_id] = last_contributor;
+		n_contrib[pix_id + H * W] = median_contributor;
+		final_T[pix_id + H * W] = M1;
+		final_T[pix_id + 2 * H * W] = M2;
+		for (int ch = 0; ch < CHANNELS; ++ch)
+			out_color[ch * H * W + pix_id] =
+				C[ch] + T * bg_color[ch];
+		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
+		out_others[pix_id + ALPHA_OFFSET * H * W] = 1.0f - T;
+		for (int ch = 0; ch < 3; ++ch)
+			out_others[pix_id + (NORMAL_OFFSET + ch) * H * W] = N[ch];
+		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
+		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + SURFACE_ALPHA_OFFSET * H * W] = surface_alpha;
+		out_others[pix_id + VOLUME_ALPHA_OFFSET * H * W] = volume_alpha;
+		out_others[pix_id + SURFACE_DEPTH_OFFSET * H * W] = surface_depth;
+		out_others[pix_id + VOLUME_DEPTH_OFFSET * H * W] = volume_depth;
+	}
+}
+
+void FORWARD::mixed_preprocess_surfaces(
+	int surface_count,
+	const float* means3D,
+	const glm::vec2* scales,
+	float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* viewmatrix,
+	const float* projmatrix,
+	int W,
+	int H,
+	int* radii,
+	float2* means2D,
+	float* depths,
+	float* transMats,
+	float3* normals,
+	const dim3 grid,
+	uint32_t* tiles_touched,
+	bool prefiltered)
+{
+	mixedPreprocessSurfacesCUDA<<<(surface_count + 255) / 256, 256>>>(
+		surface_count,
+		means3D,
+		scales,
+		scale_modifier,
+		rotations,
+		opacities,
+		viewmatrix,
+		projmatrix,
+		W,
+		H,
+		radii,
+		means2D,
+		depths,
+		transMats,
+		normals,
+		grid,
+		tiles_touched,
+		prefiltered);
+}
+
+void FORWARD::mixed_preprocess_volumes(
+	int surface_count,
+	int volume_count,
+	const float* means3D,
+	const glm::vec3* scales,
+	float scale_modifier,
+	const glm::vec4* rotations,
+	const float* opacities,
+	const float* viewmatrix,
+	const float* projmatrix,
+	int W,
+	int H,
+	float focal_x,
+	float focal_y,
+	float tan_fovx,
+	float tan_fovy,
+	int* radii,
+	float2* means2D,
+	float* depths,
+	float* cov3Ds,
+	float4* conic_opacity,
+	const dim3 grid,
+	uint32_t* tiles_touched,
+	bool prefiltered)
+{
+	mixedPreprocessVolumesCUDA<<<(volume_count + 255) / 256, 256>>>(
+		surface_count,
+		volume_count,
+		means3D,
+		scales,
+		scale_modifier,
+		rotations,
+		opacities,
+		viewmatrix,
+		projmatrix,
+		W,
+		H,
+		tan_fovx,
+		tan_fovy,
+		focal_x,
+		focal_y,
+		radii,
+		means2D,
+		depths,
+		cov3Ds,
+		conic_opacity,
+		grid,
+		tiles_touched,
+		prefiltered);
+}
+
+void FORWARD::mixed_render(
+	const dim3 grid,
+	dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int surface_count,
+	int W,
+	int H,
+	const float2* means2D,
+	const float* colors,
+	const float* opacities,
+	const float* surface_transMats,
+	const float3* surface_normals,
+	const float4* volume_conic,
+	const float* depths,
+	const float* audit_fields,
+	int audit_field_count,
+	float* primitive_responsibility,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* bg_color,
+	float* out_color,
+	float* out_others)
+{
+	mixedRenderCUDA<NUM_CHANNELS><<<grid, block>>>(
+		ranges,
+		point_list,
+		surface_count,
+		W,
+		H,
+		means2D,
+		colors,
+		opacities,
+		surface_transMats,
+		surface_normals,
+		volume_conic,
+		depths,
+		audit_fields,
+		audit_field_count,
+		primitive_responsibility,
+		final_T,
+		n_contrib,
+		bg_color,
+		out_color,
+		out_others);
+}

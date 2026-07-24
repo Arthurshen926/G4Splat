@@ -221,3 +221,273 @@ class GaussianRasterizer(nn.Module):
             raster_settings, 
         )
 
+
+def rasterize_mixed_gaussians(
+    surface_means3D,
+    surface_means2D,
+    surface_scales,
+    surface_rotations,
+    volume_means3D,
+    volume_means2D,
+    volume_scales,
+    volume_rotations,
+    colors,
+    opacities,
+    audit_fields,
+    raster_settings,
+):
+    """Rasterize native 2D surfels and 3D EWA volumes in one visibility pass.
+
+    Primitive ids ``[0, N_surface)`` are 2D surfels and the remaining ids
+    are 3D volumes. Both representations emit into one tile list and are
+    radix-sorted together by camera-space center depth before compositing.
+    """
+    return _RasterizeMixedGaussians.apply(
+        surface_means3D,
+        surface_means2D,
+        surface_scales,
+        surface_rotations,
+        volume_means3D,
+        volume_means2D,
+        volume_scales,
+        volume_rotations,
+        colors,
+        opacities,
+        audit_fields,
+        raster_settings,
+    )
+
+
+class _RasterizeMixedGaussians(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        surface_means3D,
+        surface_means2D,
+        surface_scales,
+        surface_rotations,
+        volume_means3D,
+        volume_means2D,
+        volume_scales,
+        volume_rotations,
+        colors,
+        opacities,
+        audit_fields,
+        raster_settings,
+    ):
+        args = (
+            raster_settings.bg,
+            surface_means3D,
+            surface_scales,
+            surface_rotations,
+            volume_means3D,
+            volume_scales,
+            volume_rotations,
+            colors,
+            opacities,
+            raster_settings.scale_modifier,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            audit_fields,
+            raster_settings.prefiltered,
+            raster_settings.debug,
+        )
+        if raster_settings.debug:
+            cpu_args = cpu_deep_copy_tuple(args)
+            try:
+                outputs = _C.rasterize_mixed_gaussians(*args)
+            except Exception as ex:
+                torch.save(cpu_args, "snapshot_mixed_fw.dump")
+                print(
+                    "\nMixed rasterizer forward failed; "
+                    "wrote snapshot_mixed_fw.dump."
+                )
+                raise ex
+        else:
+            outputs = _C.rasterize_mixed_gaussians(*args)
+        (
+            rendered,
+            color,
+            others,
+            radii,
+            responsibility,
+            geom_buffer,
+            binning_buffer,
+            image_buffer,
+        ) = outputs
+        ctx.raster_settings = raster_settings
+        ctx.rendered = rendered
+        ctx.surface_count = surface_means3D.shape[0]
+        ctx.mark_non_differentiable(radii, responsibility)
+        ctx.save_for_backward(
+            surface_means3D,
+            surface_scales,
+            surface_rotations,
+            volume_means3D,
+            volume_scales,
+            volume_rotations,
+            colors,
+            opacities,
+            radii,
+            geom_buffer,
+            binning_buffer,
+            image_buffer,
+        )
+        return color, radii, others, responsibility
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_color,
+        grad_radii,
+        grad_others,
+        grad_responsibility,
+    ):
+        del grad_radii, grad_responsibility
+        settings = ctx.raster_settings
+        (
+            surface_means3D,
+            surface_scales,
+            surface_rotations,
+            volume_means3D,
+            volume_scales,
+            volume_rotations,
+            colors,
+            opacities,
+            radii,
+            geom_buffer,
+            binning_buffer,
+            image_buffer,
+        ) = ctx.saved_tensors
+        if grad_color is None:
+            grad_color = torch.zeros(
+                (3, settings.image_height, settings.image_width),
+                dtype=colors.dtype,
+                device=colors.device,
+            )
+        if grad_others is None:
+            grad_others = torch.zeros(
+                (11, settings.image_height, settings.image_width),
+                dtype=colors.dtype,
+                device=colors.device,
+            )
+        args = (
+            settings.bg,
+            surface_means3D,
+            surface_scales,
+            surface_rotations,
+            volume_means3D,
+            volume_scales,
+            volume_rotations,
+            colors,
+            opacities,
+            settings.scale_modifier,
+            settings.viewmatrix,
+            settings.projmatrix,
+            settings.tanfovx,
+            settings.tanfovy,
+            radii,
+            grad_color,
+            grad_others,
+            geom_buffer,
+            ctx.rendered,
+            binning_buffer,
+            image_buffer,
+            settings.debug,
+        )
+        if settings.debug:
+            cpu_args = cpu_deep_copy_tuple(args)
+            try:
+                grads = _C.rasterize_mixed_gaussians_backward(*args)
+            except Exception as ex:
+                torch.save(cpu_args, "snapshot_mixed_bw.dump")
+                print(
+                    "\nMixed rasterizer backward failed; "
+                    "wrote snapshot_mixed_bw.dump."
+                )
+                raise ex
+        else:
+            grads = _C.rasterize_mixed_gaussians_backward(*args)
+        (
+            grad_surface_means3D,
+            grad_surface_scales,
+            grad_surface_rotations,
+            grad_volume_means3D,
+            grad_volume_scales,
+            grad_volume_rotations,
+            grad_colors,
+            grad_opacities,
+            grad_means2D,
+        ) = grads
+        split = ctx.surface_count
+        return (
+            grad_surface_means3D,
+            grad_means2D[:split],
+            grad_surface_scales,
+            grad_surface_rotations,
+            grad_volume_means3D,
+            grad_means2D[split:],
+            grad_volume_scales,
+            grad_volume_rotations,
+            grad_colors,
+            grad_opacities,
+            None,
+            None,
+        )
+
+
+class MixedGaussianRasterizer(nn.Module):
+    """PyTorch module for the native, jointly sorted mixed CUDA path."""
+
+    def __init__(self, raster_settings):
+        super().__init__()
+        self.raster_settings = raster_settings
+
+    def forward(
+        self,
+        surface_means3D,
+        surface_means2D,
+        surface_scales,
+        surface_rotations,
+        volume_means3D,
+        volume_means2D,
+        volume_scales,
+        volume_rotations,
+        colors,
+        opacities,
+        audit_fields=None,
+    ):
+        expected = surface_means3D.shape[0] + volume_means3D.shape[0]
+        if colors.shape != (expected, 3):
+            raise ValueError(
+                "colors must have shape "
+                f"({expected}, 3), received {tuple(colors.shape)}"
+            )
+        if opacities.numel() != expected:
+            raise ValueError(
+                f"opacities must contain {expected} values, "
+                f"received {opacities.numel()}"
+            )
+        if audit_fields is None:
+            audit_fields = colors.new_empty(
+                (0, self.raster_settings.image_height,
+                 self.raster_settings.image_width)
+            )
+        return rasterize_mixed_gaussians(
+            surface_means3D,
+            surface_means2D,
+            surface_scales,
+            surface_rotations,
+            volume_means3D,
+            volume_means2D,
+            volume_scales,
+            volume_rotations,
+            colors,
+            opacities,
+            audit_fields,
+            self.raster_settings,
+        )
