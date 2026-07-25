@@ -180,9 +180,12 @@ def main():
         surface_atlas_indices = None
         surface_gate_atlas = None
     rows = []
-    for index in tqdm(
-        range(0, len(views), max(1, args.stride)),
-        desc="all-view layered evaluation",
+    evaluation_indices = range(0, len(views), max(1, args.stride))
+    for evaluation_offset, index in enumerate(
+        tqdm(
+            evaluation_indices,
+            desc="all-view layered evaluation",
+        )
     ):
         view = views[index]
         task = fields.fields(
@@ -201,6 +204,11 @@ def main():
             *,
             use_uv_gate=False,
         ):
+            # Tile-list storage is view dependent and can reach tens of GiB
+            # for a giant legacy surfel.  Returning it to CUDA before the
+            # next branch keeps a large preceding view from starving a later
+            # allocation even though no tensor from that buffer is live.
+            torch.cuda.empty_cache()
             package = render_hybrid(
                 view,
                 structural,
@@ -252,7 +260,7 @@ def main():
         }
         rows.append(row)
         del parent, canonical, conditioned_base, conditioned, target, task
-        if (index + 1) % 25 == 0:
+        if (evaluation_offset + 1) % 25 == 0:
             torch.cuda.empty_cache()
     flattened = {}
     for mode in ("parent", "canonical", "conditioned"):
