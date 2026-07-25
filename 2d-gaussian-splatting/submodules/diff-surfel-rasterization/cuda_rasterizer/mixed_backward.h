@@ -29,6 +29,9 @@ namespace MIXED_BACKWARD
 		const float2* means2D,
 		const float* colors,
 		const float* opacities,
+		const int* surface_gate_indices,
+		const float* surface_gate_atlas,
+		int gate_size,
 		const float* surface_transMats,
 		const float3* surface_normals,
 		const float4* volume_conic,
@@ -43,6 +46,7 @@ namespace MIXED_BACKWARD
 		float4* dL_dvolume_conic,
 		float* dL_ddepth,
 		float* dL_dopacity,
+		float* dL_dsurface_gate_atlas,
 		float* dL_dcolors);
 
 	void preprocessVolumes(

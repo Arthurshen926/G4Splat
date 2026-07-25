@@ -86,7 +86,7 @@ def test_zero_volume_is_exactly_the_native_surfel_path():
         scales=scales,
         rotations=rotations,
     )
-    mixed_rgb, mixed_radii, mixed_aux, _ = MixedGaussianRasterizer(settings)(
+    mixed_rgb, mixed_radii, mixed_aux, _, gate_audit = MixedGaussianRasterizer(settings)(
         xyz,
         torch.zeros_like(xyz, requires_grad=True),
         scales,
@@ -104,6 +104,7 @@ def test_zero_volume_is_exactly_the_native_surfel_path():
     assert torch.allclose(mixed_aux[7:8], legacy_aux[1:2], atol=1e-7, rtol=0)
     assert torch.allclose(mixed_aux[9:10], legacy_aux[0:1], atol=2e-7, rtol=0)
     assert torch.count_nonzero(mixed_aux[[8, 10]]).item() == 0
+    assert gate_audit.numel() == 0
 
 
 @pytest.mark.parametrize("surface_depth,volume_depth,expected_red", [(2.0, 3.0, 0.0), (3.0, 2.0, 1.0)])
@@ -112,7 +113,7 @@ def test_surface_and_volume_share_one_depth_order(surface_depth, volume_depth, e
     settings = _settings(width=41, height=41)
     surface = torch.tensor([[0.0, 0.0, surface_depth]], device="cuda")
     volume = torch.tensor([[0.0, 0.0, volume_depth]], device="cuda")
-    rgb, _, aux, _ = MixedGaussianRasterizer(settings)(
+    rgb, _, aux, _, _ = MixedGaussianRasterizer(settings)(
         surface,
         torch.zeros_like(surface, requires_grad=True),
         torch.tensor([[0.35, 0.35]], device="cuda"),
@@ -147,7 +148,7 @@ def test_volume_backward_matches_finite_difference():
     opacity = torch.tensor([[0.61]], device="cuda", requires_grad=True)
 
     def render_loss():
-        rgb, _, aux, _ = MixedGaussianRasterizer(settings)(
+        rgb, _, aux, _, _ = MixedGaussianRasterizer(settings)(
             _empty(0, 3),
             _empty(0, 3),
             _empty(0, 2),
@@ -188,3 +189,82 @@ def test_volume_backward_matches_finite_difference():
             numeric.append((plus - minus) / (2.0 * epsilon))
     for actual, expected in zip(analytic, numeric):
         assert actual == pytest.approx(expected, rel=3e-2, abs=2e-5)
+
+
+def test_surface_uv_gate_is_local_differentiable_and_auditable():
+    """One surfel can be attenuated locally without changing its rigid half."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings(width=61, height=47)
+    surface = torch.tensor([[0.0, 0.0, 2.0]], device="cuda")
+    means2d = torch.zeros_like(surface, requires_grad=True)
+    scales = torch.tensor([[0.8, 0.45]], device="cuda")
+    rotations = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0]], device="cuda"
+    )
+    colors = torch.tensor([[0.8, 0.2, 0.1]], device="cuda")
+    opacity = torch.tensor([[0.9]], device="cuda")
+    gate_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    audit_fields = torch.stack(
+        [
+            torch.ones(47, 61, device="cuda"),
+            torch.linspace(0, 1, 61, device="cuda")[None].expand(47, -1),
+        ]
+    )
+
+    one = torch.ones(1, 8, 8, device="cuda")
+    identity, _, _, _, _ = MixedGaussianRasterizer(settings)(
+        surface,
+        means2d,
+        scales,
+        rotations,
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 4),
+        colors,
+        opacity,
+        surface_gate_indices=gate_indices,
+        surface_gate_atlas=one,
+    )
+    ungated, _, _, _, _ = MixedGaussianRasterizer(settings)(
+        surface,
+        means2d,
+        scales,
+        rotations,
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 4),
+        colors,
+        opacity,
+    )
+    assert torch.allclose(identity, ungated, atol=2e-7, rtol=0)
+
+    atlas = torch.ones(1, 8, 8, device="cuda", requires_grad=True)
+    with torch.no_grad():
+        atlas[:, :, :4] = 0.05
+    locally_gated, _, _, _, gate_audit = MixedGaussianRasterizer(settings)(
+        surface,
+        means2d,
+        scales,
+        rotations,
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 4),
+        colors,
+        opacity,
+        surface_gate_indices=gate_indices,
+        surface_gate_atlas=atlas,
+        audit_fields=audit_fields,
+    )
+    difference = (ungated - locally_gated).abs().sum(0)
+    assert difference[:, :30].mean() > 5 * difference[:, 40:].mean()
+    assert gate_audit.shape == (1, 8, 8, 3)
+    assert gate_audit[..., 0].sum() > 0
+    assert gate_audit[..., 1].sum() > 0
+    assert gate_audit[..., 2].sum() > 0
+    locally_gated.square().mean().backward()
+    assert atlas.grad is not None
+    assert torch.isfinite(atlas.grad).all()
+    assert atlas.grad.abs().sum() > 0

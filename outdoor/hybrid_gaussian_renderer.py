@@ -33,6 +33,7 @@ class HybridRenderOutput:
     means2d: torch.Tensor | None
     structural_count: int
     responsibility: torch.Tensor | None = None
+    gate_responsibility: torch.Tensor | None = None
     surface_alpha: torch.Tensor | None = None
     volume_alpha: torch.Tensor | None = None
     surface_depth: torch.Tensor | None = None
@@ -108,6 +109,17 @@ class VolumetricFoliageModel(nn.Module):
         )
         self.register_buffer(
             "reprojection_error", torch.empty(0, device=device)
+        )
+        self.register_buffer(
+            "ray_depth_nll", torch.empty(0, device=device)
+        )
+        self.register_buffer(
+            "free_space_violation_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "unknown_view_count",
+            torch.empty(0, dtype=torch.int16, device=device),
         )
         self.register_buffer(
             "initialization_source",
@@ -275,6 +287,17 @@ class VolumetricFoliageModel(nn.Module):
             "reprojection_error": payload.get(
                 "reprojection_error", torch.full((count,), float("nan"))
             ).to(device=device, dtype=dtype),
+            "ray_depth_nll": payload.get(
+                "ray_depth_nll", torch.zeros(count)
+            ).to(device=device, dtype=dtype),
+            "free_space_violation_count": payload.get(
+                "free_space_violation_count",
+                torch.zeros(count, dtype=torch.int16),
+            ).to(device=device, dtype=torch.int16),
+            "unknown_view_count": payload.get(
+                "unknown_view_count",
+                torch.zeros(count, dtype=torch.int16),
+            ).to(device=device, dtype=torch.int16),
             "initialization_source": payload.get(
                 "initialization_source", primitive_role
             ).to(device=device, dtype=torch.int8),
@@ -307,6 +330,9 @@ class VolumetricFoliageModel(nn.Module):
             "occupancy_probability",
             "position_covariance",
             "reprojection_error",
+            "ray_depth_nll",
+            "free_space_violation_count",
+            "unknown_view_count",
             "initialization_source",
             "initialization_center",
         )
@@ -432,15 +458,28 @@ class VolumetricFoliageModel(nn.Module):
             )
             for name in self.metadata_names
         }
+        child_start = int(keep.sum())
+        child_xyz = parameter_values["xyz"][child_start:]
+        metadata["initialization_center"][child_start:] = child_xyz.detach()
+        metadata["position_covariance"][child_start:] /= float(
+            shrink * shrink
+        )
+        new_to_old = torch.cat(
+            [
+                torch.nonzero(keep, as_tuple=False).flatten(),
+                indices.repeat_interleave(2),
+            ]
+        )
         self._replace(**parameter_values)
         self._replace_buffers(**metadata)
         return {
             "split_parents": int(indices.numel()),
             "children": int(2 * indices.numel()),
+            "_new_to_old": new_to_old,
         }
 
     @torch.no_grad()
-    def prune(self, remove: torch.Tensor) -> int:
+    def prune(self, remove: torch.Tensor) -> tuple[int, torch.Tensor]:
         remove = torch.as_tensor(
             remove, device=self.xyz.device, dtype=torch.bool
         )
@@ -450,7 +489,8 @@ class VolumetricFoliageModel(nn.Module):
         keep = ~remove
         count = int(remove.sum())
         if not count:
-            return 0
+            return 0, torch.arange(len(self), device=self.xyz.device)
+        new_to_old = torch.nonzero(keep, as_tuple=False).flatten()
         self._replace(
             **{
                 name: getattr(self, name).detach()[keep]
@@ -472,7 +512,7 @@ class VolumetricFoliageModel(nn.Module):
                 for name in self.metadata_names
             }
         )
-        return count
+        return count, new_to_old
 
     def capture(self) -> dict:
         return {
@@ -544,6 +584,13 @@ class VolumetricFoliageModel(nn.Module):
                 payload["log_scales"].exp().square()
             ),
             "reprojection_error": torch.full((count,), float("nan")),
+            "ray_depth_nll": torch.zeros(count),
+            "free_space_violation_count": torch.zeros(
+                count, dtype=torch.int16
+            ),
+            "unknown_view_count": torch.zeros(
+                count, dtype=torch.int16
+            ),
             "initialization_source": torch.zeros(count, dtype=torch.int8),
             "initialization_center": payload["xyz"].clone(),
         }
@@ -567,9 +614,13 @@ def render_hybrid(
     structural_scale_ceiling: float | None = None,
     radius_clip: float = 0.0,
     surface_gate: torch.Tensor | None = None,
+    surface_gate_indices: torch.Tensor | None = None,
+    surface_gate_atlas: torch.Tensor | None = None,
     audit_fields: torch.Tensor | None = None,
     temporal_code: torch.Tensor | None = None,
     include_dynamic: bool = False,
+    volume_means_override: torch.Tensor | None = None,
+    volume_opacity_scale: float | torch.Tensor = 1.0,
 ) -> HybridRenderOutput:
     """Rasterise exact 2D surfels and 3D volumes with native mixed CUDA."""
     del structural_thickness_ratio, radius_clip
@@ -600,11 +651,39 @@ def render_hybrid(
     # Clamping is intentionally outside the parameter state so the parent
     # opacity remains immutable and bit-identical at zero step.
     surface_opacity = surface_base_opacity * surface_gate.clamp(0.0, 1.0)
+    if surface_gate_indices is None:
+        surface_gate_indices = torch.full(
+            (structural_count,),
+            -1,
+            dtype=torch.int32,
+            device=surface_means.device,
+        )
+    else:
+        surface_gate_indices = surface_gate_indices.to(
+            device=surface_means.device, dtype=torch.int32
+        )
+    if surface_gate_atlas is None:
+        surface_gate_atlas = surface_means.new_empty((0, 0, 0))
+    if surface_gate_indices.shape != (structural_count,):
+        raise ValueError("surface_gate_indices must match structural count")
     volume_means, volume_features, volume_opacities = (
         foliage.conditioned_state(
             temporal_code,
             include_dynamic=include_dynamic,
         )
+    )
+    if volume_means_override is not None:
+        if volume_means_override.shape != volume_means.shape:
+            raise ValueError(
+                "volume_means_override must match the foliage xyz shape"
+            )
+        volume_means = volume_means_override.to(
+            device=volume_means.device, dtype=volume_means.dtype
+        )
+    volume_opacities = volume_opacities * torch.as_tensor(
+        volume_opacity_scale,
+        device=volume_opacities.device,
+        dtype=volume_opacities.dtype,
     )
     volume_scales = foliage.scales
     volume_rotations = foliage.normalized_quaternions
@@ -661,7 +740,13 @@ def render_hybrid(
         prefiltered=False,
         debug=False,
     )
-    rgb, radii, allmap, responsibility = MixedGaussianRasterizer(settings)(
+    (
+        rgb,
+        radii,
+        allmap,
+        responsibility,
+        gate_responsibility,
+    ) = MixedGaussianRasterizer(settings)(
         surface_means,
         surface_means2D,
         surface_scales,
@@ -672,7 +757,9 @@ def render_hybrid(
         volume_rotations,
         colors,
         opacities,
-        audit_fields,
+        surface_gate_indices=surface_gate_indices,
+        surface_gate_atlas=surface_gate_atlas,
+        audit_fields=audit_fields,
     )
     alpha_chw = allmap[1:2]
     depth = torch.nan_to_num(
@@ -698,6 +785,11 @@ def render_hybrid(
         structural_count=structural_count,
         responsibility=(
             responsibility if responsibility.numel() else None
+        ),
+        gate_responsibility=(
+            gate_responsibility
+            if gate_responsibility.numel()
+            else None
         ),
         surface_alpha=surface_alpha,
         volume_alpha=volume_alpha,

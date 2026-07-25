@@ -55,7 +55,8 @@ from scripts.train_hybrid_foliage_3dgs import (  # noqa: E402
 from utils.loss_utils import ssim  # noqa: E402
 
 
-PROTOCOL = "layered_dynamic_foliage_local_replace_v6"
+PROTOCOL = "layered_dynamic_foliage_surfel_uv_replace_v7"
+LEGACY_PROTOCOL = "layered_dynamic_foliage_local_replace_v6"
 
 
 def _parse_args():
@@ -86,6 +87,12 @@ def _parse_args():
     parser.add_argument("--rotation-lr", type=float, default=2e-4)
     parser.add_argument("--dynamic-lr", type=float, default=3e-4)
     parser.add_argument("--gate-lr", type=float, default=6e-3)
+    parser.add_argument("--uv-gate-size", type=int, default=8)
+    parser.add_argument("--exposure-weight", type=float, default=0.35)
+    parser.add_argument("--exposure-start-fraction", type=float, default=0.05)
+    parser.add_argument("--posterior-depth-sigma", type=float, default=0.45)
+    parser.add_argument("--ray-hit-weight", type=float, default=0.03)
+    parser.add_argument("--free-space-weight", type=float, default=0.04)
     parser.add_argument("--appearance-lr", type=float, default=8e-4)
     parser.add_argument("--pretrain-fraction", type=float, default=0.30)
     parser.add_argument("--retirement-fraction", type=float, default=0.65)
@@ -165,6 +172,8 @@ def _parse_args():
         )
     if not 0 <= args.dynamic_split_fraction <= 1:
         parser.error("--dynamic-split-fraction must be in [0, 1]")
+    if args.uv_gate_size < 2:
+        parser.error("--uv-gate-size must be at least 2")
     if not 0 < args.pretrain_fraction < args.retirement_fraction < 1:
         parser.error("stage fractions must satisfy 0 < pretrain < retirement < 1")
     return args, dataset, pipeline.extract(args)
@@ -182,6 +191,64 @@ def _save_checkpoint(path, payload):
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+@torch.no_grad()
+def _restore_geometry_evidence(foliage, seed_payload, captured_foliage):
+    """Backfill v6 states that predate persistent ray-posterior buffers.
+
+    Dynamic clones and historical split children retain the independent seed
+    centre, so one stable centre lookup restores evidence without consulting
+    RGB or the old structural surfel geometry.
+    """
+    names = (
+        "ray_depth_nll",
+        "free_space_violation_count",
+        "unknown_view_count",
+    )
+    missing = [name for name in names if name not in captured_foliage]
+    if not missing:
+        return {"needed": False, "matched": len(foliage), "unmatched": 0}
+    seed_centres = seed_payload["centers"].detach().cpu().float()
+    current_centres = foliage.initialization_center.detach().cpu().float()
+    exact = {
+        tuple(float(value) for value in centre): index
+        for index, centre in enumerate(seed_centres.tolist())
+    }
+    # Quantized fallback only handles serialization roundoff; collisions keep
+    # the first independent primitive and are reported.
+    quantized = {}
+    collisions = 0
+    for index, centre in enumerate(seed_centres.tolist()):
+        key = tuple(round(float(value), 5) for value in centre)
+        if key in quantized:
+            collisions += 1
+        else:
+            quantized[key] = index
+    mapped = []
+    for centre in current_centres.tolist():
+        key = tuple(float(value) for value in centre)
+        index = exact.get(key)
+        if index is None:
+            index = quantized.get(
+                tuple(round(float(value), 5) for value in centre)
+            )
+        mapped.append(-1 if index is None else int(index))
+    mapped = torch.tensor(mapped, dtype=torch.long, device=foliage.xyz.device)
+    valid = mapped >= 0
+    for name in missing:
+        destination = getattr(foliage, name)
+        source = seed_payload[name].to(
+            device=destination.device, dtype=destination.dtype
+        )
+        destination[valid] = source[mapped[valid]]
+    return {
+        "needed": True,
+        "matched": int(valid.sum()),
+        "unmatched": int((~valid).sum()),
+        "quantized_seed_collisions": int(collisions),
+        "restored_fields": missing,
+    }
 
 
 def _remap_candidate_values(
@@ -247,7 +314,7 @@ def _make_schedule(views, foliage, iterations, seed):
     }
 
 
-def _optimizer(args, foliage, gates, appearance):
+def _optimizer(args, foliage, gate_atlas, appearance):
     return torch.optim.Adam(
         [
             {"params": [foliage.xyz], "lr": args.position_lr, "name": "xyz"},
@@ -264,7 +331,11 @@ def _optimizer(args, foliage, gates, appearance):
                 "lr": args.dynamic_lr,
                 "name": "dynamic_leaf",
             },
-            {"params": [gates], "lr": args.gate_lr, "name": "local_legacy_gate"},
+            {
+                "params": [gate_atlas],
+                "lr": args.gate_lr,
+                "name": "surfel_uv_gate",
+            },
             {
                 "params": list(appearance.parameters()),
                 "lr": args.appearance_lr,
@@ -275,6 +346,55 @@ def _optimizer(args, foliage, gates, appearance):
     )
 
 
+def _optimizer_with_migrated_state(
+    args,
+    foliage,
+    gate_atlas,
+    appearance,
+    previous,
+    new_to_old,
+):
+    """Rebuild Adam after topology surgery without discarding its history."""
+    current = _optimizer(args, foliage, gate_atlas, appearance)
+    previous_groups = {
+        group.get("name"): group for group in previous.param_groups
+    }
+    primitive_groups = {
+        "xyz",
+        "features",
+        "opacity",
+        "scale",
+        "rotation",
+        "dynamic_leaf",
+    }
+    for group in current.param_groups:
+        name = group.get("name")
+        old_group = previous_groups.get(name)
+        if old_group is None or len(old_group["params"]) != len(group["params"]):
+            continue
+        for old_parameter, new_parameter in zip(
+            old_group["params"], group["params"]
+        ):
+            old_state = previous.state.get(old_parameter)
+            if not old_state:
+                continue
+            state = {}
+            for key, value in old_state.items():
+                if (
+                    name in primitive_groups
+                    and torch.is_tensor(value)
+                    and value.ndim > 0
+                    and value.shape[0] == old_parameter.shape[0]
+                ):
+                    state[key] = value[new_to_old].clone()
+                elif torch.is_tensor(value):
+                    state[key] = value.clone()
+                else:
+                    state[key] = value
+            current.state[new_parameter] = state
+    return current
+
+
 def _gate_vector(structural, candidates, values):
     gate = torch.ones(
         structural.get_xyz.shape[0],
@@ -282,6 +402,43 @@ def _gate_vector(structural, candidates, values):
         dtype=values.dtype,
     )
     return gate.index_copy(0, candidates, values.clamp(0.0, 1.0))
+
+
+def _surface_atlas_indices(structural, candidates):
+    """Map immutable structural primitive ids to compact UV atlas rows."""
+    indices = torch.full(
+        (structural.get_xyz.shape[0],),
+        -1,
+        dtype=torch.int32,
+        device=candidates.device,
+    )
+    return indices.index_copy(
+        0,
+        candidates,
+        torch.arange(
+            len(candidates), dtype=torch.int32, device=candidates.device
+        ),
+    )
+
+
+def _uv_total_variation(atlas, mask):
+    """Regularize only certified texel pairs; rigid texels stay untouched."""
+    horizontal = mask[:, :, 1:] & mask[:, :, :-1]
+    vertical = mask[:, 1:, :] & mask[:, :-1, :]
+    terms = []
+    if bool(horizontal.any()):
+        terms.append(
+            (atlas[:, :, 1:] - atlas[:, :, :-1]).abs()[horizontal].mean()
+        )
+    if bool(vertical.any()):
+        terms.append(
+            (atlas[:, 1:, :] - atlas[:, :-1, :]).abs()[vertical].mean()
+        )
+    return sum(terms, atlas.new_zeros(()))
+
+
+def _atlas_candidate_means(atlas):
+    return atlas.detach().mean(dim=(1, 2))
 
 
 def _joint_replacement_match(depth_match, removal_improvement):
@@ -421,12 +578,36 @@ def _adaptive_topology(args, foliage, stats):
         weak_contribution = stats["contribution"] <= torch.quantile(
             stats["contribution"], 0.10
         )
-        remove = (
-            (foliage.opacities < args.prune_opacity)
-            & weak_contribution
-            & (foliage.support_sequence_count < 2)
+        support = foliage.support_view_count.float().clamp_min(1)
+        free_space_rate = (
+            foliage.free_space_violation_count.float() / support
         )
-        pruned = foliage.prune(remove)
+        finite_depth = torch.isfinite(foliage.ray_depth_nll)
+        depth_threshold = (
+            torch.quantile(foliage.ray_depth_nll[finite_depth], 0.90)
+            if bool(finite_depth.any())
+            else foliage.ray_depth_nll.new_tensor(float("inf"))
+        )
+        contradiction = (
+            (rigid >= 0.35)
+            | (free_space_rate >= 0.30)
+            | (foliage.occupancy_probability <= 0.15)
+            | (finite_depth & (foliage.ray_depth_nll >= depth_threshold))
+            | (
+                torch.isfinite(foliage.reprojection_error)
+                & (foliage.reprojection_error >= 3.0)
+            )
+        )
+        persistently_transparent = (
+            foliage.opacities < args.prune_opacity
+        )
+        remove = (
+            weak_contribution
+            & (contradiction | persistently_transparent)
+        )
+        pruned, new_to_old = foliage.prune(remove)
+        if pruned:
+            split["_new_to_old"] = new_to_old
     else:
         pruned = 0
     return {**split, "pruned": int(pruned)}
@@ -467,6 +648,8 @@ def _evaluate_layered(
     appearance,
     fields,
     output,
+    surface_gate_indices=None,
+    surface_gate_atlas=None,
 ):
     rows = []
     for index in indices:
@@ -483,6 +666,8 @@ def _evaluate_layered(
             foliage,
             background=background,
             surface_gate=surface_gate,
+            surface_gate_indices=surface_gate_indices,
+            surface_gate_atlas=surface_gate_atlas,
             include_dynamic=False,
         )
         conditioned_package = render_hybrid(
@@ -491,6 +676,37 @@ def _evaluate_layered(
             foliage,
             background=background,
             surface_gate=surface_gate,
+            surface_gate_indices=surface_gate_indices,
+            surface_gate_atlas=surface_gate_atlas,
+            temporal_code=appearance.temporal_code(view.image_name),
+            include_dynamic=True,
+        )
+        structural_only_package = render_hybrid(
+            view,
+            structural,
+            foliage,
+            background=background,
+            surface_gate=torch.ones_like(surface_gate),
+            include_dynamic=False,
+            volume_opacity_scale=0.0,
+        )
+        gated_structural_package = render_hybrid(
+            view,
+            structural,
+            foliage,
+            background=background,
+            surface_gate=surface_gate,
+            surface_gate_indices=surface_gate_indices,
+            surface_gate_atlas=surface_gate_atlas,
+            include_dynamic=False,
+            volume_opacity_scale=0.0,
+        )
+        volume_only_package = render_hybrid(
+            view,
+            structural,
+            foliage,
+            background=background,
+            surface_gate=torch.zeros_like(surface_gate),
             temporal_code=appearance.temporal_code(view.image_name),
             include_dynamic=True,
         )
@@ -515,6 +731,18 @@ def _evaluate_layered(
         conditioned = appearance(
             conditioned_base, view, task
         ).clamp(0, 1)
+        def corrected(package):
+            return apply_per_image_affine_color_correction(
+                color,
+                composite_white_background(
+                    package.render, package.alpha, sky(view)
+                ),
+                view.image_name,
+            ).clamp(0, 1)
+
+        structural_only = corrected(structural_only_package)
+        gated_structural = corrected(gated_structural_package)
+        volume_only = corrected(volume_only_package)
         target = view.original_image.cuda()
         row = {
             "index": int(index),
@@ -542,6 +770,18 @@ def _evaluate_layered(
         _save_rgb(output / f"{stem}_ground_truth.png", target)
         _save_rgb(output / f"{stem}_canonical.png", canonical)
         _save_rgb(output / f"{stem}_conditioned.png", conditioned)
+        _save_rgb(
+            output / f"{stem}_branch_structural_ungated.png",
+            structural_only,
+        )
+        _save_rgb(
+            output / f"{stem}_branch_structural_uv_gated.png",
+            gated_structural,
+        )
+        _save_rgb(
+            output / f"{stem}_branch_volume_only.png",
+            volume_only,
+        )
         _save_rgb(
             output / f"{stem}_canonical_error_x4.png",
             (canonical - target).abs() * 4,
@@ -592,15 +832,29 @@ def main():
         dynamic_seed_count = _spawn_dynamic_layer(
             foliage, args.dynamic_seed_count
         )
+        geometry_evidence_restore = {
+            "needed": False,
+            "matched": len(foliage),
+            "unmatched": 0,
+        }
     elif initial_payload is not None:
-        if initial_payload.get("protocol") != PROTOCOL:
+        if initial_payload.get("protocol") not in {
+            PROTOCOL,
+            LEGACY_PROTOCOL,
+        }:
             raise RuntimeError("Initial layered state protocol mismatch")
         foliage.restore(initial_payload["foliage"])
+        geometry_evidence_restore = _restore_geometry_evidence(
+            foliage, seed_payload, initial_payload["foliage"]
+        )
         dynamic_seed_count = int(foliage.dynamic_leaf_mask.sum())
     else:
         if resume_payload.get("protocol") != PROTOCOL:
             raise RuntimeError("Resume checkpoint protocol mismatch")
         foliage.restore(resume_payload["foliage"])
+        geometry_evidence_restore = _restore_geometry_evidence(
+            foliage, seed_payload, resume_payload["foliage"]
+        )
         dynamic_seed_count = int(resume_payload["dynamic_seed_count"])
     audit = _load(args.replacement_audit.resolve())
     if audit.get("version") != RESPONSIBILITY_VERSION:
@@ -622,11 +876,16 @@ def main():
             default,
         )
 
-    initial_gate_values = restored_vector(
-        "gates",
-        "legacy_candidate_gates",
-        torch.ones(len(candidates), device="cuda"),
-    )
+    if resume_payload is not None and "gate_atlas" in resume_payload:
+        initial_gate_values = resume_payload["gate_atlas"].to(
+            device="cuda"
+        ).mean(dim=(1, 2))
+    else:
+        initial_gate_values = restored_vector(
+            "gates",
+            "legacy_candidate_gates",
+            torch.ones(len(candidates), device="cuda"),
+        )
     if args.certified_initial_gates:
         if initial_payload is None:
             raise RuntimeError(
@@ -647,51 +906,98 @@ def main():
             dtype=torch.bool,
         )
         initial_gate_values[~certified_mask] = 1.0
-    gates = torch.nn.Parameter(initial_gate_values)
+    atlas_shape = (
+        len(candidates),
+        args.uv_gate_size,
+        args.uv_gate_size,
+    )
+    if resume_payload is not None:
+        restored_atlas = resume_payload["gate_atlas"].to(device="cuda")
+        if tuple(restored_atlas.shape) != atlas_shape:
+            raise RuntimeError(
+                "Resume UV gate atlas shape does not match --uv-gate-size"
+            )
+    elif (
+        initial_payload is not None
+        and "surfel_uv_gate_atlas" in initial_payload
+    ):
+        old_atlas = initial_payload["surfel_uv_gate_atlas"]
+        if tuple(old_atlas.shape[1:]) != atlas_shape[1:]:
+            old_atlas = torch.nn.functional.interpolate(
+                old_atlas[:, None].float(),
+                size=atlas_shape[1:],
+                mode="bilinear",
+                align_corners=True,
+            )[:, 0]
+        restored_atlas = _remap_candidate_values(
+            candidates,
+            initial_payload["legacy_candidate_indices"].long(),
+            old_atlas,
+            torch.ones(atlas_shape, device="cuda"),
+        )
+    else:
+        restored_atlas = initial_gate_values[:, None, None].expand(
+            atlas_shape
+        ).clone()
+    gate_atlas = torch.nn.Parameter(restored_atlas)
+    surface_atlas_indices = _surface_atlas_indices(structural, candidates)
+    scalar_surface_gate = torch.ones(
+        structural.get_xyz.shape[0], device="cuda"
+    )
     local_confidence = restored_vector(
         "local_confidence",
-        "local_replacement_confidence",
-        torch.zeros_like(gates),
+        "surfel_uv_replacement_confidence",
+        torch.zeros(atlas_shape, device="cuda"),
     )
     local_observations = restored_vector(
         "local_observations",
-        "local_replacement_observations",
-        torch.zeros_like(gates),
+        "surfel_uv_replacement_observations",
+        torch.zeros(atlas_shape, dtype=torch.int16, device="cuda"),
     )
     local_sequence_bits = restored_vector(
         "local_sequence_bits",
-        "local_replacement_sequence_bits",
-        torch.zeros(len(gates), dtype=torch.int64, device="cuda"),
+        "surfel_uv_replacement_sequence_bits",
+        torch.zeros(atlas_shape, dtype=torch.int64, device="cuda"),
     )
     sequence_support = restored_vector(
         "sequence_support",
-        "local_replacement_sequence_support",
-        torch.zeros(len(gates), dtype=torch.int16, device="cuda"),
+        "surfel_uv_replacement_sequence_support",
+        torch.zeros(atlas_shape, dtype=torch.int16, device="cuda"),
     )
     if initial_payload is not None and not bool(sequence_support.any()):
+        flat_bits = local_sequence_bits.detach().cpu().reshape(-1).tolist()
         sequence_support.copy_(
             torch.as_tensor(
-                [
-                    bin(int(value)).count("1")
-                    for value in local_sequence_bits.cpu().tolist()
-                ],
+                [bin(int(value)).count("1") for value in flat_bits],
                 device="cuda",
                 dtype=torch.int16,
-            )
+            ).reshape_as(sequence_support)
         )
     low_gate_steps = restored_vector(
         "low_gate_steps",
-        "local_replacement_low_gate_steps",
-        torch.zeros(len(gates), dtype=torch.int32, device="cuda"),
+        "surfel_uv_replacement_low_gate_steps",
+        torch.zeros(atlas_shape, dtype=torch.int32, device="cuda"),
+    )
+    evidence_sum = restored_vector(
+        "evidence_sum",
+        "surfel_uv_evidence_sum",
+        torch.zeros((*atlas_shape, 4), device="cuda"),
+    )
+    evidence_weight = restored_vector(
+        "evidence_weight",
+        "surfel_uv_evidence_weight",
+        torch.zeros(atlas_shape, device="cuda"),
     )
     if args.reset_initial_replacement_proof:
         with torch.no_grad():
-            gates.fill_(1.0)
+            gate_atlas.fill_(1.0)
             local_confidence.zero_()
             local_observations.zero_()
             local_sequence_bits.zero_()
             sequence_support.zero_()
             low_gate_steps.zero_()
+            evidence_sum.zero_()
+            evidence_weight.zero_()
 
     sky = CanonicalDirectionalSky.load(args.sky_model.resolve(), device="cuda")
     for parameter in sky.parameters():
@@ -714,17 +1020,13 @@ def main():
         device="cuda",
     )
     if resume_payload is not None:
-        appearance.load_state_dict(
-            resume_payload["appearance"]["state_dict"], strict=True
-        )
+        appearance.restore(resume_payload["appearance"])
     elif initial_payload is not None:
-        appearance.load_state_dict(
-            initial_payload["appearance"]["state_dict"], strict=True
-        )
+        appearance.restore(initial_payload["appearance"])
     schedule, schedule_audit = _make_schedule(
         views, foliage, args.iterations, args.seed + 1
     )
-    optimizer = _optimizer(args, foliage, gates, appearance)
+    optimizer = _optimizer(args, foliage, gate_atlas, appearance)
     if resume_payload is None:
         topology_stats = _reset_topology_statistics(foliage)
         topology_events = []
@@ -762,7 +1064,7 @@ def main():
     if len(sequence_bits) > 62:
         raise RuntimeError("Local replacement sequence bitset exceeds 62 sequences")
 
-    all_one_gate = _gate_vector(structural, candidates, gates.detach())
+    all_one_gate = torch.ones_like(scalar_surface_gate)
     eval_indices = [
         int(value) for value in args.eval_indices.split(",") if value.strip()
     ]
@@ -839,9 +1141,20 @@ def main():
         task["image_name"] = str(view.image_name)
         target = view.original_image.cuda()
         render_gates = _gate_vector(
-            structural,
-            candidates,
-            gates.detach() if step < pretrain_end else gates,
+            structural, candidates, torch.ones(len(candidates), device="cuda")
+        )
+        # Rendering consumes a stop-gradient ownership decision.  Atlas
+        # updates come only from certified local replace-and-retire evidence,
+        # never from an unconstrained photometric shortcut.
+        render_atlas = gate_atlas.detach().clamp(0.0, 1.0)
+        evidence_average = evidence_sum / evidence_weight.clamp_min(
+            1e-8
+        )[..., None]
+        exposure_safe = (
+            (evidence_average[..., 0] >= 0.45)
+            & (evidence_average[..., 1] <= 0.08)
+            & (evidence_average[..., 2] >= 0.05)
+            & (local_observations >= 1)
         )
         code = appearance.temporal_code(view.image_name)
         canonical_package = render_hybrid(
@@ -850,16 +1163,9 @@ def main():
             foliage,
             background=background,
             surface_gate=render_gates,
+            surface_gate_indices=surface_atlas_indices,
+            surface_gate_atlas=render_atlas,
             include_dynamic=False,
-        )
-        conditioned_package = render_hybrid(
-            view,
-            structural,
-            foliage,
-            background=background,
-            surface_gate=render_gates,
-            temporal_code=code,
-            include_dynamic=True,
         )
         canonical = apply_per_image_affine_color_correction(
             color,
@@ -870,29 +1176,14 @@ def main():
             ),
             view.image_name,
         )
-        conditioned_base = apply_per_image_affine_color_correction(
-            color,
-            composite_white_background(
-                conditioned_package.render,
-                conditioned_package.alpha,
-                sky(view),
-            ),
-            view.image_name,
-        )
-        conditioned = appearance(conditioned_base, view, task)
         canonical_photo = _loss(
             canonical,
             target,
             0.35 * task["p_canopy_core"] + task["p_rigid"],
         )
-        conditioned_photo = _loss(
-            conditioned,
-            target,
-            task["p_canopy_core"] + 0.25 * task["p_rigid"],
-        )
         rigid_loss = _loss(canonical, target, task["p_rigid"])
 
-        # Tree masks are weak positive evidence, not an opaque alpha target.
+        # Tree masks are weak ray-hit evidence, never a fixed opaque target.
         alpha = canonical_package.volume_alpha[0].clamp(1e-5, 1 - 1e-5)
         positive = task["p_canopy_core"] * (1.0 - task["p_transient"])
         negative = (
@@ -900,18 +1191,20 @@ def main():
             * (1.0 - task["p_boundary_uncertain"])
             + 0.35 * task["p_sky"] * (1.0 - task["p_boundary_uncertain"])
         ).clamp(0, 1)
-        target_alpha = alpha.new_full(
-            alpha.shape, float(args.soft_crown_alpha)
-        )
         occupancy_positive = (
-            -(target_alpha * torch.log(alpha)
-              + (1 - target_alpha) * torch.log1p(-alpha))
-            * positive
+            (-torch.log(alpha) * positive)
+        ).sum() / positive.sum().clamp_min(1)
+        silhouette_floor = (
+            torch.relu(0.08 - alpha) * positive
         ).sum() / positive.sum().clamp_min(1)
         occupancy_negative = (
             -torch.log1p(-alpha) * negative
         ).sum() / negative.sum().clamp_min(1)
-        occupancy_loss = occupancy_positive + occupancy_negative
+        occupancy_loss = (
+            0.15 * occupancy_positive
+            + silhouette_floor
+            + occupancy_negative
+        )
 
         delta = foliage.xyz - foliage.initialization_center
         position_variance = foliage.position_covariance.diagonal(
@@ -923,7 +1216,20 @@ def main():
             position_nll.new_tensor(2.0),
             position_nll.new_tensor(0.25),
         )
+        finite_ray_nll = torch.nan_to_num(
+            foliage.ray_depth_nll, nan=0.0, posinf=10.0
+        ).clamp(0, 10)
+        position_weight = position_weight * (
+            1.0 + finite_ray_nll / 5.0
+        )
         depth_prior = (position_nll * position_weight).mean()
+        metadata_support = foliage.support_view_count.float().clamp_min(1)
+        free_space_rate = (
+            foliage.free_space_violation_count.float() / metadata_support
+        ).clamp(0, 1)
+        free_space_loss = (
+            foliage.opacities * free_space_rate
+        ).mean()
         dynamic_regularizer = (
             foliage.deformation_basis[foliage.dynamic_leaf_mask]
             .square()
@@ -931,77 +1237,181 @@ def main():
             if bool(foliage.dynamic_leaf_mask.any())
             else foliage.xyz.new_zeros(())
         )
+        canonical_loss = (
+            args.canonical_weight * canonical_photo
+            + args.rigid_weight * rigid_loss
+            + args.occupancy_weight * occupancy_loss
+            + args.ray_hit_weight * occupancy_positive
+            + args.free_space_weight * free_space_loss
+            + args.depth_weight * depth_prior
+            + args.dynamic_regularization * dynamic_regularizer
+        )
+        canonical_loss.backward()
+        del canonical_package, canonical, alpha
+        torch.cuda.empty_cache()
+
+        conditioned_package = render_hybrid(
+            view,
+            structural,
+            foliage,
+            background=background,
+            surface_gate=render_gates,
+            surface_gate_indices=surface_atlas_indices,
+            surface_gate_atlas=render_atlas,
+            temporal_code=code,
+            include_dynamic=True,
+            audit_fields=torch.stack(
+                [
+                    task["p_canopy_core"],
+                    task["p_rigid"],
+                    task["p_canopy_core"],
+                ],
+                dim=0,
+            ),
+        )
+        conditioned_base = apply_per_image_affine_color_correction(
+            color,
+            composite_white_background(
+                conditioned_package.render,
+                conditioned_package.alpha,
+                sky(view),
+            ),
+            view.image_name,
+        )
+        conditioned = appearance(conditioned_base, view, task)
+        conditioned_photo = _loss(
+            conditioned,
+            target,
+            task["p_canopy_core"] + 0.25 * task["p_rigid"],
+        )
         appearance_loss = appearance.heteroscedastic_loss(
             conditioned, target, task
         )
-
-        residual_map = torch.sqrt(
-            (conditioned.detach() - target).square().mean(0) + 1e-6
+        conditioned_loss = (
+            args.conditioned_weight * conditioned_photo
+            + args.appearance_weight * appearance_loss
+            + 1e-3 * appearance.regularization()
         )
-        # The counterfactual is an audit signal only: neither its pixels nor
-        # responsibility statistics contribute a gradient.  Keeping a full
-        # fourth rasterizer autograd context alive caused hard foliage views
-        # to OOM after adaptive splitting.
-        with torch.no_grad():
-            counterfactual = render_hybrid(
+        conditioned_loss.backward()
+        _accumulate_topology(
+            topology_stats,
+            conditioned_package,
+            conditioned_package.responsibility,
+        )
+        conditioned_surface_alpha = (
+            conditioned_package.surface_alpha[0].detach()
+        )
+        conditioned_volume_depth = (
+            conditioned_package.volume_depth[0].detach()
+        )
+        conditioned_surface_depth = (
+            conditioned_package.surface_depth[0].detach()
+        )
+        normal_error = (conditioned.detach() - target).abs().mean(0)
+        del conditioned_package, conditioned_base, conditioned
+        torch.cuda.empty_cache()
+
+        exposure_prediction_detached = None
+        exposure_loss = canonical_photo.new_zeros(())
+        exposure_region = positive.new_zeros(positive.shape)
+        exposure_start = int(
+            args.iterations * args.exposure_start_fraction
+        )
+        if step >= exposure_start and bool(exposure_safe.any()):
+            # Differentiable replacement exposure: the old branch and UV
+            # decision are stop-grad, while the newly visible volume remains
+            # fully differentiable and receives the reconstruction gradient.
+            exposure_atlas = torch.where(
+                exposure_safe,
+                render_atlas.new_tensor(args.counterfactual_gate),
+                render_atlas.detach(),
+            ).detach()
+            exposure_package = render_hybrid(
                 view,
                 structural,
                 foliage,
                 background=background,
-                surface_gate=_gate_vector(
-                    structural,
-                    candidates,
-                    torch.full_like(gates, args.counterfactual_gate),
-                ),
-                temporal_code=code,
+                surface_gate=render_gates.detach(),
+                surface_gate_indices=surface_atlas_indices,
+                surface_gate_atlas=exposure_atlas,
+                # The conditioned pass has already consumed and freed its
+                # normalized-code graph; exposure owns an independent graph
+                # while accumulating into the same leaf parameters.
+                temporal_code=appearance.temporal_code(view.image_name),
                 include_dynamic=True,
-                audit_fields=torch.stack(
-                    [
-                        task["p_canopy_core"],
-                        task["p_rigid"],
-                        task["p_canopy_core"] * residual_map,
-                    ],
-                    dim=0,
-                ),
             )
-            counterfactual_base = apply_per_image_affine_color_correction(
+            exposure_prediction = apply_per_image_affine_color_correction(
                 color,
                 composite_white_background(
-                    counterfactual.render,
-                    counterfactual.alpha,
+                    exposure_package.render,
+                    exposure_package.alpha,
                     sky(view),
                 ),
                 view.image_name,
             )
-            counterfactual_prediction = appearance(
-                counterfactual_base, view, task
+            exposure_region = (
+                (
+                    conditioned_surface_alpha
+                    - exposure_package.surface_alpha[0].detach()
+                ).clamp_min(0)
+                * positive
             )
+            exposure_loss = _loss(
+                exposure_prediction, target, exposure_region
+            )
+            (args.exposure_weight * exposure_loss).backward()
+            exposure_prediction_detached = exposure_prediction.detach()
+            del exposure_package, exposure_prediction
+            torch.cuda.empty_cache()
         local_q = local_confidence.detach()
         if step % args.local_audit_every == 0:
-            coverage = conditioned_package.volume_alpha[0].detach()
-            depth_match = torch.exp(
+            # Independent ray/depth posterior: initialization centres come
+            # from SfM tracks / visual-hull rays, not the old surfel depth.
+            with torch.no_grad():
+                posterior = render_hybrid(
+                    view,
+                    structural,
+                    foliage,
+                    background=background,
+                    surface_gate=torch.zeros_like(render_gates),
+                    volume_means_override=foliage.initialization_center,
+                    include_dynamic=False,
+                )
+            posterior_alpha = posterior.volume_alpha[0].detach()
+            posterior_depth = posterior.volume_depth[0].detach()
+            sigma = float(args.posterior_depth_sigma)
+            new_depth_match = torch.exp(
                 -(
-                    conditioned_package.volume_depth[0]
-                    - conditioned_package.surface_depth[0]
+                    conditioned_volume_depth - posterior_depth
                 ).abs()
-                / 0.45
-            ).detach()
-            normal_error = (
-                conditioned.detach() - target
-            ).abs().mean(0)
-            counterfactual_error = (
-                counterfactual_prediction.detach() - target
-            ).abs().mean(0)
-            removal_improvement = torch.sigmoid(
-                (normal_error - counterfactual_error) / 0.02
+                / sigma
             )
-            # Retirement requires joint evidence.  The previous maximum
-            # admitted a candidate when either depth happened to agree *or*
-            # the counterfactual looked better, which allowed geometrically
-            # overlapping but photometrically harmful removals in seq4.
-            replacement_match = _joint_replacement_match(
-                depth_match, removal_improvement
+            old_depth_match = torch.exp(
+                -(
+                    conditioned_surface_depth - posterior_depth
+                ).abs()
+                / sigma
             )
+            posterior_valid = (
+                (posterior_alpha >= 0.03)
+                & (posterior_depth > 0)
+            ).to(posterior_alpha.dtype)
+            replacement_depth_proof = (
+                new_depth_match
+                * (1.0 - old_depth_match)
+                * posterior_valid
+            ).clamp(0, 1)
+            if exposure_prediction_detached is None:
+                removal_improvement = normal_error.new_full(
+                    normal_error.shape, 0.5
+                )
+            else:
+                exposure_error = (
+                    exposure_prediction_detached - target
+                ).abs().mean(0)
+                removal_improvement = torch.sigmoid(
+                    (normal_error - exposure_error) / 0.02
+                )
             with torch.no_grad():
                 local_audit = render_hybrid(
                     view,
@@ -1009,24 +1419,35 @@ def main():
                     foliage,
                     background=background,
                     surface_gate=render_gates.detach(),
+                    surface_gate_indices=surface_atlas_indices,
+                    surface_gate_atlas=render_atlas.detach(),
                     audit_fields=torch.stack(
                         [
-                            coverage,
-                            coverage * replacement_match,
+                            task["p_canopy_core"],
                             task["p_rigid"],
+                            replacement_depth_proof,
+                            removal_improvement,
                         ],
                         dim=0,
                     ),
-                ).responsibility
+                ).gate_responsibility
             if local_audit is not None:
-                old = local_audit[candidates]
-                total = old[:, 0].clamp_min(1e-8)
-                overlap = old[:, 1] / total
-                compatible = old[:, 2] / old[:, 1].clamp_min(1e-8)
-                rigid = old[:, 3] / total
-                view_q = (overlap * compatible * (1 - rigid)).clamp(0, 1)
-                observed = old[:, 0] > 0.05
+                total = local_audit[..., 0].clamp_min(1e-8)
+                per_view = local_audit[..., 1:5] / total[..., None]
+                canopy = per_view[..., 0]
+                rigid = per_view[..., 1]
+                depth_proof = per_view[..., 2]
+                improvement = per_view[..., 3]
+                view_q = (
+                    canopy
+                    * (1.0 - rigid)
+                    * depth_proof
+                    * improvement
+                ).clamp(0, 1)
+                observed = local_audit[..., 0] > 0.02
                 with torch.no_grad():
+                    evidence_sum.add_(local_audit[..., 1:5])
+                    evidence_weight.add_(local_audit[..., 0])
                     # Confidence is a retained lower-cost local proof, not a
                     # per-view average.  The previous EMA needed dozens of
                     # repeat observations before even a very strong candidate
@@ -1042,28 +1463,27 @@ def main():
                     local_observations[proven] += 1
                     bit = sequence_bits[sequence_id(view.image_name)]
                     local_sequence_bits[proven] |= bit
-                    sequence_support.copy_(
-                        torch.tensor(
-                            [
-                                bin(int(value)).count("1")
-                                for value in local_sequence_bits.detach()
-                                .cpu()
-                                .tolist()
-                            ],
-                            device="cuda",
-                            dtype=torch.int16,
+                    sequence_support.zero_()
+                    for sequence_bit in sequence_bits.values():
+                        sequence_support.add_(
+                            (
+                                (local_sequence_bits & sequence_bit) != 0
+                            ).to(torch.int16)
                         )
-                    )
                 local_q = local_confidence.detach()
+        evidence_average = evidence_sum / evidence_weight.clamp_min(
+            1e-8
+        )[..., None]
         local_unlocked = (
             (local_q >= args.local_confidence_threshold)
             & (local_observations >= 3)
             & (sequence_support >= 2)
+            & (evidence_average[..., 1] <= 0.05)
         )
         gate_trainable = local_unlocked & (
             local_q >= args.retirement_confidence
         )
-        gate_values = gates.clamp(0, 1)
+        gate_values = gate_atlas.clamp(0, 1)
         retire = (
             local_q * gate_values
             + 0.15 * (1 - local_q) * (1 - gate_values)
@@ -1073,28 +1493,28 @@ def main():
             if bool(gate_trainable.any())
             else gate_values.new_zeros(())
         )
-        loss = (
-            args.canonical_weight * canonical_photo
-            + args.conditioned_weight * conditioned_photo
-            + args.rigid_weight * rigid_loss
-            + args.occupancy_weight * occupancy_loss
-            + args.depth_weight * depth_prior
-            + args.dynamic_regularization * dynamic_regularizer
-            + args.appearance_weight * appearance_loss
-            + 1e-3 * appearance.regularization()
-            + (
-                args.gate_weight * local_gate_loss
-                if step >= pretrain_end
-                else local_gate_loss.new_zeros(())
+        local_gate_loss = (
+            local_gate_loss
+            + 0.05 * _uv_total_variation(
+                gate_values, gate_trainable
             )
         )
-        loss.backward()
-        if gates.grad is not None:
-            gates.grad[~gate_trainable] = 0
-        _apply_role_gradient_policy(foliage)
-        _accumulate_topology(
-            topology_stats, conditioned_package, counterfactual.responsibility
+        gate_objective = (
+            args.gate_weight * local_gate_loss
+            if step >= pretrain_end
+            else local_gate_loss.new_zeros(())
         )
+        if gate_objective.requires_grad:
+            gate_objective.backward()
+        loss = (
+            canonical_loss.detach()
+            + conditioned_loss.detach()
+            + args.exposure_weight * exposure_loss.detach()
+            + gate_objective.detach()
+        )
+        if gate_atlas.grad is not None:
+            gate_atlas.grad[~gate_trainable] = 0
+        _apply_role_gradient_policy(foliage)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
@@ -1102,10 +1522,15 @@ def main():
                 torch.nn.functional.normalize(foliage.quaternions, dim=-1)
             )
             foliage.opacity_logits.clamp_(-10.0, 1.5)
-            gates.clamp_(0, 1)
+            gate_atlas.clamp_(0, 1)
+            # A rigid-contaminated texel is an absolute ownership lock.
+            rigid_locked = (
+                evidence_weight > 0
+            ) & (evidence_average[..., 1] > 0.05)
+            gate_atlas[rigid_locked] = 1.0
             if step >= retirement_start:
                 low_gate_steps += (
-                    (gates < 0.05)
+                    (gate_atlas < 0.05)
                     & (local_q >= args.retirement_confidence)
                     & local_unlocked
                 ).to(torch.int32)
@@ -1119,9 +1544,18 @@ def main():
             topology_event = _adaptive_topology(
                 args, foliage, topology_stats
             )
+            new_to_old = topology_event.pop("_new_to_old", None)
             topology_event["iteration"] = step + 1
             topology_events.append(topology_event)
-            optimizer = _optimizer(args, foliage, gates, appearance)
+            if new_to_old is not None:
+                optimizer = _optimizer_with_migrated_state(
+                    args,
+                    foliage,
+                    gate_atlas,
+                    appearance,
+                    optimizer,
+                    new_to_old,
+                )
             topology_stats = _reset_topology_statistics(foliage)
 
         if step == 0 or (step + 1) % args.log_every == 0:
@@ -1139,7 +1573,14 @@ def main():
                 "dynamic_leaf": int(foliage.dynamic_leaf_mask.sum()),
                 "local_unlocked": int(local_unlocked.sum()),
                 "local_gate_trainable": int(gate_trainable.sum()),
-                "gate_below_0_5": int((gates < 0.5).sum()),
+                "uv_texels_below_0_5": int(
+                    (gate_atlas < 0.5).sum()
+                ),
+                "uv_candidates_changed": int(
+                    (_atlas_candidate_means(gate_atlas) < 0.99).sum()
+                ),
+                "exposure_safe_texels": int(exposure_safe.sum()),
+                "exposure_loss": float(exposure_loss),
                 "local_confidence_mean": float(local_confidence.mean()),
                 "local_confidence_p95": float(
                     torch.quantile(local_confidence, 0.95)
@@ -1174,12 +1615,14 @@ def main():
                     "dynamic_seed_count": dynamic_seed_count,
                     "foliage": foliage.capture(),
                     "appearance": appearance.capture(),
-                    "gates": gates.detach(),
+                    "gate_atlas": gate_atlas.detach(),
                     "local_confidence": local_confidence,
                     "local_observations": local_observations,
                     "local_sequence_bits": local_sequence_bits,
                     "sequence_support": sequence_support,
                     "low_gate_steps": low_gate_steps,
+                    "evidence_sum": evidence_sum,
+                    "evidence_weight": evidence_weight,
                     "optimizer": optimizer.state_dict(),
                     "topology_stats": topology_stats,
                     "topology_events": topology_events,
@@ -1191,27 +1634,34 @@ def main():
                     "cuda_rng_state": torch.cuda.get_rng_state_all(),
                 },
             )
+        # Release every remaining graph-facing scalar/map before the next
+        # giant-footprint view requests its tile buffer.
+        del (
+            canonical_photo,
+            conditioned_photo,
+            rigid_loss,
+            appearance_loss,
+            canonical_loss,
+            conditioned_loss,
+            loss,
+            conditioned_surface_alpha,
+            conditioned_volume_depth,
+            conditioned_surface_depth,
+            normal_error,
+            exposure_prediction_detached,
+        )
+        if step % args.local_audit_every == 0:
+            del posterior, local_audit
+        torch.cuda.empty_cache()
 
     # The mixed hard views can require several additional GiB.  Training
     # optimizer moments and the last autograd render packages are no longer
     # needed; release them before final no-grad evaluation to avoid allocator
     # fragmentation/OOM after densification.
     del optimizer, topology_stats
-    if start_step < args.iterations:
-        del (
-            canonical_package,
-            conditioned_package,
-            counterfactual,
-            canonical,
-            conditioned,
-            conditioned_base,
-            counterfactual_base,
-            counterfactual_prediction,
-            loss,
-        )
     gc.collect()
     torch.cuda.empty_cache()
-    final_gate = _gate_vector(structural, candidates, gates.detach())
+    final_gate = torch.ones_like(scalar_surface_gate)
     after = _evaluate_layered(
         views,
         eval_indices,
@@ -1224,6 +1674,8 @@ def main():
         appearance,
         fields,
         output / "visualization" / "after",
+        surface_atlas_indices,
+        gate_atlas.detach(),
     )
     paired = []
     for initial, final in zip(before, after):
@@ -1249,11 +1701,14 @@ def main():
                 ),
             }
         )
-    retirement_eligible = (
-        (gates.detach() < 0.05)
+    retirement_texels = (
+        (gate_atlas.detach() < 0.05)
         & (local_confidence >= args.retirement_confidence)
         & (low_gate_steps >= max(20, int(0.02 * args.iterations)))
     )
+    retirement_eligible = retirement_texels.float().mean(
+        dim=(1, 2)
+    ) >= 0.80
     state_path = output / "layered_foliage_state.pth"
     torch.save(
         {
@@ -1261,12 +1716,15 @@ def main():
             "foliage": foliage.capture(),
             "appearance": appearance.capture(),
             "legacy_candidate_indices": candidates,
-            "legacy_candidate_gates": gates.detach(),
-            "local_replacement_confidence": local_confidence,
-            "local_replacement_observations": local_observations,
-            "local_replacement_sequence_bits": local_sequence_bits,
-            "local_replacement_sequence_support": sequence_support,
-            "local_replacement_low_gate_steps": low_gate_steps,
+            "legacy_candidate_gates": _atlas_candidate_means(gate_atlas),
+            "surfel_uv_gate_atlas": gate_atlas.detach(),
+            "surfel_uv_replacement_confidence": local_confidence,
+            "surfel_uv_replacement_observations": local_observations,
+            "surfel_uv_replacement_sequence_bits": local_sequence_bits,
+            "surfel_uv_replacement_sequence_support": sequence_support,
+            "surfel_uv_replacement_low_gate_steps": low_gate_steps,
+            "surfel_uv_evidence_sum": evidence_sum,
+            "surfel_uv_evidence_weight": evidence_weight,
             "retirement_eligible_indices": candidates[retirement_eligible],
         },
         state_path,
@@ -1316,6 +1774,7 @@ def main():
         "zero_volume_identity": identity,
         "schedule": schedule_audit,
         "geometry_version": seed_payload.get("geometry_version"),
+        "geometry_evidence_restore": geometry_evidence_restore,
         "initial_dynamic_leaf_count": dynamic_seed_count,
         "final_gaussians": len(foliage),
         "layer_counts": {
@@ -1326,7 +1785,8 @@ def main():
         "topology_events": topology_events,
         "local_replacement": {
             "proof_definition": (
-                "coverage_times_depth_match_times_counterfactual_improvement"
+                "per_texel_canopy_times_independent_new_depth_correct_"
+                "times_old_depth_wrong_times_exposure_improvement"
             ),
             "initial_proof_reset": bool(
                 args.reset_initial_replacement_proof
@@ -1343,9 +1803,12 @@ def main():
             "confidence_p95": float(
                 torch.quantile(local_confidence, 0.95)
             ),
-            "gate_mean": float(gates.mean()),
-            "gate_below_0_5": int((gates < 0.5).sum()),
-            "gate_below_0_05": int((gates < 0.05).sum()),
+            "gate_mean": float(gate_atlas.mean()),
+            "uv_texels_below_0_5": int((gate_atlas < 0.5).sum()),
+            "uv_texels_below_0_05": int((gate_atlas < 0.05).sum()),
+            "uv_candidates_changed": int(
+                (_atlas_candidate_means(gate_atlas) < 0.99).sum()
+            ),
             "retirement_eligible": int(retirement_eligible.sum()),
             "footprint_audit": footprint_audit,
         },

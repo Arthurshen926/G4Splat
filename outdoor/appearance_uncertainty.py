@@ -16,7 +16,8 @@ from outdoor.directional_sky import CanonicalDirectionalSky, _eval_sh
 from outdoor.foliage_view_graph import sequence_id
 
 
-APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v2"
+APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v3"
+LEGACY_APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v2"
 
 
 def _natural_key(value: str):
@@ -65,6 +66,12 @@ class OutdoorAppearanceUncertainty(nn.Module):
             )
             * 0.01
         )
+        # Geometry, foliage appearance, sky and uncertainty do not share one
+        # latent direction.  Sharing previously let a sky/exposure update
+        # move leaf geometry and encouraged low-frequency compromise.
+        self.foliage_codes = nn.Parameter(self.codes.detach().clone())
+        self.sky_codes = nn.Parameter(self.codes.detach().clone())
+        self.uncertainty_codes = nn.Parameter(self.codes.detach().clone())
         # Shared canopy affine decoder: three log-scales and three biases.
         self.canopy_decoder = nn.Parameter(
             torch.zeros(self.rank, 6, device=device)
@@ -128,8 +135,10 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 "the canonical render, not an invented training code"
             ) from error
 
-    def temporal_code(self, image_name: str) -> torch.Tensor:
-        code = self.codes[self.image_index(image_name)]
+    def _normalized_code(
+        self, values: torch.Tensor, image_name: str
+    ) -> torch.Tensor:
+        code = values[self.image_index(image_name)]
         # Low-rank deformation has a scale ambiguity between the per-frame
         # code and the per-Gaussian basis.  Raw L2 regularization previously
         # collapsed code norms to ~1e-2, leaving sub-micrometre "dynamic"
@@ -138,17 +147,33 @@ class OutdoorAppearanceUncertainty(nn.Module):
         denominator = code.detach().norm().clamp_min(1e-3)
         return code * (self.temporal_code_norm / denominator)
 
+    def temporal_code(self, image_name: str) -> torch.Tensor:
+        """Geometry/deformation code consumed by dynamic 3D leaves."""
+        return self._normalized_code(self.codes, image_name)
+
+    def foliage_code(self, image_name: str) -> torch.Tensor:
+        return self._normalized_code(self.foliage_codes, image_name)
+
+    def sky_code(self, image_name: str) -> torch.Tensor:
+        return self._normalized_code(self.sky_codes, image_name)
+
+    def uncertainty_code(self, image_name: str) -> torch.Tensor:
+        return self._normalized_code(self.uncertainty_codes, image_name)
+
     def _spatial_fields(
         self,
         image_name: str,
         shape: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        code = self.temporal_code(image_name)
+        foliage_code = self.foliage_code(image_name)
+        uncertainty_code = self.uncertainty_code(image_name)
         local_rgb = torch.einsum(
-            "r,rchw->chw", code, self.local_canopy_basis
+            "r,rchw->chw", foliage_code, self.local_canopy_basis
         )
         log_sigma = self.uncertainty_base[:, None, None] + torch.einsum(
-            "r,rchw->chw", code, self.spatial_uncertainty_basis
+            "r,rchw->chw",
+            uncertainty_code,
+            self.spatial_uncertainty_basis,
         )
         size = tuple(map(int, shape))
         local_rgb = torch.nn.functional.interpolate(
@@ -164,8 +189,9 @@ class OutdoorAppearanceUncertainty(nn.Module):
 
     def forward(self, rgb, camera, task):
         image_index = self.image_index(camera.image_name)
-        code = self.temporal_code(camera.image_name)
-        affine = code @ self.canopy_decoder
+        foliage_code = self.foliage_code(camera.image_name)
+        sky_code = self.sky_code(camera.image_name)
+        affine = foliage_code @ self.canopy_decoder
         scale = torch.exp(
             0.25 * torch.tanh(affine[:3])
         ).reshape(3, 1, 1)
@@ -185,7 +211,7 @@ class OutdoorAppearanceUncertainty(nn.Module):
         sky_residual = rgb.new_zeros((*directions.shape[:2], 3))
         for component in range(self.rank):
             coefficient = self.sky_basis[component].to(dtype=rgb.dtype)
-            sky_residual = sky_residual + code[component] * _eval_sh(
+            sky_residual = sky_residual + sky_code[component] * _eval_sh(
                 self.sky_degree, coefficient, directions
             )
         sky_residual = self.maximum_rgb_residual * torch.tanh(
@@ -221,8 +247,16 @@ class OutdoorAppearanceUncertainty(nn.Module):
         return canopy_loss + 0.5 * sky_loss + 0.25 * rigid_loss
 
     def regularization(self):
-        value = self.codes.square().mean()
-        value = value + 4.0 * self.codes.mean(dim=0).square().mean()
+        code_groups = (
+            self.codes,
+            self.foliage_codes,
+            self.sky_codes,
+            self.uncertainty_codes,
+        )
+        value = sum(group.square().mean() for group in code_groups)
+        value = value + 4.0 * sum(
+            group.mean(dim=0).square().mean() for group in code_groups
+        )
         value = value + self.canopy_decoder.square().mean()
         value = value + self.sky_basis.square().mean()
         value = value + self.local_canopy_basis.square().mean()
@@ -230,10 +264,33 @@ class OutdoorAppearanceUncertainty(nn.Module):
         value = value + 0.05 * self.uncertainty_base.square().mean()
         if self.temporal_pairs.numel():
             first, second = self.temporal_pairs.unbind(-1)
-            value = value + 0.25 * (
-                self.codes[first] - self.codes[second]
-            ).square().mean()
+            value = value + 0.25 * sum(
+                (group[first] - group[second]).square().mean()
+                for group in code_groups
+            )
         return value
+
+    @torch.no_grad()
+    def restore(self, payload):
+        """Restore v3 or migrate the former shared-code v2 checkpoint."""
+        version = payload.get("version", LEGACY_APPEARANCE_VERSION)
+        if version not in {APPEARANCE_VERSION, LEGACY_APPEARANCE_VERSION}:
+            raise RuntimeError(f"Unsupported appearance state {version!r}")
+        state = dict(payload["state_dict"])
+        shared = state.get("codes")
+        if shared is not None:
+            for name in (
+                "foliage_codes",
+                "sky_codes",
+                "uncertainty_codes",
+            ):
+                state.setdefault(name, shared.clone())
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Appearance state mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
 
     def capture(self):
         return {
@@ -263,6 +320,12 @@ class OutdoorAppearanceUncertainty(nn.Module):
             ],
             "temporal_regularization": "within_sequence_only",
             "temporal_code_parameterization": "fixed_norm_direction",
+            "temporal_code_branches": [
+                "geometry",
+                "foliage_appearance",
+                "sky",
+                "spatial_uncertainty",
+            ],
             "temporal_code_norm": self.temporal_code_norm,
             "per_pixel_free_parameters": False,
         }

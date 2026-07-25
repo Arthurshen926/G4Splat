@@ -233,6 +233,8 @@ def rasterize_mixed_gaussians(
     volume_rotations,
     colors,
     opacities,
+    surface_gate_indices,
+    surface_gate_atlas,
     audit_fields,
     raster_settings,
 ):
@@ -253,6 +255,8 @@ def rasterize_mixed_gaussians(
         volume_rotations,
         colors,
         opacities,
+        surface_gate_indices,
+        surface_gate_atlas,
         audit_fields,
         raster_settings,
     )
@@ -272,6 +276,8 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
         volume_rotations,
         colors,
         opacities,
+        surface_gate_indices,
+        surface_gate_atlas,
         audit_fields,
         raster_settings,
     ):
@@ -285,6 +291,8 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             volume_rotations,
             colors,
             opacities,
+            surface_gate_indices,
+            surface_gate_atlas,
             raster_settings.scale_modifier,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
@@ -315,6 +323,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             others,
             radii,
             responsibility,
+            gate_responsibility,
             geom_buffer,
             binning_buffer,
             image_buffer,
@@ -322,7 +331,9 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.rendered = rendered
         ctx.surface_count = surface_means3D.shape[0]
-        ctx.mark_non_differentiable(radii, responsibility)
+        ctx.mark_non_differentiable(
+            radii, responsibility, gate_responsibility
+        )
         ctx.save_for_backward(
             surface_means3D,
             surface_scales,
@@ -332,12 +343,20 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             volume_rotations,
             colors,
             opacities,
+            surface_gate_indices,
+            surface_gate_atlas,
             radii,
             geom_buffer,
             binning_buffer,
             image_buffer,
         )
-        return color, radii, others, responsibility
+        return (
+            color,
+            radii,
+            others,
+            responsibility,
+            gate_responsibility,
+        )
 
     @staticmethod
     def backward(
@@ -346,8 +365,9 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
         grad_radii,
         grad_others,
         grad_responsibility,
+        grad_gate_responsibility,
     ):
-        del grad_radii, grad_responsibility
+        del grad_radii, grad_responsibility, grad_gate_responsibility
         settings = ctx.raster_settings
         (
             surface_means3D,
@@ -358,6 +378,8 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             volume_rotations,
             colors,
             opacities,
+            surface_gate_indices,
+            surface_gate_atlas,
             radii,
             geom_buffer,
             binning_buffer,
@@ -385,6 +407,8 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             volume_rotations,
             colors,
             opacities,
+            surface_gate_indices,
+            surface_gate_atlas,
             settings.scale_modifier,
             settings.viewmatrix,
             settings.projmatrix,
@@ -421,6 +445,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             grad_volume_rotations,
             grad_colors,
             grad_opacities,
+            grad_surface_gate_atlas,
             grad_means2D,
         ) = grads
         split = ctx.surface_count
@@ -435,6 +460,8 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             grad_volume_rotations,
             grad_colors,
             grad_opacities,
+            None,
+            grad_surface_gate_atlas,
             None,
             None,
         )
@@ -459,6 +486,8 @@ class MixedGaussianRasterizer(nn.Module):
         volume_rotations,
         colors,
         opacities,
+        surface_gate_indices=None,
+        surface_gate_atlas=None,
         audit_fields=None,
     ):
         expected = surface_means3D.shape[0] + volume_means3D.shape[0]
@@ -477,6 +506,42 @@ class MixedGaussianRasterizer(nn.Module):
                 (0, self.raster_settings.image_height,
                  self.raster_settings.image_width)
             )
+        if surface_gate_indices is None:
+            surface_gate_indices = torch.full(
+                (surface_means3D.shape[0],),
+                -1,
+                dtype=torch.int32,
+                device=surface_means3D.device,
+            )
+        if surface_gate_atlas is None:
+            surface_gate_atlas = colors.new_empty((0, 0, 0))
+        if surface_gate_indices.shape != (surface_means3D.shape[0],):
+            raise ValueError(
+                "surface_gate_indices must contain one int per surfel"
+            )
+        surface_gate_indices = surface_gate_indices.to(
+            device=surface_means3D.device, dtype=torch.int32
+        )
+        if (
+            surface_gate_atlas.ndim != 3
+            or (
+                surface_gate_atlas.numel()
+                and surface_gate_atlas.shape[1]
+                != surface_gate_atlas.shape[2]
+            )
+        ):
+            raise ValueError("surface_gate_atlas must have shape (K, G, G)")
+        if surface_gate_atlas.device != surface_means3D.device:
+            raise ValueError("surface_gate_atlas must be on the render device")
+        if surface_gate_atlas.dtype != colors.dtype:
+            raise ValueError("surface_gate_atlas must match the render dtype")
+        if surface_gate_indices.numel():
+            minimum = int(surface_gate_indices.min())
+            maximum = int(surface_gate_indices.max())
+            if minimum < -1 or maximum >= surface_gate_atlas.shape[0]:
+                raise ValueError(
+                    "surface_gate_indices contains an invalid atlas row"
+                )
         return rasterize_mixed_gaussians(
             surface_means3D,
             surface_means2D,
@@ -488,6 +553,8 @@ class MixedGaussianRasterizer(nn.Module):
             volume_rotations,
             colors,
             opacities,
+            surface_gate_indices,
+            surface_gate_atlas,
             audit_fields,
             self.raster_settings,
         )

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
@@ -10,7 +11,10 @@ from outdoor.hybrid_gaussian_renderer import (
 from scripts.train_layered_foliage_v6 import (
     _adaptive_topology,
     _joint_replacement_match,
+    _optimizer,
+    _optimizer_with_migrated_state,
     _remap_candidate_values,
+    _restore_geometry_evidence,
 )
 
 
@@ -48,7 +52,17 @@ def test_metadata_survives_dynamic_clone_split_prune_and_restore():
     assert model.track_id[-1].item() == 21
 
     report = model.split(torch.tensor([0, 1]))
-    assert report == {"split_parents": 1, "children": 2}
+    assert report["split_parents"] == 1
+    assert report["children"] == 2
+    assert torch.equal(
+        report["_new_to_old"],
+        torch.tensor([1, 2, 3, 4, 0, 0]),
+    )
+    # Split children own their local posterior instead of being pulled back
+    # to their deleted parent's centre.
+    assert torch.allclose(
+        model.initialization_center[-2:], model.xyz[-2:]
+    )
     assert (model.layer_role == LAYER_STATIC_SKELETON).sum().item() == 1
 
     model.prune(model.layer_role == LAYER_DYNAMIC_LEAF)
@@ -120,3 +134,74 @@ def test_adaptive_split_reserves_dynamic_and_canonical_roles():
     report = _adaptive_topology(args, foliage, statistics)
     assert report["dynamic_split_parents"] == 4
     assert report["canonical_split_parents"] == 4
+
+
+def test_adam_history_is_migrated_across_volume_split():
+    model = VolumetricFoliageModel(0, device="cpu")
+    model.initialize_from_volume_state(_payload())
+    atlas = torch.nn.Parameter(torch.ones(2, 4, 4))
+    appearance = torch.nn.Linear(1, 1)
+    args = SimpleNamespace(
+        position_lr=1e-3,
+        feature_lr=1e-3,
+        opacity_lr=1e-3,
+        scale_lr=1e-3,
+        rotation_lr=1e-3,
+        dynamic_lr=1e-3,
+        gate_lr=1e-3,
+        appearance_lr=1e-3,
+    )
+    optimizer = _optimizer(args, model, atlas, appearance)
+    loss = sum(
+        parameter.square().sum()
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    )
+    loss.backward()
+    optimizer.step()
+    old_xyz_moment = optimizer.state[model.xyz]["exp_avg"].clone()
+    old_atlas_moment = optimizer.state[atlas]["exp_avg"].clone()
+
+    report = model.split(torch.tensor([0]))
+    migrated = _optimizer_with_migrated_state(
+        args,
+        model,
+        atlas,
+        appearance,
+        optimizer,
+        report["_new_to_old"],
+    )
+    assert torch.equal(
+        migrated.state[model.xyz]["exp_avg"],
+        old_xyz_moment[report["_new_to_old"]],
+    )
+    assert torch.equal(
+        migrated.state[atlas]["exp_avg"], old_atlas_moment
+    )
+
+
+def test_legacy_state_recovers_independent_ray_evidence_by_seed_center():
+    payload = _payload()
+    payload["ray_depth_nll"] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    payload["free_space_violation_count"] = torch.tensor(
+        [1, 2, 3, 4], dtype=torch.int16
+    )
+    payload["unknown_view_count"] = torch.tensor(
+        [4, 3, 2, 1], dtype=torch.int16
+    )
+    source = VolumetricFoliageModel(0, device="cpu")
+    source.initialize_from_volume_state(payload)
+    source.append_dynamic_leaves(torch.tensor([2]))
+    captured = source.capture()
+    for name in (
+        "ray_depth_nll",
+        "free_space_violation_count",
+        "unknown_view_count",
+    ):
+        captured.pop(name)
+    restored = VolumetricFoliageModel(0, device="cpu")
+    restored.restore(captured)
+    audit = _restore_geometry_evidence(restored, payload, captured)
+    assert audit["matched"] == 5
+    assert restored.ray_depth_nll[-1].item() == pytest.approx(0.3)
+    assert restored.free_space_violation_count[-1].item() == 3

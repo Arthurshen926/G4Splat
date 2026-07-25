@@ -133,7 +133,7 @@ RasterizeGaussiansCUDA(
   return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeMixedGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& surface_means3D,
@@ -144,6 +144,8 @@ RasterizeMixedGaussiansCUDA(
 	const torch::Tensor& volume_rotations,
 	const torch::Tensor& colors,
 	const torch::Tensor& opacities,
+	const torch::Tensor& surface_gate_indices,
+	const torch::Tensor& surface_gate_atlas,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -175,6 +177,16 @@ RasterizeMixedGaussiansCUDA(
 		AT_ERROR("colors must have shape (N_surface + N_volume, 3)");
 	if (opacities.numel() != primitive_count)
 		AT_ERROR("opacities must contain N_surface + N_volume values");
+	if (surface_gate_indices.numel() != surface_count)
+		AT_ERROR("surface_gate_indices must contain N_surface values");
+	const int gate_count =
+		surface_gate_atlas.numel() == 0 ? 0 : surface_gate_atlas.size(0);
+	const int gate_size =
+		surface_gate_atlas.numel() == 0 ? 0 : surface_gate_atlas.size(1);
+	if (surface_gate_atlas.numel() > 0 &&
+		(surface_gate_atlas.ndimension() != 3 ||
+		 surface_gate_atlas.size(2) != gate_size))
+		AT_ERROR("surface_gate_atlas must have shape (K, G, G)");
 	const int audit_field_count =
 		audit_fields.numel() == 0 ? 0 : audit_fields.size(0);
 	if (audit_field_count > 8)
@@ -194,6 +206,8 @@ RasterizeMixedGaussiansCUDA(
 	CHECK_INPUT(volume_rotations);
 	CHECK_INPUT(colors);
 	CHECK_INPUT(opacities);
+	CHECK_INPUT(surface_gate_indices);
+	CHECK_INPUT(surface_gate_atlas);
 	CHECK_INPUT(viewmatrix);
 	CHECK_INPUT(projmatrix);
 	CHECK_INPUT(audit_fields);
@@ -215,6 +229,12 @@ RasterizeMixedGaussiansCUDA(
 			{primitive_count, audit_field_count + 1},
 			float_opts)
 		: torch::empty({0, 0}, float_opts);
+	torch::Tensor gate_responsibility =
+		gate_count > 0 && audit_field_count > 0
+		? torch::zeros(
+			{gate_count, gate_size, gate_size, audit_field_count + 1},
+			float_opts)
+		: torch::empty({0, 0, 0, 0}, float_opts);
 	const torch::TensorOptions byte_options =
 		torch::TensorOptions().dtype(torch::kByte).device(colors.device());
 	torch::Tensor geomBuffer = torch::empty({0}, byte_options);
@@ -244,6 +264,10 @@ RasterizeMixedGaussiansCUDA(
 			volume_rotations.contiguous().data_ptr<float>(),
 			colors.contiguous().data_ptr<float>(),
 			opacities.contiguous().data_ptr<float>(),
+			surface_gate_indices.contiguous().data_ptr<int>(),
+			surface_gate_atlas.contiguous().data_ptr<float>(),
+			gate_count,
+			gate_size,
 			scale_modifier,
 			viewmatrix.contiguous().data_ptr<float>(),
 			projmatrix.contiguous().data_ptr<float>(),
@@ -253,6 +277,7 @@ RasterizeMixedGaussiansCUDA(
 			audit_fields.contiguous().data_ptr<float>(),
 			audit_field_count,
 			responsibility.contiguous().data_ptr<float>(),
+			gate_responsibility.contiguous().data_ptr<float>(),
 			out_color.contiguous().data_ptr<float>(),
 			out_others.contiguous().data_ptr<float>(),
 			radii.contiguous().data_ptr<int>(),
@@ -264,12 +289,14 @@ RasterizeMixedGaussiansCUDA(
 		out_others,
 		radii,
 		responsibility,
+		gate_responsibility,
 		geomBuffer,
 		binningBuffer,
 		imgBuffer);
 }
 
 std::tuple<
+	torch::Tensor,
 	torch::Tensor,
 	torch::Tensor,
 	torch::Tensor,
@@ -289,6 +316,8 @@ RasterizeMixedGaussiansBackwardCUDA(
 	const torch::Tensor& volume_rotations,
 	const torch::Tensor& colors,
 	const torch::Tensor& opacities,
+	const torch::Tensor& surface_gate_indices,
+	const torch::Tensor& surface_gate_atlas,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -312,6 +341,8 @@ RasterizeMixedGaussiansBackwardCUDA(
 	CHECK_INPUT(volume_rotations);
 	CHECK_INPUT(colors);
 	CHECK_INPUT(opacities);
+	CHECK_INPUT(surface_gate_indices);
+	CHECK_INPUT(surface_gate_atlas);
 	CHECK_INPUT(viewmatrix);
 	CHECK_INPUT(projmatrix);
 	CHECK_INPUT(radii);
@@ -340,6 +371,8 @@ RasterizeMixedGaussiansBackwardCUDA(
 		torch::zeros_like(opacities);
 	torch::Tensor dL_dcolors =
 		torch::zeros_like(colors);
+	torch::Tensor dL_dsurface_gate_atlas =
+		torch::zeros_like(surface_gate_atlas);
 	torch::Tensor dL_dsurface_means3D =
 		torch::zeros_like(surface_means3D);
 	torch::Tensor dL_dsurface_scales =
@@ -372,6 +405,11 @@ RasterizeMixedGaussiansBackwardCUDA(
 			volume_rotations.contiguous().data_ptr<float>(),
 			colors.contiguous().data_ptr<float>(),
 			opacities.contiguous().data_ptr<float>(),
+			surface_gate_indices.contiguous().data_ptr<int>(),
+			surface_gate_atlas.contiguous().data_ptr<float>(),
+			surface_gate_atlas.numel() == 0
+				? 0
+				: surface_gate_atlas.size(1),
 			scale_modifier,
 			viewmatrix.contiguous().data_ptr<float>(),
 			projmatrix.contiguous().data_ptr<float>(),
@@ -389,6 +427,7 @@ RasterizeMixedGaussiansBackwardCUDA(
 			dL_dvolume_conic.contiguous().data_ptr<float>(),
 			dL_ddepth.contiguous().data_ptr<float>(),
 			dL_dopacity.contiguous().data_ptr<float>(),
+			dL_dsurface_gate_atlas.contiguous().data_ptr<float>(),
 			dL_dcolors.contiguous().data_ptr<float>(),
 			dL_dsurface_means3D.contiguous().data_ptr<float>(),
 			dL_dsurface_scales.contiguous().data_ptr<float>(),
@@ -408,6 +447,7 @@ RasterizeMixedGaussiansBackwardCUDA(
 		dL_dvolume_rotations,
 		dL_dcolors,
 		dL_dopacity,
+		dL_dsurface_gate_atlas,
 		dL_dmean2D);
 }
 

@@ -91,8 +91,31 @@ def test_spatial_uncertainty_is_a_dense_field():
         device="cpu",
     )
     with torch.no_grad():
-        model.codes[0, 0] = 1.0
+        model.uncertainty_codes[0, 0] = 1.0
         model.spatial_uncertainty_basis[0, 0, 0, 0] = 2.0
     _, sigma = model._spatial_fields("seq1__frame00001", (12, 16))
     assert sigma.shape == (2, 12, 16)
     assert sigma[0].std().item() > 0
+
+
+def test_legacy_shared_code_checkpoint_migrates_to_split_latents():
+    model = OutdoorAppearanceUncertainty(
+        ["seq1__frame00001"], rank=2, device="cpu"
+    )
+    legacy = model.capture()
+    legacy["version"] = (
+        "outdoor_spatial_sequence_appearance_uncertainty_v2"
+    )
+    for key in (
+        "foliage_codes",
+        "sky_codes",
+        "uncertainty_codes",
+    ):
+        legacy["state_dict"].pop(key)
+    restored = OutdoorAppearanceUncertainty(
+        ["seq1__frame00001"], rank=2, device="cpu"
+    )
+    restored.restore(legacy)
+    assert torch.equal(restored.foliage_codes, restored.codes)
+    assert torch.equal(restored.sky_codes, restored.codes)
+    assert torch.equal(restored.uncertainty_codes, restored.codes)

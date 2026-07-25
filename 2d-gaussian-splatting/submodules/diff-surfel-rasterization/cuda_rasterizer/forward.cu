@@ -802,6 +802,10 @@ mixedRenderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ opacities,
+	const int* __restrict__ surface_gate_indices,
+	const float* __restrict__ surface_gate_atlas,
+	int gate_count,
+	int gate_size,
 	const float* __restrict__ surface_transMats,
 	const float3* __restrict__ surface_normals,
 	const float4* __restrict__ volume_conic,
@@ -809,6 +813,7 @@ mixedRenderCUDA(
 	const float* __restrict__ audit_fields,
 	int audit_field_count,
 	float* __restrict__ primitive_responsibility,
+	float* __restrict__ gate_responsibility,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -916,6 +921,7 @@ mixedRenderCUDA(
 			const float4 shape = collected_shape[j];
 			float power;
 			float depth;
+			float2 surface_uv = {0.0f, 0.0f};
 			if (id < surface_count)
 			{
 				const float3 Tu = collected_Tu[j];
@@ -926,14 +932,17 @@ mixedRenderCUDA(
 				const float3 p = cross(k, l);
 				if (p.z == 0.0f)
 					continue;
-				const float2 s = {p.x / p.z, p.y / p.z};
-				const float rho3d = s.x * s.x + s.y * s.y;
+				surface_uv = {p.x / p.z, p.y / p.z};
+				const float rho3d =
+					surface_uv.x * surface_uv.x
+					+ surface_uv.y * surface_uv.y;
 				const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 				const float rho2d =
 					FilterInvSquare * (d.x * d.x + d.y * d.y);
 				const float rho = min(rho3d, rho2d);
 				depth = rho3d <= rho2d
-					? s.x * Tw.x + s.y * Tw.y + Tw.z
+					? surface_uv.x * Tw.x
+						+ surface_uv.y * Tw.y + Tw.z
 					: Tw.z;
 				power = -0.5f * rho;
 			}
@@ -947,7 +956,58 @@ mixedRenderCUDA(
 			}
 			if (depth < near_n || power > 0.0f)
 				continue;
-			const float alpha = min(0.99f, shape.w * exp(power));
+			int gate_index = -1;
+			int gx0 = 0;
+			int gy0 = 0;
+			int gx1 = 0;
+			int gy1 = 0;
+			float gate_w00 = 1.0f;
+			float gate_w10 = 0.0f;
+			float gate_w01 = 0.0f;
+			float gate_w11 = 0.0f;
+			float gate_value = 1.0f;
+			if (id < surface_count && gate_count > 0 && gate_size > 0)
+			{
+				gate_index = surface_gate_indices[id];
+				if (gate_index >= 0 && gate_index < gate_count)
+				{
+					const float atlas_x = min(
+						float(gate_size - 1),
+						max(
+							0.0f,
+							(surface_uv.x / 3.0f + 1.0f)
+								* 0.5f * float(gate_size - 1)));
+					const float atlas_y = min(
+						float(gate_size - 1),
+						max(
+							0.0f,
+							(surface_uv.y / 3.0f + 1.0f)
+								* 0.5f * float(gate_size - 1)));
+					gx0 = int(floorf(atlas_x));
+					gy0 = int(floorf(atlas_y));
+					gx1 = min(gx0 + 1, gate_size - 1);
+					gy1 = min(gy0 + 1, gate_size - 1);
+					const float tx = atlas_x - float(gx0);
+					const float ty = atlas_y - float(gy0);
+					gate_w00 = (1.0f - tx) * (1.0f - ty);
+					gate_w10 = tx * (1.0f - ty);
+					gate_w01 = (1.0f - tx) * ty;
+					gate_w11 = tx * ty;
+					const int base = gate_index * gate_size * gate_size;
+					gate_value =
+						gate_w00 * surface_gate_atlas[
+							base + gy0 * gate_size + gx0]
+						+ gate_w10 * surface_gate_atlas[
+							base + gy0 * gate_size + gx1]
+						+ gate_w01 * surface_gate_atlas[
+							base + gy1 * gate_size + gx0]
+						+ gate_w11 * surface_gate_atlas[
+							base + gy1 * gate_size + gx1];
+					gate_value = min(1.0f, max(0.0f, gate_value));
+				}
+			}
+			const float alpha = min(
+				0.99f, shape.w * exp(power) * gate_value);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			const float test_T = T * (1.0f - alpha);
@@ -979,6 +1039,41 @@ mixedRenderCUDA(
 						&primitive_responsibility[
 							id * stride + field + 1],
 						w * audit_fields[field * H * W + pix_id]);
+				}
+				if (gate_index >= 0)
+				{
+					const int gate_stride = audit_field_count + 1;
+					const int texels = gate_size * gate_size;
+					const int texel_indices[4] = {
+						gy0 * gate_size + gx0,
+						gy0 * gate_size + gx1,
+						gy1 * gate_size + gx0,
+						gy1 * gate_size + gx1
+					};
+					const float texel_weights[4] = {
+						gate_w00, gate_w10, gate_w01, gate_w11
+					};
+					for (int corner = 0; corner < 4; ++corner)
+					{
+						const int gate_offset =
+							(gate_index * texels + texel_indices[corner])
+							* gate_stride;
+						atomicAdd(
+							&gate_responsibility[gate_offset],
+							w * texel_weights[corner]);
+						for (
+							int field = 0;
+							field < audit_field_count;
+							++field)
+						{
+							atomicAdd(
+								&gate_responsibility[
+									gate_offset + field + 1],
+								w * texel_weights[corner]
+									* audit_fields[
+										field * H * W + pix_id]);
+						}
+					}
 				}
 			}
 			const float A = 1.0f - T;
@@ -1130,6 +1225,10 @@ void FORWARD::mixed_render(
 	const float2* means2D,
 	const float* colors,
 	const float* opacities,
+	const int* surface_gate_indices,
+	const float* surface_gate_atlas,
+	int gate_count,
+	int gate_size,
 	const float* surface_transMats,
 	const float3* surface_normals,
 	const float4* volume_conic,
@@ -1137,6 +1236,7 @@ void FORWARD::mixed_render(
 	const float* audit_fields,
 	int audit_field_count,
 	float* primitive_responsibility,
+	float* gate_responsibility,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -1152,6 +1252,10 @@ void FORWARD::mixed_render(
 		means2D,
 		colors,
 		opacities,
+		surface_gate_indices,
+		surface_gate_atlas,
+		gate_count,
+		gate_size,
 		surface_transMats,
 		surface_normals,
 		volume_conic,
@@ -1159,6 +1263,7 @@ void FORWARD::mixed_render(
 		audit_fields,
 		audit_field_count,
 		primitive_responsibility,
+		gate_responsibility,
 		final_T,
 		n_contrib,
 		bg_color,

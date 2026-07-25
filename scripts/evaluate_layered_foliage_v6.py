@@ -36,7 +36,11 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
 )
 from outdoor.task_fields import OutdoorTaskFieldLookup  # noqa: E402
 from scene import GaussianModel, Scene  # noqa: E402
-from scripts.train_layered_foliage_v6 import _gate_vector, _load  # noqa: E402
+from scripts.train_layered_foliage_v6 import (  # noqa: E402
+    _gate_vector,
+    _load,
+    _surface_atlas_indices,
+)
 from utils.loss_utils import ssim  # noqa: E402
 
 
@@ -143,7 +147,7 @@ def main():
         ),
         device="cuda",
     )
-    appearance.load_state_dict(appearance_capture["state_dict"])
+    appearance.restore(appearance_capture)
     sky = CanonicalDirectionalSky.load(args.sky_model.resolve(), device="cuda")
     color = load_per_image_affine_color_correction(
         args.color_correction.resolve(), device="cuda"
@@ -158,11 +162,23 @@ def main():
     empty = VolumetricFoliageModel(
         dataset.sh_degree, dynamic_rank=rank
     ).cuda()
-    final_gate = _gate_vector(
-        structural,
-        state["legacy_candidate_indices"].cuda().long(),
-        state["legacy_candidate_gates"].cuda(),
-    )
+    candidates = state["legacy_candidate_indices"].cuda().long()
+    if "surfel_uv_gate_atlas" in state:
+        final_gate = torch.ones_like(
+            structural.get_opacity.reshape(-1)
+        )
+        surface_atlas_indices = _surface_atlas_indices(
+            structural, candidates
+        )
+        surface_gate_atlas = state["surfel_uv_gate_atlas"].cuda()
+    else:
+        final_gate = _gate_vector(
+            structural,
+            candidates,
+            state["legacy_candidate_gates"].cuda(),
+        )
+        surface_atlas_indices = None
+        surface_gate_atlas = None
     rows = []
     for index in tqdm(
         range(0, len(views), max(1, args.stride)),
@@ -177,13 +193,26 @@ def main():
         task["image_name"] = str(view.image_name)
         target = view.original_image.cuda()
 
-        def rendered(model, gate, include_dynamic, code=None):
+        def rendered(
+            model,
+            gate,
+            include_dynamic,
+            code=None,
+            *,
+            use_uv_gate=False,
+        ):
             package = render_hybrid(
                 view,
                 structural,
                 model,
                 background=background,
                 surface_gate=gate,
+                surface_gate_indices=(
+                    surface_atlas_indices if use_uv_gate else None
+                ),
+                surface_gate_atlas=(
+                    surface_gate_atlas if use_uv_gate else None
+                ),
                 temporal_code=code,
                 include_dynamic=include_dynamic,
             )
@@ -200,12 +229,15 @@ def main():
             torch.ones_like(structural.get_opacity.reshape(-1)),
             False,
         )
-        canonical = rendered(foliage, final_gate, False)
+        canonical = rendered(
+            foliage, final_gate, False, use_uv_gate=True
+        )
         conditioned_base = rendered(
             foliage,
             final_gate,
             True,
             appearance.temporal_code(view.image_name),
+            use_uv_gate=True,
         )
         conditioned = appearance(
             conditioned_base, view, task

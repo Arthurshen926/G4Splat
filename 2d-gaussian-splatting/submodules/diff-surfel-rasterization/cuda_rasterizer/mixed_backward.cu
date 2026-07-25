@@ -28,6 +28,9 @@ mixedRenderBackwardCUDA(
 	const float2* __restrict__ points_xy,
 	const float* __restrict__ colors,
 	const float* __restrict__ opacities,
+	const int* __restrict__ surface_gate_indices,
+	const float* __restrict__ surface_gate_atlas,
+	int gate_size,
 	const float* __restrict__ surface_transMats,
 	const float3* __restrict__ surface_normals,
 	const float4* __restrict__ volume_conic,
@@ -42,6 +45,7 @@ mixedRenderBackwardCUDA(
 	float4* __restrict__ dL_dvolume_conic,
 	float* __restrict__ dL_ddepth,
 	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dsurface_gate_atlas,
 	float* __restrict__ dL_dcolors)
 {
 	auto block = cg::this_thread_block();
@@ -243,7 +247,58 @@ mixedRenderBackwardCUDA(
 			if (depth < near_n || power > 0.0f)
 				continue;
 			const float G = exp(power);
-			const float alpha = min(0.99f, shape.w * G);
+			int gate_index = -1;
+			int gx0 = 0;
+			int gy0 = 0;
+			int gx1 = 0;
+			int gy1 = 0;
+			float gate_w00 = 1.0f;
+			float gate_w10 = 0.0f;
+			float gate_w01 = 0.0f;
+			float gate_w11 = 0.0f;
+			float gate_value = 1.0f;
+			if (is_surface && gate_size > 0)
+			{
+				gate_index = surface_gate_indices[id];
+				if (gate_index >= 0)
+				{
+					const float atlas_x = min(
+						float(gate_size - 1),
+						max(
+							0.0f,
+							(s.x / 3.0f + 1.0f)
+								* 0.5f * float(gate_size - 1)));
+					const float atlas_y = min(
+						float(gate_size - 1),
+						max(
+							0.0f,
+							(s.y / 3.0f + 1.0f)
+								* 0.5f * float(gate_size - 1)));
+					gx0 = int(floorf(atlas_x));
+					gy0 = int(floorf(atlas_y));
+					gx1 = min(gx0 + 1, gate_size - 1);
+					gy1 = min(gy0 + 1, gate_size - 1);
+					const float tx = atlas_x - float(gx0);
+					const float ty = atlas_y - float(gy0);
+					gate_w00 = (1.0f - tx) * (1.0f - ty);
+					gate_w10 = tx * (1.0f - ty);
+					gate_w01 = (1.0f - tx) * ty;
+					gate_w11 = tx * ty;
+					const int base = gate_index * gate_size * gate_size;
+					gate_value =
+						gate_w00 * surface_gate_atlas[
+							base + gy0 * gate_size + gx0]
+						+ gate_w10 * surface_gate_atlas[
+							base + gy0 * gate_size + gx1]
+						+ gate_w01 * surface_gate_atlas[
+							base + gy1 * gate_size + gx0]
+						+ gate_w11 * surface_gate_atlas[
+							base + gy1 * gate_size + gx1];
+					gate_value = min(1.0f, max(0.0f, gate_value));
+				}
+			}
+			const float alpha = min(
+				0.99f, shape.w * G * gate_value);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
@@ -361,7 +416,7 @@ mixedRenderBackwardCUDA(
 				bg_dot_dpixel += background[ch] * dL_dpixel[ch];
 			dL_dalpha +=
 				(-T_final / (1.0f - alpha)) * bg_dot_dpixel;
-			const float dL_dG = shape.w * dL_dalpha;
+			const float dL_dG = shape.w * gate_value * dL_dalpha;
 			dL_dz += w * dL_drendered_depth;
 
 			if (is_surface)
@@ -449,7 +504,29 @@ mixedRenderBackwardCUDA(
 					-0.5f * gdy * d.y * dL_dG);
 				atomicAdd(&dL_ddepth[id], dL_dz);
 			}
-			atomicAdd(&dL_dopacity[id], G * dL_dalpha);
+			atomicAdd(
+				&dL_dopacity[id], G * gate_value * dL_dalpha);
+			if (gate_index >= 0)
+			{
+				const int base = gate_index * gate_size * gate_size;
+				const float dL_dgate = shape.w * G * dL_dalpha;
+				atomicAdd(
+					&dL_dsurface_gate_atlas[
+						base + gy0 * gate_size + gx0],
+					gate_w00 * dL_dgate);
+				atomicAdd(
+					&dL_dsurface_gate_atlas[
+						base + gy0 * gate_size + gx1],
+					gate_w10 * dL_dgate);
+				atomicAdd(
+					&dL_dsurface_gate_atlas[
+						base + gy1 * gate_size + gx0],
+					gate_w01 * dL_dgate);
+				atomicAdd(
+					&dL_dsurface_gate_atlas[
+						base + gy1 * gate_size + gx1],
+					gate_w11 * dL_dgate);
+			}
 		}
 	}
 }
@@ -466,6 +543,9 @@ void MIXED_BACKWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float* opacities,
+	const int* surface_gate_indices,
+	const float* surface_gate_atlas,
+	int gate_size,
 	const float* surface_transMats,
 	const float3* surface_normals,
 	const float4* volume_conic,
@@ -480,6 +560,7 @@ void MIXED_BACKWARD::render(
 	float4* dL_dvolume_conic,
 	float* dL_ddepth,
 	float* dL_dopacity,
+	float* dL_dsurface_gate_atlas,
 	float* dL_dcolors)
 {
 	mixedRenderBackwardCUDA<NUM_CHANNELS><<<grid, block>>>(
@@ -492,6 +573,9 @@ void MIXED_BACKWARD::render(
 		means2D,
 		colors,
 		opacities,
+		surface_gate_indices,
+		surface_gate_atlas,
+		gate_size,
 		surface_transMats,
 		surface_normals,
 		volume_conic,
@@ -506,6 +590,7 @@ void MIXED_BACKWARD::render(
 		dL_dvolume_conic,
 		dL_ddepth,
 		dL_dopacity,
+		dL_dsurface_gate_atlas,
 		dL_dcolors);
 }
 

@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-"""Build independent canopy 3DGS seeds from SfM tracks and tree silhouettes."""
+"""LEGACY: build the pre-v6 silhouette-only canopy volume.
+
+Use ``build_layered_foliage_geometry.py`` for instance-aware rigid occlusion,
+ray/depth posterior, and free-space evidence.  This entry point now requires
+an explicit acknowledgement so it cannot silently create incompatible seeds.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +40,11 @@ def _digest(path):
 
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--i-understand-this-is-legacy",
+        action="store_true",
+        help="Acknowledge that this omits v6 occlusion/ray-depth evidence.",
+    )
     parser.add_argument("--source-path", type=Path, required=True)
     parser.add_argument("--tree-mask-pickle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -54,7 +64,13 @@ def _parse_args():
     parser.add_argument("--minimum-camera-distance", type=float, default=0.75)
     parser.add_argument("--maximum-projected-radius", type=float, default=128.0)
     parser.add_argument("--seed", type=int, default=37)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.i_understand_this_is_legacy:
+        parser.error(
+            "legacy builder disabled by default; use "
+            "scripts/build_layered_foliage_geometry.py"
+        )
+    return args
 
 
 def main():

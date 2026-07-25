@@ -37,7 +37,7 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool debug);
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeMixedGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& surface_means3D,
@@ -48,6 +48,8 @@ RasterizeMixedGaussiansCUDA(
 	const torch::Tensor& volume_rotations,
 	const torch::Tensor& colors,
 	const torch::Tensor& opacities,
+	const torch::Tensor& surface_gate_indices,
+	const torch::Tensor& surface_gate_atlas,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -68,6 +70,7 @@ std::tuple<
 	torch::Tensor,
 	torch::Tensor,
 	torch::Tensor,
+	torch::Tensor,
 	torch::Tensor>
 RasterizeMixedGaussiansBackwardCUDA(
 	const torch::Tensor& background,
@@ -79,6 +82,8 @@ RasterizeMixedGaussiansBackwardCUDA(
 	const torch::Tensor& volume_rotations,
 	const torch::Tensor& colors,
 	const torch::Tensor& opacities,
+	const torch::Tensor& surface_gate_indices,
+	const torch::Tensor& surface_gate_atlas,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
