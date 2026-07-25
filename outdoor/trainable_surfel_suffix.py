@@ -125,6 +125,40 @@ class TrainableSurfelSuffix:
             },
         ]
 
+    def capture(self) -> dict[str, torch.Tensor | int]:
+        return {
+            "start": self.start,
+            "xyz": self._xyz.detach(),
+            "features_dc": self._features_dc.detach(),
+            "features_rest": self._features_rest.detach(),
+            "opacity": self._opacity.detach(),
+            "scaling": self._scaling.detach(),
+            "rotation": self._rotation.detach(),
+            "initial_xyz": self.initial_xyz.detach(),
+            "initial_scaling": self.initial_scaling.detach(),
+        }
+
+    @torch.no_grad()
+    def restore(self, payload: dict[str, torch.Tensor | int]) -> None:
+        if int(payload["start"]) != self.start:
+            raise RuntimeError("Residual suffix checkpoint start mismatch")
+        for name, parameter in (
+            ("xyz", self._xyz),
+            ("features_dc", self._features_dc),
+            ("features_rest", self._features_rest),
+            ("opacity", self._opacity),
+            ("scaling", self._scaling),
+            ("rotation", self._rotation),
+        ):
+            value = payload[name].to(parameter)
+            if value.shape != parameter.shape:
+                raise RuntimeError(
+                    f"Residual suffix checkpoint {name} shape mismatch"
+                )
+            parameter.copy_(value)
+        self.initial_xyz = payload["initial_xyz"].to(self._xyz)
+        self.initial_scaling = payload["initial_scaling"].to(self._scaling)
+
     @torch.no_grad()
     def project(
         self,

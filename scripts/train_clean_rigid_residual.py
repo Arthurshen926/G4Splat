@@ -70,6 +70,8 @@ def _parse_args():
     parser.add_argument("--maximum-scale", type=float, default=0.08)
     parser.add_argument("--maximum-position-delta", type=float, default=0.08)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     dataset = model.extract(args)
     pipe = pipeline.extract(args)
@@ -85,6 +87,19 @@ def _parse_args():
     # Python covariance helper. Native CUDA covariance remains exact.
     pipe.compute_cov3D_python = False
     return args, dataset, pipe
+
+
+def _load(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def _digest(path: Path) -> str:
@@ -186,7 +201,12 @@ def _evaluate(
 def main():
     args, dataset, pipe = _parse_args()
     output = Path(dataset.model_path).resolve()
-    if output.exists() and any(output.iterdir()):
+    resume_payload = _load(args.resume.resolve()) if args.resume else None
+    if (
+        output.exists()
+        and any(output.iterdir())
+        and resume_payload is None
+    ):
         raise FileExistsError(f"Refusing non-empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
     initial_ply = args.initial_ply.resolve()
@@ -203,6 +223,10 @@ def main():
     if args.base_count >= len(structural.get_xyz):
         raise RuntimeError("The initial PLY contains no trainable suffix")
     residual = TrainableSurfelSuffix(structural, args.base_count)
+    if resume_payload is not None:
+        if resume_payload.get("protocol") != PROTOCOL:
+            raise RuntimeError("Clean rigid residual checkpoint protocol mismatch")
+        residual.restore(resume_payload["residual"])
     views = scene.getTrainCameras()
     sky = CanonicalDirectionalSky.load(args.sky_model.resolve(), device="cuda")
     color = load_per_image_affine_color_correction(
@@ -222,15 +246,19 @@ def main():
     ]
     if any(index < 0 or index >= len(views) for index in eval_indices):
         raise IndexError("An evaluation index is outside the training cameras")
-    before = _evaluate(
-        views,
-        eval_indices,
-        residual,
-        pipe,
-        sky,
-        color,
-        fields,
-        output / "visualization" / "before",
+    before = (
+        resume_payload["before"]
+        if resume_payload is not None
+        else _evaluate(
+            views,
+            eval_indices,
+            residual,
+            pipe,
+            sky,
+            color,
+            fields,
+            output / "visualization" / "before",
+        )
     )
 
     optimizer = torch.optim.Adam(
@@ -243,6 +271,12 @@ def main():
         ),
         eps=1e-15,
     )
+    start_step = 0
+    if resume_payload is not None:
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        start_step = int(resume_payload["iteration"])
+        if start_step < 0 or start_step > args.iterations:
+            raise RuntimeError("Invalid clean residual checkpoint iteration")
     rng = np.random.default_rng(args.seed + 1)
     schedule = []
     while len(schedule) < args.iterations:
@@ -251,8 +285,15 @@ def main():
     trace = output / "training_trace.jsonl"
     background = torch.ones(3, device="cuda")
     started = time.time()
-    progress = tqdm(schedule, desc="clean rigid residual")
-    for step, camera_index in enumerate(progress, start=1):
+    progress = tqdm(
+        schedule[start_step:],
+        initial=start_step,
+        total=args.iterations,
+        desc="clean rigid residual",
+    )
+    for step, camera_index in enumerate(
+        progress, start=start_step + 1
+    ):
         view = views[camera_index]
         task = fields.fields(
             view.image_name,
@@ -308,6 +349,20 @@ def main():
             progress.set_postfix(
                 loss=f"{row['loss']:.4f}",
                 opacity=f"{row['opacity_mean']:.3f}",
+            )
+        if (
+            args.checkpoint_every > 0
+            and step % args.checkpoint_every == 0
+        ):
+            _save_checkpoint(
+                output / "training_checkpoint.pth",
+                {
+                    "protocol": PROTOCOL,
+                    "iteration": step,
+                    "before": before,
+                    "residual": residual.capture(),
+                    "optimizer": optimizer.state_dict(),
+                },
             )
 
     residual.write_back()

@@ -76,3 +76,13 @@ def test_projection_bounds_suffix():
         <= 0.100001
     )
     assert torch.count_nonzero(adapter._features_rest) == 0
+
+
+def test_capture_restore_round_trip():
+    first = TrainableSurfelSuffix(_Structural(), 3)
+    first._xyz.data.add_(1)
+    payload = first.capture()
+    second = TrainableSurfelSuffix(_Structural(), 3)
+    second.restore(payload)
+    assert torch.equal(first._xyz, second._xyz)
+    assert torch.equal(first.initial_xyz, second.initial_xyz)
