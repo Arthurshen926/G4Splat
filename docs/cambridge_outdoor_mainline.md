@@ -64,3 +64,27 @@ structural-support threshold.
 The prior `18.756 / .830 / .0821` number is retained as a train-fit diagnostic
 baseline only.  The mainline writes a separate held-out trajectory result, so
 it cannot be conflated with in-sample reconstruction quality.
+
+## Clean hybrid ownership migration
+
+The final outdoor path does not have to retain a canopy-contaminated 2DGS
+parent.  Its migration stages are:
+
+1. expand the responsibility audit with `--uv-local-ownership`, so mixed
+   giant surfels are admitted while rigid safety is enforced per intrinsic UV
+   texel;
+2. train local replacement and bake the learned UV ownership with
+   `scripts/bake_surfel_uv_structure.py --mode rigid-clean`;
+3. initialize only uncovered rigid background with
+   `scripts/seed_rigid_chart_residual.py`;
+4. refine that appended suffix with
+   `scripts/train_clean_rigid_residual.py`, which keeps the baked prefix
+   immutable and allocates Adam state only for the new Chart/SfM surfels;
+5. combine the clean 2D surfels with the static-skeleton, canonical-crown and
+   dynamic-leaf 3D branches in the native jointly sorted mixed renderer.
+
+`render_hybrid(..., structural_trainable_start=N)` also exposes mixed-kernel
+gradients to an appended structural suffix while preserving the default
+fully-frozen structural contract.  The CUDA backward already computes
+surface position, scale, rotation, color and opacity gradients; this option
+removes only the Python-side stop-gradient for rows `N:`.

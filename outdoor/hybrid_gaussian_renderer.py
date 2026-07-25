@@ -621,8 +621,14 @@ def render_hybrid(
     include_dynamic: bool = False,
     volume_means_override: torch.Tensor | None = None,
     volume_opacity_scale: float | torch.Tensor = 1.0,
+    structural_trainable_start: int | None = None,
 ) -> HybridRenderOutput:
-    """Rasterise exact 2D surfels and 3D volumes with native mixed CUDA."""
+    """Rasterise exact 2D surfels and 3D volumes with native mixed CUDA.
+
+    The structural branch is immutable by default.  ``structural_trainable_start``
+    keeps that contract for the prefix while allowing an appended residual
+    suffix to receive the mixed-kernel gradients.
+    """
     del structural_thickness_ratio, radius_clip
     from diff_surfel_rasterization import (
         GaussianRasterizationSettings,
@@ -636,10 +642,26 @@ def render_hybrid(
         structural_tangent = structural_tangent.clamp_max(
             float(structural_scale_ceiling)
         )
-    surface_means = structural.get_xyz.detach()
-    surface_scales = structural_tangent.detach()
-    surface_rotations = structural.get_rotation.detach()
-    surface_base_opacity = structural.get_opacity.detach().reshape(-1)
+    def trainable_suffix(value: torch.Tensor) -> torch.Tensor:
+        if structural_trainable_start is None:
+            return value.detach()
+        start = int(structural_trainable_start)
+        if start < 0 or start > structural_count:
+            raise ValueError(
+                "structural_trainable_start must be within the structural model"
+            )
+        if start == 0:
+            return value
+        if start == structural_count:
+            return value.detach()
+        return torch.cat([value[:start].detach(), value[start:]], dim=0)
+
+    surface_means = trainable_suffix(structural.get_xyz)
+    surface_scales = trainable_suffix(structural_tangent)
+    surface_rotations = trainable_suffix(structural.get_rotation)
+    surface_base_opacity = trainable_suffix(
+        structural.get_opacity
+    ).reshape(-1)
     if surface_gate is None:
         surface_gate = torch.ones_like(surface_base_opacity)
     if surface_gate.shape != surface_base_opacity.shape:
@@ -705,9 +727,9 @@ def render_hybrid(
     degree = min(int(structural.active_sh_degree), int(foliage.sh_degree))
     surface_colors = sh_colors(
         surface_means,
-        structural.get_features.detach(),
+        trainable_suffix(structural.get_features),
         degree,
-    ).detach()
+    )
     volume_colors = sh_colors(volume_means, volume_features, degree)
     colors = torch.cat([surface_colors, volume_colors], dim=0)
     opacities = torch.cat(
@@ -716,7 +738,11 @@ def render_hybrid(
     ).reshape(-1, 1)
 
     surface_means2D = torch.zeros_like(
-        surface_means, requires_grad=surface_gate.requires_grad
+        surface_means,
+        requires_grad=(
+            surface_gate.requires_grad
+            or structural_trainable_start is not None
+        ),
     )
     volume_means2D = torch.zeros_like(volume_means, requires_grad=True)
     try:
