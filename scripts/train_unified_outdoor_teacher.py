@@ -50,7 +50,7 @@ from scene import GaussianModel  # noqa: E402
 from utils.loss_utils import ssim  # noqa: E402
 
 
-PROTOCOL = "unified_outdoor_mixed_teacher_v1"
+PROTOCOL = "cambridge_native_hybrid_teacher_v2"
 # Exact hashes of the checkpoint implementation that preceded the
 # I/O/allocator-only fast path.  This narrow allow-list lets the active formal
 # run resume without weakening the normal implementation/CUDA provenance
@@ -81,6 +81,30 @@ TRAINING_PROFILES = {
     # passes over the 1,487 Cambridge training cameras.
     "fast": {
         "iterations": 30_000,
+        "phases": (
+            ("canonical_bootstrap", 0.08),
+            ("topology", 0.40),
+            ("dynamic_appearance", 0.73),
+            ("ownership_cleanup", 0.90),
+            ("canonical_polish", 1.00),
+        ),
+        "dynamic_start": 0.08,
+    },
+    # Teacher-final schedules used by the no-student mainline.  Legacy names
+    # above remain stable so earlier checkpoints/tests keep their semantics.
+    "hybrid_quality": {
+        "iterations": 50_000,
+        "phases": (
+            ("canonical_bootstrap", 0.05),
+            ("topology", 0.50),
+            ("dynamic_appearance", 0.82),
+            ("ownership_cleanup", 0.93),
+            ("canonical_polish", 1.00),
+        ),
+        "dynamic_start": 0.05,
+    },
+    "hybrid_fast": {
+        "iterations": 18_000,
         "phases": (
             ("canonical_bootstrap", 0.08),
             ("topology", 0.40),
@@ -132,6 +156,7 @@ def _parse_args():
     parser.add_argument("--normal-weight", type=float, default=0.025)
     parser.add_argument("--ordinal-weight", type=float, default=0.015)
     parser.add_argument("--track-weight", type=float, default=0.01)
+    parser.add_argument("--structure-weight", type=float, default=0.01)
     parser.add_argument("--ownership-weight", type=float, default=0.08)
     parser.add_argument("--occupancy-weight", type=float, default=0.06)
     parser.add_argument("--dynamic-weight", type=float, default=0.65)
@@ -643,12 +668,21 @@ def _adapt_volume(args, foliage, stats):
         working_stats["rigid"]
         / working_stats["contribution"].clamp_min(1e-8)
     )
-    eligible = (
+    common_eligible = (
         ~foliage.static_skeleton_mask
-        & (foliage.support_sequence_count >= 2)
         & (working_stats["radius"] >= args.volume_split_radius)
         & (working_stats["contribution"] > 0)
         & (rigid < 0.15)
+    )
+    canonical_eligible = (
+        common_eligible
+        & foliage.canonical_crown_mask
+        & (foliage.support_sequence_count >= 2)
+    )
+    dynamic_eligible = (
+        common_eligible
+        & foliage.dynamic_leaf_mask
+        & (foliage.support_view_count >= 2)
     )
     capacity = min(
         args.maximum_volume_splits,
@@ -657,12 +691,49 @@ def _adapt_volume(args, foliage, stats):
     split_parents = 0
     children = 0
     final_to_kept = torch.arange(count, device=foliage.xyz.device)
-    if bool(eligible.any()) and capacity > 0:
-        indices = torch.nonzero(eligible, as_tuple=False).flatten()
-        score = gradient[indices] * residual[indices]
-        selected = indices[
-            torch.topk(score, min(capacity, len(indices))).indices
-        ]
+    role_split_counts = {"canonical_crown": 0, "dynamic_leaf": 0}
+    if bool((canonical_eligible | dynamic_eligible).any()) and capacity > 0:
+        selected_parts = []
+        for name, mask, fraction in (
+            ("canonical_crown", canonical_eligible, 0.60),
+            ("dynamic_leaf", dynamic_eligible, 0.40),
+        ):
+            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            quota = min(
+                len(indices),
+                max(1, int(round(capacity * fraction)))
+                if len(indices)
+                else 0,
+            )
+            if quota:
+                score = gradient[indices] * residual[indices]
+                chosen = indices[torch.topk(score, quota).indices]
+                selected_parts.append(chosen)
+                role_split_counts[name] = int(len(chosen))
+        selected = (
+            torch.cat(selected_parts)
+            if selected_parts
+            else torch.empty(0, dtype=torch.long, device=foliage.xyz.device)
+        )
+        if len(selected) < capacity:
+            all_eligible = torch.nonzero(
+                canonical_eligible | dynamic_eligible,
+                as_tuple=False,
+            ).flatten()
+            remaining_mask = ~torch.isin(all_eligible, selected)
+            remaining = all_eligible[remaining_mask]
+            extra_count = min(capacity - len(selected), len(remaining))
+            if extra_count:
+                score = gradient[remaining] * residual[remaining]
+                selected = torch.cat(
+                    [
+                        selected,
+                        remaining[torch.topk(score, extra_count).indices],
+                    ]
+                )
+        if len(selected) > capacity:
+            score = gradient[selected] * residual[selected]
+            selected = selected[torch.topk(score, capacity).indices]
         split_event = foliage.split(selected)
         split_parents = int(split_event["split_parents"])
         children = int(split_event["children"])
@@ -675,6 +746,7 @@ def _adapt_volume(args, foliage, stats):
         "split_parents": split_parents,
         "children": children,
         "pruned": pruned,
+        "role_split_parents": role_split_counts,
         "_new_to_old": final_to_old if mutated else None,
     }
 
@@ -1146,6 +1218,14 @@ def main():
     args, dataset, opt, _pipe = _parse_args()
     output = Path(dataset.model_path).resolve()
     evidence_store = load_evidence_store(args.evidence_store)
+    if evidence_store.get("geometry_source") != "mast3r_only":
+        raise RuntimeError(
+            "Native hybrid Teacher v2 requires geometry_source=mast3r_only"
+        )
+    if evidence_store.get("final_model") != "hybrid_teacher":
+        raise RuntimeError(
+            "Native hybrid Teacher v2 must be the authoritative final model"
+        )
     initialization = json.loads(
         (args.initialization / "initialization_manifest.json").read_text(
             encoding="utf-8"
@@ -1583,26 +1663,37 @@ def main():
         negative = (
             task["p_rigid"] + 0.35 * task["p_sky"]
         ).clamp(0, 1) * (1.0 - task["p_boundary_uncertain"])
-        # A semantic tree mask is not a solid-occupancy observation. It gives
-        # only a weak silhouette prior toward partial transmittance; the hard
-        # signal is free-space contradiction outside the crown.
-        silhouette_weight = (
-            task["w_topology"]
-            * (1.0 - task["p_boundary_uncertain"])
-        )
-        silhouette = (
-            F.binary_cross_entropy(
-                alpha,
-                torch.full_like(alpha, 0.35),
-                reduction="none",
-            )
-            * silhouette_weight
-        ).sum() / silhouette_weight.sum().clamp_min(1)
         free = (
             (-torch.log1p(-alpha) * negative).sum()
             / negative.sum().clamp_min(1)
         )
-        occupancy = 0.02 * silhouette + free
+        # A tree mask is not a target alpha.  Occupancy is supervised by the
+        # per-candidate visual-hull ray/depth posterior produced during
+        # initialization, while projected rigid/sky pixels supply free-space
+        # contradictions.  This removes the former fixed alpha=0.35 bias that
+        # broadened crowns into translucent paint.
+        posterior = foliage.occupancy_probability.clamp(0.01, 0.99)
+        posterior_weight = (
+            foliage.support_view_count.float()
+            / (
+                foliage.support_view_count.float()
+                + foliage.unknown_view_count.float()
+            ).clamp_min(1)
+        ).clamp(0.05, 1.0)
+        posterior_nll = (
+            F.binary_cross_entropy(
+                foliage.opacities.clamp(1e-5, 1 - 1e-5),
+                posterior,
+                reduction="none",
+            )
+            * posterior_weight
+        ).sum() / posterior_weight.sum().clamp_min(1)
+        depth_posterior = (
+            foliage.ray_depth_nll.clamp_min(0)
+            * foliage.opacities
+            * posterior_weight
+        ).sum() / posterior_weight.sum().clamp_min(1)
+        occupancy = free + 0.05 * posterior_nll + 0.01 * depth_posterior
         delta = foliage.xyz - foliage.initialization_center
         variance = foliage.position_covariance.diagonal(
             dim1=-2, dim2=-1
@@ -1735,6 +1826,8 @@ def main():
             "ordinal": 0.0,
             "track": 0.0,
             "track_matched": 0,
+            "structure": 0.0,
+            "structure_matched": 0,
         }
         if (
             args.geometry_every > 0
@@ -1779,12 +1872,22 @@ def main():
                 )
                 del geometry_package
             track_loss, track_audit = geometry.track_factor(surface)
+            structure_loss, structure_audit = geometry.structure_factor(
+                surface
+            )
             geometry_values["track"] = float(track_loss.detach())
             geometry_values["track_matched"] = int(
                 track_audit["matched"]
             )
+            geometry_values["structure"] = float(
+                structure_loss.detach()
+            )
+            geometry_values["structure_matched"] = int(
+                structure_audit["matched"]
+            )
             geometry_loss = geometry_loss + (
                 args.track_weight * track_loss
+                + args.structure_weight * structure_loss
             )
             phase_floor = (
                 1.0
@@ -2030,7 +2133,7 @@ def main():
             and (step + 1) % args.checkpoint_every == 0
         ):
             _save_checkpoint(
-                output / "unified_teacher_checkpoint.pth",
+                output / "hybrid_teacher_checkpoint.pth",
                 {
                     "protocol": PROTOCOL,
                     "iteration": step + 1,
@@ -2083,7 +2186,7 @@ def main():
         if topology_event is not None:
             torch.cuda.empty_cache()
 
-    teacher_state = output / "unified_teacher_state.pth"
+    teacher_state = output / "hybrid_teacher_state.pth"
     torch.save(
         {
             "protocol": PROTOCOL,
@@ -2143,6 +2246,8 @@ def main():
         ),
         "evidence_hash": evidence_store["evidence_hash"],
         "teacher_state": str(teacher_state),
+        "authoritative_final_model": "native_hybrid_teacher",
+        "standard_student_trained": False,
         "surface_ply": str(
             output
             / "point_cloud"
@@ -2168,12 +2273,42 @@ def main():
         "replacement_events": replacement_events,
         "targeted_evaluation": evaluation,
         "historical_parent_ply_used": False,
+        "colmap_points_or_tracks_used": False,
         "all_real_rgb_from_iteration_one": True,
         "canopy_structural_topology_gradient": False,
         "elapsed_sec": time.time() - started,
     }
     (output / "result.json").write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+    renderer_manifest = {
+        "version": "native-hybrid-teacher-renderer-manifest-v1",
+        "protocol": PROTOCOL,
+        "teacher_state": str(teacher_state),
+        "surface_ply": result["surface_ply"],
+        "evidence_hash": evidence_store["evidence_hash"],
+        "canonical_render": {
+            "include_dynamic": False,
+            "appearance_conditioning": False,
+        },
+        "conditioned_render": {
+            "include_dynamic": True,
+            "temporal_code": "known database image name",
+            "appearance_conditioning": True,
+        },
+        "mixed_kernel": (
+            "native perspective-correct 2D surfel and 3D EWA in one "
+            "tile list and one depth/alpha compositing order"
+        ),
+        "implementation_hashes": implementation_hashes,
+        "downstream_contract": (
+            "load the state with outdoor.hybrid_teacher_api; do not treat "
+            "surface_ply alone as the complete scene"
+        ),
+    }
+    (output / "renderer_manifest.json").write_text(
+        json.dumps(renderer_manifest, indent=2) + "\n",
+        encoding="utf-8",
     )
     print(json.dumps(result, indent=2))
 

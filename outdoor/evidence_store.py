@@ -29,7 +29,8 @@ from outdoor.foliage_view_graph import sequence_id
 from outdoor.scene_contract import sha256_file
 
 
-EVIDENCE_STORE_VERSION = "outdoor-unified-evidence-v1"
+EVIDENCE_STORE_VERSION = "outdoor-hybrid-teacher-evidence-v2"
+LEGACY_EVIDENCE_STORE_VERSIONS = {"outdoor-unified-evidence-v1"}
 TRACK_EVIDENCE_VERSION = "outdoor-source-track-evidence-v1"
 
 ROLE_RIGID = 0
@@ -386,12 +387,16 @@ class EvidenceStoreBuilder:
         scene_contract: Path,
         semantic_contract: Path,
         split: str = "database_train",
+        geometry_source: str = "mast3r_only",
+        final_model: str = "hybrid_teacher",
     ):
         self.root = Path(root).resolve()
         self.dataset = Path(dataset).resolve()
         self.scene_contract = Path(scene_contract).resolve()
         self.semantic_contract = Path(semantic_contract).resolve()
         self.split = str(split)
+        self.geometry_source = str(geometry_source)
+        self.final_model = str(final_model)
         self.artifacts: list[EvidenceArtifact] = []
 
     def add_file(
@@ -440,7 +445,13 @@ class EvidenceStoreBuilder:
             "schema_version": EVIDENCE_STORE_VERSION,
             "dataset": str(self.dataset),
             "split": self.split,
-            "camera_policy": "fixed_exact_K",
+            "camera_policy": "cambridge_fixed_exact_K_and_poses",
+            "camera_container": (
+                "cameras.bin/images.bin are serialization only; no "
+                "points3D.bin or COLMAP track geometry is consumed"
+            ),
+            "geometry_source": self.geometry_source,
+            "final_model": self.final_model,
             "scene_contract": str(self.scene_contract),
             "scene_contract_sha256": sha256_file(self.scene_contract),
             "semantic_contract": str(self.semantic_contract),
@@ -462,9 +473,11 @@ class EvidenceStoreBuilder:
                 "canopy_surface_topology_gradient": False,
             },
             "export_contract": {
-                "teacher": "mixed_training_only",
-                "canonical_student": "standard_3dgs_ply",
-                "custom_fields_allowed_in_student": False,
+                "authoritative_model": "native_mixed_hybrid_teacher",
+                "teacher_renderer_required": True,
+                "standard_student": None,
+                "canonical_and_conditioned_renders": True,
+                "localization_assets_exclude_dynamic_leaf_and_sky": True,
             },
         }
         payload["evidence_hash"] = _canonical_json_digest(payload)
@@ -479,7 +492,10 @@ def load_evidence_store(path: Path, *, verify_hashes: bool = True) -> dict:
     path = Path(path)
     manifest = path / "evidence_manifest.json" if path.is_dir() else path
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != EVIDENCE_STORE_VERSION:
+    if payload.get("schema_version") not in {
+        EVIDENCE_STORE_VERSION,
+        *LEGACY_EVIDENCE_STORE_VERSIONS,
+    }:
         raise RuntimeError(f"Unsupported evidence store: {manifest}")
     evidence_hash = payload.get("evidence_hash")
     unhashed = dict(payload)
@@ -510,4 +526,3 @@ def artifact_path(
     if required:
         raise KeyError(f"Evidence store has no artifact {name!r}")
     return None
-

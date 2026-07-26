@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
-from scipy.ndimage import minimum_filter
+from scipy.ndimage import distance_transform_edt, minimum_filter
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
@@ -167,7 +167,17 @@ def _sample_chart_seeds(
     selected_sigma = []
     selected_confidence = []
     with np.load(chart_path, allow_pickle=False) as charts:
-        points = charts["pts"]
+        scale_factor = float(charts["scale_factor"])
+        if not np.isfinite(scale_factor) or scale_factor <= 0:
+            raise RuntimeError(
+                f"Invalid MAtCha chart scale_factor {scale_factor}"
+            )
+        # MAtCha optimizes its atlas in a normalized scene.  Cambridge
+        # cameras, MASt3R tracks, and the final Teacher stay in the original
+        # fixed-camera world, so chart points must cross this boundary
+        # explicitly.  Omitting this conversion made valid chart evidence
+        # look like near-origin floaters.
+        points = charts["pts"] / scale_factor
         confidence = charts["confs"]
         active = charts.get(
             "quality_selection_active",
@@ -259,7 +269,11 @@ def _sample_chart_seeds(
             normalized = conf_value / max(
                 float(np.median(conf_value)), 1e-6
             )
-            sigma = np.clip(0.025 / np.sqrt(normalized), 0.006, 0.08)
+            sigma = np.clip(
+                (0.025 / scale_factor) / np.sqrt(normalized),
+                0.012,
+                0.35,
+            )
             selected_xyz.append(xyz)
             selected_rgb.append(color.astype(np.float32))
             selected_sigma.append(sigma.astype(np.float32))
@@ -304,29 +318,41 @@ def build_surface_seed(
     seed: int = 991,
 ) -> dict[str, Any]:
     store = load_evidence_store(evidence_store)
-    colmap = _load_tracks(artifact_path(store, "colmap_tracks"))
-    colmap_keep = _selection_mask(
-        colmap,
-        minimum_rigid_probability=minimum_rigid_probability,
-        maximum_canopy_probability=maximum_canopy_probability,
-        minimum_observations=2,
-        maximum_reprojection_error=2.5,
-    )
-    xyz_parts = [colmap["xyz"][colmap_keep]]
-    rgb_parts = [colmap["rgb"][colmap_keep].astype(np.float32) / 255.0]
-    sigma_parts = [
-        np.sqrt(
-            colmap["position_covariance_diag"][colmap_keep].mean(axis=1)
+    mast3r_only = store.get("geometry_source") == "mast3r_only"
+    xyz_parts: list[np.ndarray] = []
+    rgb_parts: list[np.ndarray] = []
+    sigma_parts: list[np.ndarray] = []
+    confidence_parts: list[np.ndarray] = []
+    track_parts: list[np.ndarray] = []
+    source_parts: list[np.ndarray] = []
+    source_counts: dict[str, int] = {}
+
+    if not mast3r_only:
+        colmap = _load_tracks(artifact_path(store, "colmap_tracks"))
+        colmap_keep = _selection_mask(
+            colmap,
+            minimum_rigid_probability=minimum_rigid_probability,
+            maximum_canopy_probability=maximum_canopy_probability,
+            minimum_observations=2,
+            maximum_reprojection_error=2.5,
         )
-    ]
-    confidence_parts = [
-        colmap["role_probabilities"][colmap_keep, ROLE_RIGID]
-    ]
-    track_parts = [colmap["track_id"][colmap_keep]]
-    source_parts = [
-        np.full(int(colmap_keep.sum()), SOURCE_COLMAP, dtype=np.int8)
-    ]
-    source_counts = {"colmap_rigid": int(colmap_keep.sum())}
+        xyz_parts.append(colmap["xyz"][colmap_keep])
+        rgb_parts.append(
+            colmap["rgb"][colmap_keep].astype(np.float32) / 255.0
+        )
+        sigma_parts.append(
+            np.sqrt(
+                colmap["position_covariance_diag"][colmap_keep].mean(axis=1)
+            )
+        )
+        confidence_parts.append(
+            colmap["role_probabilities"][colmap_keep, ROLE_RIGID]
+        )
+        track_parts.append(colmap["track_id"][colmap_keep])
+        source_parts.append(
+            np.full(int(colmap_keep.sum()), SOURCE_COLMAP, dtype=np.int8)
+        )
+        source_counts["colmap_rigid"] = int(colmap_keep.sum())
 
     mast3r_path = artifact_path(
         store, "mast3r_tracks", required=False
@@ -339,16 +365,18 @@ def build_surface_seed(
                 minimum_rigid_probability, 0.75
             ),
             maximum_canopy_probability=maximum_canopy_probability,
-            # Posed-MASt3R's sparse export stores one source camera per
-            # point.  Cross-view validity is supplied by the independent
-            # COLMAP-neighbour consensus below; requiring two rows here would
-            # silently discard the whole MASt3R source.
-            minimum_observations=1,
-            maximum_reprojection_error=2.5,
+            # The new mainline requires genuine ragged multi-view tracks.
+            # A one-camera MASt3R sparse export cannot pass this selection.
+            minimum_observations=2 if mast3r_only else 1,
+            maximum_reprojection_error=2.0 if mast3r_only else 2.5,
         )
         candidate = mast3r["xyz"][mast3r_keep]
-        reference = xyz_parts[0]
-        if len(candidate) and len(reference):
+        reference = (
+            np.concatenate(xyz_parts)
+            if xyz_parts
+            else np.empty((0, 3), dtype=np.float32)
+        )
+        if not mast3r_only and len(candidate) and len(reference):
             distance = cKDTree(reference).query(candidate, k=1)[0]
             candidate_support = distance <= min(
                 float(consensus_radius), 0.05
@@ -358,7 +386,7 @@ def build_surface_seed(
         mast3r_indices = np.flatnonzero(mast3r_keep)[candidate_support]
         novel = _deduplicate(
             mast3r["xyz"][mast3r_indices],
-            np.concatenate(xyz_parts),
+            reference,
             radius=dedup_radius,
         )
         mast3r_indices = mast3r_indices[novel]
@@ -385,6 +413,10 @@ def build_surface_seed(
             )
         )
         source_counts["mast3r_rigid"] = int(len(mast3r_indices))
+    if mast3r_only and not xyz_parts:
+        raise RuntimeError(
+            "MASt3R-only initialization has no valid multi-view rigid tracks"
+        )
 
     chart_path = artifact_path(
         store, "chart_geometry", required=False
@@ -466,6 +498,8 @@ def build_surface_seed(
         "canopy_surface_seed_count": 0,
         "historical_trained_ply_used": False,
         "all_real_rgb_initialization_used": False,
+        "geometry_source": store.get("geometry_source", "legacy_mixed"),
+        "colmap_points_or_tracks_used": not mast3r_only,
         "scale_median": np.median(scales, axis=0).tolist(),
         "position_sigma_median": float(np.median(sigma)),
     }
@@ -473,6 +507,360 @@ def build_surface_seed(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
     return summary
+
+
+def _mast3r_tree_tracks(
+    archive_path: Path,
+    images: dict[int, dict],
+    *,
+    minimum_track_observations: int,
+    maximum_reprojection_error: float,
+) -> list[dict[str, Any]]:
+    """Adapt native MASt3R track observations to the canopy-volume contract."""
+    by_stem = {
+        Path(str(image["name"])).stem: int(image_id)
+        for image_id, image in images.items()
+    }
+    with np.load(archive_path, allow_pickle=False) as archive:
+        names = [str(value) for value in archive["camera_names"]]
+        mapped_ids = np.asarray(
+            [by_stem.get(Path(name).stem, -1) for name in names],
+            dtype=np.int32,
+        )
+        offsets = archive["observation_offsets"]
+        observation_cameras = archive["observation_camera_indices"]
+        keep = (
+            (
+                archive["role_probabilities"][:, ROLE_CANOPY]
+                >= 0.55
+            )
+            & (
+                archive["valid_observation_count"]
+                >= int(minimum_track_observations)
+            )
+            & (
+                archive["reprojection_error"]
+                <= float(maximum_reprojection_error)
+            )
+        )
+        result: list[dict[str, Any]] = []
+        for index in np.flatnonzero(keep):
+            begin, end = int(offsets[index]), int(offsets[index + 1])
+            image_ids = mapped_ids[observation_cameras[begin:end]]
+            image_ids = np.unique(image_ids[image_ids >= 0])
+            if len(image_ids) < int(minimum_track_observations):
+                continue
+            result.append(
+                {
+                    "id": int(archive["track_id"][index]),
+                    "xyz": archive["xyz"][index].astype(np.float64),
+                    "rgb": archive["rgb"][index].astype(np.uint8),
+                    "error": float(
+                        archive["reprojection_error"][index]
+                    ),
+                    "image_ids": image_ids,
+                    "point2d_indices": np.full(
+                        len(image_ids), -1, dtype=np.int64
+                    ),
+                    "tree_image_ids": image_ids,
+                    "tree_sequence_count": int(
+                        archive["sequence_count"][index]
+                    ),
+                    "tree_fraction": float(
+                        archive["role_probabilities"][
+                            index, ROLE_CANOPY
+                        ]
+                    ),
+                }
+            )
+    return result
+
+
+def _cross_view_tree_hull_anchors(
+    local_tracks: list[dict[str, Any]],
+    images: dict[int, dict],
+    cameras: dict[int, dict],
+    masks: CambridgeMaskLookup,
+    *,
+    maximum_reprojection_error: float,
+) -> list[dict[str, Any]]:
+    """Validate local foliage anchors against all fixed-camera tree masks.
+
+    This is a visual-hull support operation, not an invented static feature
+    correspondence.  The returned cross-view support may seed canonical crown
+    occupancy, but the original sequence-local track remains the only dynamic
+    correspondence and neither representation is exported as a localization
+    landmark.
+    """
+    all_image_ids = np.asarray(sorted(images), dtype=np.int64)
+    candidates = [
+        {
+            **track,
+            "image_ids": all_image_ids,
+            "point2d_indices": np.full(
+                len(all_image_ids), -1, dtype=np.int64
+            ),
+        }
+        for track in local_tracks
+    ]
+    return semantic_tree_tracks(
+        candidates,
+        images,
+        cameras,
+        masks,
+        minimum_tree_observations=3,
+        minimum_sequences=2,
+        minimum_tree_fraction=0.60,
+        maximum_reprojection_error=maximum_reprojection_error,
+    )
+
+
+def _chart_foliage_samples(
+    store: dict,
+    images: dict[int, dict],
+    masks: CambridgeMaskLookup,
+    *,
+    samples_per_view: int = 320,
+    maximum_samples: int = 8_000,
+    voxel_size: float = 0.04,
+) -> list[dict[str, Any]]:
+    """Fill sequence-local leaf coverage where no pairwise track can exist.
+
+    The aligned chart archive deliberately zeros canopy pixels because those
+    pixels are invalid for rigid chart alignment.  The raw MASt3R pointmaps,
+    however, retain their world points and confidence there.  We therefore
+    use the chart only to define an active, fixed-camera-aligned view and a
+    conservative nearby correction field; canopy geometry comes from the raw
+    pointmap and is always assigned to the dynamic leaf branch.
+    """
+    chart_path = artifact_path(store, "chart_geometry", required=False)
+    camera_path = artifact_path(store, "chart_cameras", required=False)
+    if chart_path is None or camera_path is None:
+        return []
+    camera_payload = json.loads(camera_path.read_text(encoding="utf-8"))
+    filepaths = [Path(value) for value in camera_payload["filepaths"]]
+    pointmap_index_path = artifact_path(
+        store, "mast3r_pointmap_index", required=False
+    )
+    if pointmap_index_path is not None:
+        pointmap_records = json.loads(
+            pointmap_index_path.read_text(encoding="utf-8")
+        )["records"]
+    else:
+        # Legacy evidence stores are accepted for regression tests only.
+        pointmap_root = camera_path.parent / "pointmaps"
+        if not pointmap_root.is_dir():
+            return []
+        pointmap_records = {
+            path.stem: {"path": str(path)}
+            for path in pointmap_root.glob("*.json")
+        }
+    by_stem = {
+        Path(str(image["name"])).stem: int(image_id)
+        for image_id, image in images.items()
+    }
+    result: list[dict[str, Any]] = []
+    occupied: set[tuple[int, int, int]] = set()
+
+    def load_geometry(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        """Decode point/conf arrays without materializing the huge RGB list."""
+        raw = path.read_bytes()
+        point_marker = b'"points":'
+        confidence_marker = b'"confs":'
+        point_start = raw.find(point_marker)
+        confidence_start = raw.find(confidence_marker)
+        if point_start < 0 or confidence_start < 0:
+            raise RuntimeError(f"Malformed MASt3R pointmap: {path}")
+        point_start += len(point_marker)
+        confidence_value_start = confidence_start + len(
+            confidence_marker
+        )
+        payload_end = raw.rfind(b"}")
+        point_payload = raw[point_start:confidence_start].rstrip()
+        if point_payload.endswith(b","):
+            point_payload = point_payload[:-1].rstrip()
+        # ``json.loads`` creates hundreds of thousands of boxed Python floats
+        # per view.  Parsing the numeric payload directly keeps peak memory
+        # bounded across all active charts.
+        bracket_table = bytes.maketrans(b"[]", b"  ")
+        point_values = np.fromstring(
+            point_payload.translate(bracket_table),
+            dtype=np.float32,
+            sep=",",
+        )
+        confidence_payload = raw[
+            confidence_value_start:payload_end
+        ].strip()
+        confidence_values = np.fromstring(
+            confidence_payload.translate(bracket_table),
+            dtype=np.float32,
+            sep=",",
+        )
+        pixel_count = int(confidence_values.size)
+        if point_values.size != 3 * pixel_count:
+            raise RuntimeError(
+                f"Point/conf size mismatch in MASt3R pointmap {path}"
+            )
+        # Current MASt3R pointmaps are written with their native 16:9 shape.
+        # Resolve the exact height through the chart tensor below; retain a
+        # flat representation here to avoid guessing from JSON formatting.
+        confidence_array = confidence_values
+        point_array = point_values.reshape(pixel_count, 3)
+        return point_array, confidence_array
+
+    with np.load(chart_path, allow_pickle=False) as archive:
+        chart_points = archive["pts"]
+        chart_confidence = archive["confs"]
+        scale_factor = float(archive["scale_factor"])
+        if not np.isfinite(scale_factor) or scale_factor <= 0:
+            raise RuntimeError(
+                f"Invalid MAtCha chart scale_factor {scale_factor}"
+            )
+        active = archive.get(
+            "quality_selection_active",
+            np.ones(len(chart_points), dtype=bool),
+        ).astype(bool)
+        active &= archive.get(
+            "alignment_gate_valid",
+            np.ones(len(chart_points), dtype=bool),
+        ).astype(bool)
+        for chart_index in np.flatnonzero(active):
+            image_path = filepaths[int(chart_index)]
+            image_id = by_stem.get(image_path.stem)
+            if image_id is None:
+                continue
+            pointmap_record = pointmap_records.get(image_path.stem)
+            if pointmap_record is None:
+                continue
+            pointmap_path = Path(pointmap_record["path"])
+            if not pointmap_path.is_file():
+                continue
+            raw_xyz, conf = load_geometry(pointmap_path)
+            height, width = chart_confidence[int(chart_index)].shape
+            if conf.size != height * width:
+                raise RuntimeError(
+                    f"Raw/chart resolution mismatch for {pointmap_path}"
+                )
+            conf = conf.reshape(height, width)
+            raw_xyz = raw_xyz.reshape(height, width, 3)
+            aligned_xyz = (
+                chart_points[int(chart_index)].astype(np.float32)
+                / scale_factor
+            )
+            aligned_conf = chart_confidence[int(chart_index)]
+            key = masks.source_name_for(image_path.name)
+            channels = masks.masks[key]
+            resized = [
+                torch.nn.functional.interpolate(
+                    value.detach().float()[None, None],
+                    size=(height, width),
+                    mode="nearest",
+                )[0, 0]
+                .bool()
+                .numpy()
+                for value in channels[:4]
+            ]
+            canopy = (
+                resized[0]
+                & resized[1]
+                & ~resized[3]
+                & np.isfinite(conf)
+                & (conf >= 1.0)
+            )
+            canopy &= (
+                np.isfinite(raw_xyz).all(axis=-1)
+                & (np.linalg.norm(raw_xyz, axis=-1) > 1e-5)
+            )
+            candidates = np.flatnonzero(canopy)
+            if not len(candidates):
+                continue
+            # Propagate only a small local MAtCha alignment correction from
+            # the nearest rigid pixels.  A hard 25 cm cap prevents a flexible
+            # facade chart from dragging non-rigid leaves across depth layers.
+            aligned_valid = (
+                np.isfinite(aligned_xyz).all(axis=-1)
+                & (np.linalg.norm(aligned_xyz, axis=-1) > 1e-5)
+                & np.isfinite(aligned_conf)
+                & (aligned_conf > 0)
+                & np.isfinite(raw_xyz).all(axis=-1)
+            )
+            corrected_xyz = raw_xyz
+            if np.any(aligned_valid):
+                distance, nearest = distance_transform_edt(
+                    ~aligned_valid, return_indices=True
+                )
+                correction = aligned_xyz - raw_xyz
+                local = correction[nearest[0], nearest[1]]
+                global_correction = np.median(
+                    correction[aligned_valid], axis=0
+                )
+                local = np.where(
+                    (distance <= 48)[..., None],
+                    local,
+                    global_correction[None, None],
+                )
+                magnitude = np.linalg.norm(local, axis=-1, keepdims=True)
+                local = local * np.minimum(
+                    1.0, 0.25 / np.maximum(magnitude, 1e-8)
+                )
+                corrected_xyz = raw_xyz + local.astype(np.float32)
+            order = candidates[
+                np.argsort(
+                    conf.reshape(-1)[candidates], kind="stable"
+                )[::-1]
+            ][: int(samples_per_view)]
+            if image_path.is_file():
+                image = Image.open(image_path).convert("RGB").resize(
+                    (width, height), Image.Resampling.BILINEAR
+                )
+            else:
+                image = Image.open(
+                    Path(store["dataset"])
+                    / "images"
+                    / images[image_id]["name"]
+                ).convert("RGB").resize(
+                    (width, height), Image.Resampling.BILINEAR
+                )
+            rgb = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
+            for flat in order:
+                value = corrected_xyz.reshape(-1, 3)[flat].astype(
+                    np.float64
+                )
+                cell = tuple(
+                    np.floor(value / float(voxel_size)).astype(int)
+                )
+                if cell in occupied:
+                    continue
+                occupied.add(cell)
+                result.append(
+                    {
+                        "id": -(len(result) + 1),
+                        "xyz": value,
+                        "rgb": rgb[flat],
+                        "error": float(
+                            0.5
+                            / max(
+                                np.sqrt(float(conf.reshape(-1)[flat])),
+                                0.25,
+                            )
+                        ),
+                        "image_ids": np.asarray(
+                            [image_id], dtype=np.int64
+                        ),
+                        "point2d_indices": np.asarray(
+                            [-1], dtype=np.int64
+                        ),
+                        "tree_image_ids": np.asarray(
+                            [image_id], dtype=np.int32
+                        ),
+                        "tree_sequence_count": 1,
+                        "tree_fraction": 1.0,
+                        "chart_sequence_local_sample": True,
+                    }
+                )
+                if len(result) >= int(maximum_samples):
+                    return result
+    return result
 
 
 def sparse_rigid_depth_maps(
@@ -559,9 +947,34 @@ def _merge_foliage(
     position_covariance = np.eye(3, dtype=np.float32)[None] * (
         covariance_scale[:, None, None] ** 2
     )
+    sequence_support = np.asarray(
+        [point["tree_sequence_count"] for point in tracks],
+        dtype=np.int16,
+    )
+    # Cross-sequence linear tracks are stable trunk/branch anchors.  Tracks
+    # supported only inside one traversal are useful high-frequency leaf
+    # evidence, but must enter the sequence-conditioned branch rather than
+    # contaminating canonical localization geometry.
+    strongly_linear = linearity >= 1.5 * float(skeleton_linearity)
     layer_role = np.where(
-        linearity >= float(skeleton_linearity), 1, 0
+        (sequence_support >= 2) & (
+            linearity >= float(skeleton_linearity)
+        )
+        | strongly_linear,
+        1,
+        np.where(sequence_support < 2, 2, 0),
     ).astype(np.int8)
+    chart_local = np.asarray(
+        [
+            bool(point.get("chart_sequence_local_sample", False))
+            for point in tracks
+        ],
+        dtype=bool,
+    )
+    # A single MAtCha canopy pointmap has no evidence for a canonical
+    # trunk/branch identity.  Even if its local spatial neighbourhood happens
+    # to look linear, it remains sequence-conditioned leaf evidence.
+    layer_role[chart_local] = 2
     values = {
         "centers": xyz,
         "colors": rgb,
@@ -619,6 +1032,7 @@ def _merge_foliage(
         "tree_tracks": track_count,
         "static_skeleton": int((layer_role == 1).sum()),
         "canonical_track_anchors": int((layer_role == 0).sum()),
+        "sequence_local_dynamic_tracks": int((layer_role == 2).sum()),
         "tree_instances": int(track_instances.max()) + 1,
     }
 
@@ -648,40 +1062,111 @@ def build_foliage_seed(
     sparse = dataset / "sparse" / "0"
     cameras = read_cameras_binary(sparse / "cameras.bin")
     images = read_images_binary(sparse / "images.bin")
-    points = read_points3d_binary_with_tracks(sparse / "points3D.bin")
     masks = CambridgeMaskLookup(
         dataset, tree_mask, mask_indices=[0, 1, 2, 3]
     )
-    tracks = semantic_tree_tracks(
-        points,
-        images,
-        cameras,
-        masks,
-        minimum_tree_observations=minimum_track_observations,
-        minimum_sequences=minimum_track_sequences,
-        maximum_reprojection_error=maximum_reprojection_error,
-    )
+    mast3r_only = store.get("geometry_source") == "mast3r_only"
+    if mast3r_only:
+        tracks = _mast3r_tree_tracks(
+            artifact_path(store, "mast3r_multiview_tracks"),
+            images,
+            # Keep sequence-local foliage observations.  Their layer role is
+            # made dynamic below; canonical hull support still requires
+            # cross-sequence agreement.
+            minimum_track_observations=max(
+                2, minimum_track_observations - 1
+            ),
+            maximum_reprojection_error=maximum_reprojection_error,
+        )
+        hull_tracks = _cross_view_tree_hull_anchors(
+            tracks,
+            images,
+            cameras,
+            masks,
+            maximum_reprojection_error=maximum_reprojection_error,
+        )
+        cross_sequence_hull = bool(hull_tracks)
+        if not hull_tracks:
+            # Non-rigid foliage commonly has no valid cross-traversal
+            # correspondence.  Build a traversal-local visual hull from true
+            # observations, keep it out of localization, and let the dynamic
+            # branch explain its high frequencies.
+            hull_tracks = tracks
+        native_track_count = len(tracks)
+        chart_foliage = _chart_foliage_samples(
+            store, images, masks
+        )
+        tracks = [*tracks, *chart_foliage]
+    else:
+        points = read_points3d_binary_with_tracks(
+            sparse / "points3D.bin"
+        )
+        tracks = semantic_tree_tracks(
+            points,
+            images,
+            cameras,
+            masks,
+            minimum_tree_observations=minimum_track_observations,
+            minimum_sequences=minimum_track_sequences,
+            maximum_reprojection_error=maximum_reprojection_error,
+        )
+        hull_tracks = tracks
+        cross_sequence_hull = True
+        native_track_count = len(tracks)
+        chart_foliage = []
     if not tracks:
         raise RuntimeError("No multi-view semantic tree tracks survived")
     track_xyz = np.stack([point["xyz"] for point in tracks])
-    instances = cluster_tree_instances(track_xyz)
+    if mast3r_only and chart_foliage and native_track_count:
+        native_xyz = track_xyz[:native_track_count]
+        native_instances = cluster_tree_instances(native_xyz)
+        chart_instances = native_instances[
+            cKDTree(native_xyz).query(
+                track_xyz[native_track_count:], k=1
+            )[1]
+        ]
+        instances = np.concatenate(
+            [native_instances, chart_instances]
+        ).astype(np.int32)
+    else:
+        instances = cluster_tree_instances(track_xyz)
     view_records = [
         _camera_record(image, cameras[image["camera_id"]], masks)
         for image in images.values()
     ]
-    selected = greedy_diverse_views(
-        view_records,
-        limit=selected_view_count,
-        minimum_center_distance=0.75,
-    )
+    if mast3r_only:
+        observed_ids = {
+            int(image_id)
+            for track in hull_tracks
+            for image_id in track.get("tree_image_ids", ())
+        }
+        observed_views = [
+            view
+            for view in view_records
+            if int(view["image_id"]) in observed_ids
+        ]
+        selected = greedy_diverse_views(
+            observed_views,
+            limit=min(selected_view_count, len(observed_views)),
+            minimum_center_distance=0.20,
+        )
+    else:
+        selected = greedy_diverse_views(
+            view_records,
+            limit=selected_view_count,
+            minimum_center_distance=0.75,
+        )
     rigid_depth = sparse_rigid_depth_maps(selected, rigid_xyz)
     hull = build_instance_aware_canopy_volume(
-        tracks,
+        hull_tracks,
         images,
         cameras,
         masks,
         rigid_depth_maps=rigid_depth,
         selected_views=selected,
+        minimum_support_sequences=(
+            2 if cross_sequence_hull else 1
+        ),
         voxel_size=voxel_size,
         maximum_voxels=maximum_voxels,
         seed=seed,
@@ -710,7 +1195,9 @@ def build_foliage_seed(
             "positive_negative_unknown_evidence": True,
             "real_ray_depth_posterior": True,
             "sparse_rigid_occlusion_zbuffer": True,
-            "historical_trained_ply_used": False,
+        "historical_trained_ply_used": False,
+        "geometry_source": store.get("geometry_source", "legacy_mixed"),
+        "colmap_points_or_tracks_used": not mast3r_only,
             **counts,
             "selected_views": [
                 {
@@ -738,6 +1225,16 @@ def build_foliage_seed(
         "support_sequences_median": float(
             np.median(merged["support_sequence_count"])
         ),
+        "sequence_local_track_count": int(len(tracks)),
+        "native_sequence_local_track_count": int(native_track_count),
+        "chart_sequence_local_sample_count": int(
+            len(chart_foliage)
+        ),
+        "cross_view_visual_hull_anchor_count": int(
+            len(hull_tracks)
+        ),
+        "cross_sequence_visual_hull": cross_sequence_hull,
+        "localization_landmark_eligible": False,
     }
     output.with_suffix(".json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"

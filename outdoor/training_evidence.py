@@ -25,13 +25,28 @@ class OutdoorGeometryEvidence:
             self.store, "chart_cameras", required=False
         )
         self.chart = None
+        self.chart_scale_factor = 1.0
         self.frame_by_stem: dict[str, int] = {}
         if chart_path is not None and chart_camera_path is not None:
             archive = np.load(chart_path, allow_pickle=False)
+            self.chart_scale_factor = float(archive["scale_factor"])
+            if (
+                not np.isfinite(self.chart_scale_factor)
+                or self.chart_scale_factor <= 0
+            ):
+                raise RuntimeError(
+                    "MAtCha chart scale_factor must be finite and positive"
+                )
             # Materialize only the fields used by training.  Keeping the
             # pointmaps out saves hundreds of MiB in every worker.
             self.chart = {
-                "depth": archive["depths"].astype(np.float32),
+                # All renderers and fixed Cambridge cameras use the original
+                # world scale.  MAtCha stores atlas depths in its normalized
+                # optimization scale.
+                "depth": (
+                    archive["depths"].astype(np.float32)
+                    / self.chart_scale_factor
+                ),
                 "confidence": archive["confs"].astype(np.float32),
                 "reference_mask": archive.get(
                     "alignment_reference_mask",
@@ -97,13 +112,30 @@ class OutdoorGeometryEvidence:
                         order
                     ].astype(np.float32),
                 }
+        structure_path = artifact_path(
+            self.store, "structure_graph", required=False
+        )
+        self.structure = None
+        if structure_path is not None:
+            with np.load(structure_path, allow_pickle=False) as archive:
+                self.structure = {
+                    "centers": (
+                        archive["unit_centers"].astype(np.float32)
+                        / self.chart_scale_factor
+                    ),
+                    "weight": archive["unit_weight"].astype(np.float32),
+                    "view_count": archive["unit_view_count"].astype(np.float32),
+                    "block_id": archive["unit_block_ids"].astype(np.int32),
+                }
         self._track_device_cache = {}
+        self._structure_device_cache = {}
         self.consumed = {
             "chart": 0,
             "plane": 0,
             "inverse_depth": 0,
             "dav2": 0,
             "track_factor": 0,
+            "structure_factor": 0,
         }
 
     def track_factor(
@@ -161,6 +193,50 @@ class OutdoorGeometryEvidence:
             self.consumed["track_factor"] += 1
         return total / total_weight.clamp_min(1), {
             "matched": matched_total,
+        }
+
+    def structure_factor(
+        self, surface, *, maximum_points: int = 2048
+    ) -> tuple[torch.Tensor, dict]:
+        """Persistent MAtCha/G4 structural-unit support for rigid surfels."""
+        zero = surface.get_xyz.new_zeros(())
+        if self.structure is None or not len(surface.get_xyz):
+            return zero, {"matched": 0, "blocks": 0}
+        device = surface.get_xyz.device
+        key = str(device)
+        if key not in self._structure_device_cache:
+            self._structure_device_cache[key] = {
+                name: torch.from_numpy(value).to(device=device)
+                for name, value in self.structure.items()
+            }
+        structure = self._structure_device_cache[key]
+        # Surface initialization is rigid-only by contract, including
+        # chart-bound source_type=2 surfels.
+        rigid = torch.arange(len(surface.get_xyz), device=device)
+        if len(rigid) > maximum_points:
+            stride = int(np.ceil(len(rigid) / maximum_points))
+            rigid = rigid[::stride][:maximum_points]
+        points = surface.get_xyz[rigid]
+        # 2k x 2.2k is bounded and keeps the selected unit differentiable
+        # with respect to the surfel position.
+        distance = torch.cdist(points, structure["centers"])
+        nearest_distance, nearest = distance.min(dim=1)
+        confidence = (
+            structure["weight"][nearest].clamp_min(0.05)
+            * structure["view_count"][nearest].clamp_min(1).sqrt()
+        )
+        # Units summarize finite facade patches, not exact point targets.
+        # A 4 cm dead zone preserves texture-driven substructure.
+        residual = (nearest_distance - 0.04).clamp_min(0)
+        loss = (
+            torch.log1p((residual / 0.08).square()) * confidence
+        ).sum() / confidence.sum().clamp_min(1)
+        self.consumed["structure_factor"] += 1
+        return loss, {
+            "matched": int(len(points)),
+            "blocks": int(
+                structure["block_id"][nearest].unique().numel()
+            ),
         }
 
     @property
@@ -240,6 +316,10 @@ class OutdoorGeometryEvidence:
                 & np.isfinite(confidence)
                 & (confidence > 0)
             )
+            if np.any(valid):
+                median_depth = float(np.median(depth[valid]))
+                absolute_limit = max(6.0 * median_depth, 5.0)
+                valid &= depth <= absolute_limit
             confidence = confidence / max(
                 float(np.median(confidence[valid]))
                 if np.any(valid)
@@ -267,6 +347,7 @@ class OutdoorGeometryEvidence:
             )
             if plane_depth.is_file() and plane_confidence.is_file():
                 depth = np.load(plane_depth)
+                depth = depth / self.chart_scale_factor
                 confidence = np.load(plane_confidence)
                 valid = (
                     np.isfinite(depth)
@@ -318,8 +399,17 @@ class OutdoorGeometryEvidence:
                         if name in {"source_bitmask", "support_view_count"}
                         else "bilinear"
                     )
+                    value = np.load(path)
+                    if name == "rho_mean":
+                        value = value * self.chart_scale_factor
+                    elif name == "rho_variance":
+                        value = (
+                            value
+                            * self.chart_scale_factor
+                            * self.chart_scale_factor
+                        )
                     result[name] = self._tensor(
-                        np.load(path),
+                        value,
                         device=device,
                         shape=shape,
                         mode=mode,
@@ -342,4 +432,8 @@ class OutdoorGeometryEvidence:
             "source_consumption_count": dict(self.consumed),
             "source_losses_are_mutually_exclusive": True,
             "inverse_depth_is_cache_not_replacement": True,
+            "chart_to_cambridge_world_scale": float(
+                1.0 / self.chart_scale_factor
+            ),
+            "all_metric_depth_factors_use_cambridge_world_scale": True,
         }
