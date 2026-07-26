@@ -97,6 +97,13 @@ def _load(path: Path):
         return torch.load(path, map_location="cpu")
 
 
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    """Atomically publish checkpoints so interruption cannot poison resume."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -842,7 +849,8 @@ def main():
             args.checkpoint_every > 0
             and (step + 1) % args.checkpoint_every == 0
         ):
-            torch.save(
+            _save_checkpoint(
+                output / "student_checkpoint.pth",
                 {
                     "protocol": PROTOCOL,
                     "iteration": step + 1,
@@ -861,7 +869,6 @@ def main():
                     "cuda_rng_state": torch.cuda.get_rng_state_all(),
                     "jitter_rng_state": jitter_rng.bit_generator.state,
                 },
-                output / "student_checkpoint.pth",
             )
     ply_path = (
         output
