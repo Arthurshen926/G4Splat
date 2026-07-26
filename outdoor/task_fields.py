@@ -164,10 +164,10 @@ class OutdoorTaskFieldLookup:
         # aliases of the only available rigid proxy, not invented labels.
         w_gaussian_rgb = (
             distortion
-            * (0.15 * p_rigid + 1.5 * p_canopy)
+            * (1.20 * p_rigid + 0.35 * p_canopy)
             * (1.0 - p_sky)
             * (1.0 - 0.8 * p_transient)
-            * (1.0 - 0.5 * p_boundary)
+            * (1.0 - 0.35 * p_boundary)
         )
         w_sky_rgb = (
             distortion

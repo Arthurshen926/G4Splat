@@ -39,8 +39,38 @@ def _parse_args():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--indices", default="408,409,410")
     parser.add_argument("--all", action="store_true")
+    parser.add_argument(
+        "--render-only",
+        action="store_true",
+        help=(
+            "Save every standard-3DGS prediction but omit duplicate GT, "
+            "error and alpha PNGs. Metrics are unchanged and auxiliary "
+            "visualizations can still be produced by a targeted evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--skip-metrics",
+        action="store_true",
+        help=(
+            "Render predictions without decoding GT or semantic fields. "
+            "Use evaluate_render_dir.py afterwards for the complete metric "
+            "protocol."
+        ),
+    )
+    parser.add_argument(
+        "--resume-render",
+        action="store_true",
+        help=(
+            "With --skip-metrics, reuse prediction PNGs already present in "
+            "the output directory."
+        ),
+    )
     parser.add_argument("--view-cache-size", type=int, default=2)
     args = parser.parse_args()
+    if args.skip_metrics and not args.render_only:
+        parser.error("--skip-metrics requires --render-only")
+    if args.resume_render and not args.skip_metrics:
+        parser.error("--resume-render requires --skip-metrics")
     return args, model.extract(args)
 
 
@@ -113,12 +143,14 @@ def main():
         }
     )
     empty = _empty_surface(dataset.sh_degree)
-    fields = OutdoorTaskFieldLookup(
-        Path(dataset.source_path),
-        args.tree_mask_pickle,
-        args.semantic_contract,
-        max_cached_views=0,
-    )
+    fields = None
+    if not args.skip_metrics:
+        fields = OutdoorTaskFieldLookup(
+            Path(dataset.source_path),
+            args.tree_mask_pickle,
+            args.semantic_contract,
+            max_cached_views=0,
+        )
     if args.all:
         indices = list(range(len(views)))
     else:
@@ -129,9 +161,24 @@ def main():
         ]
     background = torch.ones(3, device="cuda")
     rows = []
+    reused_renders = 0
     with torch.no_grad():
         for index in indices:
             view = views[index]
+            prediction_path = output / f"{index:05d}_standard_3dgs.png"
+            if (
+                args.skip_metrics
+                and args.resume_render
+                and prediction_path.is_file()
+            ):
+                rows.append(
+                    {
+                        "index": index,
+                        "image_name": str(view.image_name),
+                    }
+                )
+                reused_renders += 1
+                continue
             package = render_hybrid(
                 view,
                 empty,
@@ -140,33 +187,44 @@ def main():
                 include_dynamic=False,
             )
             prediction = package.render.clamp(0, 1)
-            target = view.original_image.cuda()
-            task = fields.fields(
-                view.image_name,
-                (view.image_height, view.image_width),
-                torch.device("cuda"),
-            )
-            mse = (prediction - target).square().mean()
             row = {
                 "index": index,
                 "image_name": str(view.image_name),
-                "psnr": float(-10 * torch.log10(mse.clamp_min(1e-12))),
-                "ssim": float(ssim(prediction, target)),
-                "mae": float((prediction - target).abs().mean()),
-                "rigid": _region_metrics(
-                    prediction, target, task["p_rigid"]
-                ),
-                "canopy": _region_metrics(
-                    prediction, target, task["p_canopy"]
-                ),
             }
+            if not args.skip_metrics:
+                target = view.original_image.cuda()
+                task = fields.fields(
+                    view.image_name,
+                    (view.image_height, view.image_width),
+                    torch.device("cuda"),
+                )
+                mse = (prediction - target).square().mean()
+                row.update(
+                    {
+                        "psnr": float(
+                            -10 * torch.log10(mse.clamp_min(1e-12))
+                        ),
+                        "ssim": float(ssim(prediction, target)),
+                        "mae": float((prediction - target).abs().mean()),
+                        "rigid": _region_metrics(
+                            prediction, target, task["p_rigid"]
+                        ),
+                        "canopy": _region_metrics(
+                            prediction, target, task["p_canopy"]
+                        ),
+                    }
+                )
             rows.append(row)
-            for name, value in (
-                ("gt", target),
-                ("standard_3dgs", prediction),
-                ("error_x4", (prediction - target).abs() * 4),
-                ("alpha", package.alpha.expand(3, -1, -1)),
-            ):
+            images_to_save = [("standard_3dgs", prediction)]
+            if not args.render_only:
+                images_to_save.extend(
+                    (
+                        ("gt", target),
+                        ("error_x4", (prediction - target).abs() * 4),
+                        ("alpha", package.alpha.expand(3, -1, -1)),
+                    )
+                )
+            for name, value in images_to_save:
                 pixels = (
                     value.clamp(0, 1)
                     .mul(255)
@@ -179,19 +237,37 @@ def main():
                     output / f"{index:05d}_{name}.png"
                 )
             scene.release_images()
-    aggregate = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in ("psnr", "ssim", "mae")
-    }
     result = {
-        "protocol": "standard_3dgs_direct_evaluation_v1",
+        "protocol": (
+            "standard_3dgs_direct_render_v1"
+            if args.skip_metrics
+            else "standard_3dgs_direct_evaluation_v1"
+        ),
         "point_cloud": str(args.point_cloud.resolve()),
         "view_count": len(rows),
-        "aggregate": aggregate,
-        "per_view": rows,
         "custom_teacher_interface_used": False,
     }
-    (output / "metrics.json").write_text(
+    if args.skip_metrics:
+        result.update(
+            {
+                "rendered_view_indices": [row["index"] for row in rows],
+                "reused_render_count": reused_renders,
+                "metrics_computed": False,
+            }
+        )
+        result_path = output / "render_manifest.json"
+    else:
+        result.update(
+            {
+                "aggregate": {
+                    key: float(np.mean([row[key] for row in rows]))
+                    for key in ("psnr", "ssim", "mae")
+                },
+                "per_view": rows,
+            }
+        )
+        result_path = output / "metrics.json"
+    result_path.write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(result, indent=2))

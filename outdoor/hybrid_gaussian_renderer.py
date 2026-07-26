@@ -465,6 +465,27 @@ class VolumetricFoliageModel(nn.Module):
         metadata["position_covariance"][child_start:] /= float(
             shrink * shrink
         )
+        # Children inherit the semantic/tree identity, but not the full
+        # confidence of a ray posterior evaluated at the deleted parent
+        # centre.  Halving discrete evidence prevents duplicated support from
+        # making freshly split children look independently verified.
+        for name in (
+            "support_view_count",
+            "free_space_violation_count",
+            "unknown_view_count",
+        ):
+            value = metadata[name][child_start:]
+            metadata[name][child_start:] = torch.div(
+                value,
+                2,
+                rounding_mode="floor",
+            )
+        metadata["support_view_count"][child_start:].clamp_(min=1)
+        metadata["occupancy_probability"][child_start:] = (
+            0.5
+            * metadata["occupancy_probability"][child_start:]
+            + 0.25
+        ).clamp(0, 1)
         new_to_old = torch.cat(
             [
                 torch.nonzero(keep, as_tuple=False).flatten(),

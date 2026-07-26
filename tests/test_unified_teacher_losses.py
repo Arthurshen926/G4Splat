@@ -4,16 +4,20 @@ import torch
 
 from scripts.train_unified_outdoor_teacher import (
     TRAINING_PROFILES,
+    _dynamic_enabled,
     _geometry_losses,
+    _masked_ssim_loss,
     _phase,
     _surface_capture_to_device,
 )
 
 
-def test_fast_profile_reaches_dynamic_foliage_at_12k():
+def test_fast_profile_overlaps_dynamic_foliage_with_topology():
     assert TRAINING_PROFILES["fast"]["iterations"] == 30_000
-    assert _phase(5_999, 30_000, "fast") == "canonical_bootstrap"
-    assert _phase(6_000, 30_000, "fast") == "topology"
+    assert _phase(2_399, 30_000, "fast") == "canonical_bootstrap"
+    assert _phase(2_400, 30_000, "fast") == "topology"
+    assert not _dynamic_enabled(2_399, 30_000, "fast")
+    assert _dynamic_enabled(2_400, 30_000, "fast")
     assert _phase(11_999, 30_000, "fast") == "topology"
     assert _phase(12_000, 30_000, "fast") == "dynamic_appearance"
     assert _phase(21_899, 30_000, "fast") == "dynamic_appearance"
@@ -24,10 +28,18 @@ def test_fast_profile_reaches_dynamic_foliage_at_12k():
 
 def test_quality_profile_keeps_final_benchmark_schedule():
     assert TRAINING_PROFILES["quality"]["iterations"] == 80_000
-    assert _phase(15_999, 80_000) == "canonical_bootstrap"
-    assert _phase(16_000, 80_000) == "topology"
-    assert _phase(47_999, 80_000) == "topology"
-    assert _phase(48_000, 80_000) == "dynamic_appearance"
+    assert _phase(4_799, 80_000) == "canonical_bootstrap"
+    assert _phase(4_800, 80_000) == "topology"
+    assert _dynamic_enabled(4_800, 80_000, "quality")
+    assert _phase(46_399, 80_000) == "topology"
+    assert _phase(46_400, 80_000) == "dynamic_appearance"
+
+
+def test_masked_ssim_does_not_create_zero_boundary_error():
+    image = torch.rand(3, 32, 32)
+    weight = torch.zeros(32, 32)
+    weight[8:24, 8:24] = 1
+    assert _masked_ssim_loss(image, image, weight).item() < 1e-6
 
 
 def test_surface_resume_capture_moves_parameters_buffers_and_metadata():

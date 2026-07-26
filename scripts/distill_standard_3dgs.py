@@ -34,8 +34,14 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     render_hybrid,
 )
 from outdoor.lazy_scene import LazyScene  # noqa: E402
+from outdoor.runtime_provenance import collect_runtime_provenance  # noqa: E402
 from outdoor.standard_3dgs import (  # noqa: E402
     STANDARD_3DGS_VERSION,
+    STUDENT_ROLE_CROWN,
+    STUDENT_ROLE_DYNAMIC_BAKED,
+    STUDENT_ROLE_RIGID,
+    STUDENT_ROLE_SKELETON,
+    STUDENT_ROLE_SKY,
     canonical_student_seed,
     save_standard_3dgs_ply,
     validate_standard_3dgs_ply,
@@ -47,7 +53,7 @@ from utils.loss_utils import ssim  # noqa: E402
 from utils.point_utils import depth_to_normal  # noqa: E402
 
 
-PROTOCOL = "mixed_teacher_render_space_standard_3dgs_distillation_v1"
+PROTOCOL = "role_aware_standard_3dgs_optimization_v2"
 
 
 def _parse_args():
@@ -65,7 +71,15 @@ def _parse_args():
     parser.add_argument("--opacity-lr", type=float, default=4e-3)
     parser.add_argument("--scale-lr", type=float, default=3e-4)
     parser.add_argument("--rotation-lr", type=float, default=2e-4)
-    parser.add_argument("--novel-every", type=int, default=8)
+    parser.add_argument("--novel-every", type=int, default=0)
+    parser.add_argument("--densify-from-iter", type=int, default=500)
+    parser.add_argument("--densify-until-fraction", type=float, default=0.65)
+    parser.add_argument("--densification-interval", type=int, default=500)
+    parser.add_argument("--maximum-gaussians", type=int, default=2_000_000)
+    parser.add_argument("--maximum-splits-per-event", type=int, default=8_000)
+    parser.add_argument("--split-radius", type=float, default=7.0)
+    parser.add_argument("--split-gradient-threshold", type=float, default=2e-5)
+    parser.add_argument("--prune-opacity", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=4321)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--view-cache-size", type=int, default=4)
@@ -158,14 +172,60 @@ def _student_from_seed(seed: dict, sh_degree: int):
 def _optimizer(args, student):
     return torch.optim.Adam(
         [
-            {"params": [student.xyz], "lr": args.position_lr},
-            {"params": [student.features], "lr": args.feature_lr},
-            {"params": [student.opacity_logits], "lr": args.opacity_lr},
-            {"params": [student.log_scales], "lr": args.scale_lr},
-            {"params": [student.quaternions], "lr": args.rotation_lr},
+            {
+                "params": [student.xyz],
+                "lr": args.position_lr,
+                "name": "xyz",
+            },
+            {
+                "params": [student.features],
+                "lr": args.feature_lr,
+                "name": "features",
+            },
+            {
+                "params": [student.opacity_logits],
+                "lr": args.opacity_lr,
+                "name": "opacity",
+            },
+            {
+                "params": [student.log_scales],
+                "lr": args.scale_lr,
+                "name": "scale",
+            },
+            {
+                "params": [student.quaternions],
+                "lr": args.rotation_lr,
+                "name": "rotation",
+            },
         ],
         eps=1e-15,
     )
+
+
+def _migrate_optimizer(args, student, previous, new_to_old):
+    current = _optimizer(args, student)
+    old_groups = {group["name"]: group for group in previous.param_groups}
+    for group in current.param_groups:
+        old_group = old_groups[group["name"]]
+        old_parameter = old_group["params"][0]
+        new_parameter = group["params"][0]
+        state = previous.state.get(old_parameter)
+        if not state:
+            continue
+        migrated = {}
+        for key, value in state.items():
+            if (
+                torch.is_tensor(value)
+                and value.ndim > 0
+                and value.shape[0] == old_parameter.shape[0]
+            ):
+                migrated[key] = value[new_to_old].clone()
+            elif torch.is_tensor(value):
+                migrated[key] = value.clone()
+            else:
+                migrated[key] = value
+        current.state[new_parameter] = migrated
+    return current
 
 
 def _jitter_camera(view, rng, scene_extent, step):
@@ -200,6 +260,151 @@ def _mean(value, weight):
     return (value * weight).sum() / (
         weight.sum() * value.shape[0]
     ).clamp_min(1)
+
+
+def _gradient_loss(prediction, target, weight):
+    horizontal_weight = torch.minimum(weight[:, 1:], weight[:, :-1])
+    vertical_weight = torch.minimum(weight[1:, :], weight[:-1, :])
+    horizontal = (
+        prediction[:, :, 1:]
+        - prediction[:, :, :-1]
+        - target[:, :, 1:]
+        + target[:, :, :-1]
+    ).abs().mean(0)
+    vertical = (
+        prediction[:, 1:, :]
+        - prediction[:, :-1, :]
+        - target[:, 1:, :]
+        + target[:, :-1, :]
+    ).abs().mean(0)
+    return (
+        (horizontal * horizontal_weight).sum()
+        / horizontal_weight.sum().clamp_min(1)
+        + (vertical * vertical_weight).sum()
+        / vertical_weight.sum().clamp_min(1)
+    )
+
+
+def _masked_ssim_loss(prediction, target, weight, window_size=11):
+    prediction = prediction[None]
+    target = target[None]
+    weight = weight[None, None]
+    padding = window_size // 2
+    mu_prediction = F.avg_pool2d(
+        prediction, window_size, 1, padding
+    )
+    mu_target = F.avg_pool2d(target, window_size, 1, padding)
+    variance_prediction = F.avg_pool2d(
+        prediction.square(), window_size, 1, padding
+    ) - mu_prediction.square()
+    variance_target = F.avg_pool2d(
+        target.square(), window_size, 1, padding
+    ) - mu_target.square()
+    covariance = F.avg_pool2d(
+        prediction * target, window_size, 1, padding
+    ) - mu_prediction * mu_target
+    similarity = (
+        (2 * mu_prediction * mu_target + 0.01**2)
+        * (2 * covariance + 0.03**2)
+        / (
+            (mu_prediction.square() + mu_target.square() + 0.01**2)
+            * (variance_prediction + variance_target + 0.03**2)
+        ).clamp_min(1e-8)
+    ).mean(1, keepdim=True)
+    valid = -F.max_pool2d(-weight, window_size, 1, padding)
+    valid[..., :padding, :] = 0
+    valid[..., -padding:, :] = 0
+    valid[..., :, :padding] = 0
+    valid[..., :, -padding:] = 0
+    return ((1 - similarity) * valid).sum() / valid.sum().clamp_min(1)
+
+
+def _topology_stats(student):
+    count = len(student)
+    device = student.xyz.device
+    return {
+        "gradient": torch.zeros(count, device=device),
+        "gradient_count": torch.zeros(count, device=device),
+        "radius": torch.zeros(count, device=device),
+        "contribution": torch.zeros(count, device=device),
+        "residual": torch.zeros(count, device=device),
+    }
+
+
+@torch.no_grad()
+def _accumulate_student_stats(stats, package):
+    radii = package.radii.float()
+    visible = radii > 0
+    stats["radius"] = torch.maximum(stats["radius"], radii)
+    if package.volume_means2d is not None and package.volume_means2d.grad is not None:
+        gradient = torch.nan_to_num(
+            package.volume_means2d.grad[:, :2]
+        ).norm(dim=-1)
+        stats["gradient"][visible] += gradient[visible]
+        stats["gradient_count"][visible] += 1
+    if package.responsibility is not None:
+        responsibility = package.responsibility
+        stats["contribution"] += responsibility[:, 0]
+        if responsibility.shape[1] >= 4:
+            stats["residual"] += responsibility[:, 3]
+
+
+@torch.no_grad()
+def _adapt_student_topology(args, student, stats):
+    old_count = len(student)
+    role = student.primitive_role
+    protected = (role == STUDENT_ROLE_SKY) | (
+        role == STUDENT_ROLE_SKELETON
+    )
+    remove = (student.opacities < args.prune_opacity) & ~protected
+    pruned, kept_old = student.prune(remove)
+    working = {name: value[kept_old] for name, value in stats.items()}
+    role = student.primitive_role
+    gradient = (
+        working["gradient"]
+        / working["gradient_count"].clamp_min(1)
+    )
+    residual = (
+        working["residual"]
+        / working["contribution"].clamp_min(1e-8)
+    )
+    eligible = (
+        (role != STUDENT_ROLE_SKY)
+        & (role != STUDENT_ROLE_SKELETON)
+        & (working["radius"] >= args.split_radius)
+        & (gradient >= args.split_gradient_threshold)
+        & (working["contribution"] > 0)
+    )
+    capacity = min(
+        args.maximum_splits_per_event,
+        max(args.maximum_gaussians - len(student), 0),
+    )
+    split_parents = 0
+    children = 0
+    final_to_kept = torch.arange(len(student), device=student.xyz.device)
+    if bool(eligible.any()) and capacity > 0:
+        indices = torch.nonzero(eligible, as_tuple=False).flatten()
+        score = gradient[indices] * residual[indices]
+        chosen = indices[
+            torch.topk(score, min(capacity, len(indices))).indices
+        ]
+        event = student.split(chosen)
+        split_parents = int(event["split_parents"])
+        children = int(event["children"])
+        final_to_kept = event["_new_to_old"]
+    final_to_old = kept_old[final_to_kept]
+    return {
+        "old_count": old_count,
+        "new_count": len(student),
+        "pruned": int(pruned),
+        "split_parents": split_parents,
+        "children": children,
+        "_new_to_old": (
+            final_to_old
+            if pruned or split_parents
+            else None
+        ),
+    }
 
 
 def main():
@@ -262,6 +467,12 @@ def main():
         parameter.requires_grad_(False)
     centers = torch.stack([view.camera_center for view in views])
     if resume is None:
+        temporal_codes = torch.stack(
+            [
+                appearance.temporal_code(view.image_name).detach()
+                for view in views
+            ]
+        )
         seed, initialization_audit = canonical_student_seed(
             teacher_surface,
             teacher_foliage,
@@ -269,9 +480,12 @@ def main():
             centers,
             maximum_surface_gaussians=args.maximum_surface_gaussians,
             sky_gaussians=args.sky_gaussians,
+            temporal_codes=temporal_codes,
         )
         student = _student_from_seed(seed, dataset.sh_degree)
         start = 0
+        topology_stats = _topology_stats(student)
+        topology_events = []
     else:
         if resume.get("protocol") != PROTOCOL:
             raise RuntimeError("Student resume protocol mismatch")
@@ -283,6 +497,11 @@ def main():
         student.restore(resume["student"])
         initialization_audit = resume["initialization_audit"]
         start = int(resume["iteration"])
+        topology_stats = {
+            name: value.cuda()
+            for name, value in resume["topology_stats"].items()
+        }
+        topology_events = list(resume.get("topology_events", []))
     optimizer = _optimizer(args, student)
     if resume is not None:
         optimizer.load_state_dict(resume["optimizer"])
@@ -325,6 +544,19 @@ def main():
             "cuda_rasterizer/forward.cu"
         ),
     }
+    runtime_provenance = collect_runtime_provenance(
+        REPO_ROOT,
+        python_modules=(
+            "scripts.distill_standard_3dgs",
+            "outdoor.hybrid_gaussian_renderer",
+            "outdoor.standard_3dgs",
+            "diff_surfel_rasterization",
+        ),
+        extension_roots=(
+            SURFEL_ROOT / "submodules/diff-surfel-rasterization",
+            SURFEL_ROOT / "submodules/simple-knn",
+        ),
+    )
     jitter_rng = np.random.default_rng(args.seed + 2)
     if resume is not None:
         if resume.get("schedule_hash") != schedule_hash:
@@ -374,19 +606,40 @@ def main():
             else real_view
         )
         prefetch_training_images(step + 1)
+        task = None
+        target = None
+        if not novel:
+            task = fields.fields(
+                real_view.image_name,
+                (
+                    real_view.image_height,
+                    real_view.image_width,
+                ),
+                torch.device("cuda"),
+            )
+            target = real_view.original_image.cuda(non_blocking=True)
         with torch.no_grad():
             teacher_package = render_hybrid(
                 view,
                 teacher_surface,
                 teacher_foliage,
                 background=background,
-                include_dynamic=False,
+                temporal_code=(
+                    appearance.temporal_code(real_view.image_name)
+                    if not novel
+                    else None
+                ),
+                include_dynamic=not novel,
             )
             teacher_rgb = composite_white_background(
                 teacher_package.render,
                 teacher_package.alpha,
                 sky(view),
             ).clamp(0, 1)
+            if not novel:
+                teacher_rgb = appearance(
+                    teacher_rgb, real_view, task
+                ).clamp(0, 1)
         student_package = render_hybrid(
             view,
             empty,
@@ -395,21 +648,42 @@ def main():
             include_dynamic=False,
         )
         prediction = student_package.render.clamp(0, 1)
-        teacher_rgb_loss = (prediction - teacher_rgb).abs().mean()
-        alpha_loss = (
-            student_package.alpha - teacher_package.alpha
-        ).abs().mean()
+        if not novel:
+            rigid = task["p_rigid"] * (1.0 - task["p_transient"])
+            crown = task["p_canopy"] * (1.0 - task["p_transient"])
+            sky_weight = task["p_sky"] * (1.0 - task["p_transient"])
+            teacher_rgb_weight = (
+                rigid + 0.35 * crown + sky_weight
+            ).clamp(0, 1)
+        else:
+            rigid = (teacher_package.surface_alpha[0] > 0.05).float()
+            crown = (teacher_package.volume_alpha[0] > 0.05).float()
+            sky_weight = torch.zeros_like(rigid)
+            teacher_rgb_weight = torch.ones_like(rigid)
+        teacher_rgb_loss = _mean(
+            (prediction - teacher_rgb).abs(), teacher_rgb_weight
+        )
+        foreground = (rigid + crown).clamp(0, 1)
+        alpha_loss = _mean(
+            (
+                student_package.alpha
+                - teacher_package.alpha
+            ).abs(),
+            foreground,
+        )
         depth_valid = (
             (teacher_package.alpha > 0.05)
             & (teacher_package.depth > 0)
             & (student_package.depth > 0)
-        ).float()
+        ).float() * rigid[None]
         depth_loss = _mean(
-            (
-                student_package.depth
-                - teacher_package.depth
-            ).abs()
-            / teacher_package.depth.clamp_min(0.1),
+            torch.log1p(
+                (
+                    student_package.depth
+                    - teacher_package.depth
+                ).abs()
+                / teacher_package.depth.clamp_min(0.1)
+            ),
             depth_valid[0],
         )
         student_normal = depth_to_normal(
@@ -423,36 +697,74 @@ def main():
         )
         normal_loss = _mean(
             1.0 - (student_normal * teacher_normal).sum(0).abs(),
-            depth_valid[0],
+            depth_valid[0] * rigid,
         )
-        gt_loss = prediction.new_zeros(())
+        gt_rigid = prediction.new_zeros(())
+        gt_ssim = prediction.new_zeros(())
+        gt_edge = prediction.new_zeros(())
+        gt_crown_low = prediction.new_zeros(())
+        gt_sky = prediction.new_zeros(())
         if not novel:
-            task = fields.fields(
-                real_view.image_name,
-                (
-                    real_view.image_height,
-                    real_view.image_width,
-                ),
-                torch.device("cuda"),
+            gt_rigid = _mean(
+                (prediction - target).abs(), rigid
             )
-            target = real_view.original_image.cuda(non_blocking=True)
-            static_weight = (
-                task["p_rigid"]
-                + 0.20
-                * task["p_canopy"]
-                * (1.0 - task["p_transient"])
-            ).clamp(0, 1)
-            gt_loss = _mean(
-                (prediction - target).abs(), static_weight
+            gt_ssim = _masked_ssim_loss(
+                prediction, target, rigid
             )
-        loss = (
-            0.55 * teacher_rgb_loss
-            + 0.55 * gt_loss
-            + 0.12 * depth_loss
-            + 0.04 * normal_loss
-            + 0.06 * alpha_loss
-        )
+            gt_edge = _gradient_loss(
+                prediction,
+                target,
+                rigid * (1.0 - task["p_boundary_uncertain"]),
+            )
+            low_prediction = F.avg_pool2d(
+                prediction[None], 9, 1, 4
+            )[0]
+            low_target = F.avg_pool2d(target[None], 9, 1, 4)[0]
+            gt_crown_low = _mean(
+                (low_prediction - low_target).abs(), crown
+            )
+            gt_sky = _mean(
+                (prediction - target).abs(), sky_weight
+            )
+            loss = (
+                0.70 * gt_rigid
+                + 0.20 * gt_ssim
+                + 0.12 * gt_edge
+                + 0.25 * gt_crown_low
+                + 0.30 * gt_sky
+                + 0.20 * teacher_rgb_loss
+                + 0.10 * depth_loss
+                + 0.03 * normal_loss
+                + 0.04 * alpha_loss
+            )
+        else:
+            loss = (
+                teacher_rgb_loss
+                + 0.08 * depth_loss
+                + 0.02 * normal_loss
+                + 0.04 * alpha_loss
+            )
         loss.backward()
+        _accumulate_student_stats(topology_stats, student_package)
+        gradient_audit = {
+            name: float(
+                torch.nan_to_num(parameter.grad).norm()
+                if parameter.grad is not None
+                else 0.0
+            )
+            for name, parameter in (
+                ("xyz", student.xyz),
+                ("features", student.features),
+                ("opacity", student.opacity_logits),
+                ("scale", student.log_scales),
+                ("rotation", student.quaternions),
+            )
+        }
+        if step == 0 and (
+            gradient_audit["xyz"] <= 0
+            or gradient_audit["features"] <= 0
+        ):
+            raise RuntimeError("Standard 3DGS received no xyz/feature gradient")
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
@@ -461,17 +773,67 @@ def main():
             )
             student.opacity_logits.clamp_(-12, 5)
             student.log_scales.clamp_(-12, 5)
+        topology_event = None
+        topology_end = int(
+            args.iterations * args.densify_until_fraction
+        )
+        if (
+            not novel
+            and step + 1 >= args.densify_from_iter
+            and step + 1 <= topology_end
+            and args.densification_interval > 0
+            and (step + 1) % args.densification_interval == 0
+        ):
+            with torch.no_grad():
+                topology_package = render_hybrid(
+                    view,
+                    empty,
+                    student,
+                    background=background,
+                    include_dynamic=False,
+                    audit_fields=torch.stack(
+                        [
+                            rigid,
+                            crown,
+                            (prediction.detach() - target).abs().mean(0),
+                        ]
+                    ),
+                )
+                _accumulate_student_stats(
+                    topology_stats, topology_package
+                )
+                topology_event = _adapt_student_topology(
+                    args, student, topology_stats
+                )
+                new_to_old = topology_event.pop("_new_to_old")
+                if new_to_old is not None:
+                    optimizer = _migrate_optimizer(
+                        args,
+                        student,
+                        optimizer,
+                        new_to_old,
+                    )
+                topology_events.append(
+                    {"iteration": step + 1, **topology_event}
+                )
+                topology_stats = _topology_stats(student)
         if step == 0 or (step + 1) % 100 == 0:
             row = {
                 "iteration": step + 1,
                 "novel_camera": novel,
                 "loss": float(loss),
                 "teacher_rgb": float(teacher_rgb_loss),
-                "gt_static": float(gt_loss),
+                "gt_rigid": float(gt_rigid),
+                "gt_masked_ssim": float(gt_ssim),
+                "gt_rigid_edge": float(gt_edge),
+                "gt_crown_low": float(gt_crown_low),
+                "gt_sky": float(gt_sky),
                 "depth": float(depth_loss),
                 "normal": float(normal_loss),
                 "alpha": float(alpha_loss),
                 "gaussians": len(student),
+                "gradient_norms": gradient_audit,
+                "topology_event": topology_event,
             }
             with trace.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")
@@ -490,6 +852,9 @@ def main():
                     "evidence_hash": store["evidence_hash"],
                     "schedule_hash": schedule_hash,
                     "implementation_hashes": implementation_hashes,
+                    "runtime_provenance": runtime_provenance,
+                    "topology_stats": topology_stats,
+                    "topology_events": topology_events,
                     "python_rng_state": random.getstate(),
                     "numpy_rng_state": np.random.get_state(),
                     "torch_rng_state": torch.get_rng_state(),
@@ -536,6 +901,14 @@ def main():
         "cameras": str(cameras_source),
         "schema": schema,
         "implementation_hashes": implementation_hashes,
+        "runtime_provenance": runtime_provenance,
+        "topology_events": topology_events,
+        "density_control": {
+            "from_iteration": args.densify_from_iter,
+            "until_fraction": args.densify_until_fraction,
+            "interval": args.densification_interval,
+            "maximum_gaussians": args.maximum_gaussians,
+        },
         "requires_custom_cuda": False,
         "requires_uv_gate": False,
         "requires_temporal_code": False,

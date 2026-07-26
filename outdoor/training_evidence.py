@@ -66,15 +66,129 @@ class OutdoorGeometryEvidence:
         self.inverse_root = (
             inverse_marker.parent if inverse_marker is not None else None
         )
+        dav2_index_path = artifact_path(
+            self.store, "dav2_index", required=False
+        )
+        self.dav2_records: dict[str, Path] = {}
+        if dav2_index_path is not None:
+            payload = json.loads(
+                dav2_index_path.read_text(encoding="utf-8")
+            )
+            self.dav2_records = {
+                stem: Path(record["path"])
+                for stem, record in payload.get("records", {}).items()
+            }
+        self.track_archives = {}
+        for source_code, artifact_name in (
+            (0, "colmap_tracks"),
+            (1, "mast3r_tracks"),
+        ):
+            path = artifact_path(
+                self.store, artifact_name, required=False
+            )
+            if path is None:
+                continue
+            with np.load(path, allow_pickle=False) as archive:
+                order = np.argsort(archive["track_id"])
+                self.track_archives[source_code] = {
+                    "track_id": archive["track_id"][order].astype(np.int64),
+                    "xyz": archive["xyz"][order].astype(np.float32),
+                    "variance": archive["position_covariance_diag"][
+                        order
+                    ].astype(np.float32),
+                }
+        self._track_device_cache = {}
         self.consumed = {
             "chart": 0,
             "plane": 0,
             "inverse_depth": 0,
+            "dav2": 0,
+            "track_factor": 0,
+        }
+
+    def track_factor(
+        self, surface, *, maximum_tracks: int = 8192
+    ) -> tuple[torch.Tensor, dict]:
+        """Robust persistent SfM/MASt3R 3D track factor for seed primitives."""
+        zero = surface.get_xyz.new_zeros(())
+        if not self.track_archives or not hasattr(surface, "_track_id"):
+            return zero, {"matched": 0}
+        device = surface.get_xyz.device
+        device_key = str(device)
+        if device_key not in self._track_device_cache:
+            self._track_device_cache[device_key] = {
+                source: {
+                    name: torch.from_numpy(value).to(device=device)
+                    for name, value in archive.items()
+                }
+                for source, archive in self.track_archives.items()
+            }
+        total = zero
+        total_weight = zero
+        matched_total = 0
+        for source, archive in self._track_device_cache[device_key].items():
+            candidate = (
+                (surface._source_type == int(source))
+                & (surface._track_id >= 0)
+            )
+            indices = torch.nonzero(candidate, as_tuple=False).flatten()
+            if not len(indices):
+                continue
+            if len(indices) > maximum_tracks:
+                stride = int(np.ceil(len(indices) / maximum_tracks))
+                indices = indices[::stride][:maximum_tracks]
+            ids = surface._track_id[indices]
+            position = torch.searchsorted(archive["track_id"], ids)
+            in_range = position < len(archive["track_id"])
+            safe_position = position.clamp_max(
+                max(len(archive["track_id"]) - 1, 0)
+            )
+            matched = in_range & (
+                archive["track_id"][safe_position] == ids
+            )
+            if not bool(matched.any()):
+                continue
+            indices = indices[matched]
+            position = safe_position[matched]
+            variance = archive["variance"][position].clamp_min(1e-6)
+            delta = surface.get_xyz[indices] - archive["xyz"][position]
+            mahalanobis = (delta.square() / variance).sum(-1)
+            weight = surface._geometry_confidence[indices].clamp(0.05, 1)
+            total = total + (torch.log1p(mahalanobis) * weight).sum()
+            total_weight = total_weight + weight.sum()
+            matched_total += int(len(indices))
+        if matched_total:
+            self.consumed["track_factor"] += 1
+        return total / total_weight.clamp_min(1), {
+            "matched": matched_total,
         }
 
     @property
     def geometry_view_stems(self) -> tuple[str, ...]:
-        return tuple(sorted(self.frame_by_stem))
+        return tuple(
+            sorted(set(self.frame_by_stem) | set(self.dav2_records))
+        )
+
+    @staticmethod
+    def _load_monocular_depth(path: Path) -> np.ndarray:
+        suffix = path.suffix.lower()
+        if suffix == ".npy":
+            value = np.load(path)
+        elif suffix == ".npz":
+            with np.load(path, allow_pickle=False) as archive:
+                for key in ("depth", "pred", "prediction", "arr_0"):
+                    if key in archive:
+                        value = archive[key]
+                        break
+                else:
+                    raise KeyError(f"No depth array in {path}")
+        else:
+            value = np.asarray(Image.open(path))
+        value = np.asarray(value, dtype=np.float32)
+        value = np.squeeze(value)
+        if value.ndim != 2:
+            raise ValueError(f"DAV2 depth must be HxW, got {value.shape}")
+        return value
 
     @staticmethod
     def _tensor(
@@ -111,10 +225,12 @@ class OutdoorGeometryEvidence:
     ) -> dict[str, torch.Tensor]:
         stem = Path(str(image_name)).stem
         frame = self.frame_by_stem.get(stem)
-        if frame is None:
-            return {}
         result: dict[str, torch.Tensor] = {}
-        if self.chart is not None and self.chart["active"][frame]:
+        if (
+            frame is not None
+            and self.chart is not None
+            and self.chart["active"][frame]
+        ):
             depth = self.chart["depth"][frame]
             confidence = self.chart["confidence"][frame]
             valid = (
@@ -139,7 +255,7 @@ class OutdoorGeometryEvidence:
                 shape=shape,
             )
             self.consumed["chart"] += 1
-        if self.plane_root is not None:
+        if self.plane_root is not None and frame is not None:
             plane_depth = self.plane_root / f"plane_depth_frame{frame:06d}.npy"
             plane_confidence = (
                 self.plane_root
@@ -184,7 +300,7 @@ class OutdoorGeometryEvidence:
                     device=device,
                     shape=shape,
                 )
-        if self.inverse_root is not None:
+        if self.inverse_root is not None and frame is not None:
             paths = {
                 "rho_mean": self.inverse_root
                 / f"rho_mean_frame{frame:06d}.npy",
@@ -209,12 +325,21 @@ class OutdoorGeometryEvidence:
                         mode=mode,
                     )
                 self.consumed["inverse_depth"] += 1
+        dav2_path = self.dav2_records.get(stem)
+        if dav2_path is not None and dav2_path.is_file():
+            result["mono_depth"] = self._tensor(
+                self._load_monocular_depth(dav2_path),
+                device=device,
+                shape=shape,
+            )
+            self.consumed["dav2"] += 1
         return result
 
     def audit(self) -> dict:
         return {
             "available_geometry_views": len(self.frame_by_stem),
+            "available_dav2_views": len(self.dav2_records),
             "source_consumption_count": dict(self.consumed),
-            "source_losses_are_independent": True,
+            "source_losses_are_mutually_exclusive": True,
             "inverse_depth_is_cache_not_replacement": True,
         }

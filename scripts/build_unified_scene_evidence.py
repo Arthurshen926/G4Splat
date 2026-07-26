@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -241,16 +242,61 @@ def main() -> None:
 
     if args.dav2_root is not None:
         dav2 = args.dav2_root.expanduser().resolve()
+        scene_records = json.loads(
+            scene_contract.read_text(encoding="utf-8")
+        )["records"]
+        requested = {
+            Path(record["image_name"]).stem for record in scene_records
+        }
         candidates = sorted(
             path for path in dav2.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".json", ".npz"}
+            if path.is_file()
+            and path.suffix.lower()
+            in {".npy", ".npz", ".png", ".tif", ".tiff"}
         )
-        if candidates:
+        by_stem = {}
+        for path in candidates:
+            stem = path.stem
+            for suffix in (
+                "_depth",
+                "_dav2",
+                "_depth_anything_v2",
+                "_pred",
+            ):
+                if stem.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+                    break
+            if stem in requested and stem not in by_stem:
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1 << 20), b""):
+                        digest.update(block)
+                by_stem[stem] = {
+                    "path": str(path),
+                    "sha256": digest.hexdigest(),
+                    "size": path.stat().st_size,
+                }
+        if by_stem:
+            dav2_index = output / "dav2_index.json"
+            dav2_index.write_text(
+                json.dumps(
+                    {
+                        "version": "dav2-real-view-index-v1",
+                        "root": str(dav2),
+                        "scene_view_count": len(requested),
+                        "indexed_view_count": len(by_stem),
+                        "records": by_stem,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             builder.add_file(
-                "dav2_manifest",
+                "dav2_index",
                 "depth_anything_v2",
-                candidates[0],
-                measurement="monocular ordinal depth/index",
+                dav2_index,
+                measurement="per-real-view monocular ordinal depth index",
                 coordinate_frame="camera_rays",
                 covariance="ordinal_only_not_metric",
                 semantic_role="rigid_depth_order",

@@ -14,6 +14,11 @@ from scipy.spatial.transform import Rotation
 
 STANDARD_3DGS_VERSION = "canonical-standard-3dgs-v1"
 C0 = 0.28209479177387814
+STUDENT_ROLE_RIGID = 10
+STUDENT_ROLE_SKELETON = 11
+STUDENT_ROLE_CROWN = 12
+STUDENT_ROLE_DYNAMIC_BAKED = 13
+STUDENT_ROLE_SKY = 14
 
 
 def _rotation_from_z(directions: np.ndarray) -> np.ndarray:
@@ -91,6 +96,7 @@ def canonical_student_seed(
     *,
     maximum_surface_gaussians: int = 1_500_000,
     sky_gaussians: int = 8192,
+    temporal_codes: torch.Tensor | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Sample thin 3D volumes over teacher surfels, then append foliage/sky."""
     from utils.general_utils import build_rotation
@@ -108,6 +114,7 @@ def canonical_student_seed(
     quaternion_values = []
     opacity_values = []
     feature_values = []
+    role_values = []
     confidence = surface._geometry_confidence.detach().clamp(0, 1)
     for value in (1, 2, 3):
         indices = torch.nonzero(
@@ -142,6 +149,14 @@ def canonical_student_seed(
             (
                 surface.get_xyz.detach()[indices, None] + offset
             ).reshape(-1, 3)
+        )
+        role_values.append(
+            torch.full(
+                (len(indices) * child_count,),
+                STUDENT_ROLE_RIGID,
+                dtype=torch.int8,
+                device=device,
+            )
         )
         tangent = (
             parent_scale[:, None, :].expand(-1, child_count, -1)
@@ -191,6 +206,63 @@ def canonical_student_seed(
         foliage.opacities.detach()[canonical, None]
     )
     feature_values.append(foliage.features.detach()[canonical])
+    canonical_roles = torch.full(
+        (int(canonical.sum()),),
+        STUDENT_ROLE_CROWN,
+        dtype=torch.int8,
+        device=device,
+    )
+    canonical_roles[
+        foliage.static_skeleton_mask[canonical]
+    ] = STUDENT_ROLE_SKELETON
+    role_values.append(canonical_roles)
+
+    dynamic = foliage.dynamic_leaf_mask
+    baked_dynamic_count = 0
+    temporal_variance_mean = 0.0
+    if bool(dynamic.any()) and temporal_codes is not None and len(temporal_codes):
+        codes = temporal_codes.to(device=device, dtype=dtype)
+        median_code = codes.median(dim=0).values
+        centered = codes - codes.mean(dim=0, keepdim=True)
+        code_covariance = centered.T @ centered / max(len(codes) - 1, 1)
+        basis = foliage.deformation_basis.detach()[dynamic]
+        displacement_variance = torch.einsum(
+            "nrc,rs,nsc->n", basis, code_covariance, basis
+        ).clamp_min(0)
+        dynamic_scale = foliage.scales.detach()[dynamic].square().mean(1)
+        stability = torch.exp(
+            -displacement_variance / dynamic_scale.clamp_min(1e-6)
+        ).clamp(0.10, 1.0)
+        conditioned_xyz, conditioned_features, conditioned_opacity = (
+            foliage.conditioned_state(
+                median_code, include_dynamic=True
+            )
+        )
+        xyz_values.append(conditioned_xyz.detach()[dynamic])
+        scale_values.append(
+            foliage.scales.detach()[dynamic] * 0.75
+        )
+        quaternion_values.append(
+            foliage.normalized_quaternions.detach()[dynamic]
+        )
+        opacity_values.append(
+            (
+                conditioned_opacity.detach()[dynamic]
+                * stability
+                * 0.22
+            )[:, None]
+        )
+        feature_values.append(conditioned_features.detach()[dynamic])
+        role_values.append(
+            torch.full(
+                (int(dynamic.sum()),),
+                STUDENT_ROLE_DYNAMIC_BAKED,
+                dtype=torch.int8,
+                device=device,
+            )
+        )
+        baked_dynamic_count = int(dynamic.sum())
+        temporal_variance_mean = float(displacement_variance.mean())
 
     centers = camera_centers.to(device=device, dtype=dtype)
     scene_center = torch.median(centers, dim=0).values
@@ -237,9 +309,17 @@ def canonical_student_seed(
     scale_values.append(shell_scales)
     quaternion_values.append(shell_quaternion)
     opacity_values.append(
-        torch.full((count, 1), 0.92, device=device, dtype=dtype)
+        torch.full((count, 1), 0.08, device=device, dtype=dtype)
     )
     feature_values.append(shell_features)
+    role_values.append(
+        torch.full(
+            (count,),
+            STUDENT_ROLE_SKY,
+            dtype=torch.int8,
+            device=device,
+        )
+    )
 
     xyz = torch.cat(xyz_values)
     scales = torch.cat(scale_values)
@@ -252,12 +332,17 @@ def canonical_student_seed(
         "quaternions": quaternion,
         "opacity_logits": torch.logit(opacity),
         "features": features,
+        "primitive_role": torch.cat(role_values),
     }
+    surface_student_count = int(
+        sum(
+            int((roles == STUDENT_ROLE_RIGID).sum())
+            for roles in role_values
+        )
+    )
     audit = {
         "surface_parent_count": len(surface.get_xyz),
-        "surface_student_count": int(
-            sum(value.shape[0] for value in xyz_values[:-2])
-        ),
+        "surface_student_count": surface_student_count,
         "surface_subdivision_counts": {
             str(value): int((subdivisions == value).sum())
             for value in (1, 2, 3)
@@ -265,10 +350,18 @@ def canonical_student_seed(
         "canonical_foliage_count": int(canonical.sum()),
         "dynamic_foliage_omitted": int(
             foliage.dynamic_leaf_mask.sum()
+        ) - baked_dynamic_count,
+        "dynamic_foliage_baked": baked_dynamic_count,
+        "dynamic_temporal_variance_mean": temporal_variance_mean,
+        "dynamic_bake_policy": (
+            "median_temporal_code_with_variance_opacity_attenuation"
+            if baked_dynamic_count
+            else "not_available"
         ),
         "sky_shell_count": count,
         "sky_shell_radius": float(shell_radius),
         "total_count": len(xyz),
+        "training_roles_stripped_on_export": True,
     }
     return seed, audit
 

@@ -63,6 +63,7 @@ class GaussianModel:
         # continuations auditable without changing rasterizer inputs.
         self._primitive_class = torch.empty(0, dtype=torch.int16)
         self._source_type = torch.empty(0, dtype=torch.int16)
+        self._track_id = torch.empty(0, dtype=torch.int64)
         self._geometry_confidence = torch.empty(0)
         self._protected_flag = torch.empty(0, dtype=torch.bool)
         self._block_id = torch.empty(0, dtype=torch.int32)
@@ -92,6 +93,7 @@ class GaussianModel:
             {
                 "primitive_class": self._primitive_class,
                 "source_type": self._source_type,
+                "track_id": self._track_id,
                 "geometry_confidence": self._geometry_confidence,
                 "protected_flag": self._protected_flag,
                 "block_id": self._block_id,
@@ -128,6 +130,7 @@ class GaussianModel:
         *,
         primitive_class=PRIMITIVE_STRUCTURAL,
         source_type=SOURCE_SFM_OR_BASE,
+        track_id=-1,
         geometry_confidence=1.0,
         protected_flag=False,
         block_id=-1,
@@ -140,6 +143,9 @@ class GaussianModel:
         )
         self._source_type = torch.full(
             (count,), int(source_type), dtype=torch.int16, device=device
+        )
+        self._track_id = torch.full(
+            (count,), int(track_id), dtype=torch.int64, device=device
         )
         self._geometry_confidence = torch.full(
             (count,), float(geometry_confidence), dtype=torch.float32, device=device
@@ -169,6 +175,13 @@ class GaussianModel:
         fields = {
             "_primitive_class": (metadata["primitive_class"], torch.int16),
             "_source_type": (metadata["source_type"], torch.int16),
+            "_track_id": (
+                metadata.get(
+                    "track_id",
+                    torch.full((point_count,), -1, dtype=torch.int64),
+                ),
+                torch.int64,
+            ),
             "_geometry_confidence": (metadata["geometry_confidence"], torch.float32),
             "_protected_flag": (metadata["protected_flag"], torch.bool),
             "_block_id": (metadata["block_id"], torch.int32),
@@ -189,6 +202,7 @@ class GaussianModel:
         metadata = {
             "primitive_class": self._primitive_class[indices],
             "source_type": self._source_type[indices],
+            "track_id": self._track_id[indices],
             "geometry_confidence": self._geometry_confidence[indices],
             "protected_flag": self._protected_flag[indices],
             "block_id": self._block_id[indices],
@@ -196,6 +210,7 @@ class GaussianModel:
         dtype_by_name = {
             "primitive_class": torch.int16,
             "source_type": torch.int16,
+            "track_id": torch.int64,
             "geometry_confidence": torch.float32,
             "protected_flag": torch.bool,
             "block_id": torch.int32,
@@ -217,6 +232,10 @@ class GaussianModel:
     @property
     def get_source_type(self):
         return self._source_type
+
+    @property
+    def get_track_id(self):
+        return self._track_id
 
     @property
     def get_geometry_confidence(self):
@@ -719,6 +738,7 @@ class GaussianModel:
             [
                 "primitive_class",
                 "source_type",
+                "track_id",
                 "geometry_confidence",
                 "protected_flag",
                 "block_id",
@@ -740,6 +760,7 @@ class GaussianModel:
             [
                 self._primitive_class.detach().cpu().numpy(),
                 self._source_type.detach().cpu().numpy(),
+                self._track_id.detach().cpu().numpy(),
                 self._geometry_confidence.detach().cpu().numpy(),
                 self._protected_flag.detach().cpu().numpy().astype(np.float32),
                 self._block_id.detach().cpu().numpy(),
@@ -956,6 +977,15 @@ class GaussianModel:
                 dtype=torch.int16,
                 device="cuda",
             )
+            self._track_id = torch.tensor(
+                (
+                    np.asarray(plydata.elements[0]["track_id"])
+                    if "track_id" in property_names
+                    else np.full(len(xyz), -1)
+                ),
+                dtype=torch.int64,
+                device="cuda",
+            )
             self._geometry_confidence = torch.tensor(
                 np.asarray(plydata.elements[0]["geometry_confidence"]),
                 dtype=torch.float32,
@@ -1028,6 +1058,7 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self._primitive_class = self._primitive_class[valid_points_mask]
         self._source_type = self._source_type[valid_points_mask]
+        self._track_id = self._track_id[valid_points_mask]
         self._geometry_confidence = self._geometry_confidence[valid_points_mask]
         self._protected_flag = self._protected_flag[valid_points_mask]
         self._block_id = self._block_id[valid_points_mask]
@@ -1091,6 +1122,9 @@ class GaussianModel:
                     (new_count,), self.SOURCE_SFM_OR_BASE,
                     dtype=torch.int16, device=self._xyz.device
                 ),
+                "track_id": torch.full(
+                    (new_count,), -1, dtype=torch.int64, device=self._xyz.device
+                ),
                 "geometry_confidence": torch.ones(
                     new_count, dtype=torch.float32, device=self._xyz.device
                 ),
@@ -1104,6 +1138,7 @@ class GaussianModel:
         for name, attribute in (
             ("primitive_class", "_primitive_class"),
             ("source_type", "_source_type"),
+            ("track_id", "_track_id"),
             ("geometry_confidence", "_geometry_confidence"),
             ("protected_flag", "_protected_flag"),
             ("block_id", "_block_id"),
@@ -1184,7 +1219,9 @@ class GaussianModel:
             new_opacity,
             new_scaling,
             new_rotation,
-            metadata=self._point_metadata_from_indices(selected_indices, repeat=N),
+            metadata=self._point_metadata_from_indices(
+                selected_indices, repeat=N, track_id=-1
+            ),
         )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -1211,7 +1248,9 @@ class GaussianModel:
             new_opacities,
             new_scaling,
             new_rotation,
-            metadata=self._point_metadata_from_indices(selected_indices),
+            metadata=self._point_metadata_from_indices(
+                selected_indices, track_id=-1
+            ),
         )
 
     def densify_and_clone_limited(
@@ -1298,6 +1337,7 @@ class GaussianModel:
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
+                track_id=-1,
             ),
         )
         if parent_mip_filter is not None:
@@ -1408,6 +1448,7 @@ class GaussianModel:
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
+                track_id=-1,
             ),
         )
         if parent_mip_filter is not None:

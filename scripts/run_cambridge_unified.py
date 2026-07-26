@@ -20,17 +20,17 @@ from outdoor.evidence_store import load_evidence_store  # noqa: E402
 from outdoor.standard_3dgs import validate_standard_3dgs_ply  # noqa: E402
 
 
-PIPELINE_VERSION = "cambridge-unified-reconstruction-v1"
+PIPELINE_VERSION = "cambridge-unified-reconstruction-v2"
 EXPERIMENT_PROFILES = {
     "quality": {
-        "teacher_iterations": 80_000,
+        "teacher_iterations": 50_000,
         "student_iterations": 30_000,
         "teacher_profile": "quality",
         "checkpoint_every": 1000,
     },
     "fast": {
-        "teacher_iterations": 30_000,
-        "student_iterations": 10_000,
+        "teacher_iterations": 20_000,
+        "student_iterations": 15_000,
         "teacher_profile": "fast",
         "checkpoint_every": 500,
     },
@@ -75,6 +75,23 @@ def _parse_args():
         ),
     )
     parser.add_argument("--frontend-run", type=Path)
+    parser.add_argument(
+        "--dav2-root",
+        type=Path,
+        help=(
+            "Optional all-real-view Depth Anything V2 cache. Files are "
+            "indexed by database image stem and consumed as rigid-only "
+            "ordinal evidence."
+        ),
+    )
+    parser.add_argument(
+        "--build-dav2-cache",
+        action="store_true",
+        help=(
+            "Generate/resume a DAV2 cache under the run directory before "
+            "building the immutable evidence store."
+        ),
+    )
     parser.add_argument("--frontend-run-tag", default="unified-evidence-v1")
     parser.add_argument("--broad-charts", type=int, default=56)
     parser.add_argument("--min-charts", type=int, default=24)
@@ -295,9 +312,9 @@ def main():
             args.gpu, args.minimum_free_gpu_memory_mib
         )
     run_suffix = (
-        "unified_v1"
+        "unified_v2"
         if args.profile == "quality"
-        else f"unified_{args.profile}_v1"
+        else f"unified_{args.profile}_v2"
     )
     run = (args.run_root / f"{args.scene}_{run_suffix}").resolve()
     run.mkdir(parents=True, exist_ok=True)
@@ -408,13 +425,31 @@ def main():
     if "evidence" in selected:
         evidence_manifest = evidence / "evidence_manifest.json"
         if not evidence_manifest.is_file():
-            _run(
-                [
-                    python,
-                    str(
-                        REPO_ROOT
-                        / "scripts/build_unified_scene_evidence.py"
-                    ),
+            dav2_root = args.dav2_root
+            if args.build_dav2_cache:
+                dav2_root = run / "dav2_real_views"
+                _run(
+                    [
+                        python,
+                        str(
+                            REPO_ROOT
+                            / "scripts/cache_dav2_real_views.py"
+                        ),
+                        "--dataset",
+                        str(dataset),
+                        "--output",
+                        str(dav2_root),
+                    ],
+                    env=env,
+                    log=run / "logs/dav2.log",
+                    dry_run=args.dry_run,
+                )
+            command = [
+                python,
+                str(
+                    REPO_ROOT
+                    / "scripts/build_unified_scene_evidence.py"
+                ),
                     "--dataset",
                     str(dataset),
                     "--mask-pickle",
@@ -433,7 +468,13 @@ def main():
                     str(frontend / "mast3r_sfm"),
                     "--output",
                     str(evidence),
-                ],
+            ]
+            if dav2_root is not None:
+                command.extend(
+                    ["--dav2-root", str(dav2_root.resolve())]
+                )
+            _run(
+                command,
                 env=env,
                 log=run / "logs/evidence.log",
                 dry_run=args.dry_run,

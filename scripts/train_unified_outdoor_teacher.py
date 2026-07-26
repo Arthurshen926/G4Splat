@@ -43,6 +43,7 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     render_hybrid,
 )
 from outdoor.lazy_scene import LazyScene  # noqa: E402
+from outdoor.runtime_provenance import collect_runtime_provenance  # noqa: E402
 from outdoor.task_fields import OutdoorTaskFieldLookup  # noqa: E402
 from outdoor.training_evidence import OutdoorGeometryEvidence  # noqa: E402
 from scene import GaussianModel  # noqa: E402
@@ -67,12 +68,13 @@ TRAINING_PROFILES = {
     "quality": {
         "iterations": 80_000,
         "phases": (
-            ("canonical_bootstrap", 0.20),
-            ("topology", 0.60),
+            ("canonical_bootstrap", 0.06),
+            ("topology", 0.58),
             ("dynamic_appearance", 0.85),
             ("ownership_cleanup", 0.95),
             ("canonical_polish", 1.00),
         ),
+        "dynamic_start": 0.06,
     },
     # Reconstruction-quality validation schedule: the dynamic foliage branch
     # starts at 12k instead of 48k, while every phase still sees several full
@@ -80,12 +82,13 @@ TRAINING_PROFILES = {
     "fast": {
         "iterations": 30_000,
         "phases": (
-            ("canonical_bootstrap", 0.20),
+            ("canonical_bootstrap", 0.08),
             ("topology", 0.40),
             ("dynamic_appearance", 0.73),
             ("ownership_cleanup", 0.90),
             ("canonical_polish", 1.00),
         ),
+        "dynamic_start": 0.08,
     },
 }
 
@@ -128,6 +131,7 @@ def _parse_args():
     parser.add_argument("--plane-weight", type=float, default=0.06)
     parser.add_argument("--normal-weight", type=float, default=0.025)
     parser.add_argument("--ordinal-weight", type=float, default=0.015)
+    parser.add_argument("--track-weight", type=float, default=0.01)
     parser.add_argument("--ownership-weight", type=float, default=0.08)
     parser.add_argument("--occupancy-weight", type=float, default=0.06)
     parser.add_argument("--dynamic-weight", type=float, default=0.65)
@@ -244,6 +248,13 @@ def _phase(
     return phases[-1][0]
 
 
+def _dynamic_enabled(
+    step: int, iterations: int, training_profile: str
+) -> bool:
+    start = float(TRAINING_PROFILES[training_profile]["dynamic_start"])
+    return (step + 1) / float(iterations) > start
+
+
 def _full_epoch_schedule(count: int, iterations: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     result = []
@@ -288,6 +299,35 @@ def _weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     ).clamp_min(1.0)
 
 
+def _gradient_norm(parameter: torch.Tensor) -> float:
+    gradient = parameter.grad
+    if gradient is None:
+        return 0.0
+    return float(torch.nan_to_num(gradient).norm().detach())
+
+
+def _teacher_gradient_audit(surface, foliage, package) -> dict[str, float]:
+    return {
+        "surface_xyz": _gradient_norm(surface._xyz),
+        "surface_feature_dc": _gradient_norm(surface._features_dc),
+        "surface_feature_rest": _gradient_norm(surface._features_rest),
+        "surface_opacity": _gradient_norm(surface._opacity),
+        "surface_scale": _gradient_norm(surface._scaling),
+        "surface_rotation": _gradient_norm(surface._rotation),
+        "surface_means2d": (
+            0.0
+            if package.surface_means2d is None
+            or package.surface_means2d.grad is None
+            else float(
+                torch.nan_to_num(package.surface_means2d.grad).norm()
+            )
+        ),
+        "foliage_xyz": _gradient_norm(foliage.xyz),
+        "foliage_features": _gradient_norm(foliage.features),
+        "foliage_opacity": _gradient_norm(foliage.opacity_logits),
+    }
+
+
 def _photo_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -295,11 +335,64 @@ def _photo_loss(
     lambda_dssim: float,
 ) -> torch.Tensor:
     l1 = _weighted_mean((prediction - target).abs(), weight)
-    structural = 1.0 - ssim(
-        prediction * weight[None],
-        target * weight[None],
-    )
+    structural = _masked_ssim_loss(prediction, target, weight)
     return (1.0 - lambda_dssim) * l1 + lambda_dssim * structural
+
+
+def _masked_ssim_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    window_size: int = 11,
+) -> torch.Tensor:
+    """SSIM over valid windows, without artificial zero-valued mask edges."""
+    if weight.ndim == 2:
+        weight = weight[None, None]
+    elif weight.ndim == 3:
+        weight = weight[None]
+    prediction = prediction[None] if prediction.ndim == 3 else prediction
+    target = target[None] if target.ndim == 3 else target
+    padding = window_size // 2
+    mu_prediction = F.avg_pool2d(
+        prediction, window_size, stride=1, padding=padding
+    )
+    mu_target = F.avg_pool2d(
+        target, window_size, stride=1, padding=padding
+    )
+    prediction_variance = F.avg_pool2d(
+        prediction.square(), window_size, stride=1, padding=padding
+    ) - mu_prediction.square()
+    target_variance = F.avg_pool2d(
+        target.square(), window_size, stride=1, padding=padding
+    ) - mu_target.square()
+    covariance = F.avg_pool2d(
+        prediction * target, window_size, stride=1, padding=padding
+    ) - mu_prediction * mu_target
+    c1, c2 = 0.01**2, 0.03**2
+    similarity = (
+        (2 * mu_prediction * mu_target + c1)
+        * (2 * covariance + c2)
+        / (
+            (mu_prediction.square() + mu_target.square() + c1)
+            * (prediction_variance + target_variance + c2)
+        ).clamp_min(1e-8)
+    ).mean(1, keepdim=True)
+    # A minimum pool erodes hard masks and preserves the confidence floor for
+    # soft masks. Padding is explicitly invalid so image borders do not gain
+    # synthetic support.
+    eroded = -F.max_pool2d(
+        -weight, window_size, stride=1, padding=padding
+    )
+    border = torch.ones_like(eroded)
+    border[..., :padding, :] = 0
+    border[..., -padding:, :] = 0
+    border[..., :, :padding] = 0
+    border[..., :, -padding:] = 0
+    valid = eroded.clamp(0, 1) * border
+    if not bool((valid > 0).any()):
+        return prediction.new_zeros(())
+    return ((1.0 - similarity) * valid).sum() / valid.sum().clamp_min(1)
 
 
 def _high_frequency_loss(
@@ -345,6 +438,9 @@ def _initialize_surface(
         source_type = torch.from_numpy(
             seed["source_type"]
         ).to(device="cuda", dtype=torch.int16)
+        track_id = torch.from_numpy(
+            seed["track_id"]
+        ).to(device="cuda", dtype=torch.int64)
         confidence = torch.from_numpy(
             seed["geometry_confidence"]
         ).float().cuda()
@@ -355,6 +451,7 @@ def _initialize_surface(
         torch.logit(opacity[:, None].clamp(1e-6, 1 - 1e-6))
     )
     surface._source_type = source_type
+    surface._track_id = track_id
     surface._geometry_confidence = confidence
     surface._primitive_class.fill_(GaussianModel.PRIMITIVE_STRUCTURAL)
     surface._protected_flag.zero_()
@@ -504,54 +601,87 @@ def _accumulate_volume_stats(stats, package) -> None:
 
 @torch.no_grad()
 def _adapt_volume(args, foliage, stats):
+    """Prune contradictions first, then split residuals in one mutation.
+
+    The returned mapping always addresses the topology that entered this
+    function, so Adam state can be migrated exactly once after both changes.
+    """
+    old_count = len(foliage)
+    support = foliage.support_view_count.float().clamp_min(1)
+    contradiction_ratio = (
+        foliage.free_space_violation_count.float() / support
+    )
+    contribution_floor = torch.quantile(stats["contribution"], 0.10)
+    low_contribution = stats["contribution"] <= contribution_floor
+    low_opacity = foliage.opacities < 0.002
+    strong_contradiction = (
+        (contradiction_ratio >= 0.55)
+        | (foliage.occupancy_probability < 0.06)
+    )
+    weak_contradiction = (
+        (contradiction_ratio >= 0.30)
+        | (foliage.occupancy_probability < 0.12)
+    )
+    remove = strong_contradiction | (
+        weak_contradiction & low_contribution & low_opacity
+    )
+    pruned, kept_old = foliage.prune(remove)
+    working_stats = {
+        name: value[kept_old] for name, value in stats.items()
+    }
+
     count = len(foliage)
-    gradient = stats["gradient"] / stats["gradient_count"].clamp_min(1)
-    residual = stats["residual"] / stats["contribution"].clamp_min(1e-8)
-    rigid = stats["rigid"] / stats["contribution"].clamp_min(1e-8)
+    gradient = (
+        working_stats["gradient"]
+        / working_stats["gradient_count"].clamp_min(1)
+    )
+    residual = (
+        working_stats["residual"]
+        / working_stats["contribution"].clamp_min(1e-8)
+    )
+    rigid = (
+        working_stats["rigid"]
+        / working_stats["contribution"].clamp_min(1e-8)
+    )
     eligible = (
         ~foliage.static_skeleton_mask
         & (foliage.support_sequence_count >= 2)
-        & (stats["radius"] >= args.volume_split_radius)
-        & (stats["contribution"] > 0)
+        & (working_stats["radius"] >= args.volume_split_radius)
+        & (working_stats["contribution"] > 0)
         & (rigid < 0.15)
     )
     capacity = min(
         args.maximum_volume_splits,
         max(args.maximum_volume_gaussians - count, 0),
     )
+    split_parents = 0
+    children = 0
+    final_to_kept = torch.arange(count, device=foliage.xyz.device)
     if bool(eligible.any()) and capacity > 0:
         indices = torch.nonzero(eligible, as_tuple=False).flatten()
         score = gradient[indices] * residual[indices]
         selected = indices[
             torch.topk(score, min(capacity, len(indices))).indices
         ]
-        event = foliage.split(selected)
-        event["pruned"] = 0
-        return event
-    support = foliage.support_view_count.float().clamp_min(1)
-    contradiction = (
-        (
-            foliage.free_space_violation_count.float()
-            / support
-        )
-        >= 0.30
-    ) | (foliage.occupancy_probability < 0.12)
-    weak = (
-        foliage.opacities < 0.002
-    ) & (
-        stats["contribution"]
-        <= torch.quantile(stats["contribution"], 0.10)
-    )
-    pruned, new_to_old = foliage.prune(weak & contradiction)
+        split_event = foliage.split(selected)
+        split_parents = int(split_event["split_parents"])
+        children = int(split_event["children"])
+        final_to_kept = split_event["_new_to_old"]
+    final_to_old = kept_old[final_to_kept]
+    mutated = pruned > 0 or split_parents > 0
     return {
-        "split_parents": 0,
-        "children": 0,
+        "old_count": old_count,
+        "new_count": len(foliage),
+        "split_parents": split_parents,
+        "children": children,
         "pruned": pruned,
-        "_new_to_old": new_to_old if pruned else None,
+        "_new_to_old": final_to_old if mutated else None,
     }
 
 
-def _apply_volume_role_gradients(foliage, phase: str) -> None:
+def _apply_volume_role_gradients(
+    foliage, phase: str, *, dynamic_active: bool
+) -> None:
     skeleton = foliage.static_skeleton_mask
     dynamic = foliage.dynamic_leaf_mask
     if foliage.xyz.grad is not None:
@@ -569,10 +699,7 @@ def _apply_volume_role_gradients(foliage, phase: str) -> None:
     ):
         if parameter.grad is not None:
             parameter.grad[~dynamic] = 0
-            if phase not in {
-                "dynamic_appearance",
-                "ownership_cleanup",
-            }:
+            if not dynamic_active or phase == "canonical_polish":
                 parameter.grad[dynamic] = 0
 
 
@@ -581,6 +708,9 @@ def _geometry_losses(
     evidence: dict[str, torch.Tensor],
     rigid: torch.Tensor,
     args,
+    *,
+    geometry_weight: torch.Tensor | None = None,
+    plane_task_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     zero = package.depth.new_zeros(())
     losses = {
@@ -600,6 +730,33 @@ def _geometry_losses(
         torch.ones_like(predicted_depth),
     )
     valid_prediction = valid_prediction_mask.float()
+    geometry_weight = (
+        rigid
+        if geometry_weight is None
+        else geometry_weight * rigid
+    )
+    plane_task_weight = (
+        geometry_weight
+        if plane_task_weight is None
+        else plane_task_weight * rigid
+    )
+    source_bits = evidence.get("source_bitmask")
+    if source_bits is not None:
+        source_bits = source_bits[0].to(torch.uint8)
+        has_plane = (source_bits & 1) != 0
+        has_chart = (source_bits & 2) != 0
+        has_mono = (source_bits & 4) != 0
+    else:
+        has_plane = torch.zeros_like(rigid, dtype=torch.bool)
+        has_chart = torch.zeros_like(rigid, dtype=torch.bool)
+        has_mono = torch.zeros_like(rigid, dtype=torch.bool)
+    # Exactly one dense metric source owns each pixel: plane beats Chart,
+    # Chart beats calibrated mono. Raw Chart depth is a fallback only when no
+    # fused inverse-depth source is available.
+    plane_owner = has_plane
+    chart_owner = has_chart & ~plane_owner
+    mono_owner = has_mono & ~plane_owner & ~chart_owner
+    fused_available = source_bits is not None and "rho_mean" in evidence
     if "chart_depth" in evidence:
         raw_target = evidence["chart_depth"][0]
         valid_target = torch.isfinite(raw_target) & (raw_target > 0)
@@ -608,10 +765,12 @@ def _geometry_losses(
         )
         weight = (
             evidence["chart_weight"][0]
-            * rigid
+            * geometry_weight
             * valid_prediction
             * valid_target.float()
         )
+        if fused_available:
+            weight = weight * (~(plane_owner | chart_owner)).float()
         relative = (
             safe_predicted_depth - target
         ).abs() / target.clamp_min(0.1)
@@ -626,10 +785,12 @@ def _geometry_losses(
         )
         weight = (
             evidence["plane_weight"][0]
-            * rigid
+            * plane_task_weight
             * valid_prediction
             * valid_target.float()
         )
+        if source_bits is not None:
+            weight = weight * plane_owner.float()
         relative = (
             safe_predicted_depth - target
         ).abs() / target.clamp_min(0.1)
@@ -690,11 +851,13 @@ def _geometry_losses(
         )
         support = (evidence["support_view_count"][0] >= 2).float()
         weight = (
-            rigid
+            geometry_weight
             * support
             * valid_prediction
             * valid_target.float()
         )
+        if source_bits is not None:
+            weight = weight * chart_owner.float()
         nll = torch.log1p((rho - target).square() / variance)
         losses["inverse"] = (
             nll * weight
@@ -723,11 +886,23 @@ def _geometry_losses(
             & torch.isfinite(pred_b[:height, :width])
             & (delta.abs() > 0.01 * mono_scale)
         )
+        rigid_pair = torch.minimum(
+            geometry_weight[::8, ::8][:height, :width],
+            geometry_weight[4::8, 4::8][:height, :width],
+        )
+        if source_bits is not None:
+            mono_pair = (
+                mono_owner[::8, ::8][:height, :width]
+                & mono_owner[4::8, 4::8][:height, :width]
+            )
+            valid = valid & mono_pair
         order = sign * (
             pred_a[:height, :width] - pred_b[:height, :width]
         )
         losses["ordinal"] = (
-            F.softplus(-order[valid]).mean()
+            (
+                F.softplus(-order) * rigid_pair
+            )[valid].sum() / rigid_pair[valid].sum().clamp_min(1)
             if bool(valid.any())
             else zero
         )
@@ -1154,6 +1329,19 @@ def main():
             "cuda_rasterizer/mixed_backward.cu"
         ),
     }
+    runtime_provenance = collect_runtime_provenance(
+        REPO_ROOT,
+        python_modules=(
+            "scripts.train_unified_outdoor_teacher",
+            "outdoor.hybrid_gaussian_renderer",
+            "scene.gaussian_model",
+            "diff_surfel_rasterization",
+        ),
+        extension_roots=(
+            SURFEL_ROOT / "submodules/diff-surfel-rasterization",
+            SURFEL_ROOT / "submodules/simple-knn",
+        ),
+    )
     if resume is not None:
         resume_hashes = resume.get("implementation_hashes", {})
         if resume_hashes != implementation_hashes:
@@ -1284,6 +1472,9 @@ def main():
     prefetch_training_images(start_step)
     for step in progress:
         phase = _phase(step, args.iterations, args.training_profile)
+        dynamic_active = _dynamic_enabled(
+            step, args.iterations, args.training_profile
+        )
         surface.update_learning_rate(step + 1)
         if (step + 1) % 1000 == 0:
             surface.oneupSHdegree()
@@ -1310,20 +1501,27 @@ def main():
                 [
                     task["p_canopy_core"],
                     task["p_rigid"],
-                    (target - 0.5).abs().mean(0),
+                    torch.zeros_like(task["w_topology"]),
                 ]
             ),
         )
         canonical = composite_white_background(
             package.render, package.alpha, sky(view)
         )
-        canonical_weight = task["w_rgb"]
+        canonical_weight = (
+            task["w_gaussian_rgb"] + task["w_sky_rgb"]
+        ).clamp(0, 1.5)
+        # The canonical crown owns stable low-frequency colour and average
+        # transmittance only. Dynamic high-frequency observations are never
+        # allowed to dominate it, including before the conditioned branch
+        # starts.
+        canonical_weight = canonical_weight * (
+            task["p_rigid"]
+            + task["p_sky"]
+            + 0.25 * task["p_canopy"]
+        ).clamp(0, 1)
         static_confidence_mean = canonical_weight.new_tensor(1.0)
-        if phase in {
-            "dynamic_appearance",
-            "ownership_cleanup",
-            "canonical_polish",
-        }:
+        if dynamic_active:
             # Once the conditioned branch is active, pixels that repeatedly
             # disagree in space/time no longer drag the canonical crown into
             # a broad average.  Sigma is detached here: uncertainty is trained
@@ -1357,7 +1555,14 @@ def main():
             canonical,
             target,
             task["p_rigid"],
-            0.10,
+            0.20,
+        )
+        rigid_high_frequency = _high_frequency_loss(
+            canonical,
+            target,
+            task["p_rigid"]
+            * (1.0 - task["p_boundary_uncertain"])
+            * (1.0 - task["p_transient"]),
         )
         surface_in_canopy = _weighted_mean(
             package.surface_alpha,
@@ -1375,21 +1580,29 @@ def main():
             surface_in_canopy + volume_in_rigid + finite_in_sky
         )
         alpha = package.volume_alpha[0].clamp(1e-5, 1 - 1e-5)
-        positive = (
-            task["p_canopy_core"] * (1.0 - task["p_transient"])
-        )
         negative = (
             task["p_rigid"] + 0.35 * task["p_sky"]
         ).clamp(0, 1) * (1.0 - task["p_boundary_uncertain"])
-        hit = (
-            (-torch.log(alpha) * positive).sum()
-            / positive.sum().clamp_min(1)
+        # A semantic tree mask is not a solid-occupancy observation. It gives
+        # only a weak silhouette prior toward partial transmittance; the hard
+        # signal is free-space contradiction outside the crown.
+        silhouette_weight = (
+            task["w_topology"]
+            * (1.0 - task["p_boundary_uncertain"])
         )
+        silhouette = (
+            F.binary_cross_entropy(
+                alpha,
+                torch.full_like(alpha, 0.35),
+                reduction="none",
+            )
+            * silhouette_weight
+        ).sum() / silhouette_weight.sum().clamp_min(1)
         free = (
             (-torch.log1p(-alpha) * negative).sum()
             / negative.sum().clamp_min(1)
         )
-        occupancy = 0.15 * hit + free
+        occupancy = 0.02 * silhouette + free
         delta = foliage.xyz - foliage.initialization_center
         variance = foliage.position_covariance.diagonal(
             dim1=-2, dim2=-1
@@ -1405,7 +1618,8 @@ def main():
         ).mean()
         canonical_loss = (
             photo
-            + 0.25 * rigid_photo
+            + 0.45 * rigid_photo
+            + 0.12 * rigid_high_frequency
             + args.ownership_weight * ownership
             + args.occupancy_weight * occupancy
             + 0.015 * geometry_floor
@@ -1444,7 +1658,7 @@ def main():
         conditioned_loss = canonical_loss.new_zeros(())
         uncertainty_loss = canonical_loss.new_zeros(())
         high_frequency_loss = canonical_loss.new_zeros(())
-        if phase in {"dynamic_appearance", "ownership_cleanup"}:
+        if dynamic_active and phase != "canonical_polish":
             conditioned_package = render_hybrid(
                 view,
                 surface,
@@ -1519,6 +1733,8 @@ def main():
             "normal": 0.0,
             "inverse": 0.0,
             "ordinal": 0.0,
+            "track": 0.0,
+            "track_matched": 0,
         }
         if (
             args.geometry_every > 0
@@ -1542,6 +1758,7 @@ def main():
                     geometry_view.image_width,
                 ),
             )
+            geometry_loss = canonical_loss.new_zeros(())
             if source_fields:
                 geometry_package = render_hybrid(
                     geometry_view,
@@ -1557,16 +1774,26 @@ def main():
                     source_fields,
                     geometry_task["p_rigid"],
                     args,
+                    geometry_weight=geometry_task["w_geometry"],
+                    plane_task_weight=geometry_task["w_plane"],
                 )
-                phase_floor = (
-                    1.0
-                    if phase
-                    in {"canonical_bootstrap", "topology"}
-                    else 0.35
-                )
-                geometry_loss = phase_floor * geometry_loss
-                geometry_loss.backward()
                 del geometry_package
+            track_loss, track_audit = geometry.track_factor(surface)
+            geometry_values["track"] = float(track_loss.detach())
+            geometry_values["track_matched"] = int(
+                track_audit["matched"]
+            )
+            geometry_loss = geometry_loss + (
+                args.track_weight * track_loss
+            )
+            phase_floor = (
+                1.0
+                if phase in {"canonical_bootstrap", "topology"}
+                else 0.35
+            )
+            geometry_loss = phase_floor * geometry_loss
+            if geometry_loss.requires_grad:
+                geometry_loss.backward()
 
         topology_loss = canonical_loss.new_zeros(())
         if (
@@ -1593,18 +1820,6 @@ def main():
                 background=background,
                 include_dynamic=False,
                 structural_trainable_start=None,
-                audit_fields=torch.stack(
-                    [
-                        topology_task["p_canopy_core"],
-                        topology_task["p_rigid"],
-                        (
-                            topology_target
-                            - topology_target.mean(dim=(1, 2), keepdim=True)
-                        )
-                        .abs()
-                        .mean(0),
-                    ]
-                ),
             )
             topology_prediction = composite_white_background(
                 topology_package.render,
@@ -1618,10 +1833,34 @@ def main():
                 0.10,
             )
             (0.20 * topology_loss).backward()
-            _accumulate_volume_stats(
-                volume_stats, topology_package
+            topology_audit = render_hybrid(
+                topology_view,
+                surface,
+                foliage,
+                background=background,
+                include_dynamic=False,
+                structural_trainable_start=None,
+                audit_fields=torch.stack(
+                    [
+                        topology_task["p_canopy_core"],
+                        topology_task["p_rigid"],
+                        (
+                            topology_prediction.detach()
+                            - topology_target
+                        ).abs().mean(0)
+                        * topology_task["w_topology"],
+                    ]
+                ),
             )
-            del topology_package, topology_prediction, topology_target
+            _accumulate_volume_stats(
+                volume_stats, topology_audit
+            )
+            del (
+                topology_package,
+                topology_audit,
+                topology_prediction,
+                topology_target,
+            )
 
         replacement_event = None
         if phase == "ownership_cleanup":
@@ -1654,7 +1893,23 @@ def main():
                 }
                 replacement_events.append(replacement_event)
 
-        _apply_volume_role_gradients(foliage, phase)
+        gradient_audit = _teacher_gradient_audit(
+            surface, foliage, package
+        )
+        if (
+            step == 0
+            and (
+                gradient_audit["surface_xyz"] <= 0
+                or gradient_audit["surface_feature_dc"] <= 0
+            )
+        ):
+            raise RuntimeError(
+                "Structural 2DGS received no xyz/DC gradient while "
+                "structural_trainable_start=0"
+            )
+        _apply_volume_role_gradients(
+            foliage, phase, dynamic_active=dynamic_active
+        )
         surface.optimizer.step()
         volume_optimizer.step()
         surface.optimizer.zero_grad(set_to_none=True)
@@ -1731,6 +1986,10 @@ def main():
                 "loss": float(total_loss),
                 "canonical_photo": float(photo.detach()),
                 "rigid_photo": float(rigid_photo.detach()),
+                "rigid_high_frequency": float(
+                    rigid_high_frequency.detach()
+                ),
+                "dynamic_active": dynamic_active,
                 "conditioned": float(conditioned_loss.detach()),
                 "uncertainty": float(uncertainty_loss.detach()),
                 "high_frequency": float(
@@ -1742,6 +2001,7 @@ def main():
                 "ownership": float(ownership.detach()),
                 "occupancy": float(occupancy.detach()),
                 "geometry": geometry_values,
+                "gradient_norms": gradient_audit,
                 "surface_count": len(surface.get_xyz),
                 "foliage_count": len(foliage),
                 "static_skeleton": int(
@@ -1792,6 +2052,7 @@ def main():
                         "topology": topology_schedule,
                     },
                     "implementation_hashes": implementation_hashes,
+                    "runtime_provenance": runtime_provenance,
                     "phase": phase,
                     "surface": surface.capture(),
                     "surface_audit": surface_audit,
@@ -1838,6 +2099,7 @@ def main():
                 args.maximum_surface_growth_per_event
             ),
             "evidence_hash": evidence_store["evidence_hash"],
+            "runtime_provenance": runtime_provenance,
             "surface": surface.capture(),
             "surface_audit": surface_audit,
             "foliage": foliage.capture(),
@@ -1901,6 +2163,7 @@ def main():
         },
         "geometry_evidence": geometry.audit(),
         "implementation_hashes": implementation_hashes,
+        "runtime_provenance": runtime_provenance,
         "topology_events": topology_events,
         "replacement_events": replacement_events,
         "targeted_evaluation": evaluation,
