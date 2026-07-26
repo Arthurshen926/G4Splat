@@ -27,6 +27,7 @@ class HybridRenderOutput:
     render: torch.Tensor
     alpha: torch.Tensor
     depth: torch.Tensor
+    normal_world: torch.Tensor
     median_depth: torch.Tensor
     distortion: torch.Tensor
     radii: torch.Tensor
@@ -791,6 +792,11 @@ def render_hybrid(
     depth = torch.nan_to_num(
         allmap[0:1] / alpha_chw.clamp_min(1e-8), 0.0, 0.0
     )
+    normal_camera = allmap[2:5]
+    normal_world = (
+        normal_camera.permute(1, 2, 0)
+        @ camera.world_view_transform[:3, :3].T
+    ).permute(2, 0, 1)
     median_depth = torch.nan_to_num(allmap[5:6], 0.0, 0.0)
     surface_alpha = allmap[7:8]
     volume_alpha = allmap[8:9]
@@ -804,6 +810,7 @@ def render_hybrid(
         render=rgb,
         alpha=alpha_chw,
         depth=depth,
+        normal_world=normal_world,
         median_depth=median_depth,
         distortion=allmap[6:7],
         radii=radii,

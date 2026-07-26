@@ -187,6 +187,14 @@ class OutdoorAppearanceUncertainty(nn.Module):
             log_sigma.clamp(-4.5, -0.7).exp(),
         )
 
+    def spatial_uncertainty(
+        self,
+        image_name: str,
+        shape: tuple[int, int],
+    ) -> torch.Tensor:
+        """Return learned canopy/sky sigma maps for robust static supervision."""
+        return self._spatial_fields(image_name, shape)[1]
+
     def forward(self, rgb, camera, task):
         image_index = self.image_index(camera.image_name)
         foliage_code = self.foliage_code(camera.image_name)
@@ -220,9 +228,23 @@ class OutdoorAppearanceUncertainty(nn.Module):
         conditioned = conditioned + task["p_sky"][None] * sky_residual
         return conditioned.clamp(0.0, 1.0)
 
-    def heteroscedastic_loss(self, prediction, target, task, epsilon=1e-3):
-        _, sigma = self._spatial_fields(
-            task["image_name"],
+    def heteroscedastic_loss(
+        self,
+        prediction,
+        target,
+        task,
+        *,
+        image_name: str | None = None,
+        epsilon=1e-3,
+    ):
+        if image_name is None:
+            image_name = task.get("image_name")
+        if image_name is None:
+            raise ValueError(
+                "Spatial uncertainty requires the calibrated training image name"
+            )
+        sigma = self.spatial_uncertainty(
+            image_name,
             (prediction.shape[-2], prediction.shape[-1]),
         )
         robust = torch.sqrt((prediction - target).square() + epsilon**2).mean(0)

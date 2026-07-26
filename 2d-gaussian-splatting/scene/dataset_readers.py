@@ -76,7 +76,13 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(
+    cam_extrinsics,
+    cam_intrinsics,
+    images_folder,
+    *,
+    load_images=True,
+):
 
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -113,7 +119,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        # Unified outdoor training keeps calibrated cameras resident and
+        # decodes RGB through its bounded LRU only when a view is sampled.
+        # Width/height already come from COLMAP, so opening every image here
+        # would add thousands of cold filesystem reads for no information.
+        image = Image.open(image_path) if load_images else None
 
         cam_info = CameraInfo(
             uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -197,7 +207,14 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(
+    path,
+    images,
+    eval,
+    llffhold=8,
+    *,
+    load_images=True,
+):
 
     if eval:
         # G4Splat datasets may provide an all-sparse model for evaluation, while
@@ -247,7 +264,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     reading_dir = "images" if images == None else images
 
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        load_images=load_images,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     # if eval:

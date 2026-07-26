@@ -148,6 +148,13 @@ class CambridgeMaskLookup:
         }
         self._valid_ratio_cache: dict[tuple[str, tuple[int, ...]], float] = {}
         self._resized_mask_cache: dict[tuple[str, int, int, str], torch.Tensor] = {}
+        # Stacking the four 360x640 semantic masks used to be repeated for
+        # every full-resolution training sample.  Keep the compact CPU stack;
+        # this is roughly the same size as the source pickle and avoids four
+        # independent host-to-device copies and interpolation launches.
+        self._index_stack_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
 
     def with_indices(self, mask_indices: list[int]) -> "CambridgeMaskLookup":
         lookup = object.__new__(type(self))
@@ -160,6 +167,7 @@ class CambridgeMaskLookup:
         lookup.source_by_stem = self.source_by_stem
         lookup._valid_ratio_cache = {}
         lookup._resized_mask_cache = {}
+        lookup._index_stack_cache = {}
         return lookup
 
     def source_name_for(self, image_name: str) -> str:
@@ -239,6 +247,41 @@ class CambridgeMaskLookup:
         if index < 0 or index >= len(mask_tuple):
             raise RuntimeError(f"Mask index {index} is outside tuple length {len(mask_tuple)}")
         return tensor_to_resized_mask(mask_tuple[index], shape, device)
+
+    def get_index_masks(
+        self,
+        image_name: str,
+        indices: list[int] | tuple[int, ...],
+        shape: tuple[int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return several keep masks through one transfer/interpolation.
+
+        This is bit-equivalent to calling :meth:`get_index_mask` for each
+        channel because nearest-neighbour interpolation is channel-separable.
+        """
+        source_name = self.source_name_for(image_name)
+        mask_tuple = self.masks[source_name]
+        selected = tuple(int(index) for index in indices)
+        if not selected:
+            raise RuntimeError("At least one mask index is required")
+        for index in selected:
+            if index < 0 or index >= len(mask_tuple):
+                raise RuntimeError(
+                    f"Mask index {index} is outside tuple length "
+                    f"{len(mask_tuple)}"
+                )
+        cache_key = (source_name, selected)
+        compact = self._index_stack_cache.get(cache_key)
+        if compact is None:
+            compact = torch.stack(
+                [mask_tuple[index].to(dtype=torch.bool) for index in selected]
+            ).contiguous()
+            self._index_stack_cache[cache_key] = compact
+        target = compact.to(device=device, dtype=torch.float32)[None]
+        if target.shape[-2:] != tuple(shape):
+            target = F.interpolate(target, size=shape, mode="nearest")
+        return target[0] > 0.5
 
     def valid_ratio(self, image_name: str) -> float:
         return self.valid_ratio_for_indices(image_name, self.mask_indices)

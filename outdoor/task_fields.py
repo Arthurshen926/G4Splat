@@ -24,11 +24,15 @@ TASK_FIELD_VERSION = "cambridge_runtime_task_fields_v2"
 def _soft_boundary(mask: torch.Tensor, radius: int) -> torch.Tensor:
     if radius <= 0:
         return torch.zeros_like(mask, dtype=torch.float32)
-    value = mask.to(dtype=torch.float32)[None, None]
+    value = mask.to(dtype=torch.float32)
     kernel = 2 * int(radius) + 1
-    dilated = F.max_pool2d(value, kernel_size=kernel, stride=1, padding=radius)
-    eroded = -F.max_pool2d(-value, kernel_size=kernel, stride=1, padding=radius)
-    return (dilated - eroded)[0, 0].clamp(0.0, 1.0)
+    extrema = F.max_pool2d(
+        torch.stack([value, -value])[:, None],
+        kernel_size=kernel,
+        stride=1,
+        padding=radius,
+    )
+    return (extrema[0, 0] + extrema[1, 0]).clamp(0.0, 1.0)
 
 
 def _scale_aware_radius(mask: torch.Tensor, base_radius: int) -> int:
@@ -83,6 +87,13 @@ class OutdoorTaskFieldLookup:
         self._mask_cache: OrderedDict[
             tuple[str, int, int, str], tuple[torch.Tensor, ...]
         ] = OrderedDict()
+        # The adaptive radius requires a scalar GPU reduction.  Cache the two
+        # deterministic integers per camera/resolution so subsequent epochs
+        # do not introduce four device synchronizations per training step.
+        self._radius_cache: dict[
+            tuple[str, int, int], tuple[int, int]
+        ] = {}
+        self._canopy_fraction_cache: dict[str, float] = {}
 
     def _keep_masks(
         self,
@@ -95,10 +106,13 @@ class OutdoorTaskFieldLookup:
             masks = self._mask_cache.pop(key)
             self._mask_cache[key] = masks
             return masks
-        masks = tuple(
-            self.lookup.get_index_mask(image_name, index, shape, device)
-            for index in range(4)
+        stacked = self.lookup.get_index_masks(
+            image_name,
+            (0, 1, 2, 3),
+            shape,
+            device,
         )
+        masks = tuple(stacked[index] for index in range(4))
         if self.max_cached_views:
             self._mask_cache[key] = masks
             while len(self._mask_cache) > self.max_cached_views:
@@ -126,13 +140,20 @@ class OutdoorTaskFieldLookup:
             * tree_keep.float()
         )
         uncertain_union = (p_transient + p_sky + p_canopy).clamp(0.0, 1.0)
-        adaptive_radius = _scale_aware_radius(
-            uncertain_union > 0.5, self.boundary_radius
-        )
+        radius_key = (str(image_name), int(shape[0]), int(shape[1]))
+        cached_radii = self._radius_cache.get(radius_key)
+        if cached_radii is None:
+            adaptive_radius = _scale_aware_radius(
+                uncertain_union > 0.5, self.boundary_radius
+            )
+            canopy_radius = _scale_aware_radius(
+                p_canopy > 0.5, self.boundary_radius
+            )
+            cached_radii = (adaptive_radius, canopy_radius)
+            self._radius_cache[radius_key] = cached_radii
+        else:
+            adaptive_radius, canopy_radius = cached_radii
         p_boundary = _soft_boundary(uncertain_union > 0.5, adaptive_radius)
-        canopy_radius = _scale_aware_radius(
-            p_canopy > 0.5, self.boundary_radius
-        )
         p_canopy_boundary = _soft_boundary(
             p_canopy > 0.5, canopy_radius
         ) * p_canopy
@@ -190,12 +211,54 @@ class OutdoorTaskFieldLookup:
         image_name: str,
         shape: tuple[int, int],
     ) -> float:
-        """Fast CPU ranking signal without materializing boundary fields."""
-        object_keep, sky_keep, _, tree_keep = self._keep_masks(
-            image_name, shape, torch.device("cpu")
+        """Fast source-grid CPU ranking signal.
+
+        Ranking does not need a training-resolution tensor.  Avoid stacking
+        and resizing all four channels for every camera at cold start; doing
+        that for the 1,487-view Cambridge set used several CPU-minutes and
+        retained gigabytes of compact-mask cache entries before iteration one.
+        A bounded regular sample of the source grid is sufficient for this
+        view-priority statistic.
+        """
+        source_name = self.lookup.source_name_for(image_name)
+        cached = self._canopy_fraction_cache.get(source_name)
+        if cached is not None:
+            return cached
+        mask_tuple = self.lookup.masks[source_name]
+        source_height, source_width = mask_tuple[0].shape
+        target_height = max(int(shape[0]), 1)
+        target_width = max(int(shape[1]), 1)
+        row_stride = max(
+            (source_height + target_height - 1) // target_height, 1
         )
+        column_stride = max(
+            (source_width + target_width - 1) // target_width, 1
+        )
+        sample = (
+            slice(None, None, row_stride),
+            slice(None, None, column_stride),
+        )
+        object_keep = mask_tuple[0][sample].to(
+            device="cpu", dtype=torch.bool
+        )
+        sky_keep = mask_tuple[1][sample].to(
+            device="cpu", dtype=torch.bool
+        )
+        tree_keep = mask_tuple[3][sample].to(
+            device="cpu", dtype=torch.bool
+        )
+        if not (
+            object_keep.shape == sky_keep.shape == tree_keep.shape
+        ):
+            raise RuntimeError(
+                f"Semantic mask shapes differ for {source_name}"
+            )
         canopy = (~tree_keep) & object_keep & sky_keep
-        return float(canopy.float().mean().item())
+        fraction = float(
+            canopy.sum(dtype=torch.float32).item() / canopy.numel()
+        )
+        self._canopy_fraction_cache[source_name] = fraction
+        return fraction
 
     def audit(self) -> dict:
         return {

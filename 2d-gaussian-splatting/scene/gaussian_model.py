@@ -1436,6 +1436,139 @@ class GaussianModel:
         if use_mip_filter:
             self.set_mip_filter(True)
 
+    def densify_and_prune_bounded(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        *,
+        max_points,
+        max_growth,
+    ):
+        """Run native clone/split topology under a strict point budget.
+
+        Native 2DGS densification selects every point above the gradient
+        threshold.  Large outdoor scenes can therefore add hundreds of
+        thousands of surfels in one event and exhaust the mixed rasterizer
+        before the dynamic foliage phases begin.  This variant first applies
+        the native culling rules, then admits only the highest-gradient
+        clone/split candidates that fit both the global and per-event budgets.
+        Split parents are still retired exactly as in native 2DGS.
+        """
+        max_points = int(max_points)
+        max_growth = int(max_growth)
+        if max_points <= 0 or max_growth <= 0:
+            raise ValueError("Surface topology budgets must be positive")
+
+        use_mip_filter = self.use_mip_filter
+        if use_mip_filter:
+            self.set_mip_filter(False)
+
+        before = int(self.get_xyz.shape[0])
+        grads = torch.nan_to_num(
+            self.xyz_gradient_accum / self.denom,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = (
+                self.get_scaling.max(dim=1).values > 0.1 * extent
+            )
+            prune_mask = torch.logical_or(
+                prune_mask,
+                torch.logical_or(big_points_vs, big_points_ws),
+            )
+        # Explicitly protected points are never removed by routine topology
+        # maintenance.  Descendants inherit this metadata contract.
+        if len(self._protected_flag) == len(prune_mask):
+            prune_mask = torch.logical_and(
+                prune_mask, ~self._protected_flag
+            )
+        pruned = int(prune_mask.sum())
+        if pruned:
+            grads = grads[~prune_mask]
+            self.prune_points(prune_mask)
+
+        point_count = int(self.get_xyz.shape[0])
+        remaining = min(
+            max(max_points - point_count, 0),
+            max_growth,
+        )
+        cloned = 0
+        split_parents = 0
+        if remaining > 0 and point_count:
+            grad_norm = torch.norm(grads, dim=-1)
+            max_scale = self.get_scaling.max(dim=1).values
+            clone_candidates = torch.logical_and(
+                grad_norm >= max_grad,
+                max_scale <= self.percent_dense * extent,
+            )
+            split_candidates = torch.logical_and(
+                grads.squeeze(-1) >= max_grad,
+                max_scale > self.percent_dense * extent,
+            )
+            candidate_mask = torch.logical_or(
+                clone_candidates, split_candidates
+            )
+            candidate_indices = torch.nonzero(
+                candidate_mask, as_tuple=False
+            ).flatten()
+            if candidate_indices.numel() > remaining:
+                ranking = torch.topk(
+                    grad_norm[candidate_indices], k=remaining
+                ).indices
+                candidate_indices = candidate_indices[ranking]
+
+            admitted = torch.zeros(
+                point_count, dtype=torch.bool, device=self.get_xyz.device
+            )
+            admitted[candidate_indices] = True
+            clone_admitted = torch.logical_and(
+                admitted, clone_candidates
+            )
+            split_admitted = torch.logical_and(
+                admitted, split_candidates
+            )
+            cloned = int(clone_admitted.sum())
+            split_parents = int(split_admitted.sum())
+
+            clone_grads = torch.zeros_like(grads)
+            clone_grads[clone_admitted] = grads[clone_admitted]
+            split_grads = torch.zeros_like(grads)
+            split_grads[split_admitted] = grads[split_admitted]
+            if cloned:
+                self.densify_and_clone(
+                    clone_grads, max_grad, extent
+                )
+            if split_parents:
+                self.densify_and_split(
+                    split_grads, max_grad, extent
+                )
+
+        after = int(self.get_xyz.shape[0])
+        if after > max_points:
+            raise RuntimeError(
+                f"Bounded densification exceeded its budget: "
+                f"{after} > {max_points}"
+            )
+        torch.cuda.empty_cache()
+        if use_mip_filter:
+            self.set_mip_filter(True)
+        return {
+            "before": before,
+            "pruned": pruned,
+            "cloned": cloned,
+            "split_parents": split_parents,
+            "after": after,
+            "budget": max_points,
+            "remaining": max(max_points - after, 0),
+        }
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1

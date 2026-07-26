@@ -122,14 +122,16 @@ def clean_vertices(
     if isolation_distance is not None:
         from scipy.spatial import cKDTree
 
-        finite_indices = np.flatnonzero(finite)
-        if len(finite_indices) < 2:
-            raise RuntimeError("At least two finite Gaussian centers are required")
-        distances, _ = cKDTree(xyz[finite_indices]).query(
-            xyz[finite_indices], k=2, workers=-1
+        candidate_indices = np.flatnonzero(keep)
+        if len(candidate_indices) < 2:
+            raise RuntimeError(
+                "At least two pre-isolation Gaussian centers are required"
+            )
+        distances, _ = cKDTree(xyz[candidate_indices]).query(
+            xyz[candidate_indices], k=2, workers=-1
         )
         nearest_distance = np.full(count, np.inf, dtype=np.float64)
-        nearest_distance[finite_indices] = distances[:, 1]
+        nearest_distance[candidate_indices] = distances[:, 1]
         normalized_isolation = nearest_distance / np.maximum(
             maximum_scale, 5e-3
         )

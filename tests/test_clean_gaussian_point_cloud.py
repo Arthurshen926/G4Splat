@@ -30,11 +30,12 @@ def _vertices():
         ("scale_1", "f4"),
         ("primitive_class", "f4"),
     ]
-    value = np.zeros(4, dtype=dtype)
-    value["x"] = [0.0, 0.01, 1.0, 10.0]
+    value = np.zeros(5, dtype=dtype)
+    value["x"] = [0.0, 0.01, 1.0, 10.0, 0.02]
     value["opacity"] = [
         np.log(0.5 / 0.5),
         np.log(0.001 / 0.999),
+        np.log(0.5 / 0.5),
         np.log(0.5 / 0.5),
         np.log(0.5 / 0.5),
     ]
@@ -52,8 +53,8 @@ def test_clean_vertices_tracks_exclusive_reasons():
         isolation_distance=0.5,
         isolation_scale_ratio=4.0,
     )
-    assert indices.tolist() == [0]
-    assert len(retained) == 1
+    assert indices.tolist() == [0, 4]
+    assert len(retained) == 2
     assert audit["exclusive_removal_reason_counts"] == {
         "nonfinite": 0,
         "nonstructural": 1,

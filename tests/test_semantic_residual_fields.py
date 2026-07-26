@@ -10,6 +10,7 @@ from outdoor.directional_sky import (
     composite_white_background,
 )
 from outdoor.task_fields import OutdoorTaskFieldLookup
+from outdoor.task_fields import _soft_boundary
 
 
 def _task_lookup(tmp_path):
@@ -83,6 +84,46 @@ def test_task_fields_explicitly_report_rigid_building_ground_proxies(tmp_path):
         audit["mask_channel_contract"]["building"]
         == "rigid_proxy_not_semantic_segmentation"
     )
+
+
+def test_vectorized_mask_and_boundary_fast_paths_are_exact(tmp_path):
+    lookup = _task_lookup(tmp_path)
+    shape = (7, 9)
+    individual = torch.stack(
+        [
+            lookup.lookup.get_index_mask(
+                "seq1__frame00001", index, shape, torch.device("cpu")
+            )
+            for index in range(4)
+        ]
+    )
+    vectorized = lookup.lookup.get_index_masks(
+        "seq1__frame00001",
+        (0, 1, 2, 3),
+        shape,
+        torch.device("cpu"),
+    )
+    assert torch.equal(vectorized, individual)
+
+    mask = torch.tensor(
+        [
+            [False, False, True, False, False],
+            [False, True, True, True, False],
+            [False, False, True, False, False],
+        ]
+    )
+    for radius in (1, 2, 4):
+        value = mask.float()[None, None]
+        kernel = 2 * radius + 1
+        legacy = (
+            torch.nn.functional.max_pool2d(
+                value, kernel, stride=1, padding=radius
+            )
+            + torch.nn.functional.max_pool2d(
+                -value, kernel, stride=1, padding=radius
+            )
+        )[0, 0].clamp(0, 1)
+        assert torch.equal(_soft_boundary(mask, radius), legacy)
 
 
 def test_directional_sky_uses_world_rays_and_white_alpha_compositing():
