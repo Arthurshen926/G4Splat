@@ -184,7 +184,9 @@ class OutdoorAppearanceUncertainty(nn.Module):
         )[0]
         return (
             self.maximum_rgb_residual * torch.tanh(local_rgb),
-            log_sigma.clamp(-4.5, -0.7).exp(),
+            # Spatial uncertainty is a robust residual scale, not permission
+            # to explain half the RGB range as noise.
+            log_sigma.clamp(-4.5, -1.5).exp(),
         )
 
     def spatial_uncertainty(
@@ -194,6 +196,21 @@ class OutdoorAppearanceUncertainty(nn.Module):
     ) -> torch.Tensor:
         """Return learned canopy/sky sigma maps for robust static supervision."""
         return self._spatial_fields(image_name, shape)[1]
+
+    def uncertainty_regularization(
+        self, image_name: str, shape: tuple[int, int]
+    ) -> torch.Tensor:
+        """Prior and total variation for the late uncertainty curriculum."""
+        sigma = self.spatial_uncertainty(image_name, shape)
+        log_sigma = sigma.clamp_min(1e-6).log()
+        prior = (log_sigma + 3.0).square().mean()
+        horizontal = (
+            log_sigma[:, :, 1:] - log_sigma[:, :, :-1]
+        ).abs().mean()
+        vertical = (
+            log_sigma[:, 1:, :] - log_sigma[:, :-1, :]
+        ).abs().mean()
+        return prior + 0.25 * (horizontal + vertical)
 
     def forward(self, rgb, camera, task):
         image_index = self.image_index(camera.image_name)
@@ -255,15 +272,18 @@ class OutdoorAppearanceUncertainty(nn.Module):
         def region(mask, value):
             return (value * mask).sum() / mask.sum().clamp_min(1.0)
 
-        # Positive robust uncertainty objective.  The additive floor prevents
-        # vanishing sigma from amplifying sub-pixel residuals without bound;
-        # log1p keeps increasing uncertainty costly while preserving readable
-        # non-negative training traces.
+        # Proper robust scale likelihood. The direct conditioned photo loss is
+        # optimized separately, so sigma cannot weaken geometry or topology.
+        effective_sigma = sigma + 0.02
         canopy_loss = region(
-            canopy, robust / (sigma[0] + 0.05) + torch.log1p(sigma[0])
+            canopy,
+            0.5 * (robust / effective_sigma[0]).square()
+            + effective_sigma[0].log(),
         )
         sky_loss = region(
-            sky, robust / (sigma[1] + 0.05) + torch.log1p(sigma[1])
+            sky,
+            0.5 * (robust / effective_sigma[1]).square()
+            + effective_sigma[1].log(),
         )
         rigid_loss = region(rigid, robust)
         return canopy_loss + 0.5 * sky_loss + 0.25 * rigid_loss
@@ -283,7 +303,9 @@ class OutdoorAppearanceUncertainty(nn.Module):
         value = value + self.sky_basis.square().mean()
         value = value + self.local_canopy_basis.square().mean()
         value = value + self.spatial_uncertainty_basis.square().mean()
-        value = value + 0.05 * self.uncertainty_base.square().mean()
+        value = value + 0.05 * (
+            self.uncertainty_base + 3.0
+        ).square().mean()
         if self.temporal_pairs.numel():
             first, second = self.temporal_pairs.unbind(-1)
             value = value + 0.25 * sum(

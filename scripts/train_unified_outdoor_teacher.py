@@ -30,6 +30,7 @@ from arguments import (  # noqa: E402
 from outdoor.appearance_uncertainty import (  # noqa: E402
     OutdoorAppearanceUncertainty,
 )
+from outdoor.chart_surface_model import ChartSurfaceModel  # noqa: E402
 from outdoor.directional_sky import (  # noqa: E402
     CanonicalDirectionalSky,
     composite_white_background,
@@ -127,8 +128,8 @@ def _parse_args():
         data_device="cpu",
         white_background=True,
         densify_until_iter=None,
-        densification_interval=200,
-        opacity_cull=0.004,
+        densification_interval=100,
+        opacity_cull=0.0005,
         lambda_dssim=0.20,
     )
     parser.add_argument("--evidence-store", type=Path, required=True)
@@ -158,6 +159,7 @@ def _parse_args():
     parser.add_argument("--ordinal-weight", type=float, default=0.015)
     parser.add_argument("--track-weight", type=float, default=0.05)
     parser.add_argument("--structure-weight", type=float, default=0.03)
+    parser.add_argument("--chart-anchor-weight", type=float, default=0.05)
     parser.add_argument("--ownership-weight", type=float, default=0.08)
     parser.add_argument(
         "--conditioned-ownership-weight", type=float, default=0.20
@@ -174,23 +176,23 @@ def _parse_args():
     parser.add_argument(
         "--maximum-surface-growth-per-event",
         type=int,
-        default=500,
+        default=1000,
     )
     parser.add_argument(
-        "--maximum-surface-growth-multiplier", type=float, default=2.0
+        "--maximum-surface-growth-multiplier", type=float, default=3.0
     )
     # Surface seeds are generated with a 0.18 m physical cap.  A small
     # optimization margin is enough; larger values turn sparse surfels into
     # metre-scale screen-space paint blobs.
     parser.add_argument("--maximum-surface-scale", type=float, default=0.20)
-    parser.add_argument("--maximum-volume-scale", type=float, default=0.60)
+    parser.add_argument("--maximum-volume-scale", type=float, default=0.25)
     parser.add_argument(
         "--maximum-dynamic-volume-scale", type=float, default=0.35
     )
     parser.add_argument("--maximum-volume-gaussians", type=int, default=300_000)
     parser.add_argument("--maximum-volume-splits", type=int, default=500)
     parser.add_argument(
-        "--maximum-volume-growth-multiplier", type=float, default=2.0
+        "--maximum-volume-growth-multiplier", type=float, default=12.0
     )
     parser.add_argument("--volume-split-radius", type=float, default=3.0)
     parser.add_argument("--volume-densify-every", type=int, default=600)
@@ -309,6 +311,50 @@ def _dynamic_enabled(
 ) -> bool:
     start = float(TRAINING_PROFILES[training_profile]["dynamic_start"])
     return (step + 1) / float(iterations) > start
+
+
+def _dynamic_visibility_gate(
+    foliage,
+    view,
+    camera_sequence_lookup: torch.Tensor,
+    camera_frame_lookup: torch.Tensor,
+) -> torch.Tensor:
+    """Soft camera/sequence ownership for sequence-local leaf primitives."""
+    gate = torch.ones(
+        len(foliage), device=foliage.xyz.device, dtype=foliage.xyz.dtype
+    )
+    dynamic = foliage.dynamic_leaf_mask
+    if not bool(dynamic.any()) or foliage.support_camera_ids.numel() == 0:
+        return gate
+    support = foliage.support_camera_ids.long()
+    valid = (support >= 0) & (support < len(camera_sequence_lookup))
+    safe = support.clamp(0, max(len(camera_sequence_lookup) - 1, 0))
+    support_sequence = camera_sequence_lookup[safe]
+    support_frame = camera_frame_lookup[safe]
+    current_camera = int(view.colmap_id)
+    current_sequence = camera_sequence_lookup[current_camera]
+    current_frame = camera_frame_lookup[current_camera]
+    exact = (support == current_camera).any(dim=1)
+    same_sequence = valid & (support_sequence == current_sequence)
+    temporal = 0.75 * torch.exp(
+        -(
+            support_frame.to(gate.dtype)
+            - current_frame.to(gate.dtype)
+        ).abs()
+        / 12.0
+    )
+    temporal = torch.where(same_sequence, temporal, torch.zeros_like(temporal))
+    nearby = temporal.max(dim=1).values
+    # Exact observations own the primitive. Sharing decays continuously with
+    # frame distance, so ray-footprint-sized leaves do not become persistent
+    # blobs across an entire traversal.
+    dynamic_gate = torch.where(
+        exact,
+        gate.new_tensor(1.0),
+        torch.maximum(nearby, gate.new_tensor(0.01)),
+    )
+    gate[dynamic] = dynamic_gate[dynamic]
+    return gate
 
 
 def _full_epoch_schedule(count: int, iterations: int, seed: int) -> np.ndarray:
@@ -716,6 +762,21 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
         & (working_stats["contribution"] > 0)
         & (rigid < 0.15)
     )
+    if bool(common_eligible.any()):
+        residual_floor = torch.quantile(
+            residual[common_eligible], 0.60
+        )
+        common_eligible &= residual >= residual_floor
+    coverage_deficit = (
+        working_stats["radius"] / max(args.volume_split_radius, 1e-6)
+        - 1.0
+    ).clamp_min(0)
+    split_score = (
+        residual
+        * (1.0 + coverage_deficit)
+        * (0.10 + gradient)
+        * foliage.occupancy_probability.clamp(0.05, 1.0)
+    )
     skeleton_eligible = (
         common_eligible
         & foliage.static_skeleton_mask
@@ -735,7 +796,10 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
     dynamic_eligible = (
         common_eligible
         & foliage.dynamic_leaf_mask
-        & (foliage.support_view_count >= 2)
+        # A sequence-local leaf deliberately has one geometric owner camera.
+        # Persistent projected residual/contribution, not a fabricated second
+        # correspondence, is the evidence required for adaptive refinement.
+        & (foliage.support_view_count >= 1)
     )
     effective_budget = (
         args.maximum_volume_gaussians
@@ -772,7 +836,7 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
                 else 0,
             )
             if quota:
-                score = gradient[indices] * residual[indices]
+                score = split_score[indices]
                 chosen = indices[torch.topk(score, quota).indices]
                 selected_parts.append(chosen)
                 role_split_counts[name] = int(len(chosen))
@@ -790,7 +854,7 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
             remaining = all_eligible[remaining_mask]
             extra_count = min(capacity - len(selected), len(remaining))
             if extra_count:
-                score = gradient[remaining] * residual[remaining]
+                score = split_score[remaining]
                 selected = torch.cat(
                     [
                         selected,
@@ -798,7 +862,7 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
                     ]
                 )
         if len(selected) > capacity:
-            score = gradient[selected] * residual[selected]
+            score = split_score[selected]
             selected = selected[torch.topk(score, capacity).indices]
         split_event = foliage.split(
             selected, allow_static_skeleton=True
@@ -1215,12 +1279,34 @@ def _replacement_audit(
         * average[:, 2]
         * average[:, 3]
     )
+    evidence_id = structural._track_id
+    has_external_owner = evidence_id != -1
+    replaceable_owner = ~structural._protected_flag
+    if bool(has_external_owner.any()):
+        _, inverse = torch.unique(
+            evidence_id[has_external_owner],
+            sorted=False,
+            return_inverse=True,
+        )
+        active_count = torch.zeros(
+            int(inverse.max()) + 1,
+            dtype=torch.int32,
+            device=evidence_id.device,
+        )
+        active_count.scatter_add_(
+            0,
+            inverse,
+            (~stats["retired"][has_external_owner]).to(torch.int32),
+        )
+        replaceable_owner[has_external_owner] |= (
+            active_count[inverse] >= 2
+        )
     eligible = (
         (confidence >= 0.45)
         & (stats["observations"] >= 3)
         & (sequence_count >= 2)
         & ~stats["retired"]
-        & ~structural._protected_flag
+        & replaceable_owner
     )
     # Per-candidate replace-and-retire: a candidate is attenuated only after
     # its own cross-sequence ray/depth and RGB counterfactual proof passes.
@@ -1244,6 +1330,8 @@ def _evaluate(
     appearance,
     background,
     fields,
+    camera_sequence_lookup,
+    camera_frame_lookup,
     output: Path,
 ) -> list[dict]:
     from PIL import Image as PILImage
@@ -1276,6 +1364,12 @@ def _evaluate(
             background=background,
             temporal_code=appearance.temporal_code(view.image_name),
             include_dynamic=True,
+            volume_gate=_dynamic_visibility_gate(
+                foliage,
+                view,
+                camera_sequence_lookup,
+                camera_frame_lookup,
+            ),
         )
         conditioned = appearance(
             composite_white_background(
@@ -1345,6 +1439,38 @@ def main():
     )
     if initialization["evidence_hash"] != evidence_store["evidence_hash"]:
         raise RuntimeError("Initialization/evidence hash mismatch")
+    representation_audit_warnings = []
+    foliage_initialization_audit = initialization.get("foliage", {})
+    selected_sequences = {
+        str(row["sequence_id"])
+        for row in foliage_initialization_audit.get("selected_views", [])
+    }
+    if evidence_store.get("geometry_source") == "mast3r_only":
+        gate_failures = []
+        if not foliage_initialization_audit.get(
+            "cross_sequence_visual_hull", False
+        ):
+            gate_failures.append("cross-sequence visual hull is false")
+        if len(selected_sequences) < 2:
+            gate_failures.append(
+                f"only {len(selected_sequences)} selected sequence(s)"
+            )
+        if int(foliage_initialization_audit.get("canonical_crown", 0)) <= 0:
+            gate_failures.append("canonical crown is empty")
+        if int(foliage_initialization_audit.get("static_skeleton", 0)) <= 0:
+            gate_failures.append("static trunk/branch skeleton is empty")
+        if int(
+            foliage_initialization_audit.get(
+                "sequence_local_dynamic_tracks", 0
+            )
+        ) <= 0:
+            gate_failures.append("sequence-conditioned leaf branch is empty")
+        if gate_failures:
+            representation_audit_warnings.extend(gate_failures)
+            print(
+                "[WARN] Soft representation audit: "
+                + "; ".join(gate_failures)
+            )
     resume = _load(args.resume.resolve()) if args.resume else None
     if output.exists() and any(output.iterdir()) and resume is None:
         raise FileExistsError(f"Refusing non-empty output: {output}")
@@ -1374,6 +1500,32 @@ def main():
         raise RuntimeError(
             "Teacher cameras do not match the evidence contract: "
             f"loaded={len(loaded_names)}, expected={len(expected_names)}"
+        )
+    sequence_names = sorted(
+        {sequence_id(view.image_name) for view in views}
+    )
+    sequence_index = {
+        name: index for index, name in enumerate(sequence_names)
+    }
+    maximum_camera_id = max(int(view.colmap_id) for view in views)
+    camera_sequence_lookup = torch.full(
+        (maximum_camera_id + 1,),
+        -1,
+        dtype=torch.int16,
+        device="cuda",
+    )
+    camera_frame_lookup = torch.zeros(
+        maximum_camera_id + 1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for view in views:
+        camera_sequence_lookup[int(view.colmap_id)] = sequence_index[
+            sequence_id(view.image_name)
+        ]
+        stem = Path(str(view.image_name)).stem
+        camera_frame_lookup[int(view.colmap_id)] = int(
+            stem.rsplit("frame", 1)[-1]
         )
     if resume is None:
         surface_audit = _initialize_surface(
@@ -1419,20 +1571,10 @@ def main():
     seed_payload = _load(Path(initialization["foliage_seed"]))
     if resume is None:
         foliage.initialize_from_volume_state(seed_payload)
-        eligible = torch.nonzero(
-            (foliage.layer_role == LAYER_CANONICAL_CROWN)
-            & (foliage.support_sequence_count >= 2),
-            as_tuple=False,
-        ).flatten()
-        if len(eligible) > args.dynamic_seed_count:
-            score = (
-                foliage.occupancy_probability[eligible]
-                * foliage.support_sequence_count[eligible].float()
-            )
-            eligible = eligible[
-                torch.topk(score, args.dynamic_seed_count).indices
-            ]
-        dynamic_seed_count = foliage.append_dynamic_leaves(eligible)
+        # Dynamic leaves already come from real sequence-local pointmaps.
+        # Cloning canonical crown primitives created two co-located alpha
+        # owners and the opaque green paint layer seen in conditioned views.
+        dynamic_seed_count = int(foliage.dynamic_leaf_mask.sum())
     else:
         foliage.restore(resume["foliage"])
         dynamic_seed_count = int(resume["dynamic_seed_count"])
@@ -1461,6 +1603,9 @@ def main():
         max_cached_views=0,
     )
     geometry = OutdoorGeometryEvidence(args.evidence_store)
+    chart_surface = ChartSurfaceModel(
+        Path(initialization["surface_seed"]), seed=args.seed + 19
+    )
     appearance = OutdoorAppearanceUncertainty(
         [view.image_name for view in views],
         rank=args.dynamic_rank,
@@ -1534,6 +1679,9 @@ def main():
         "trainer": _file_sha256(Path(__file__)),
         "appearance_uncertainty": _file_sha256(
             REPO_ROOT / "outdoor/appearance_uncertainty.py"
+        ),
+        "chart_surface_model": _file_sha256(
+            REPO_ROOT / "outdoor/chart_surface_model.py"
         ),
         "lazy_scene": _file_sha256(
             REPO_ROOT / "outdoor/lazy_scene.py"
@@ -1698,6 +1846,7 @@ def main():
 
     trace = output / "training_trace.jsonl"
     started = time.time()
+    geometry_audit_warnings: set[str] = set()
     progress = tqdm(
         range(start_step, args.iterations),
         initial=start_step,
@@ -1734,7 +1883,7 @@ def main():
         phase = _phase(step, args.iterations, args.training_profile)
         dynamic_active = _dynamic_enabled(
             step, args.iterations, args.training_profile
-        )
+        ) and phase != "canonical_polish"
         surface.update_learning_rate(step + 1)
         if (step + 1) % 1000 == 0:
             surface.oneupSHdegree()
@@ -1860,20 +2009,27 @@ def main():
                 + foliage.unknown_view_count.float()
             ).clamp_min(1)
         ).clamp(0.05, 1.0)
-        posterior_nll = (
-            F.binary_cross_entropy(
-                foliage.opacities.clamp(1e-5, 1 - 1e-5),
-                posterior,
-                reduction="none",
-            )
-            * posterior_weight
+        # Visual-hull occupancy is the probability that a candidate exists;
+        # it is not the target alpha of every overlapping Gaussian. The old
+        # BCE drove each supported leaf toward opacity~occupancy, so dozens of
+        # valid candidates on one ray inevitably became a solid paint layer.
+        false_positive_opacity = (
+            foliage.opacities * (1.0 - posterior) * posterior_weight
+        ).sum() / posterior_weight.sum().clamp_min(1)
+        opacity_complexity = (
+            foliage.opacities.square() * posterior_weight
         ).sum() / posterior_weight.sum().clamp_min(1)
         depth_posterior = (
             foliage.ray_depth_nll.clamp_min(0)
             * foliage.opacities
             * posterior_weight
         ).sum() / posterior_weight.sum().clamp_min(1)
-        occupancy = free + 0.05 * posterior_nll + 0.01 * depth_posterior
+        occupancy = (
+            free
+            + 0.05 * false_positive_opacity
+            + 0.002 * opacity_complexity
+            + 0.01 * depth_posterior
+        )
         delta = foliage.xyz - foliage.initialization_center
         variance = foliage.position_covariance.diagonal(
             dim1=-2, dim2=-1
@@ -1931,6 +2087,12 @@ def main():
         high_frequency_loss = canonical_loss.new_zeros(())
         conditioned_ownership = canonical_loss.new_zeros(())
         if dynamic_active:
+            dynamic_gate = _dynamic_visibility_gate(
+                foliage,
+                view,
+                camera_sequence_lookup,
+                camera_frame_lookup,
+            )
             conditioned_package = render_hybrid(
                 view,
                 surface,
@@ -1938,6 +2100,7 @@ def main():
                 background=background,
                 temporal_code=appearance.temporal_code(view.image_name),
                 include_dynamic=True,
+                volume_gate=dynamic_gate,
                 structural_trainable_start=None,
                 audit_fields=torch.stack(
                     [
@@ -1978,12 +2141,23 @@ def main():
                 ).clamp(0, 1),
                 0.15,
             )
-            uncertainty_loss = appearance.heteroscedastic_loss(
-                conditioned,
-                target,
-                task,
-                image_name=view.image_name,
-            )
+            if phase in {"dynamic_appearance", "ownership_cleanup"}:
+                uncertainty_loss = (
+                    appearance.heteroscedastic_loss(
+                        conditioned,
+                        target,
+                        task,
+                        image_name=view.image_name,
+                    )
+                    + 0.05
+                    * appearance.uncertainty_regularization(
+                        view.image_name,
+                        (
+                            view.image_height,
+                            view.image_width,
+                        ),
+                    )
+                )
             high_frequency_loss = _high_frequency_loss(
                 conditioned_base,
                 target,
@@ -1998,6 +2172,18 @@ def main():
                 .square()
                 .mean()
             )
+            owner_dynamic = (
+                foliage.dynamic_leaf_mask & (dynamic_gate >= 0.5)
+            )
+            dynamic_presence = canonical_loss.new_zeros(())
+            if bool(owner_dynamic.any()):
+                minimum_logit = foliage.opacity_logits.new_tensor(
+                    0.015
+                ).logit()
+                dynamic_presence = (
+                    minimum_logit
+                    - foliage.opacity_logits[owner_dynamic, 0]
+                ).clamp_min(0).square().mean()
             conditioned_loss = (
                 args.dynamic_weight * conditioned_photo
                 + args.appearance_weight * uncertainty_loss
@@ -2006,6 +2192,7 @@ def main():
                 * conditioned_ownership
                 + 1e-3 * appearance.regularization()
                 + 0.02 * dynamic_regularization
+                + 0.002 * dynamic_presence
             )
             conditioned_loss.backward()
             _accumulate_volume_stats(
@@ -2024,6 +2211,8 @@ def main():
             "track_matched": 0,
             "structure": 0.0,
             "structure_matched": 0,
+            "chart_anchor": 0.0,
+            "chart_anchor_matched": 0,
             "plane_pixels": 0,
             "chart_pixels": 0,
             "inverse_pixels": 0,
@@ -2073,9 +2262,8 @@ def main():
                     geometry_values["chart_pixels"] > 0
                     and geometry_values["inverse_pixels"] <= 0
                 ):
-                    raise RuntimeError(
-                        "Chart owner has zero effective inverse-depth pixels "
-                        f"for {geometry_view.image_name}"
+                    geometry_audit_warnings.add(
+                        "chart_owner_with_zero_effective_inverse_depth"
                     )
                 if (
                     geometry_values["chart_pixels"] > 0
@@ -2085,15 +2273,15 @@ def main():
                     )
                     < 0.95
                 ):
-                    raise RuntimeError(
-                        "Effective inverse-depth coverage fell below 95% "
-                        f"after resizing for {geometry_view.image_name}: "
-                        f"{geometry_values['inverse_pixels']}/"
-                        f"{geometry_values['chart_pixels']}"
+                    geometry_audit_warnings.add(
+                        "chart_inverse_depth_coverage_below_95_percent"
                     )
                 del geometry_package
             track_loss, track_audit = geometry.track_factor(surface)
             structure_loss, structure_audit = geometry.structure_factor(
+                surface
+            )
+            chart_anchor_loss, chart_anchor_audit = chart_surface.factor(
                 surface
             )
             geometry_values["track"] = float(track_loss.detach())
@@ -2106,9 +2294,16 @@ def main():
             geometry_values["structure_matched"] = int(
                 structure_audit["matched"]
             )
+            geometry_values["chart_anchor"] = float(
+                chart_anchor_loss.detach()
+            )
+            geometry_values["chart_anchor_matched"] = int(
+                chart_anchor_audit["matched"]
+            )
             geometry_loss = geometry_loss + (
                 args.track_weight * track_loss
                 + args.structure_weight * structure_loss
+                + args.chart_anchor_weight * chart_anchor_loss
             )
             phase_floor = (
                 1.0
@@ -2240,10 +2435,29 @@ def main():
         surface.optimizer.zero_grad(set_to_none=True)
         volume_optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
+            appearance.uncertainty_base.clamp_(-4.5, -1.5)
             foliage.quaternions.copy_(
                 F.normalize(foliage.quaternions, dim=-1)
             )
             foliage.opacity_logits.clamp_(-10, 2)
+            skeleton_opacity_ceiling = foliage.opacity_logits.new_tensor(
+                0.25
+            ).logit()
+            crown_opacity_ceiling = foliage.opacity_logits.new_tensor(
+                0.35
+            ).logit()
+            dynamic_opacity_ceiling = foliage.opacity_logits.new_tensor(
+                0.25
+            ).logit()
+            foliage.opacity_logits[foliage.static_skeleton_mask].clamp_(
+                max=skeleton_opacity_ceiling
+            )
+            foliage.opacity_logits[foliage.canonical_crown_mask].clamp_(
+                max=crown_opacity_ceiling
+            )
+            foliage.opacity_logits[foliage.dynamic_leaf_mask].clamp_(
+                max=dynamic_opacity_ceiling
+            )
             surface._opacity.clamp_(-12, 4)
             surface_scale_ceiling = surface._scaling.new_tensor(
                 float(args.maximum_surface_scale)
@@ -2257,6 +2471,9 @@ def main():
             )
             volume_limit[foliage.dynamic_leaf_mask] = float(
                 args.maximum_dynamic_volume_scale
+            )
+            volume_limit[foliage.static_skeleton_mask] = min(
+                float(args.maximum_volume_scale), 0.08
             )
             foliage.log_scales.copy_(
                 torch.minimum(foliage.log_scales, volume_limit.log())
@@ -2348,7 +2565,10 @@ def main():
             and (step + 1) % args.opacity_reset_interval == 0
             and (step + 1) <= args.densify_until_iter
         ):
-            surface.reset_opacity()
+            # Native global resets repeatedly crushed the permanent metric
+            # skeleton to alpha<=0.01. Reset only photometric descendants;
+            # anchors remain governed by RGB, ownership, and geometry factors.
+            surface.reset_opacity(~surface._protected_flag)
 
         total_loss = (
             canonical_loss.detach()
@@ -2479,6 +2699,23 @@ def main():
         if topology_event is not None:
             torch.cuda.empty_cache()
 
+    # A completed Teacher is not valid if a permanent external factor was
+    # silently starved by fixed-stride subsampling.
+    evidence_coverage = geometry.coverage_audit()
+    chart_coverage = chart_surface.audit()["coverage"]
+    if any(
+        audit["never_visited"]
+        for audit in evidence_coverage["tracks"].values()
+    ):
+        geometry_audit_warnings.add("track_evidence_not_fully_visited")
+    if (
+        evidence_coverage["structure"] is not None
+        and evidence_coverage["structure"]["never_visited"]
+    ):
+        geometry_audit_warnings.add("structure_evidence_not_fully_visited")
+    if chart_coverage["never_visited"]:
+        geometry_audit_warnings.add("chart_evidence_not_fully_visited")
+
     # Export is a geometric model, not an optimizer graveyard. Physically
     # remove proven replacements and unprotected transparent descendants so
     # downstream point-cloud tools do not expose retired floaters as vertices.
@@ -2578,6 +2815,8 @@ def main():
         appearance,
         background,
         fields,
+        camera_sequence_lookup,
+        camera_frame_lookup,
         output / "visualization",
     )
     scene.close()
@@ -2617,6 +2856,9 @@ def main():
             "dynamic_leaf": int(foliage.dynamic_leaf_mask.sum()),
         },
         "geometry_evidence": geometry.audit(),
+        "chart_surface": chart_surface.audit(),
+        "representation_audit_warnings": representation_audit_warnings,
+        "geometry_audit_warnings": sorted(geometry_audit_warnings),
         "implementation_hashes": implementation_hashes,
         "runtime_provenance": runtime_provenance,
         "topology_events": topology_events,

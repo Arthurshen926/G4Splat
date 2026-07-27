@@ -14,6 +14,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from matcha.cambridge_masks import CambridgeMaskLookup
+from matcha.see3d_geometry import robust_align_inverse_depth
 from outdoor.evidence_store import (
     ROLE_CANOPY,
     ROLE_RIGID,
@@ -26,20 +27,25 @@ from outdoor.foliage_geometry import (
     _camera_record,
     build_instance_aware_canopy_volume,
     cluster_tree_instances,
+    quaternion_to_rotation,
     read_cameras_binary,
     read_images_binary,
     read_points3d_binary_with_tracks,
     semantic_tree_tracks,
 )
-from outdoor.foliage_view_graph import greedy_diverse_views
+from outdoor.foliage_view_graph import (
+    greedy_diverse_views,
+    sequence_balanced_diverse_views,
+)
 from scripts.augment_foliage_seed_with_sfm_tracks import _track_frames
 
 
-INITIALIZATION_VERSION = "outdoor-role-aware-initialization-v1"
+INITIALIZATION_VERSION = "outdoor-role-aware-initialization-v7-ray-footprint-canopy"
 
 SOURCE_COLMAP = 0
 SOURCE_MAST3R = 1
 SOURCE_CHART = 2
+SOURCE_DAV2 = 3
 
 
 def _load_tracks(path: Path) -> dict[str, np.ndarray]:
@@ -166,6 +172,8 @@ def _sample_chart_seeds(
     selected_rgb = []
     selected_sigma = []
     selected_confidence = []
+    selected_chart_id = []
+    selected_uv = []
     with np.load(chart_path, allow_pickle=False) as charts:
         scale_factor = float(charts["scale_factor"])
         if not np.isfinite(scale_factor) or scale_factor <= 0:
@@ -278,30 +286,50 @@ def _sample_chart_seeds(
             selected_rgb.append(color.astype(np.float32))
             selected_sigma.append(sigma.astype(np.float32))
             selected_confidence.append(normalized.astype(np.float32))
+            selected_chart_id.append(
+                np.full(len(xyz), int(chart_index), dtype=np.int32)
+            )
+            rows, columns = np.unravel_index(chosen, (height, width))
+            selected_uv.append(
+                np.column_stack(
+                    [
+                        (columns + 0.5) / float(width),
+                        (rows + 0.5) / float(height),
+                    ]
+                ).astype(np.float32)
+            )
     if not selected_xyz:
         return {
             "xyz": np.empty((0, 3), dtype=np.float32),
             "rgb": np.empty((0, 3), dtype=np.float32),
             "sigma": np.empty(0, dtype=np.float32),
             "confidence": np.empty(0, dtype=np.float32),
+            "chart_id": np.empty(0, dtype=np.int32),
+            "uv": np.empty((0, 2), dtype=np.float32),
         }
     xyz = np.concatenate(selected_xyz)
     rgb = np.concatenate(selected_rgb)
     sigma = np.concatenate(selected_sigma)
     confidence = np.concatenate(selected_confidence)
+    chart_id = np.concatenate(selected_chart_id)
+    uv = np.concatenate(selected_uv)
     if len(xyz) > int(maximum_total):
         order = np.argsort(confidence)[-int(maximum_total) :]
-        xyz, rgb, sigma, confidence = (
+        xyz, rgb, sigma, confidence, chart_id, uv = (
             xyz[order],
             rgb[order],
             sigma[order],
             confidence[order],
+            chart_id[order],
+            uv[order],
         )
     return {
         "xyz": xyz,
         "rgb": rgb,
         "sigma": sigma,
         "confidence": confidence,
+        "chart_id": chart_id,
+        "uv": uv,
     }
 
 
@@ -313,8 +341,8 @@ def build_surface_seed(
     maximum_canopy_probability: float = 0.15,
     consensus_radius: float = 0.10,
     dedup_radius: float = 0.012,
-    chart_seeds_per_view: int = 2000,
-    maximum_chart_seeds: int = 80_000,
+    chart_seeds_per_view: int = 3000,
+    maximum_chart_seeds: int = 120_000,
     seed: int = 991,
 ) -> dict[str, Any]:
     store = load_evidence_store(evidence_store)
@@ -325,6 +353,8 @@ def build_surface_seed(
     confidence_parts: list[np.ndarray] = []
     track_parts: list[np.ndarray] = []
     source_parts: list[np.ndarray] = []
+    chart_id_parts: list[np.ndarray] = []
+    chart_uv_parts: list[np.ndarray] = []
     source_counts: dict[str, int] = {}
 
     if not mast3r_only:
@@ -351,6 +381,12 @@ def build_surface_seed(
         track_parts.append(colmap["track_id"][colmap_keep])
         source_parts.append(
             np.full(int(colmap_keep.sum()), SOURCE_COLMAP, dtype=np.int8)
+        )
+        chart_id_parts.append(
+            np.full(int(colmap_keep.sum()), -1, dtype=np.int32)
+        )
+        chart_uv_parts.append(
+            np.full((int(colmap_keep.sum()), 2), np.nan, dtype=np.float32)
         )
         source_counts["colmap_rigid"] = int(colmap_keep.sum())
 
@@ -412,6 +448,12 @@ def build_surface_seed(
                 len(mast3r_indices), SOURCE_MAST3R, dtype=np.int8
             )
         )
+        chart_id_parts.append(
+            np.full(len(mast3r_indices), -1, dtype=np.int32)
+        )
+        chart_uv_parts.append(
+            np.full((len(mast3r_indices), 2), np.nan, dtype=np.float32)
+        )
         source_counts["mast3r_rigid"] = int(len(mast3r_indices))
     if mast3r_only and not xyz_parts:
         raise RuntimeError(
@@ -455,12 +497,17 @@ def build_surface_seed(
         confidence_parts.append(
             np.clip(chart["confidence"] / 2.0, 0.05, 1.0)
         )
+        # Negative ids below -1 are permanent Chart evidence identities.
+        # They are deliberately outside the SfM track namespace and survive
+        # render-primitive split/retire through metadata inheritance.
         track_parts.append(
-            np.full(len(chart["xyz"]), -1, dtype=np.int64)
+            -(np.arange(len(chart["xyz"]), dtype=np.int64) + 2)
         )
         source_parts.append(
             np.full(len(chart["xyz"]), SOURCE_CHART, dtype=np.int8)
         )
+        chart_id_parts.append(chart["chart_id"].astype(np.int32))
+        chart_uv_parts.append(chart["uv"].astype(np.float32))
         source_counts["chart_rigid_residual"] = int(len(chart["xyz"]))
 
     xyz = np.concatenate(xyz_parts).astype(np.float32)
@@ -469,6 +516,8 @@ def build_surface_seed(
     confidence = np.concatenate(confidence_parts).astype(np.float32)
     track_id = np.concatenate(track_parts).astype(np.int64)
     source_type = np.concatenate(source_parts).astype(np.int8)
+    chart_id = np.concatenate(chart_id_parts).astype(np.int32)
+    chart_uv = np.concatenate(chart_uv_parts).astype(np.float32)
     scales, quaternions, normals = _surface_frames(xyz, sigma)
     initial_opacity = np.choose(
         source_type,
@@ -489,6 +538,8 @@ def build_surface_seed(
         position_sigma=sigma,
         source_type=source_type,
         track_id=track_id,
+        chart_id=chart_id,
+        chart_uv=chart_uv,
     )
     summary = {
         "version": INITIALIZATION_VERSION,
@@ -620,8 +671,8 @@ def _chart_foliage_samples(
     images: dict[int, dict],
     masks: CambridgeMaskLookup,
     *,
-    samples_per_view: int = 320,
-    maximum_samples: int = 8_000,
+    samples_per_view: int = 1_600,
+    maximum_samples: int = 24_000,
     voxel_size: float = 0.04,
 ) -> list[dict[str, Any]]:
     """Fill sequence-local leaf coverage where no pairwise track can exist.
@@ -660,7 +711,10 @@ def _chart_foliage_samples(
         for image_id, image in images.items()
     }
     result: list[dict[str, Any]] = []
-    occupied: set[tuple[int, int, int]] = set()
+    # Deduplicate inside a camera only. Global voxel deduplication erased the
+    # later traversal's independent depth posterior and made cross-sequence
+    # support impossible by construction.
+    occupied: set[tuple[int, int, int, int]] = set()
 
     def load_geometry(path: Path) -> tuple[np.ndarray, np.ndarray]:
         """Decode point/conf arrays without materializing the huge RGB list."""
@@ -724,7 +778,11 @@ def _chart_foliage_samples(
             "alignment_gate_valid",
             np.ones(len(chart_points), dtype=bool),
         ).astype(bool)
-        for chart_index in np.flatnonzero(active):
+        # Rigid Chart alignment status must not erase a real sequence-local
+        # canopy observation. Inactive Charts are excluded from the building
+        # surface branch, but their raw MASt3R pointmaps remain useful for
+        # dynamic leaves with lower confidence and sequence-local visibility.
+        for chart_index in range(len(chart_points)):
             image_path = filepaths[int(chart_index)]
             image_id = by_stem.get(image_path.stem)
             if image_id is None:
@@ -804,11 +862,38 @@ def _chart_foliage_samples(
                     1.0, 0.25 / np.maximum(magnitude, 1e-8)
                 )
                 corrected_xyz = raw_xyz + local.astype(np.float32)
-            order = candidates[
+            # Confidence-only top-k collapses onto a few high-confidence
+            # boughs and leaves most of the projected canopy transparent.
+            # First retain the best point in each image-space cell, then use
+            # the remaining confidence-ranked samples to add local detail.
+            ranked = candidates[
                 np.argsort(
                     conf.reshape(-1)[candidates], kind="stable"
                 )[::-1]
-            ][: int(samples_per_view)]
+            ]
+            grid_side = max(
+                1, int(np.ceil(np.sqrt(float(samples_per_view))))
+            )
+            rows, columns = np.divmod(ranked, width)
+            cells = (
+                (rows * grid_side // height) * grid_side
+                + columns * grid_side // width
+            )
+            _, first = np.unique(cells, return_index=True)
+            first = np.sort(first)
+            coverage = ranked[first]
+            if len(coverage) < int(samples_per_view):
+                detail_mask = np.ones(len(ranked), dtype=bool)
+                detail_mask[first] = False
+                coverage = np.concatenate(
+                    [
+                        coverage,
+                        ranked[detail_mask][
+                            : int(samples_per_view) - len(coverage)
+                        ],
+                    ]
+                )
+            order = coverage[: int(samples_per_view)]
             if image_path.is_file():
                 image = Image.open(image_path).convert("RGB").resize(
                     (width, height), Image.Resampling.BILINEAR
@@ -826,8 +911,11 @@ def _chart_foliage_samples(
                 value = corrected_xyz.reshape(-1, 3)[flat].astype(
                     np.float64
                 )
-                cell = tuple(
-                    np.floor(value / float(voxel_size)).astype(int)
+                cell = (
+                    int(image_id),
+                    *tuple(
+                        np.floor(value / float(voxel_size)).astype(int)
+                    ),
                 )
                 if cell in occupied:
                     continue
@@ -838,7 +926,7 @@ def _chart_foliage_samples(
                         "xyz": value,
                         "rgb": rgb[flat],
                         "error": float(
-                            0.5
+                            (0.5 if active[int(chart_index)] else 1.0)
                             / max(
                                 np.sqrt(float(conf.reshape(-1)[flat])),
                                 0.25,
@@ -854,13 +942,273 @@ def _chart_foliage_samples(
                             [image_id], dtype=np.int32
                         ),
                         "tree_sequence_count": 1,
-                        "tree_fraction": 1.0,
+                        "tree_fraction": (
+                            1.0 if active[int(chart_index)] else 0.60
+                        ),
                         "chart_sequence_local_sample": True,
+                        "chart_alignment_active": bool(
+                            active[int(chart_index)]
+                        ),
                     }
                 )
-                if len(result) >= int(maximum_samples):
-                    return result
-    return result
+    if len(result) <= int(maximum_samples):
+        return result
+    # Cap only after every active Chart has contributed. An early global cap
+    # made archive order decide the tree model and previously filled all
+    # samples from the first traversal.
+    by_sequence: dict[str, list[dict[str, Any]]] = {}
+    for record in result:
+        image_name = str(images[int(record["image_ids"][0])]["name"])
+        sequence = image_name.split("__", 1)[0].split("/", 1)[0]
+        by_sequence.setdefault(sequence, []).append(record)
+    selected: list[dict[str, Any]] = []
+    quota = max(1, int(maximum_samples) // len(by_sequence))
+    remainder: list[dict[str, Any]] = []
+    for sequence in sorted(by_sequence):
+        rows = sorted(by_sequence[sequence], key=lambda row: row["error"])
+        selected.extend(rows[:quota])
+        remainder.extend(rows[quota:])
+    if len(selected) < int(maximum_samples):
+        selected.extend(
+            sorted(remainder, key=lambda row: row["error"])[
+                : int(maximum_samples) - len(selected)
+            ]
+        )
+    return selected[: int(maximum_samples)]
+
+
+def _dav2_foliage_samples(
+    store: dict,
+    images: dict[int, dict],
+    cameras: dict[int, dict],
+    masks: CambridgeMaskLookup,
+    rigid_xyz: np.ndarray,
+    *,
+    samples_per_view: int = 128,
+    maximum_samples: int = 120_000,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Back-project sparse per-view leaf owners from scaled DAV2 depth.
+
+    A raw monocular depth map has an affine inverse-depth ambiguity.  We fit
+    that ambiguity independently in every fixed Cambridge camera using only
+    rigid-mask pixels covered by the MASt3R/MAtCha surface z-buffer.  Canopy
+    pixels are then back-projected in the same camera, so a near tree cannot
+    disappear merely because the small Chart subset omitted that timestamp.
+    """
+    index_path = artifact_path(store, "dav2_index", required=False)
+    if index_path is None:
+        return [], {"views": 0, "accepted_views": 0}
+    records = json.loads(index_path.read_text(encoding="utf-8"))["records"]
+    output: list[dict[str, Any]] = []
+    accepted_views = 0
+    rejected_views = 0
+    rigid_xyz = np.asarray(rigid_xyz, dtype=np.float64)
+    dataset = Path(store["dataset"])
+
+    for image_id in sorted(images):
+        image_record = images[image_id]
+        stem = Path(str(image_record["name"])).stem
+        depth_record = records.get(stem)
+        if depth_record is None:
+            continue
+        depth_path = Path(depth_record["path"])
+        if not depth_path.is_file():
+            continue
+        relative_depth = np.asarray(np.load(depth_path), dtype=np.float32)
+        relative_depth = np.squeeze(relative_depth)
+        if relative_depth.ndim != 2:
+            rejected_views += 1
+            continue
+        source_height, source_width = relative_depth.shape
+        scale = min(
+            1.0,
+            240.0 / max(source_width, 1),
+            135.0 / max(source_height, 1),
+        )
+        if scale < 1.0:
+            target_shape = (
+                max(1, int(round(source_height * scale))),
+                max(1, int(round(source_width * scale))),
+            )
+            relative_depth = (
+                torch.nn.functional.interpolate(
+                    torch.from_numpy(relative_depth)[None, None],
+                    size=target_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+                .numpy()
+                .astype(np.float32)
+            )
+        height, width = relative_depth.shape
+        camera = cameras[int(image_record["camera_id"])]
+        if camera["model"] == "SIMPLE_PINHOLE":
+            fx = fy = float(camera["params"][0])
+            cx, cy = map(float, camera["params"][1:3])
+        else:
+            fx, fy, cx, cy = map(float, camera["params"][:4])
+        sx = width / float(camera["width"])
+        sy = height / float(camera["height"])
+        fx, fy, cx, cy = fx * sx, fy * sy, cx * sx, cy * sy
+        rotation = quaternion_to_rotation(image_record["qvec"])
+        translation = np.asarray(
+            image_record["tvec"], dtype=np.float64
+        )
+        camera_xyz = rigid_xyz @ rotation.T + translation[None]
+        z = camera_xyz[:, 2]
+        columns = np.rint(
+            fx * camera_xyz[:, 0] / np.maximum(z, 1e-8) + cx
+        ).astype(np.int64)
+        rows = np.rint(
+            fy * camera_xyz[:, 1] / np.maximum(z, 1e-8) + cy
+        ).astype(np.int64)
+        valid = (
+            (z > 0.05)
+            & (columns >= 0)
+            & (columns < width)
+            & (rows >= 0)
+            & (rows < height)
+        )
+        zbuffer = np.full(height * width, np.inf, dtype=np.float32)
+        linear = rows[valid] * width + columns[valid]
+        np.minimum.at(zbuffer, linear, z[valid].astype(np.float32))
+        zbuffer = minimum_filter(
+            zbuffer.reshape(height, width),
+            size=5,
+            mode="constant",
+            cval=np.inf,
+        )
+        key = masks.source_name_for(image_record["name"])
+        channels = masks.masks[key]
+        resized = [
+            torch.nn.functional.interpolate(
+                value.detach().float()[None, None],
+                size=(height, width),
+                mode="nearest",
+            )[0, 0]
+            .bool()
+            .numpy()
+            for value in channels[:4]
+        ]
+        canopy = resized[0] & resized[1] & ~resized[3]
+        rigid = resized[0] & resized[1] & resized[3]
+        support = rigid & np.isfinite(zbuffer) & (zbuffer > 0)
+        aligned, diagnostics = robust_align_inverse_depth(
+            torch.from_numpy(
+                1.0 / np.maximum(relative_depth, 1e-6)
+            ),
+            torch.from_numpy(zbuffer),
+            torch.from_numpy(support),
+            min_samples=64,
+            max_samples=8_000,
+            max_relative_rmse=0.35,
+        )
+        if not diagnostics.accepted:
+            rejected_views += 1
+            continue
+        metric_depth = aligned.numpy()
+        candidates = np.flatnonzero(
+            canopy
+            & np.isfinite(metric_depth)
+            & (metric_depth > 0.05)
+        )
+        if not len(candidates):
+            rejected_views += 1
+            continue
+        accepted_views += 1
+        grid_side = max(
+            1, int(np.ceil(np.sqrt(float(samples_per_view))))
+        )
+        candidate_rows, candidate_columns = np.divmod(
+            candidates, width
+        )
+        cells = (
+            (candidate_rows * grid_side // height) * grid_side
+            + candidate_columns * grid_side // width
+        )
+        # Prefer central pixels in every cell; this is spatial coverage, not
+        # a confidence hard gate.
+        cell_center_x = (
+            (cells % grid_side + 0.5) * width / grid_side
+        )
+        cell_center_y = (
+            (cells // grid_side + 0.5) * height / grid_side
+        )
+        distance = (
+            (candidate_columns - cell_center_x) ** 2
+            + (candidate_rows - cell_center_y) ** 2
+        )
+        ranked = candidates[np.argsort(distance, kind="stable")]
+        ranked_cells = cells[np.argsort(distance, kind="stable")]
+        _, first = np.unique(ranked_cells, return_index=True)
+        selected = ranked[np.sort(first)][: int(samples_per_view)]
+        selected_rows, selected_columns = np.divmod(selected, width)
+        selected_depth = metric_depth[
+            selected_rows, selected_columns
+        ].astype(np.float64)
+        camera_points = np.stack(
+            [
+                (selected_columns - cx) * selected_depth / fx,
+                (selected_rows - cy) * selected_depth / fy,
+                selected_depth,
+            ],
+            axis=1,
+        )
+        world_points = (
+            camera_points - translation[None]
+        ) @ rotation
+        image_path = dataset / "images" / image_record["name"]
+        rgb_image = np.asarray(
+            Image.open(image_path).convert("RGB").resize(
+                (width, height), Image.Resampling.BILINEAR
+            ),
+            dtype=np.uint8,
+        )
+        footprint = np.clip(
+            selected_depth
+            * (min(height, width) / grid_side)
+            / max(0.5 * (fx + fy), 1e-6)
+            * 0.65,
+            0.06,
+            0.35,
+        )
+        for point, row, column, point_scale in zip(
+            world_points, selected_rows, selected_columns, footprint
+        ):
+            output.append(
+                {
+                    "id": -(10_000_000 + len(output)),
+                    "xyz": point.astype(np.float64),
+                    "rgb": rgb_image[int(row), int(column)],
+                    "error": float(
+                        max(diagnostics.relative_rmse, 0.02)
+                    ),
+                    "image_ids": np.asarray(
+                        [image_id], dtype=np.int64
+                    ),
+                    "point2d_indices": np.asarray(
+                        [-1], dtype=np.int64
+                    ),
+                    "tree_image_ids": np.asarray(
+                        [image_id], dtype=np.int32
+                    ),
+                    "tree_sequence_count": 1,
+                    "tree_fraction": float(
+                        np.clip(
+                            diagnostics.inlier_ratio, 0.55, 1.0
+                        )
+                    ),
+                    "ray_footprint_scale": float(point_scale),
+                    "dav2_sequence_local_sample": True,
+                }
+            )
+        if len(output) >= int(maximum_samples):
+            break
+    return output[: int(maximum_samples)], {
+        "views": int(accepted_views + rejected_views),
+        "accepted_views": int(accepted_views),
+        "rejected_views": int(rejected_views),
+    }
 
 
 def sparse_rigid_depth_maps(
@@ -929,8 +1277,30 @@ def _merge_foliage(
         np.stack([point["rgb"] for point in tracks]).astype(np.float32)
         / 255.0
     )
+    chart_local = np.asarray(
+        [
+            bool(point.get("chart_sequence_local_sample", False))
+            for point in tracks
+        ],
+        dtype=bool,
+    )
+    dav2_local = np.asarray(
+        [
+            bool(point.get("dav2_sequence_local_sample", False))
+            for point in tracks
+        ],
+        dtype=bool,
+    )
     scales, quaternions, linearity = _track_frames(
         xyz, 0.008, 0.035, 0.10
+    )
+    ray_footprint = np.asarray(
+        [point.get("ray_footprint_scale", 0.0) for point in tracks],
+        dtype=np.float32,
+    )
+    scales[dav2_local] = np.maximum(
+        scales[dav2_local],
+        ray_footprint[dav2_local, None],
     )
     track_count = len(tracks)
     capacity = hull["support_camera_ids"].shape[1]
@@ -964,24 +1334,17 @@ def _merge_foliage(
         1,
         np.where(sequence_support < 2, 2, 0),
     ).astype(np.int8)
-    chart_local = np.asarray(
-        [
-            bool(point.get("chart_sequence_local_sample", False))
-            for point in tracks
-        ],
-        dtype=bool,
-    )
-    # A single MAtCha canopy pointmap has no evidence for a canonical
-    # trunk/branch identity.  Even if its local spatial neighbourhood happens
-    # to look linear, it remains sequence-conditioned leaf evidence.
-    layer_role[chart_local] = 2
+    # A single dense depth observation has no evidence for a canonical
+    # trunk/branch identity. Even when its local neighbourhood looks linear,
+    # it remains sequence-conditioned leaf evidence.
+    layer_role[chart_local | dav2_local] = 2
     values = {
         "centers": xyz,
         "colors": rgb,
         "scales": scales,
-        "opacities": np.full(
-            (track_count, 1), 0.025, dtype=np.float32
-        ),
+        "opacities": np.where(
+            dav2_local[:, None], 0.08, 0.025
+        ).astype(np.float32),
         "quaternions": quaternions,
         "primitive_role": np.ones(track_count, dtype=np.int8),
         "layer_role": layer_role,
@@ -989,9 +1352,11 @@ def _merge_foliage(
             [point["id"] for point in tracks], dtype=np.int64
         ),
         "tree_instance_id": track_instances.astype(np.int32),
-        "initialization_source": np.ones(
-            track_count, dtype=np.int8
-        ),
+        "initialization_source": np.where(
+            dav2_local,
+            SOURCE_DAV2,
+            np.where(chart_local, SOURCE_CHART, SOURCE_MAST3R),
+        ).astype(np.int8),
         "occupancy_probability": np.asarray(
             [point["tree_fraction"] for point in tracks],
             dtype=np.float32,
@@ -1030,10 +1395,19 @@ def _merge_foliage(
     return merged, {
         "visual_hull": int(len(hull["centers"])),
         "tree_tracks": track_count,
-        "static_skeleton": int((layer_role == 1).sum()),
+        "static_skeleton": int(
+            (hull["layer_role"] == 1).sum() + (layer_role == 1).sum()
+        ),
         "canonical_track_anchors": int((layer_role == 0).sum()),
+        "canonical_crown": int((hull["layer_role"] == 0).sum()),
         "sequence_local_dynamic_tracks": int((layer_role == 2).sum()),
-        "tree_instances": int(track_instances.max()) + 1,
+        "tree_instances": int(
+            max(
+                track_instances.max(),
+                hull["tree_instance_id"].max(),
+            )
+        )
+        + 1,
     }
 
 
@@ -1096,7 +1470,16 @@ def build_foliage_seed(
         chart_foliage = _chart_foliage_samples(
             store, images, masks
         )
-        tracks = [*tracks, *chart_foliage]
+        dav2_foliage, dav2_audit = _dav2_foliage_samples(
+            store, images, cameras, masks, rigid_xyz
+        )
+        tracks = [*tracks, *chart_foliage, *dav2_foliage]
+        # Sequence-local chart pointmaps are not correspondence tracks, but
+        # they are valid ray/depth observations in their own fixed cameras.
+        # Feed them to the probabilistic hull so canonical occupancy must be
+        # corroborated by different traversals instead of being extruded from
+        # whichever sequence happened to contain the surviving MASt3R tracks.
+        hull_tracks = [*hull_tracks, *chart_foliage]
     else:
         points = read_points3d_binary_with_tracks(
             sparse / "points3D.bin"
@@ -1114,6 +1497,8 @@ def build_foliage_seed(
         cross_sequence_hull = True
         native_track_count = len(tracks)
         chart_foliage = []
+        dav2_foliage = []
+        dav2_audit = {"views": 0, "accepted_views": 0}
     if not tracks:
         raise RuntimeError("No multi-view semantic tree tracks survived")
     track_xyz = np.stack([point["xyz"] for point in tracks])
@@ -1145,7 +1530,7 @@ def build_foliage_seed(
             for view in view_records
             if int(view["image_id"]) in observed_ids
         ]
-        selected = greedy_diverse_views(
+        selected = sequence_balanced_diverse_views(
             observed_views,
             limit=min(selected_view_count, len(observed_views)),
             minimum_center_distance=0.20,
@@ -1164,9 +1549,7 @@ def build_foliage_seed(
         masks,
         rigid_depth_maps=rigid_depth,
         selected_views=selected,
-        minimum_support_sequences=(
-            2 if cross_sequence_hull else 1
-        ),
+        minimum_support_sequences=2,
         voxel_size=voxel_size,
         maximum_voxels=maximum_voxels,
         seed=seed,
@@ -1230,10 +1613,14 @@ def build_foliage_seed(
         "chart_sequence_local_sample_count": int(
             len(chart_foliage)
         ),
+        "dav2_sequence_local_sample_count": int(len(dav2_foliage)),
+        "dav2_depth_alignment": dav2_audit,
         "cross_view_visual_hull_anchor_count": int(
             len(hull_tracks)
         ),
-        "cross_sequence_visual_hull": cross_sequence_hull,
+        "cross_sequence_visual_hull": bool(
+            len({view["sequence_id"] for view in selected_views}) >= 2
+        ),
         "localization_landmark_eligible": False,
     }
     output.with_suffix(".json").write_text(

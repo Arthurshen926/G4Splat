@@ -88,3 +88,55 @@ def greedy_diverse_views(records, *, limit, minimum_center_distance=0.5):
         sequence = chosen["sequence_id"]
         sequence_counts[sequence] = sequence_counts.get(sequence, 0) + 1
     return selected
+
+
+def sequence_balanced_diverse_views(
+    records, *, limit, minimum_center_distance=0.5
+):
+    """Select real cameras without letting one traversal own the hull.
+
+    The first pass reserves one useful, spatially diverse camera per
+    sequence.  The normal greedy rule then fills the remaining capacity.
+    This matters for foliage: a globally ranked canopy list can otherwise be
+    entirely consumed by one traversal and make a nominal visual hull a
+    single-sequence extrusion.
+    """
+    records = list(records)
+    limit = int(limit)
+    if limit <= 0 or not records:
+        return []
+    by_sequence = {}
+    for row in records:
+        by_sequence.setdefault(str(row["sequence_id"]), []).append(row)
+    selected = []
+    # Prefer sequences with stronger canopy support, but reserve at most one
+    # view until every represented traversal has had a chance.
+    sequence_order = sorted(
+        by_sequence,
+        key=lambda sequence: (
+            -max(float(row["canopy_fraction"]) for row in by_sequence[sequence]),
+            sequence,
+        ),
+    )
+    for sequence in sequence_order[:limit]:
+        candidates = greedy_diverse_views(
+            by_sequence[sequence],
+            limit=1,
+            minimum_center_distance=minimum_center_distance,
+        )
+        if candidates:
+            selected.extend(candidates)
+    if len(selected) >= limit:
+        return selected[:limit]
+    selected_ids = {int(row["image_id"]) for row in selected}
+    remainder = [
+        row for row in records if int(row["image_id"]) not in selected_ids
+    ]
+    # Seed the score with already selected views by greedily choosing from the
+    # remainder and rejecting near-identical duplicates afterwards.
+    fill = greedy_diverse_views(
+        remainder,
+        limit=limit - len(selected),
+        minimum_center_distance=minimum_center_distance,
+    )
+    return [*selected, *fill]

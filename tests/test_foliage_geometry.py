@@ -4,9 +4,11 @@ import torch
 from outdoor.foliage_geometry import semantic_tree_tracks
 from outdoor.foliage_view_graph import (
     greedy_diverse_views,
+    sequence_balanced_diverse_views,
     sequence_id,
     support_geometry,
 )
+from outdoor.training_evidence import EvidenceEpochSampler
 
 
 def test_sequence_id_is_not_frame_identity():
@@ -57,6 +59,39 @@ def test_diverse_view_selection_penalizes_repeated_sequences():
     selected = greedy_diverse_views(records, limit=2, minimum_center_distance=0.5)
 
     assert {row["sequence_id"] for row in selected} == {"seq1", "seq2"}
+
+
+def test_sequence_balanced_selection_reserves_each_traversal():
+    records = [
+        {
+            "image_id": index,
+            "image_name": f"seq1__{index}",
+            "sequence_id": "seq1",
+            "canopy_fraction": 1.0 - index * 0.01,
+            "camera_center": np.array([float(index), 0.0, 0.0]),
+        }
+        for index in range(8)
+    ]
+    records.append(
+        {
+            "image_id": 99,
+            "image_name": "seq2__a",
+            "sequence_id": "seq2",
+            "canopy_fraction": 0.05,
+            "camera_center": np.array([20.0, 0.0, 0.0]),
+        }
+    )
+    selected = sequence_balanced_diverse_views(records, limit=4)
+    assert {row["sequence_id"] for row in selected} == {"seq1", "seq2"}
+
+
+def test_evidence_epoch_sampler_visits_every_factor_without_fixed_stride():
+    sampler = EvidenceEpochSampler(11, seed=3)
+    batches = [sampler.next(4) for _ in range(3)]
+    assert len(np.unique(np.concatenate(batches)[:11])) == 11
+    audit = sampler.audit()
+    assert audit["never_visited"] == 0
+    assert audit["completed_epochs"] == 1
 
 
 def test_empty_cambridge_point2d_rows_use_tracked_calibrated_reprojection():

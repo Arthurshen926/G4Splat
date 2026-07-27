@@ -15,6 +15,50 @@ from outdoor.evidence_store import artifact_path, load_evidence_store
 from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION
 
 
+class EvidenceEpochSampler:
+    """Deterministic shuffled epochs with an auditable coverage contract."""
+
+    def __init__(self, count: int, *, seed: int):
+        self.count = int(count)
+        self.rng = np.random.default_rng(int(seed))
+        self.order = self.rng.permutation(self.count)
+        self.cursor = 0
+        self.epoch = 0
+        self.visits = np.zeros(self.count, dtype=np.int64)
+
+    def next(self, maximum: int) -> np.ndarray:
+        if self.count == 0 or int(maximum) <= 0:
+            return np.empty(0, dtype=np.int64)
+        take = min(int(maximum), self.count)
+        chunks = []
+        remaining = take
+        while remaining:
+            available = self.count - self.cursor
+            amount = min(remaining, available)
+            chunk = self.order[self.cursor : self.cursor + amount]
+            chunks.append(chunk)
+            self.visits[chunk] += 1
+            self.cursor += amount
+            remaining -= amount
+            if self.cursor == self.count:
+                self.epoch += 1
+                self.order = self.rng.permutation(self.count)
+                self.cursor = 0
+        return np.concatenate(chunks)
+
+    def audit(self) -> dict:
+        visited = int((self.visits > 0).sum())
+        return {
+            "count": self.count,
+            "visited": visited,
+            "never_visited": self.count - visited,
+            "coverage": visited / max(self.count, 1),
+            "completed_epochs": self.epoch,
+            "minimum_visits": int(self.visits.min()) if self.count else 0,
+            "maximum_visits": int(self.visits.max()) if self.count else 0,
+        }
+
+
 class OutdoorGeometryEvidence:
     """Keep every geometry source separate at loss construction time."""
 
@@ -148,6 +192,19 @@ class OutdoorGeometryEvidence:
                 }
         self._track_device_cache = {}
         self._structure_device_cache = {}
+        self._track_samplers = {
+            source: EvidenceEpochSampler(
+                len(archive["track_id"]), seed=1701 + int(source)
+            )
+            for source, archive in self.track_archives.items()
+        }
+        self._structure_sampler = (
+            None
+            if self.structure is None
+            else EvidenceEpochSampler(
+                len(self.structure["centers"]), seed=2719
+            )
+        )
         self.consumed = {
             "chart": 0,
             "plane": 0,
@@ -296,7 +353,13 @@ class OutdoorGeometryEvidence:
     def track_factor(
         self, surface, *, maximum_tracks: int = 8192
     ) -> tuple[torch.Tensor, dict]:
-        """Robust persistent SfM/MASt3R 3D track factor for seed primitives."""
+        """Persistent external track factor with shuffled full coverage.
+
+        A track remains an evidence node after its original render primitive
+        is cloned, split, or retired. Descendants may share the same track id;
+        their losses are normalized per external track so topology cannot
+        multiply a measurement's weight.
+        """
         zero = surface.get_xyz.new_zeros(())
         if not self.track_archives or not hasattr(surface, "_track_id"):
             return zero, {"matched": 0}
@@ -313,7 +376,19 @@ class OutdoorGeometryEvidence:
         total = zero
         total_weight = zero
         matched_total = 0
+        sampled_total = 0
         for source, archive in self._track_device_cache[device_key].items():
+            sampled_numpy = self._track_samplers[source].next(
+                maximum_tracks
+            )
+            sampled_total += int(len(sampled_numpy))
+            sampled = torch.from_numpy(sampled_numpy).to(
+                device=device, dtype=torch.long
+            )
+            selected_archive = torch.zeros(
+                len(archive["track_id"]), dtype=torch.bool, device=device
+            )
+            selected_archive[sampled] = True
             candidate = (
                 (surface._source_type == int(source))
                 & (surface._track_id >= 0)
@@ -321,9 +396,6 @@ class OutdoorGeometryEvidence:
             indices = torch.nonzero(candidate, as_tuple=False).flatten()
             if not len(indices):
                 continue
-            if len(indices) > maximum_tracks:
-                stride = int(np.ceil(len(indices) / maximum_tracks))
-                indices = indices[::stride][:maximum_tracks]
             ids = surface._track_id[indices]
             position = torch.searchsorted(archive["track_id"], ids)
             in_range = position < len(archive["track_id"])
@@ -332,7 +404,7 @@ class OutdoorGeometryEvidence:
             )
             matched = in_range & (
                 archive["track_id"][safe_position] == ids
-            )
+            ) & selected_archive[safe_position]
             if not bool(matched.any()):
                 continue
             indices = indices[matched]
@@ -341,13 +413,32 @@ class OutdoorGeometryEvidence:
             delta = surface.get_xyz[indices] - archive["xyz"][position]
             mahalanobis = (delta.square() / variance).sum(-1)
             weight = surface._geometry_confidence[indices].clamp(0.05, 1)
-            total = total + (torch.log1p(mahalanobis) * weight).sum()
-            total_weight = total_weight + weight.sum()
-            matched_total += int(len(indices))
+            per_primitive = torch.log1p(mahalanobis) * weight
+            # Normalize all render descendants of one evidence node before
+            # reducing across the sampled external archive.
+            unique_ids, inverse = torch.unique(
+                ids[matched], sorted=False, return_inverse=True
+            )
+            grouped_loss = torch.zeros(
+                len(unique_ids), device=device, dtype=per_primitive.dtype
+            )
+            grouped_weight = torch.zeros_like(grouped_loss)
+            grouped_loss.scatter_add_(0, inverse, per_primitive)
+            grouped_weight.scatter_add_(0, inverse, weight)
+            total = total + (
+                grouped_loss / grouped_weight.clamp_min(1e-6)
+            ).sum()
+            total_weight = total_weight + len(unique_ids)
+            matched_total += int(len(unique_ids))
         if matched_total:
             self.consumed["track_factor"] += 1
         return total / total_weight.clamp_min(1), {
             "matched": matched_total,
+            "sampled": sampled_total,
+            "coverage": {
+                str(source): sampler.audit()
+                for source, sampler in self._track_samplers.items()
+            },
         }
 
     def structure_factor(
@@ -375,13 +466,23 @@ class OutdoorGeometryEvidence:
         if not len(owned):
             return zero, {"matched": 0, "blocks": 0}
         if len(owned) > maximum_points:
-            stride = int(np.ceil(len(owned) / maximum_points))
-            owned = owned[::stride][:maximum_points]
+            # Rotate the render-side responsibilities as well; unlike a fixed
+            # stride this cannot starve the tail of an evolving topology.
+            offset = (
+                self.consumed["structure_factor"] * maximum_points
+            ) % len(owned)
+            owned = torch.roll(owned, shifts=-int(offset))[:maximum_points]
         points = surface.get_xyz[owned]
-        # 2k x 2.2k is bounded and keeps the selected unit differentiable
-        # with respect to the surfel position.
-        distance = torch.cdist(points, structure["centers"])
+        unit_numpy = self._structure_sampler.next(maximum_points)
+        unit_indices = torch.from_numpy(unit_numpy).to(
+            device=device, dtype=torch.long
+        )
+        sampled_centers = structure["centers"][unit_indices]
+        # Both sides rotate through complete epochs. This keeps the cdist
+        # bounded while ensuring every permanent structural unit is consumed.
+        distance = torch.cdist(points, sampled_centers)
         nearest_distance, nearest = distance.min(dim=1)
+        nearest = unit_indices[nearest]
         confidence = (
             structure["weight"][nearest].clamp_min(0.05)
             * structure["view_count"][nearest].clamp_min(1).sqrt()
@@ -398,7 +499,35 @@ class OutdoorGeometryEvidence:
             "blocks": int(
                 structure["block_id"][nearest].unique().numel()
             ),
+            "coverage": self._structure_sampler.audit(),
         }
+
+    def coverage_audit(self) -> dict:
+        return {
+            "tracks": {
+                str(source): sampler.audit()
+                for source, sampler in self._track_samplers.items()
+            },
+            "structure": (
+                None
+                if self._structure_sampler is None
+                else self._structure_sampler.audit()
+            ),
+        }
+
+    def assert_complete_coverage(self) -> None:
+        incomplete = []
+        for name, audit in self.coverage_audit()["tracks"].items():
+            if audit["never_visited"]:
+                incomplete.append(f"track source {name}: {audit}")
+        structure = self.coverage_audit()["structure"]
+        if structure is not None and structure["never_visited"]:
+            incomplete.append(f"structure: {structure}")
+        if incomplete:
+            raise RuntimeError(
+                "Geometry evidence epoch did not reach full coverage: "
+                + "; ".join(incomplete)
+            )
 
     @property
     def geometry_view_stems(self) -> tuple[str, ...]:
@@ -603,4 +732,5 @@ class OutdoorGeometryEvidence:
             ),
             "metric_preflight": dict(self.preflight),
             "all_metric_depth_factors_use_cambridge_world_scale": True,
+            "evidence_epoch_coverage": self.coverage_audit(),
         }

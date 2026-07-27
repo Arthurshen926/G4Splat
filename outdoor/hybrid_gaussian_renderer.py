@@ -644,6 +644,7 @@ def render_hybrid(
     include_dynamic: bool = False,
     volume_means_override: torch.Tensor | None = None,
     volume_opacity_scale: float | torch.Tensor = 1.0,
+    volume_gate: torch.Tensor | None = None,
     structural_trainable_start: int | None = None,
 ) -> HybridRenderOutput:
     """Rasterise exact 2D surfels and 3D volumes with native mixed CUDA.
@@ -730,6 +731,15 @@ def render_hybrid(
         device=volume_opacities.device,
         dtype=volume_opacities.dtype,
     )
+    if volume_gate is not None:
+        volume_gate = torch.as_tensor(
+            volume_gate,
+            device=volume_opacities.device,
+            dtype=volume_opacities.dtype,
+        ).reshape(-1)
+        if len(volume_gate) != len(volume_opacities):
+            raise ValueError("volume_gate must have one value per volume Gaussian")
+        volume_opacities = volume_opacities * volume_gate.clamp(0, 1)
     volume_scales = foliage.scales
     volume_rotations = foliage.normalized_quaternions
 

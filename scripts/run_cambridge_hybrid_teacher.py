@@ -18,6 +18,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from outdoor.evidence_store import load_evidence_store  # noqa: E402
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
+from outdoor.role_aware_initialization import (  # noqa: E402
+    INITIALIZATION_VERSION,
+)
 
 
 PIPELINE_VERSION = "cambridge-native-hybrid-teacher-mainline-v3-causal-repair"
@@ -91,9 +94,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--gpu", default="2")
     parser.add_argument("--minimum-free-gpu-memory-mib", type=int, default=20_000)
-    parser.add_argument("--maximum-surface-gaussians", type=int, default=200_000)
+    parser.add_argument("--maximum-surface-gaussians", type=int, default=300_000)
     parser.add_argument(
-        "--maximum-surface-growth-per-event", type=int, default=500
+        "--maximum-surface-growth-per-event", type=int, default=1000
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -416,6 +419,8 @@ def main() -> None:
             )
             rebuild_initialization = (
                 current_initialization.get("evidence_hash") != store_hash
+                or current_initialization.get("version")
+                != INITIALIZATION_VERSION
             )
         if rebuild_initialization:
             command = [

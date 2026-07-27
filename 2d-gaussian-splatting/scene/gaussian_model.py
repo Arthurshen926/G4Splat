@@ -908,8 +908,17 @@ class GaussianModel:
         self.mip_filter = mip_filter[..., None]
         self.restore_frozen_prefix_mip_filter()
 
-    def reset_opacity(self):
-        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+    def reset_opacity(self, mask=None):
+        current = self.get_opacity
+        capped = torch.min(current, torch.ones_like(current) * 0.01)
+        if mask is not None:
+            mask = torch.as_tensor(
+                mask, dtype=torch.bool, device=current.device
+            ).reshape(-1, 1)
+            if len(mask) != len(current):
+                raise ValueError("Opacity reset mask must cover every Gaussian")
+            capped = torch.where(mask, capped, current)
+        opacities_new = self.inverse_opacity_activation(capped)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -1345,7 +1354,6 @@ class GaussianModel:
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
-                track_id=-1,
             ),
         )
         if parent_mip_filter is not None:
@@ -1362,6 +1370,7 @@ class GaussianModel:
         children_per_parent=2,
         opacity_ceiling=0.02,
         max_parent_scale_fraction=0.1,
+        require_large_world_scale=True,
         eligibility_mask=None,
         primitive_class=None,
         source_type=None,
@@ -1397,7 +1406,12 @@ class GaussianModel:
             return 0
         grad_norm = torch.nan_to_num(torch.norm(grads[:point_count], dim=-1), nan=0.0)
         parent_scales = torch.max(self.get_scaling[:point_count], dim=1).values
-        selected_pts_mask = torch.logical_and(grad_norm >= grad_threshold, parent_scales > self.percent_dense * scene_extent)
+        selected_pts_mask = grad_norm >= grad_threshold
+        if require_large_world_scale:
+            selected_pts_mask = torch.logical_and(
+                selected_pts_mask,
+                parent_scales > self.percent_dense * scene_extent,
+            )
         selected_pts_mask = torch.logical_and(
             selected_pts_mask,
             parent_scales <= float(max_parent_scale_fraction) * scene_extent,
@@ -1456,7 +1470,6 @@ class GaussianModel:
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
-                track_id=-1,
             ),
         )
         if parent_mip_filter is not None:
@@ -1495,7 +1508,7 @@ class GaussianModel:
         max_points,
         max_growth,
     ):
-        """Run native clone/split topology under a strict point budget.
+        """Run anchor-preserving residual topology under a strict budget.
 
         Native 2DGS densification selects every point above the gradient
         threshold.  Large outdoor scenes can therefore add hundreds of
@@ -1503,7 +1516,11 @@ class GaussianModel:
         before the dynamic foliage phases begin.  This variant first applies
         the native culling rules, then admits only the highest-gradient
         clone/split candidates that fit both the global and per-event budgets.
-        Split parents are still retired exactly as in native 2DGS.
+        Large metric anchors are never retired. They remain the permanent
+        low-frequency evidence responsibility while compact, low-opacity
+        children inherit the same external track identity. The corresponding
+        factor normalizes descendants per evidence node, so splitting cannot
+        multiply a measurement's weight.
         """
         max_points = int(max_points)
         max_growth = int(max_growth)
@@ -1557,53 +1574,50 @@ class GaussianModel:
                 grad_norm >= max_grad,
                 max_scale <= self.percent_dense * extent,
             )
+            projected_large = self.max_radii2D > min(
+                16.0, 0.25 * float(max_screen_size)
+            )
             split_candidates = torch.logical_and(
                 grads.squeeze(-1) >= max_grad,
-                max_scale > self.percent_dense * extent,
+                torch.logical_or(
+                    max_scale > self.percent_dense * extent,
+                    projected_large,
+                ),
             )
-            if len(self._protected_flag) == point_count:
-                # Metric anchors may seed conservative clones, but a native
-                # split retires its parent. Never replace a fixed SfM/MAtCha
-                # measurement with unanchored children.
-                split_candidates = torch.logical_and(
-                    split_candidates, ~self._protected_flag
+            clone_candidates = torch.logical_and(
+                clone_candidates, ~projected_large
+            )
+            # Large footprint deficits are the failure mode that creates
+            # facade/tree smearing, so reserve capacity for compact children
+            # before spending the remainder on same-scale clones.
+            split_capacity = min(
+                remaining,
+                int(split_candidates.sum()) * 2,
+            )
+            split_capacity -= split_capacity % 2
+            if split_capacity:
+                split_children = self.densify_and_split_limited(
+                    grads,
+                    max_grad,
+                    extent,
+                    split_capacity,
+                    children_per_parent=2,
+                    opacity_ceiling=0.02,
+                    require_large_world_scale=False,
+                    eligibility_mask=split_candidates,
+                    protected_flag=False,
                 )
-            candidate_mask = torch.logical_or(
-                clone_candidates, split_candidates
-            )
-            candidate_indices = torch.nonzero(
-                candidate_mask, as_tuple=False
-            ).flatten()
-            if candidate_indices.numel() > remaining:
-                ranking = torch.topk(
-                    grad_norm[candidate_indices], k=remaining
-                ).indices
-                candidate_indices = candidate_indices[ranking]
-
-            admitted = torch.zeros(
-                point_count, dtype=torch.bool, device=self.get_xyz.device
-            )
-            admitted[candidate_indices] = True
-            clone_admitted = torch.logical_and(
-                admitted, clone_candidates
-            )
-            split_admitted = torch.logical_and(
-                admitted, split_candidates
-            )
-            cloned = int(clone_admitted.sum())
-            split_parents = int(split_admitted.sum())
-
-            clone_grads = torch.zeros_like(grads)
-            clone_grads[clone_admitted] = grads[clone_admitted]
-            split_grads = torch.zeros_like(grads)
-            split_grads[split_admitted] = grads[split_admitted]
-            if cloned:
-                self.densify_and_clone(
-                    clone_grads, max_grad, extent
-                )
-            if split_parents:
-                self.densify_and_split(
-                    split_grads, max_grad, extent
+                split_parents = int(split_children // 2)
+                remaining -= int(split_children)
+            if remaining:
+                cloned = self.densify_and_clone_limited(
+                    grads,
+                    max_grad,
+                    extent,
+                    remaining,
+                    opacity_ceiling=0.015,
+                    eligibility_mask=clone_candidates,
+                    protected_flag=False,
                 )
 
         after = int(self.get_xyz.shape[0])

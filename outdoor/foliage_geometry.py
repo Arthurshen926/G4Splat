@@ -456,7 +456,7 @@ def build_instance_aware_canopy_volume(
     dilation_steps=3,
     maximum_voxels=400_000,
     selected_view_count=64,
-    minimum_support_views=3,
+    minimum_support_views=2,
     minimum_depth_support_views=2,
     minimum_support_sequences=2,
     minimum_occupancy=0.52,
@@ -644,10 +644,11 @@ def build_instance_aware_canopy_volume(
         confirmed_negative = (
             valid
             & ~occluded
-            & (
-                ((component == 0) & ~posterior_found)
-                | free
-            )
+            # A mask miss without a local depth posterior is not free-space
+            # evidence: the candidate may be behind an unmodelled occluder or
+            # outside this traversal's observed crown. Only a measured
+            # in-front-of-posterior violation is a true negative.
+            & free
         )
         ambiguous = valid & ~(supported | confirmed_negative)
         positive += supported.astype(np.int16)
@@ -729,8 +730,33 @@ def build_instance_aware_canopy_volume(
         )
     )
     if not np.any(keep):
+        gate_counts = {
+            "candidates": int(count),
+            "positive_views": int(
+                (positive >= int(minimum_support_views)).sum()
+            ),
+            "depth_views": int(
+                (depth_support >= int(minimum_depth_support_views)).sum()
+            ),
+            "sequences": int(
+                (sequence_count >= int(minimum_support_sequences)).sum()
+            ),
+            "occupancy": int(
+                (occupancy >= float(minimum_occupancy)).sum()
+            ),
+            "baseline": int(
+                (maximum_baseline >= float(minimum_baseline)).sum()
+            ),
+            "angle": int(
+                (
+                    maximum_angle
+                    >= float(minimum_triangulation_angle_degrees)
+                ).sum()
+            ),
+        }
         raise RuntimeError(
-            "No instance-aware ray/depth-supported canopy voxel survived"
+            "No instance-aware ray/depth-supported canopy voxel survived: "
+            f"{gate_counts}"
         )
     accepted_information = information[keep]
     weak = np.linalg.det(accepted_information) <= 1e-12
@@ -738,9 +764,57 @@ def build_instance_aware_canopy_volume(
         np.eye(3)[None] / max(voxel_size * voxel_size, 1e-6)
     )
     position_covariance = np.linalg.inv(accepted_information)
+    accepted_centers = centers[keep]
+    accepted_instances = center_instances[keep]
+    # Infer a conservative static trunk/branch graph from cross-sequence
+    # occupied voxels. Pointwise PCA thresholds alone leave almost no
+    # skeleton in leafy scenes. A robust instance axis supplies a trunk
+    # proposal and local line-like neighbourhoods supply branches.
+    skeleton = np.zeros(len(accepted_centers), dtype=bool)
+    accepted_sequence_count = sequence_count[keep]
+    for instance in np.unique(accepted_instances):
+        instance_indices = np.nonzero(
+            (accepted_instances == instance)
+            & (accepted_sequence_count >= 2)
+        )[0]
+        if len(instance_indices) < 8:
+            continue
+        points = accepted_centers[instance_indices]
+        robust_center = np.median(points, axis=0)
+        centered = points - robust_center
+        _, _, axes = np.linalg.svd(centered, full_matrices=False)
+        axis = axes[0]
+        longitudinal = centered @ axis
+        radial = np.linalg.norm(
+            centered - longitudinal[:, None] * axis[None], axis=1
+        )
+        trunk = radial <= np.quantile(radial, 0.08)
+        tree = cKDTree(points)
+        neighbors = tree.query(points, k=min(12, len(points)))[1]
+        linearity = np.zeros(len(points), dtype=np.float64)
+        for local_index, local_neighbors in enumerate(neighbors):
+            local = points[np.atleast_1d(local_neighbors)]
+            covariance = np.cov((local - local.mean(0)).T)
+            eigenvalues = np.linalg.eigvalsh(covariance)
+            linearity[local_index] = (
+                eigenvalues[-1] / max(eigenvalues[-2], 1e-10)
+            )
+        branch = linearity >= 4.0
+        proposed = np.nonzero(trunk | branch)[0]
+        maximum = max(8, int(np.ceil(0.15 * len(points))))
+        if len(proposed) > maximum:
+            score = linearity[proposed] + 1.0 / np.maximum(
+                radial[proposed], voxel_size * 0.25
+            )
+            proposed = proposed[np.argsort(score)[-maximum:]]
+        skeleton[instance_indices[proposed]] = True
     nearest = nearest_anchor[keep]
+    # Visual-hull crown voxels are never promoted to trunk/branch merely
+    # because a sparse local neighbourhood looks linear. Static skeleton
+    # roles are reserved for elongated tracked primitives in the merge stage.
+    layer_role = np.zeros(int(keep.sum()), dtype=np.int8)
     return {
-        "centers": centers[keep].astype(np.float32),
+        "centers": accepted_centers.astype(np.float32),
         "colors": anchor_rgb[nearest].astype(np.float32) / 255.0,
         "scales": np.full(
             (int(keep.sum()), 3), voxel_size * 0.65, dtype=np.float32
@@ -755,7 +829,7 @@ def build_instance_aware_canopy_volume(
         "primitive_role": np.full(
             int(keep.sum()), 0, dtype=np.int8
         ),
-        "layer_role": np.full(int(keep.sum()), 0, dtype=np.int8),
+        "layer_role": layer_role,
         "track_id": np.full(int(keep.sum()), -1, dtype=np.int64),
         "tree_instance_id": center_instances[keep].astype(np.int32),
         "initialization_source": np.full(
