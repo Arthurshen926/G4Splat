@@ -99,6 +99,9 @@ def _args() -> argparse.Namespace:
         "--maximum-surface-growth-per-event", type=int, default=1000
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-trainer-repair-resume", action="store_true"
+    )
     args = parser.parse_args()
     if args.iterations is None:
         args.iterations = PROFILES[args.profile]["iterations"]
@@ -486,9 +489,11 @@ def main() -> None:
             ]
             checkpoint = teacher / "hybrid_teacher_checkpoint.pth"
             if checkpoint.is_file():
-                command.extend(
-                    ["--resume", str(checkpoint), "--allow-performance-resume"]
-                )
+                command.extend(["--resume", str(checkpoint)])
+                if args.allow_trainer_repair_resume:
+                    command.append("--allow-trainer-repair-resume")
+                else:
+                    command.append("--allow-performance-resume")
             _run(
                 command,
                 env=train_env,

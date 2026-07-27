@@ -517,6 +517,7 @@ def build_instance_aware_canopy_volume(
     selected_image_ids = np.asarray(
         [view["image_id"] for view in selected], dtype=np.int32
     )
+    ray_records: list[dict[str, np.ndarray]] = []
 
     track_images = [
         {int(value) for value in point.get("tree_image_ids", ())}
@@ -651,6 +652,46 @@ def build_instance_aware_canopy_volume(
             & free
         )
         ambiguous = valid & ~(supported | confirmed_negative)
+        ray_valid = valid & posterior_found & matched_instance
+        ray_indices = np.nonzero(ray_valid)[0]
+        if len(ray_indices):
+            observation_type = np.zeros(len(ray_indices), dtype=np.int8)
+            observation_type[supported[ray_indices]] = 1
+            observation_type[confirmed_negative[ray_indices]] = -1
+            ray_records.append(
+                {
+                    "candidate": ray_indices.astype(np.int64),
+                    "camera_id": np.full(
+                        len(ray_indices), image_id, dtype=np.int32
+                    ),
+                    "pixel": np.column_stack(
+                        [u[ray_indices], v[ray_indices]]
+                    ).astype(np.float32),
+                    "free_end": (
+                        posterior_depth[ray_indices]
+                        - float(free_space_margin)
+                    ).astype(np.float32),
+                    "hit_start": (
+                        posterior_depth[ray_indices]
+                        - 2.5 * posterior_sigma[ray_indices]
+                    ).astype(np.float32),
+                    "hit_end": (
+                        posterior_depth[ray_indices]
+                        + 2.5 * posterior_sigma[ray_indices]
+                    ).astype(np.float32),
+                    "type": observation_type,
+                    "confidence": np.exp(
+                        -0.5
+                        * (
+                            residual[ray_indices]
+                            / np.maximum(
+                                posterior_sigma[ray_indices], 1e-6
+                            )
+                        )
+                        ** 2
+                    ).astype(np.float32),
+                }
+            )
         positive += supported.astype(np.int16)
         depth_support += compatible.astype(np.int16)
         negative += confirmed_negative.astype(np.int16)
@@ -813,6 +854,63 @@ def build_instance_aware_canopy_volume(
     # because a sparse local neighbourhood looks linear. Static skeleton
     # roles are reserved for elongated tracked primitives in the merge stage.
     layer_role = np.zeros(int(keep.sum()), dtype=np.int8)
+    old_to_new = np.full(count, -1, dtype=np.int64)
+    old_to_new[np.nonzero(keep)[0]] = np.arange(int(keep.sum()))
+    if ray_records:
+        ray_candidate = np.concatenate(
+            [record["candidate"] for record in ray_records]
+        )
+        ray_keep = old_to_new[ray_candidate] >= 0
+        ray_primitive = old_to_new[ray_candidate[ray_keep]]
+        ray_camera = np.concatenate(
+            [record["camera_id"] for record in ray_records]
+        )[ray_keep]
+        ray_pixel = np.concatenate(
+            [record["pixel"] for record in ray_records]
+        )[ray_keep]
+        ray_free_end = np.concatenate(
+            [record["free_end"] for record in ray_records]
+        )[ray_keep]
+        ray_hit_start = np.concatenate(
+            [record["hit_start"] for record in ray_records]
+        )[ray_keep]
+        ray_hit_end = np.concatenate(
+            [record["hit_end"] for record in ray_records]
+        )[ray_keep]
+        ray_type = np.concatenate(
+            [record["type"] for record in ray_records]
+        )[ray_keep]
+        ray_confidence = np.concatenate(
+            [record["confidence"] for record in ray_records]
+        )[ray_keep]
+        order = np.argsort(ray_primitive, kind="stable")
+        ray_primitive = ray_primitive[order]
+        counts = np.bincount(
+            ray_primitive, minlength=int(keep.sum())
+        )
+        ray_offsets = np.zeros(int(keep.sum()) + 1, dtype=np.int64)
+        ray_offsets[1:] = np.cumsum(counts)
+        ray_evidence = {
+            "offsets": ray_offsets,
+            "camera_ids": ray_camera[order],
+            "pixels": ray_pixel[order],
+            "free_end_depth": ray_free_end[order],
+            "hit_start_depth": ray_hit_start[order],
+            "hit_end_depth": ray_hit_end[order],
+            "observation_type": ray_type[order],
+            "confidence": ray_confidence[order],
+        }
+    else:
+        ray_evidence = {
+            "offsets": np.zeros(int(keep.sum()) + 1, dtype=np.int64),
+            "camera_ids": np.empty(0, dtype=np.int32),
+            "pixels": np.empty((0, 2), dtype=np.float32),
+            "free_end_depth": np.empty(0, dtype=np.float32),
+            "hit_start_depth": np.empty(0, dtype=np.float32),
+            "hit_end_depth": np.empty(0, dtype=np.float32),
+            "observation_type": np.empty(0, dtype=np.int8),
+            "confidence": np.empty(0, dtype=np.float32),
+        }
     return {
         "centers": accepted_centers.astype(np.float32),
         "colors": anchor_rgb[nearest].astype(np.float32) / 255.0,
@@ -857,6 +955,7 @@ def build_instance_aware_canopy_volume(
         "candidate_count": count,
         "tree_instance_count": int(center_instances.max()) + 1,
         "rigid_depth_view_count": len(rigid_depth_maps),
+        "ray_evidence": ray_evidence,
     }
 
 

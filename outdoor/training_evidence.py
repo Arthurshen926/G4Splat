@@ -59,6 +59,103 @@ class EvidenceEpochSampler:
         }
 
 
+class FoliageRayEvidence:
+    """Sparse per-camera free/hit intervals retained outside 3D primitives."""
+
+    def __init__(self, payload: dict | None):
+        payload = payload or {}
+        self.camera_ids = payload.get(
+            "camera_ids", torch.empty(0, dtype=torch.int32)
+        ).cpu()
+        self.pixels = payload.get(
+            "pixels", torch.empty(0, 2)
+        ).cpu()
+        self.free_end = payload.get(
+            "free_end_depth", torch.empty(0)
+        ).cpu()
+        self.hit_start = payload.get(
+            "hit_start_depth", torch.empty(0)
+        ).cpu()
+        self.hit_end = payload.get(
+            "hit_end_depth", torch.empty(0)
+        ).cpu()
+        self.observation_type = payload.get(
+            "observation_type", torch.empty(0, dtype=torch.int8)
+        ).cpu()
+        self.confidence = payload.get(
+            "confidence", torch.empty(0)
+        ).cpu()
+
+    def factor(self, view, package, *, maximum_rays: int = 8192):
+        depth_map = package.volume_depth[0]
+        alpha_map = package.volume_alpha[0]
+        zero = depth_map.new_zeros(())
+        selected = torch.nonzero(
+            self.camera_ids == int(view.colmap_id), as_tuple=False
+        ).flatten()
+        if not len(selected):
+            return zero, {"rays": 0, "free": 0.0, "hit": 0.0}
+        if len(selected) > int(maximum_rays):
+            positions = torch.linspace(
+                0, len(selected) - 1, int(maximum_rays)
+            ).long()
+            selected = selected[positions]
+        device, dtype = depth_map.device, depth_map.dtype
+        pixels = self.pixels[selected].to(device=device, dtype=dtype)
+        grid = torch.stack(
+            [
+                2.0 * (pixels[:, 0] + 0.5) / view.image_width - 1.0,
+                2.0 * (pixels[:, 1] + 0.5) / view.image_height - 1.0,
+            ],
+            dim=-1,
+        ).reshape(1, -1, 1, 2)
+        depth = F.grid_sample(
+            depth_map[None, None], grid, align_corners=False
+        ).reshape(-1)
+        alpha = F.grid_sample(
+            alpha_map[None, None], grid, align_corners=False
+        ).reshape(-1)
+        free_end = self.free_end[selected].to(device=device, dtype=dtype)
+        hit_start = self.hit_start[selected].to(device=device, dtype=dtype)
+        hit_end = self.hit_end[selected].to(device=device, dtype=dtype)
+        kind = self.observation_type[selected].to(device=device)
+        weight = self.confidence[selected].to(
+            device=device, dtype=dtype
+        ).clamp(0.05, 1.0)
+        has_mass = (depth > 0).to(dtype)
+        free_penalty = (
+            (free_end - depth).clamp_min(0)
+            / free_end.clamp_min(0.1)
+            * alpha
+            * has_mass
+        )
+        free_mask = kind <= 0
+        free_loss = (
+            (free_penalty * weight)[free_mask].sum()
+            / weight[free_mask].sum().clamp_min(1)
+            if bool(free_mask.any())
+            else zero
+        )
+        hit_mask = kind > 0
+        if bool(hit_mask.any()):
+            interval_distance = (
+                (hit_start - depth).clamp_min(0)
+                + (depth - hit_end).clamp_min(0)
+            ) / (hit_end - hit_start).clamp_min(0.1)
+            hit_penalty = -torch.log(alpha.clamp_min(1e-4)) + interval_distance
+            hit_loss = (
+                (hit_penalty * weight)[hit_mask].sum()
+                / weight[hit_mask].sum().clamp_min(1)
+            )
+        else:
+            hit_loss = zero
+        return free_loss + hit_loss, {
+            "rays": int(len(selected)),
+            "free": float(free_loss.detach()),
+            "hit": float(hit_loss.detach()),
+        }
+
+
 class OutdoorGeometryEvidence:
     """Keep every geometry source separate at loss construction time."""
 
@@ -157,6 +254,7 @@ class OutdoorGeometryEvidence:
                 for stem, record in payload.get("records", {}).items()
             }
         self.track_archives = {}
+        self.track_observations: dict[str, dict[str, np.ndarray]] = {}
         for source_code, artifact_name in (
             (0, "colmap_tracks"),
             (1, "mast3r_tracks"),
@@ -175,6 +273,37 @@ class OutdoorGeometryEvidence:
                         order
                     ].astype(np.float32),
                 }
+                required_observations = {
+                    "observation_camera_indices",
+                    "observation_pixels",
+                    "observation_camera_depth",
+                    "observation_confidence",
+                    "camera_names",
+                    "camera_image_sizes",
+                }
+                if source_code == 1 and required_observations.issubset(
+                    archive.files
+                ):
+                    camera_indices = archive[
+                        "observation_camera_indices"
+                    ].astype(np.int32)
+                    pixels = archive["observation_pixels"].astype(np.float32)
+                    depths = archive[
+                        "observation_camera_depth"
+                    ].astype(np.float32)
+                    confidence = archive[
+                        "observation_confidence"
+                    ].astype(np.float32)
+                    sizes = archive["camera_image_sizes"].astype(np.int32)
+                    names = [Path(str(value)).stem for value in archive["camera_names"]]
+                    for camera_index, name in enumerate(names):
+                        selected = camera_indices == camera_index
+                        self.track_observations[name] = {
+                            "pixels": pixels[selected],
+                            "depth": depths[selected],
+                            "confidence": confidence[selected],
+                            "image_size": sizes[camera_index],
+                        }
         structure_path = artifact_path(
             self.store, "structure_graph", required=False
         )
@@ -211,9 +340,92 @@ class OutdoorGeometryEvidence:
             "inverse_depth": 0,
             "dav2": 0,
             "track_factor": 0,
+            "track_observation_factor": 0,
             "structure_factor": 0,
         }
         self.preflight = self._metric_preflight()
+
+    def track_observation_factor(
+        self,
+        image_name: str,
+        package,
+        *,
+        maximum_observations: int = 8192,
+    ) -> tuple[torch.Tensor, dict]:
+        """Constrain the rendered surface on real fixed-camera track rays."""
+        depth_map = package.surface_depth[0]
+        alpha_map = package.surface_alpha[0]
+        zero = depth_map.new_zeros(())
+        record = self.track_observations.get(Path(str(image_name)).stem)
+        if record is None or not len(record["pixels"]):
+            return zero, {"matched": 0}
+        count = min(int(maximum_observations), len(record["pixels"]))
+        # Deterministic bounded coverage within the current camera.
+        if count < len(record["pixels"]):
+            indices = np.linspace(
+                0, len(record["pixels"]) - 1, count, dtype=np.int64
+            )
+        else:
+            indices = np.arange(count, dtype=np.int64)
+        pixels = torch.from_numpy(record["pixels"][indices]).to(
+            device=depth_map.device, dtype=depth_map.dtype
+        )
+        target = torch.from_numpy(record["depth"][indices]).to(
+            device=depth_map.device, dtype=depth_map.dtype
+        )
+        confidence = torch.from_numpy(record["confidence"][indices]).to(
+            device=depth_map.device, dtype=depth_map.dtype
+        )
+        source_width, source_height = map(int, record["image_size"])
+        x = pixels[:, 0] * (depth_map.shape[1] / source_width)
+        y = pixels[:, 1] * (depth_map.shape[0] / source_height)
+        grid = torch.stack(
+            [
+                2.0 * (x + 0.5) / depth_map.shape[1] - 1.0,
+                2.0 * (y + 0.5) / depth_map.shape[0] - 1.0,
+            ],
+            dim=-1,
+        ).reshape(1, -1, 1, 2)
+        predicted = F.grid_sample(
+            depth_map[None, None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).reshape(-1)
+        alpha = F.grid_sample(
+            alpha_map[None, None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).reshape(-1)
+        valid = (
+            torch.isfinite(predicted)
+            & (predicted > 0)
+            & torch.isfinite(target)
+            & (target > 0)
+        )
+        if not bool(valid.any()):
+            return zero, {"matched": 0}
+        weight = (
+            confidence[valid] / confidence[valid].median().clamp_min(1e-6)
+        ).clamp(0.25, 4.0)
+        relative = (predicted[valid] - target[valid]).abs() / target[
+            valid
+        ].clamp_min(0.1)
+        depth_loss = (
+            torch.log1p(relative) * weight
+        ).sum() / weight.sum().clamp_min(1)
+        hit_loss = (
+            -torch.log(alpha[valid].clamp_min(1e-4)) * weight
+        ).sum() / weight.sum().clamp_min(1)
+        self.consumed["track_observation_factor"] += 1
+        return depth_loss + 0.05 * hit_loss, {
+            "matched": int(valid.sum()),
+            "depth": float(depth_loss.detach()),
+            "hit": float(hit_loss.detach()),
+        }
 
     def _verify_array_index(self, artifact_name: str) -> None:
         index_path = artifact_path(
@@ -412,22 +624,23 @@ class OutdoorGeometryEvidence:
             variance = archive["variance"][position].clamp_min(1e-6)
             delta = surface.get_xyz[indices] - archive["xyz"][position]
             mahalanobis = (delta.square() / variance).sum(-1)
-            weight = surface._geometry_confidence[indices].clamp(0.05, 1)
-            per_primitive = torch.log1p(mahalanobis) * weight
-            # Normalize all render descendants of one evidence node before
-            # reducing across the sampled external archive.
+            per_primitive = torch.log1p(mahalanobis)
+            # One local primitive explaining the external track is enough.
+            # Averaging all descendants pulled every split child back to the
+            # same XYZ and made evidence fight surface coverage.
             unique_ids, inverse = torch.unique(
                 ids[matched], sorted=False, return_inverse=True
             )
-            grouped_loss = torch.zeros(
-                len(unique_ids), device=device, dtype=per_primitive.dtype
+            grouped_loss = torch.full(
+                (len(unique_ids),),
+                float("inf"),
+                device=device,
+                dtype=per_primitive.dtype,
             )
-            grouped_weight = torch.zeros_like(grouped_loss)
-            grouped_loss.scatter_add_(0, inverse, per_primitive)
-            grouped_weight.scatter_add_(0, inverse, weight)
-            total = total + (
-                grouped_loss / grouped_weight.clamp_min(1e-6)
-            ).sum()
+            grouped_loss.scatter_reduce_(
+                0, inverse, per_primitive, reduce="amin", include_self=True
+            )
+            total = total + grouped_loss.sum()
             total_weight = total_weight + len(unique_ids)
             matched_total += int(len(unique_ids))
         if matched_total:

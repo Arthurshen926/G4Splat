@@ -5,10 +5,15 @@ import torch
 from scripts.train_unified_outdoor_teacher import (
     TRAINING_PROFILES,
     _dynamic_enabled,
+    _dynamic_observation_factor,
     _geometry_losses,
     _masked_ssim_loss,
     _phase,
     _surface_capture_to_device,
+)
+from outdoor.hybrid_gaussian_renderer import (
+    LAYER_DYNAMIC_LEAF,
+    VolumetricFoliageModel,
 )
 
 
@@ -40,6 +45,44 @@ def test_masked_ssim_does_not_create_zero_boundary_error():
     weight = torch.zeros(32, 32)
     weight[8:24, 8:24] = 1
     assert _masked_ssim_loss(image, image, weight).item() < 1e-6
+
+
+def test_dynamic_observation_factor_has_geometry_gradient_at_tiny_opacity():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.2, 0.0, 2.0]]),
+        "scales": torch.tensor([[0.1, 0.1, 0.1]]),
+        "colors": torch.tensor([[0.2, 0.4, 0.6]]),
+        "opacities": torch.tensor([[1e-6]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([LAYER_DYNAMIC_LEAF], dtype=torch.int8),
+        "support_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_uv": torch.tensor([[[0.5, 0.5]]]),
+        "observation_depth": torch.tensor([[2.0]]),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+    camera = SimpleNamespace(
+        colmap_id=7,
+        world_view_transform=torch.eye(4),
+        focal_x=100.0,
+        focal_y=100.0,
+        cx=50.0,
+        cy=50.0,
+        image_width=100,
+        image_height=100,
+    )
+    loss, observed, audit = _dynamic_observation_factor(
+        model, camera, torch.zeros(model.dynamic_rank)
+    )
+    assert audit["matched"] == 1
+    assert observed.tolist() == [True]
+    assert loss > 0
+    loss.backward()
+    assert model.xyz.grad is not None
+    assert model.xyz.grad.norm() > 0
+    assert model.opacity_logits.grad is None
 
 
 def test_surface_resume_capture_moves_parameters_buffers_and_metadata():

@@ -41,12 +41,16 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     VolumetricFoliageModel,
+    dynamic_visibility_gate,
     render_hybrid,
 )
 from outdoor.lazy_scene import LazyScene  # noqa: E402
 from outdoor.runtime_provenance import collect_runtime_provenance  # noqa: E402
 from outdoor.task_fields import OutdoorTaskFieldLookup  # noqa: E402
-from outdoor.training_evidence import OutdoorGeometryEvidence  # noqa: E402
+from outdoor.training_evidence import (  # noqa: E402
+    FoliageRayEvidence,
+    OutdoorGeometryEvidence,
+)
 from scene import GaussianModel  # noqa: E402
 from utils.loss_utils import ssim  # noqa: E402
 
@@ -96,24 +100,28 @@ TRAINING_PROFILES = {
     "hybrid_quality": {
         "iterations": 50_000,
         "phases": (
-            ("canonical_bootstrap", 0.05),
-            ("topology", 0.50),
+            ("canonical_bootstrap", 0.12),
+            ("topology", 0.45),
+            ("static_foliage", 0.65),
             ("dynamic_appearance", 0.82),
             ("ownership_cleanup", 0.93),
             ("canonical_polish", 1.00),
         ),
-        "dynamic_start": 0.05,
+        "foliage_start": 0.45,
+        "dynamic_start": 0.65,
     },
     "hybrid_fast": {
         "iterations": 18_000,
         "phases": (
             ("canonical_bootstrap", 0.08),
-            ("topology", 0.40),
-            ("dynamic_appearance", 0.73),
-            ("ownership_cleanup", 0.90),
+            ("topology", 0.42),
+            ("static_foliage", 0.58),
+            ("dynamic_appearance", 0.86),
+            ("ownership_cleanup", 0.95),
             ("canonical_polish", 1.00),
         ),
-        "dynamic_start": 0.08,
+        "foliage_start": 0.42,
+        "dynamic_start": 0.58,
     },
 }
 
@@ -207,6 +215,15 @@ def _parse_args():
     parser.add_argument("--image-prefetch-depth", type=int, default=4)
     parser.add_argument("--maintenance-every", type=int, default=1000)
     parser.add_argument("--allow-performance-resume", action="store_true")
+    parser.add_argument(
+        "--allow-trainer-repair-resume",
+        action="store_true",
+        help=(
+            "Allow a checkpoint to cross a trainer-only causal repair while "
+            "still requiring identical evidence, schedules, budgets, model "
+            "implementations, and CUDA kernels."
+        ),
+    )
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     profile = TRAINING_PROFILES[args.training_profile]
@@ -319,42 +336,145 @@ def _dynamic_visibility_gate(
     camera_sequence_lookup: torch.Tensor,
     camera_frame_lookup: torch.Tensor,
 ) -> torch.Tensor:
-    """Soft camera/sequence ownership for sequence-local leaf primitives."""
-    gate = torch.ones(
-        len(foliage), device=foliage.xyz.device, dtype=foliage.xyz.dtype
+    """Compatibility wrapper around the shared train/inference contract."""
+    return dynamic_visibility_gate(
+        foliage,
+        int(view.colmap_id),
+        camera_sequence_lookup,
+        camera_frame_lookup,
     )
-    dynamic = foliage.dynamic_leaf_mask
-    if not bool(dynamic.any()) or foliage.support_camera_ids.numel() == 0:
-        return gate
-    support = foliage.support_camera_ids.long()
-    valid = (support >= 0) & (support < len(camera_sequence_lookup))
-    safe = support.clamp(0, max(len(camera_sequence_lookup) - 1, 0))
-    support_sequence = camera_sequence_lookup[safe]
-    support_frame = camera_frame_lookup[safe]
-    current_camera = int(view.colmap_id)
-    current_sequence = camera_sequence_lookup[current_camera]
-    current_frame = camera_frame_lookup[current_camera]
-    exact = (support == current_camera).any(dim=1)
-    same_sequence = valid & (support_sequence == current_sequence)
-    temporal = 0.75 * torch.exp(
-        -(
-            support_frame.to(gate.dtype)
-            - current_frame.to(gate.dtype)
-        ).abs()
-        / 12.0
+
+
+def _dynamic_observation_factor(
+    foliage,
+    view,
+    temporal_code: torch.Tensor,
+    *,
+    maximum_observations: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Anchor dynamic leaves to their real image ray and camera-space depth.
+
+    This factor acts directly on conditioned 3D centers. It is intentionally
+    independent of rendered opacity, so a wrongly initialized leaf cannot
+    escape geometric supervision by becoming transparent.
+    """
+    zero = foliage.xyz.new_zeros(())
+    empty = torch.zeros(
+        len(foliage), dtype=torch.bool, device=foliage.xyz.device
     )
-    temporal = torch.where(same_sequence, temporal, torch.zeros_like(temporal))
-    nearby = temporal.max(dim=1).values
-    # Exact observations own the primitive. Sharing decays continuously with
-    # frame distance, so ray-footprint-sized leaves do not become persistent
-    # blobs across an entire traversal.
-    dynamic_gate = torch.where(
-        exact,
-        gate.new_tensor(1.0),
-        torch.maximum(nearby, gate.new_tensor(0.01)),
+    if foliage.observation_camera_ids.numel() == 0:
+        return zero, empty, {"matched": 0}
+    matches = (
+        foliage.observation_camera_ids == int(view.colmap_id)
+    ) & foliage.dynamic_leaf_mask[:, None]
+    primitive_indices, slots = torch.nonzero(matches, as_tuple=True)
+    if not len(primitive_indices):
+        return zero, empty, {"matched": 0}
+    if len(primitive_indices) > int(maximum_observations):
+        selection = torch.linspace(
+            0,
+            len(primitive_indices) - 1,
+            int(maximum_observations),
+            device=primitive_indices.device,
+        ).long()
+        primitive_indices = primitive_indices[selection]
+        slots = slots[selection]
+    target_uv = foliage.observation_uv[primitive_indices, slots]
+    target_depth = foliage.observation_depth[primitive_indices, slots]
+    xyz, _, _ = foliage.conditioned_state(
+        temporal_code, include_dynamic=True
     )
-    gate[dynamic] = dynamic_gate[dynamic]
-    return gate
+    homogeneous = torch.cat(
+        [xyz[primitive_indices], torch.ones_like(xyz[primitive_indices, :1])],
+        dim=1,
+    )
+    camera_xyz = homogeneous @ view.world_view_transform
+    depth = camera_xyz[:, 2]
+    predicted_uv = torch.stack(
+        [
+            (
+                float(view.focal_x) * camera_xyz[:, 0]
+                / depth.clamp_min(1e-5)
+                + float(view.cx)
+            )
+            / float(view.image_width),
+            (
+                float(view.focal_y) * camera_xyz[:, 1]
+                / depth.clamp_min(1e-5)
+                + float(view.cy)
+            )
+            / float(view.image_height),
+        ],
+        dim=1,
+    )
+    valid = (
+        torch.isfinite(target_uv).all(dim=1)
+        & torch.isfinite(target_depth)
+        & (target_depth > 0.05)
+        & torch.isfinite(depth)
+        & (depth > 0.05)
+    )
+    if not bool(valid.any()):
+        return zero, empty, {"matched": 0}
+    primitive_indices = primitive_indices[valid]
+    pixel_scale = target_uv.new_tensor(
+        [float(view.image_width), float(view.image_height)]
+    )
+    pixel_error = (
+        (predicted_uv[valid] - target_uv[valid]) * pixel_scale
+    ).norm(dim=1)
+    depth_sigma = foliage.position_covariance[
+        primitive_indices
+    ].diagonal(dim1=-2, dim2=-1).sum(dim=1).sqrt().clamp(0.03, 0.30)
+    depth_error = (
+        depth[valid] - target_depth[valid]
+    ) / depth_sigma
+    individual_ray = torch.log1p((pixel_error / 2.0).square())
+    individual_depth = torch.log1p(depth_error.square())
+    individual = individual_ray + 0.25 * individual_depth
+    # A split lineage must explain one physical observation at least once;
+    # forcing every descendant back to the same ray collapses adaptive volume
+    # refinement. Normalized soft-min keeps a smooth gradient without making
+    # the objective cheaper merely because a lineage has more children.
+    lineage = foliage.track_id[primitive_indices]
+    _, inverse = torch.unique(
+        lineage, sorted=False, return_inverse=True
+    )
+    group_count = int(inverse.max()) + 1
+    temperature = individual.new_tensor(0.10)
+    score = -individual / temperature
+    maxima = torch.full(
+        (group_count,),
+        -torch.inf,
+        device=score.device,
+        dtype=score.dtype,
+    )
+    maxima.scatter_reduce_(
+        0, inverse, score, reduce="amax", include_self=True
+    )
+    exponential = torch.zeros_like(maxima)
+    exponential.scatter_add_(
+        0, inverse, torch.exp(score - maxima[inverse])
+    )
+    counts = torch.zeros_like(maxima)
+    counts.scatter_add_(0, inverse, torch.ones_like(score))
+    grouped = -temperature * (
+        maxima + torch.log(exponential / counts.clamp_min(1))
+    )
+    loss = grouped.mean()
+    group_minimum = torch.full_like(maxima, torch.inf)
+    group_minimum.scatter_reduce_(
+        0, inverse, individual.detach(), reduce="amin", include_self=True
+    )
+    winner = individual.detach() <= group_minimum[inverse] + 1e-6
+    observed = empty.clone()
+    observed[primitive_indices[winner]] = True
+    return loss, observed, {
+        "matched": int(valid.sum()),
+        "lineages": group_count,
+        "ray_pixels": float(pixel_error.mean().detach()),
+        "depth_sigma": float(depth_error.abs().mean().detach()),
+    }
 
 
 def _full_epoch_schedule(count: int, iterations: int, seed: int) -> np.ndarray:
@@ -689,6 +809,8 @@ def _volume_stats(foliage) -> dict[str, torch.Tensor]:
         "contribution": torch.zeros(count, device=device),
         "residual": torch.zeros(count, device=device),
         "rigid": torch.zeros(count, device=device),
+        "observation_gradient": torch.zeros(count, device=device),
+        "observation_count": torch.zeros(count, device=device),
     }
 
 
@@ -711,6 +833,17 @@ def _accumulate_volume_stats(stats, package) -> None:
         if volume.shape[1] >= 4:
             stats["rigid"] += volume[:, 2]
             stats["residual"] += volume[:, 3]
+
+
+@torch.no_grad()
+def _accumulate_dynamic_observation_stats(
+    stats, foliage, observed: torch.Tensor
+) -> None:
+    if foliage.xyz.grad is None or not bool(observed.any()):
+        return
+    gradient = torch.nan_to_num(foliage.xyz.grad).norm(dim=1)
+    stats["observation_gradient"][observed] += gradient[observed]
+    stats["observation_count"][observed] += 1
 
 
 @torch.no_grad()
@@ -739,6 +872,16 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
     remove = strong_contradiction | (
         weak_contradiction & low_contribution & low_opacity
     )
+    # A real observation ray is stronger existence evidence than transient
+    # render contribution. Do not prune it merely because opacity collapsed.
+    observation_count = stats.get(
+        "observation_count", torch.zeros_like(stats["contribution"])
+    )
+    observation_gradient_sum = stats.get(
+        "observation_gradient", torch.zeros_like(stats["contribution"])
+    )
+    observed_before_prune = observation_count > 0
+    remove &= ~observed_before_prune
     pruned, kept_old = foliage.prune(remove)
     working_stats = {
         name: value[kept_old] for name, value in stats.items()
@@ -757,16 +900,25 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
         working_stats["rigid"]
         / working_stats["contribution"].clamp_min(1e-8)
     )
-    common_eligible = (
-        (working_stats["radius"] >= args.volume_split_radius)
-        & (working_stats["contribution"] > 0)
+    observation_gradient = (
+        working_stats.get(
+            "observation_gradient",
+            observation_gradient_sum[kept_old],
+        )
+        / working_stats.get(
+            "observation_count", observation_count[kept_old]
+        ).clamp_min(1)
+    )
+    observation_evidence = (
+        working_stats.get(
+            "observation_count", observation_count[kept_old]
+        )
+        > 0
+    )
+    evidence_eligible = (
+        (working_stats["contribution"] > 0)
         & (rigid < 0.15)
     )
-    if bool(common_eligible.any()):
-        residual_floor = torch.quantile(
-            residual[common_eligible], 0.60
-        )
-        common_eligible &= residual >= residual_floor
     coverage_deficit = (
         working_stats["radius"] / max(args.volume_split_radius, 1e-6)
         - 1.0
@@ -777,30 +929,47 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
         * (0.10 + gradient)
         * foliage.occupancy_probability.clamp(0.05, 1.0)
     )
+    dynamic_split_score = (
+        torch.log1p(observation_gradient)
+        * (1.0 + coverage_deficit)
+        * foliage.occupancy_probability.clamp(0.05, 1.0)
+    )
     skeleton_eligible = (
-        common_eligible
+        evidence_eligible
         & foliage.static_skeleton_mask
+        & (working_stats["radius"] >= args.volume_split_radius)
         & (foliage.support_sequence_count >= 2)
     )
     canonical_eligible = (
-        common_eligible
+        evidence_eligible
         & foliage.canonical_crown_mask
+        & (working_stats["radius"] >= args.volume_split_radius)
+        & (foliage.support_sequence_count >= 2)
+    )
+    dynamic_eligible = (
+        foliage.dynamic_leaf_mask
         & (
-            (foliage.support_sequence_count >= 2)
+            (observation_evidence & (observation_gradient > 0))
             | (
-                (foliage.support_view_count >= 3)
-                & (foliage.occupancy_probability >= 0.70)
+                ("observation_count" not in stats)
+                & evidence_eligible
+                & (
+                    working_stats["radius"]
+                    >= min(1.0, float(args.volume_split_radius))
+                )
             )
         )
     )
-    dynamic_eligible = (
-        common_eligible
-        & foliage.dynamic_leaf_mask
-        # A sequence-local leaf deliberately has one geometric owner camera.
-        # Persistent projected residual/contribution, not a fabricated second
-        # correspondence, is the evidence required for adaptive refinement.
-        & (foliage.support_view_count >= 1)
+    split_score = torch.where(
+        foliage.dynamic_leaf_mask, dynamic_split_score, split_score
     )
+    # Allocate high-residual capacity within each physical role.  A global
+    # quantile was dominated by broad canonical crown residuals and silently
+    # removed every otherwise-valid dynamic candidate.
+    for eligible in (skeleton_eligible, canonical_eligible):
+        if bool(eligible.any()):
+            residual_floor = torch.quantile(residual[eligible], 0.60)
+            eligible &= residual >= residual_floor
     effective_budget = (
         args.maximum_volume_gaussians
         if volume_budget is None
@@ -864,6 +1033,20 @@ def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
         if len(selected) > capacity:
             score = split_score[selected]
             selected = selected[torch.topk(score, capacity).indices]
+        # Report the actual final allocation, including capacity left over
+        # after the initial role quotas.  The former audit under-counted
+        # canonical splits and made healthy growth look unclassified.
+        role_split_counts = {
+            "static_skeleton": int(
+                foliage.static_skeleton_mask[selected].sum()
+            ),
+            "canonical_crown": int(
+                foliage.canonical_crown_mask[selected].sum()
+            ),
+            "dynamic_leaf": int(
+                foliage.dynamic_leaf_mask[selected].sum()
+            ),
+        }
         split_event = foliage.split(
             selected, allow_static_skeleton=True
         )
@@ -1603,6 +1786,7 @@ def main():
         max_cached_views=0,
     )
     geometry = OutdoorGeometryEvidence(args.evidence_store)
+    foliage_rays = FoliageRayEvidence(seed_payload.get("ray_evidence"))
     chart_surface = ChartSurfaceModel(
         Path(initialization["surface_seed"]), seed=args.seed + 19
     )
@@ -1622,6 +1806,35 @@ def main():
     )
     if resume is not None:
         volume_optimizer.load_state_dict(resume["volume_optimizer"])
+        if args.allow_trainer_repair_resume:
+            dynamic = foliage.dynamic_leaf_mask
+            dynamic_opacity = foliage.opacities[dynamic]
+            if (
+                bool(dynamic.any())
+                and float(dynamic_opacity.median()) < 0.005
+            ):
+                with torch.no_grad():
+                    repaired = dynamic & (
+                        foliage.opacities < 0.01
+                    )
+                    foliage.opacity_logits[repaired, 0] = (
+                        foliage.opacity_logits.new_tensor(0.01).logit()
+                    )
+                    state = volume_optimizer.state.get(
+                        foliage.opacity_logits, {}
+                    )
+                    for value in state.values():
+                        if (
+                            torch.is_tensor(value)
+                            and value.shape
+                            == foliage.opacity_logits.shape
+                        ):
+                            value[repaired] = 0
+                print(
+                    "Trainer repair restored dynamic opacity prior and "
+                    "cleared stale opacity Adam moments for "
+                    f"{int(repaired.sum())} leaves."
+                )
 
     rgb_schedule = _full_epoch_schedule(
         len(views), args.iterations, args.seed + 1
@@ -1744,15 +1957,25 @@ def main():
                     for key, value in PERFORMANCE_RESUME_PREDECESSOR.items()
                 )
             )
-            if not performance_only:
+            trainer_repair = (
+                args.allow_trainer_repair_resume
+                and changed == {"trainer"}
+            )
+            if not performance_only and not trainer_repair:
                 raise RuntimeError(
                     "Resume implementation/CUDA hash mismatch; start a new "
                     "unified run"
                 )
-            print(
-                "Resuming the exact pre-fast-path checkpoint with "
-                "I/O/allocator-only compatibility enabled."
-            )
+            if trainer_repair:
+                print(
+                    "Resuming across an explicit trainer-only causal repair; "
+                    "all evidence/model/CUDA hashes remain identical."
+                )
+            else:
+                print(
+                    "Resuming the exact pre-fast-path checkpoint with "
+                    "I/O/allocator-only compatibility enabled."
+                )
     if resume is not None and resume["schedule_hash"] != schedule_hash:
         raise RuntimeError("Resume camera schedules changed")
     if resume is not None:
@@ -1821,6 +2044,10 @@ def main():
             name: value.cuda()
             for name, value in resume["volume_stats"].items()
         }
+        for name in ("observation_gradient", "observation_count"):
+            volume_stats.setdefault(
+                name, torch.zeros(len(foliage), device="cuda")
+            )
         replacement_stats = (
             None
             if resume["replacement_stats"] is None
@@ -1881,6 +2108,11 @@ def main():
     prefetch_training_images(start_step)
     for step in progress:
         phase = _phase(step, args.iterations, args.training_profile)
+        profile = TRAINING_PROFILES[args.training_profile]
+        foliage_active = (
+            (step + 1) / max(args.iterations, 1)
+            >= float(profile.get("foliage_start", 0.0))
+        )
         dynamic_active = _dynamic_enabled(
             step, args.iterations, args.training_profile
         ) and phase != "canonical_polish"
@@ -1905,6 +2137,7 @@ def main():
             foliage,
             background=background,
             include_dynamic=False,
+            volume_opacity_scale=1.0 if foliage_active else 0.0,
             structural_trainable_start=0,
             audit_fields=torch.stack(
                 [
@@ -2009,26 +2242,36 @@ def main():
                 + foliage.unknown_view_count.float()
             ).clamp_min(1)
         ).clamp(0.05, 1.0)
+        canonical_volume = (~foliage.dynamic_leaf_mask).to(
+            posterior_weight.dtype
+        )
+        canonical_posterior_weight = (
+            posterior_weight * canonical_volume
+        )
         # Visual-hull occupancy is the probability that a candidate exists;
         # it is not the target alpha of every overlapping Gaussian. The old
         # BCE drove each supported leaf toward opacity~occupancy, so dozens of
         # valid candidates on one ray inevitably became a solid paint layer.
         false_positive_opacity = (
-            foliage.opacities * (1.0 - posterior) * posterior_weight
-        ).sum() / posterior_weight.sum().clamp_min(1)
+            foliage.opacities
+            * (1.0 - posterior)
+            * canonical_posterior_weight
+        ).sum() / canonical_posterior_weight.sum().clamp_min(1)
         opacity_complexity = (
-            foliage.opacities.square() * posterior_weight
-        ).sum() / posterior_weight.sum().clamp_min(1)
-        depth_posterior = (
-            foliage.ray_depth_nll.clamp_min(0)
-            * foliage.opacities
-            * posterior_weight
-        ).sum() / posterior_weight.sum().clamp_min(1)
+            foliage.opacities.square() * canonical_posterior_weight
+        ).sum() / canonical_posterior_weight.sum().clamp_min(1)
+        ray_loss, ray_audit = (
+            foliage_rays.factor(view, package)
+            if foliage_active
+            else (package.depth.new_zeros(()), {"rays": 0})
+        )
         occupancy = (
             free
             + 0.05 * false_positive_opacity
             + 0.002 * opacity_complexity
-            + 0.01 * depth_posterior
+            + ray_loss
+            if foliage_active
+            else package.depth.new_zeros(())
         )
         delta = foliage.xyz - foliage.initialization_center
         variance = foliage.position_covariance.diagonal(
@@ -2049,7 +2292,7 @@ def main():
             + 0.12 * rigid_high_frequency
             + args.ownership_weight * ownership
             + args.occupancy_weight * occupancy
-            + 0.015 * geometry_floor
+            + (0.015 * geometry_floor if foliage_active else 0.0)
         )
         canonical_loss.backward()
         # Surface topology only consumes rigid-dominant responsibility.  A
@@ -2086,6 +2329,11 @@ def main():
         uncertainty_loss = canonical_loss.new_zeros(())
         high_frequency_loss = canonical_loss.new_zeros(())
         conditioned_ownership = canonical_loss.new_zeros(())
+        dynamic_observation_loss = canonical_loss.new_zeros(())
+        dynamic_observed = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
+        dynamic_observation_audit = {"matched": 0}
         if dynamic_active:
             dynamic_gate = _dynamic_visibility_gate(
                 foliage,
@@ -2093,12 +2341,13 @@ def main():
                 camera_sequence_lookup,
                 camera_frame_lookup,
             )
+            temporal_code = appearance.temporal_code(view.image_name)
             conditioned_package = render_hybrid(
                 view,
                 surface,
                 foliage,
                 background=background,
-                temporal_code=appearance.temporal_code(view.image_name),
+                temporal_code=temporal_code,
                 include_dynamic=True,
                 volume_gate=dynamic_gate,
                 structural_trainable_start=None,
@@ -2184,6 +2433,13 @@ def main():
                     minimum_logit
                     - foliage.opacity_logits[owner_dynamic, 0]
                 ).clamp_min(0).square().mean()
+            (
+                dynamic_observation_loss,
+                dynamic_observed,
+                dynamic_observation_audit,
+            ) = _dynamic_observation_factor(
+                foliage, view, temporal_code
+            )
             conditioned_loss = (
                 args.dynamic_weight * conditioned_photo
                 + args.appearance_weight * uncertainty_loss
@@ -2192,9 +2448,13 @@ def main():
                 * conditioned_ownership
                 + 1e-3 * appearance.regularization()
                 + 0.02 * dynamic_regularization
-                + 0.002 * dynamic_presence
+                + 0.02 * dynamic_presence
+                + 0.10 * dynamic_observation_loss
             )
             conditioned_loss.backward()
+            _accumulate_dynamic_observation_stats(
+                volume_stats, foliage, dynamic_observed
+            )
             _accumulate_volume_stats(
                 volume_stats, conditioned_package
             )
@@ -2240,6 +2500,8 @@ def main():
                 ),
             )
             geometry_loss = canonical_loss.new_zeros(())
+            track_observation_loss = canonical_loss.new_zeros(())
+            track_observation_audit = {"matched": 0}
             if source_fields:
                 geometry_package = render_hybrid(
                     geometry_view,
@@ -2276,6 +2538,11 @@ def main():
                     geometry_audit_warnings.add(
                         "chart_inverse_depth_coverage_below_95_percent"
                     )
+                track_observation_loss, track_observation_audit = (
+                    geometry.track_observation_factor(
+                        geometry_view.image_name, geometry_package
+                    )
+                )
                 del geometry_package
             track_loss, track_audit = geometry.track_factor(surface)
             structure_loss, structure_audit = geometry.structure_factor(
@@ -2285,6 +2552,12 @@ def main():
                 surface
             )
             geometry_values["track"] = float(track_loss.detach())
+            geometry_values["track_observation"] = float(
+                track_observation_loss.detach()
+            )
+            geometry_values["track_observation_matched"] = int(
+                track_observation_audit["matched"]
+            )
             geometry_values["track_matched"] = int(
                 track_audit["matched"]
             )
@@ -2301,7 +2574,8 @@ def main():
                 chart_anchor_audit["matched"]
             )
             geometry_loss = geometry_loss + (
-                args.track_weight * track_loss
+                args.track_weight
+                * (track_observation_loss + 0.10 * track_loss)
                 + args.structure_weight * structure_loss
                 + args.chart_anchor_weight * chart_anchor_loss
             )
@@ -2338,6 +2612,7 @@ def main():
                 foliage,
                 background=background,
                 include_dynamic=False,
+                volume_opacity_scale=0.0,
                 structural_trainable_start=None,
             )
             topology_prediction = composite_white_background(
@@ -2358,6 +2633,7 @@ def main():
                 foliage,
                 background=background,
                 include_dynamic=False,
+                volume_opacity_scale=0.0,
                 structural_trainable_start=None,
                 audit_fields=torch.stack(
                     [
@@ -2435,7 +2711,6 @@ def main():
         surface.optimizer.zero_grad(set_to_none=True)
         volume_optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
-            appearance.uncertainty_base.clamp_(-4.5, -1.5)
             foliage.quaternions.copy_(
                 F.normalize(foliage.quaternions, dim=-1)
             )
@@ -2532,33 +2807,36 @@ def main():
                         f"protected={current_protected}/"
                         f"{surface_audit['protected_anchor_count']}"
                     )
-            if (
-                (step + 1) % args.volume_densify_every == 0
-                and len(foliage)
-            ):
-                event = _adapt_volume(
-                    args,
-                    foliage,
-                    volume_stats,
-                    volume_budget=volume_budget,
-                )
-                new_to_old = event.pop("_new_to_old", None)
-                if new_to_old is not None:
-                    volume_optimizer = _migrate_volume_optimizer(
-                        args,
-                        foliage,
-                        appearance,
-                        sky,
-                        volume_optimizer,
-                        new_to_old,
-                    )
-                volume_stats = _volume_stats(foliage)
-                topology_event = {
-                    **(topology_event or {"iteration": step + 1}),
-                    "volume": event,
-                }
             if topology_event is not None:
                 topology_events.append(topology_event)
+        if (
+            phase in {"static_foliage", "dynamic_appearance"}
+            and foliage_active
+            and (step + 1) % args.volume_densify_every == 0
+            and len(foliage)
+        ):
+            event = _adapt_volume(
+                args,
+                foliage,
+                volume_stats,
+                volume_budget=volume_budget,
+            )
+            new_to_old = event.pop("_new_to_old", None)
+            if new_to_old is not None:
+                volume_optimizer = _migrate_volume_optimizer(
+                    args,
+                    foliage,
+                    appearance,
+                    sky,
+                    volume_optimizer,
+                    new_to_old,
+                )
+            volume_stats = _volume_stats(foliage)
+            topology_event = {
+                "iteration": step + 1,
+                "volume": event,
+            }
+            topology_events.append(topology_event)
         if (
             phase == "topology"
             and args.opacity_reset_interval > 0
@@ -2599,6 +2877,10 @@ def main():
                 "conditioned_ownership": float(
                     conditioned_ownership.detach()
                 ),
+                "dynamic_observation": {
+                    "loss": float(dynamic_observation_loss.detach()),
+                    **dynamic_observation_audit,
+                },
                 "occupancy": float(occupancy.detach()),
                 "geometry": geometry_values,
                 "gradient_norms": gradient_audit,
@@ -2673,6 +2955,10 @@ def main():
                     "surface": surface.capture(),
                     "surface_audit": surface_audit,
                     "foliage": foliage.capture(),
+                    "camera_ownership_contract": {
+                        "sequence_lookup": camera_sequence_lookup.cpu(),
+                        "frame_lookup": camera_frame_lookup.cpu(),
+                    },
                     "dynamic_seed_count": dynamic_seed_count,
                     "sky": sky.state_dict(),
                     "appearance": appearance.capture(),
@@ -2726,9 +3012,15 @@ def main():
         retired_before_compaction = 0
         if replacement_stats is not None:
             retired_before_compaction = int(
-                replacement_stats["retired"].sum()
+                (
+                    replacement_stats["retired"]
+                    & ~surface._protected_flag
+                ).sum()
             )
-            final_remove |= replacement_stats["retired"]
+            final_remove |= (
+                replacement_stats["retired"]
+                & ~surface._protected_flag
+            )
         final_cleanup = {
             "before": len(surface.get_xyz),
             "retired": retired_before_compaction,
@@ -2789,6 +3081,10 @@ def main():
             "surface": surface.capture(),
             "surface_audit": surface_audit,
             "foliage": foliage.capture(),
+            "camera_ownership_contract": {
+                "sequence_lookup": camera_sequence_lookup.cpu(),
+                "frame_lookup": camera_frame_lookup.cpu(),
+            },
             "dynamic_seed_count": dynamic_seed_count,
             "sky": sky.state_dict(),
             "sky_degree": sky.degree,

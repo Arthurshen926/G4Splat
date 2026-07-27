@@ -20,6 +20,7 @@ from outdoor.directional_sky import (  # noqa: E402
 )
 from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     VolumetricFoliageModel,
+    dynamic_visibility_gate,
     render_hybrid,
 )
 from scene import GaussianModel  # noqa: E402
@@ -59,6 +60,24 @@ class HybridTeacher:
             if conditioned
             else None
         )
+        volume_gate = None
+        if conditioned:
+            contract = self.state.get("camera_ownership_contract")
+            if contract is not None:
+                volume_gate = dynamic_visibility_gate(
+                    self.foliage,
+                    int(camera.colmap_id),
+                    contract["sequence_lookup"].to(
+                        device=self.foliage.xyz.device
+                    ),
+                    contract["frame_lookup"].to(
+                        device=self.foliage.xyz.device
+                    ),
+                )
+            else:
+                volume_gate = dynamic_visibility_gate(
+                    self.foliage, int(camera.colmap_id), None, None
+                )
         package = render_hybrid(
             camera,
             self.surface,
@@ -66,6 +85,7 @@ class HybridTeacher:
             background=background,
             temporal_code=temporal_code,
             include_dynamic=conditioned,
+            volume_gate=volume_gate,
         )
         rgb = composite_white_background(
             package.render, package.alpha, self.sky(camera)

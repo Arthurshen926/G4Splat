@@ -1377,15 +1377,12 @@ class GaussianModel:
         geometry_confidence=None,
         protected_flag=None,
         block_id=None,
+        replace_parent=False,
     ):
-        """Append compact children for large, high-gradient Gaussians.
+        """Create compact children for large, high-gradient Gaussians.
 
-        Unlike native ``densify_and_split``, this continuation primitive never
-        deletes the large parent.  It is for a protected model whose broad
-        Chart-led surfels still cover a real camera view but cannot express its
-        local facade/foliage detail.  Children receive a local randomized
-        offset and reduced scales, while their opacity is capped so the parent
-        remains the stable low-frequency explanation during refinement.
+        ``replace_parent`` is the from-scratch topology path: children take
+        over and the broad low-frequency parent is retired immediately.
         """
         max_new_points = int(max_new_points)
         children_per_parent = int(children_per_parent)
@@ -1474,7 +1471,17 @@ class GaussianModel:
         )
         if parent_mip_filter is not None:
             self.mip_filter[-len(parent_mip_filter):] = parent_mip_filter
+        if replace_parent:
+            self._retire_replaced_split_parents(selected_indices)
         return int(repeated_indices.numel())
+
+    def _retire_replaced_split_parents(self, selected_indices):
+        """Retire only parents explicitly replaced by verified children."""
+        remove = torch.zeros(
+            len(self.get_xyz), dtype=torch.bool, device=self.get_xyz.device
+        )
+        remove[selected_indices] = True
+        self.prune_points(remove)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         use_mip_filter = self.use_mip_filter
@@ -1584,6 +1591,16 @@ class GaussianModel:
                     projected_large,
                 ),
             )
+            # Chart topology belongs to its UV atlas. Random 3D splitting
+            # destroys chart adjacency and is therefore forbidden here.
+            if len(self._source_type) == point_count:
+                split_candidates &= self._source_type != 2
+            # Metric anchors are the immutable geometric scaffold.  They may
+            # spawn a low-opacity residual clone, but random child offsets
+            # must never replace the anchor itself.  A later event can split
+            # and retire that unprotected residual locally.
+            if len(self._protected_flag) == point_count:
+                split_candidates &= ~self._protected_flag
             clone_candidates = torch.logical_and(
                 clone_candidates, ~projected_large
             )
@@ -1595,6 +1612,20 @@ class GaussianModel:
                 int(split_candidates.sum()) * 2,
             )
             split_capacity -= split_capacity % 2
+            # Clone original indices before a replacing split prunes parents
+            # and compacts every per-point tensor.  Calling clone afterwards
+            # would address the compacted model with stale gradients/masks.
+            clone_capacity = remaining - split_capacity
+            if clone_capacity:
+                cloned = self.densify_and_clone_limited(
+                    grads,
+                    max_grad,
+                    extent,
+                    clone_capacity,
+                    opacity_ceiling=0.015,
+                    eligibility_mask=clone_candidates,
+                    protected_flag=False,
+                )
             if split_capacity:
                 split_children = self.densify_and_split_limited(
                     grads,
@@ -1606,19 +1637,11 @@ class GaussianModel:
                     require_large_world_scale=False,
                     eligibility_mask=split_candidates,
                     protected_flag=False,
+                    replace_parent=True,
                 )
                 split_parents = int(split_children // 2)
                 remaining -= int(split_children)
-            if remaining:
-                cloned = self.densify_and_clone_limited(
-                    grads,
-                    max_grad,
-                    extent,
-                    remaining,
-                    opacity_ceiling=0.015,
-                    eligibility_mask=clone_candidates,
-                    protected_flag=False,
-                )
+            remaining -= int(cloned)
 
         after = int(self.get_xyz.shape[0])
         if after > max_points:

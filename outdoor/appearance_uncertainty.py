@@ -7,6 +7,7 @@ render remains available for mapping and localization evaluation.
 
 from __future__ import annotations
 
+import math
 import re
 
 import torch
@@ -184,9 +185,12 @@ class OutdoorAppearanceUncertainty(nn.Module):
         )[0]
         return (
             self.maximum_rgb_residual * torch.tanh(local_rgb),
-            # Spatial uncertainty is a robust residual scale, not permission
-            # to explain half the RGB range as noise.
-            log_sigma.clamp(-4.5, -1.5).exp(),
+            # Smooth bounded parameterization preserves a recovery gradient
+            # at both limits. A hard clamp stranded raw parameters outside
+            # the valid range while displaying an apparently healthy sigma.
+            math.exp(-4.5)
+            + (math.exp(-1.5) - math.exp(-4.5))
+            * torch.sigmoid(log_sigma),
         )
 
     def spatial_uncertainty(

@@ -22,6 +22,59 @@ LAYER_STATIC_SKELETON = 1
 LAYER_DYNAMIC_LEAF = 2
 
 
+def dynamic_visibility_gate(
+    foliage,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+    camera_frame_lookup: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return the same sequence/time ownership gate in training and inference.
+
+    A legacy state without an ownership contract must not activate every
+    sequence-local primitive globally. Canonical/static primitives remain
+    visible, while dynamic leaves default to invisible.
+    """
+    gate = torch.ones(
+        len(foliage), device=foliage.xyz.device, dtype=foliage.xyz.dtype
+    )
+    dynamic = foliage.dynamic_leaf_mask
+    if not bool(dynamic.any()):
+        return gate
+    if (
+        camera_sequence_lookup is None
+        or camera_frame_lookup is None
+        or foliage.support_camera_ids.numel() == 0
+        or camera_id < 0
+        or camera_id >= len(camera_sequence_lookup)
+        or int(camera_sequence_lookup[camera_id]) < 0
+    ):
+        gate[dynamic] = 0
+        return gate
+    support = foliage.support_camera_ids.long()
+    valid = (support >= 0) & (support < len(camera_sequence_lookup))
+    safe = support.clamp(0, len(camera_sequence_lookup) - 1)
+    support_sequence = camera_sequence_lookup[safe]
+    support_frame = camera_frame_lookup[safe]
+    current_sequence = camera_sequence_lookup[camera_id]
+    current_frame = camera_frame_lookup[camera_id]
+    exact = (support == int(camera_id)).any(dim=1)
+    same_sequence = valid & (support_sequence == current_sequence)
+    nearby = torch.where(
+        same_sequence,
+        0.75
+        * torch.exp(
+            -(
+                support_frame.to(gate.dtype)
+                - current_frame.to(gate.dtype)
+            ).abs()
+            / 12.0
+        ),
+        torch.zeros_like(support_frame, dtype=gate.dtype),
+    ).max(dim=1).values
+    gate[dynamic] = torch.where(exact, gate.new_tensor(1.0), nearby)[dynamic]
+    return gate
+
+
 @dataclass
 class HybridRenderOutput:
     render: torch.Tensor
@@ -92,6 +145,18 @@ class VolumetricFoliageModel(nn.Module):
             torch.empty(0, 0, dtype=torch.int32, device=device),
         )
         self.register_buffer(
+            "observation_camera_ids",
+            torch.empty(0, 0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "observation_uv",
+            torch.empty(0, 0, 2, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "observation_depth",
+            torch.empty(0, 0, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
             "support_view_count",
             torch.empty(0, dtype=torch.int16, device=device),
         )
@@ -128,6 +193,10 @@ class VolumetricFoliageModel(nn.Module):
         )
         self.register_buffer(
             "initialization_center", torch.empty(0, 3, device=device)
+        )
+        self.register_buffer(
+            "replacement_group",
+            torch.empty(0, dtype=torch.int64, device=device),
         )
 
     def __len__(self) -> int:
@@ -235,6 +304,29 @@ class VolumetricFoliageModel(nn.Module):
             support_camera_ids = torch.full(
                 (count, 0), -1, dtype=torch.int32
             )
+        observation_capacity = int(support_camera_ids.shape[1])
+        observation_camera_ids = payload.get(
+            "observation_camera_ids",
+            torch.full(
+                (count, observation_capacity), -1, dtype=torch.int32
+            ),
+        )
+        observation_uv = payload.get(
+            "observation_uv",
+            torch.full(
+                (count, observation_capacity, 2),
+                float("nan"),
+                dtype=torch.float32,
+            ),
+        )
+        observation_depth = payload.get(
+            "observation_depth",
+            torch.full(
+                (count, observation_capacity),
+                float("nan"),
+                dtype=torch.float32,
+            ),
+        )
         track_id = payload.get("track_id")
         if track_id is None:
             track_id = torch.full((count,), -1, dtype=torch.int64)
@@ -272,6 +364,15 @@ class VolumetricFoliageModel(nn.Module):
             "support_camera_ids": support_camera_ids.to(
                 device=device, dtype=torch.int32
             ),
+            "observation_camera_ids": observation_camera_ids.to(
+                device=device, dtype=torch.int32
+            ),
+            "observation_uv": observation_uv.to(
+                device=device, dtype=dtype
+            ),
+            "observation_depth": observation_depth.to(
+                device=device, dtype=dtype
+            ),
             "support_view_count": payload.get(
                 "support_view_count", torch.zeros(count, dtype=torch.int16)
             ).to(device=device, dtype=torch.int16),
@@ -306,6 +407,39 @@ class VolumetricFoliageModel(nn.Module):
                 "initialization_center", xyz
             ).to(device=device, dtype=dtype),
         }
+        replacement_group = torch.full(
+            (count,), -1, dtype=torch.int64, device=device
+        )
+        canonical_indices = torch.nonzero(
+            layer_role == LAYER_CANONICAL_CROWN, as_tuple=False
+        ).flatten()
+        replacement_group[canonical_indices] = torch.arange(
+            len(canonical_indices), dtype=torch.int64, device=device
+        )
+        dynamic_indices = torch.nonzero(
+            layer_role == LAYER_DYNAMIC_LEAF, as_tuple=False
+        ).flatten()
+        # Bind each sequence-local residual to one nearby canonical cell in
+        # the same tree. The stable group id survives prune/split reindexing.
+        for tree in torch.unique(metadata["tree_instance_id"][dynamic_indices]):
+            if int(tree) < 0:
+                continue
+            dynamic_tree = dynamic_indices[
+                metadata["tree_instance_id"][dynamic_indices] == tree
+            ]
+            canonical_tree = canonical_indices[
+                metadata["tree_instance_id"][canonical_indices] == tree
+            ]
+            if not len(canonical_tree):
+                continue
+            for chunk in dynamic_tree.split(2048):
+                nearest = torch.cdist(
+                    xyz[chunk], xyz[canonical_tree]
+                ).argmin(dim=1)
+                replacement_group[chunk] = replacement_group[
+                    canonical_tree[nearest]
+                ]
+        metadata["replacement_group"] = replacement_group
         self._replace_buffers(**metadata)
         return int(len(xyz))
 
@@ -325,6 +459,9 @@ class VolumetricFoliageModel(nn.Module):
             "track_id",
             "tree_instance_id",
             "support_camera_ids",
+            "observation_camera_ids",
+            "observation_uv",
+            "observation_depth",
             "support_view_count",
             "support_sequence_count",
             "track_linearity",
@@ -336,6 +473,7 @@ class VolumetricFoliageModel(nn.Module):
             "unknown_view_count",
             "initialization_source",
             "initialization_center",
+            "replacement_group",
         )
 
     @torch.no_grad()
@@ -599,6 +737,11 @@ class VolumetricFoliageModel(nn.Module):
                 (count,), -1, dtype=torch.int32
             ),
             "support_camera_ids": torch.empty(count, 0, dtype=torch.int32),
+            "observation_camera_ids": torch.empty(
+                count, 0, dtype=torch.int32
+            ),
+            "observation_uv": torch.empty(count, 0, 2),
+            "observation_depth": torch.empty(count, 0),
             "support_view_count": torch.zeros(count, dtype=torch.int16),
             "support_sequence_count": torch.zeros(count, dtype=torch.int16),
             "track_linearity": torch.zeros(count),
@@ -616,6 +759,9 @@ class VolumetricFoliageModel(nn.Module):
             ),
             "initialization_source": torch.zeros(count, dtype=torch.int8),
             "initialization_center": payload["xyz"].clone(),
+            "replacement_group": torch.full(
+                (count,), -1, dtype=torch.int64
+            ),
         }
         self._replace_buffers(
             **{
@@ -740,6 +886,35 @@ def render_hybrid(
         if len(volume_gate) != len(volume_opacities):
             raise ValueError("volume_gate must have one value per volume Gaussian")
         volume_opacities = volume_opacities * volume_gate.clamp(0, 1)
+    if include_dynamic and volume_gate is not None and len(volume_opacities):
+        dynamic = foliage.dynamic_leaf_mask
+        canonical = foliage.canonical_crown_mask
+        groups = foliage.replacement_group
+        valid_dynamic = dynamic & (groups >= 0)
+        if bool(valid_dynamic.any()) and bool(canonical.any()):
+            group_count = int(groups[valid_dynamic].max()) + 1
+            replacement = volume_opacities.new_zeros(group_count)
+            # Replacement is a gradual mass hand-off, not a binary ownership
+            # switch.  Using the temporal gate alone erased the canonical
+            # crown even when its dynamic substitute had alpha ~= 1e-3,
+            # leaving large holes in conditioned tree views.
+            dynamic_replacement_strength = (
+                volume_opacities[valid_dynamic].reshape(-1) / 0.02
+            ).clamp(0, 1)
+            replacement.scatter_reduce_(
+                0,
+                groups[valid_dynamic],
+                dynamic_replacement_strength,
+                reduce="amax",
+                include_self=True,
+            )
+            valid_canonical = canonical & (groups >= 0) & (
+                groups < group_count
+            )
+            volume_opacities = volume_opacities.clone()
+            volume_opacities[valid_canonical] *= (
+                1.0 - replacement[groups[valid_canonical]]
+            )
     volume_scales = foliage.scales
     volume_rotations = foliage.normalized_quaternions
 

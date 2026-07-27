@@ -842,6 +842,21 @@ if __name__ == "__main__":
     output_cameras = {
         'filepaths': [img['instance'] for img in imgs],
         'focals': focals.numpy().tolist(),
+        # The scalar ``focals`` field is retained for old MAtCha readers only.
+        # Geometry consumers must use this exact per-view pinhole contract.
+        'intrinsics': [
+            [
+                float(intrinsics[index][0, 0]),
+                float(intrinsics[index][1, 1]),
+                float(intrinsics[index][0, 2]),
+                float(intrinsics[index][1, 2]),
+            ]
+            for index in range(len(imgs))
+        ],
+        'image_sizes': [
+            [int(img['img'].shape[-1]), int(img['img'].shape[-2])]
+            for img in imgs
+        ],
         'cams2world': cams2world.numpy().tolist(),
     }
     with open(os.path.join(output_dir, 'cameras.json'), 'w') as f:

@@ -40,7 +40,9 @@ from outdoor.foliage_view_graph import (
 from scripts.augment_foliage_seed_with_sfm_tracks import _track_frames
 
 
-INITIALIZATION_VERSION = "outdoor-role-aware-initialization-v7-ray-footprint-canopy"
+INITIALIZATION_VERSION = (
+    "outdoor-role-aware-initialization-v8-exact-observation-rays"
+)
 
 SOURCE_COLMAP = 0
 SOURCE_MAST3R = 1
@@ -174,6 +176,9 @@ def _sample_chart_seeds(
     selected_confidence = []
     selected_chart_id = []
     selected_uv = []
+    selected_scales = []
+    selected_quaternions = []
+    selected_normals = []
     with np.load(chart_path, allow_pickle=False) as charts:
         scale_factor = float(charts["scale_factor"])
         if not np.isfinite(scale_factor) or scale_factor <= 0:
@@ -290,6 +295,39 @@ def _sample_chart_seeds(
                 np.full(len(xyz), int(chart_index), dtype=np.int32)
             )
             rows, columns = np.unravel_index(chosen, (height, width))
+            left = pointmap[rows, np.maximum(columns - 1, 0)]
+            right = pointmap[rows, np.minimum(columns + 1, width - 1)]
+            up = pointmap[np.maximum(rows - 1, 0), columns]
+            down = pointmap[np.minimum(rows + 1, height - 1), columns]
+            tangent_u = right - left
+            tangent_v = down - up
+            axis_u = tangent_u / np.maximum(
+                np.linalg.norm(tangent_u, axis=1, keepdims=True), 1e-8
+            )
+            tangent_v = tangent_v - (
+                tangent_v * axis_u
+            ).sum(axis=1, keepdims=True) * axis_u
+            axis_v = tangent_v / np.maximum(
+                np.linalg.norm(tangent_v, axis=1, keepdims=True), 1e-8
+            )
+            normal = np.cross(axis_u, axis_v)
+            normal /= np.maximum(
+                np.linalg.norm(normal, axis=1, keepdims=True), 1e-8
+            )
+            frames = np.stack([axis_u, axis_v, normal], axis=2)
+            finite_frame = np.isfinite(frames).all(axis=(1, 2))
+            frames[~finite_frame] = np.eye(3, dtype=np.float32)
+            xyzw = Rotation.from_matrix(frames).as_quat().astype(np.float32)
+            quaternion = np.column_stack(
+                [xyzw[:, 3], xyzw[:, 0], xyzw[:, 1], xyzw[:, 2]]
+            )
+            footprint = np.column_stack(
+                [
+                    0.55 * np.linalg.norm(tangent_u, axis=1),
+                    0.55 * np.linalg.norm(tangent_v, axis=1),
+                ]
+            )
+            footprint = np.clip(footprint, 0.003, 0.06).astype(np.float32)
             selected_uv.append(
                 np.column_stack(
                     [
@@ -298,6 +336,9 @@ def _sample_chart_seeds(
                     ]
                 ).astype(np.float32)
             )
+            selected_scales.append(footprint)
+            selected_quaternions.append(quaternion)
+            selected_normals.append(normal.astype(np.float32))
     if not selected_xyz:
         return {
             "xyz": np.empty((0, 3), dtype=np.float32),
@@ -306,6 +347,9 @@ def _sample_chart_seeds(
             "confidence": np.empty(0, dtype=np.float32),
             "chart_id": np.empty(0, dtype=np.int32),
             "uv": np.empty((0, 2), dtype=np.float32),
+            "scales": np.empty((0, 2), dtype=np.float32),
+            "quaternions": np.empty((0, 4), dtype=np.float32),
+            "normals": np.empty((0, 3), dtype=np.float32),
         }
     xyz = np.concatenate(selected_xyz)
     rgb = np.concatenate(selected_rgb)
@@ -313,15 +357,21 @@ def _sample_chart_seeds(
     confidence = np.concatenate(selected_confidence)
     chart_id = np.concatenate(selected_chart_id)
     uv = np.concatenate(selected_uv)
+    scales = np.concatenate(selected_scales)
+    quaternions = np.concatenate(selected_quaternions)
+    normals = np.concatenate(selected_normals)
     if len(xyz) > int(maximum_total):
         order = np.argsort(confidence)[-int(maximum_total) :]
-        xyz, rgb, sigma, confidence, chart_id, uv = (
+        xyz, rgb, sigma, confidence, chart_id, uv, scales, quaternions, normals = (
             xyz[order],
             rgb[order],
             sigma[order],
             confidence[order],
             chart_id[order],
             uv[order],
+            scales[order],
+            quaternions[order],
+            normals[order],
         )
     return {
         "xyz": xyz,
@@ -330,6 +380,9 @@ def _sample_chart_seeds(
         "confidence": confidence,
         "chart_id": chart_id,
         "uv": uv,
+        "scales": scales,
+        "quaternions": quaternions,
+        "normals": normals,
     }
 
 
@@ -518,7 +571,19 @@ def build_surface_seed(
     source_type = np.concatenate(source_parts).astype(np.int8)
     chart_id = np.concatenate(chart_id_parts).astype(np.int32)
     chart_uv = np.concatenate(chart_uv_parts).astype(np.float32)
-    scales, quaternions, normals = _surface_frames(xyz, sigma)
+    scales = np.empty((len(xyz), 2), dtype=np.float32)
+    quaternions = np.empty((len(xyz), 4), dtype=np.float32)
+    normals = np.empty((len(xyz), 3), dtype=np.float32)
+    free = source_type != SOURCE_CHART
+    if bool(free.any()):
+        scales[free], quaternions[free], normals[free] = _surface_frames(
+            xyz[free], sigma[free], maximum_scale=0.08
+        )
+    chart_rows = source_type == SOURCE_CHART
+    if bool(chart_rows.any()):
+        scales[chart_rows] = chart["scales"]
+        quaternions[chart_rows] = chart["quaternions"]
+        normals[chart_rows] = chart["normals"]
     initial_opacity = np.choose(
         source_type,
         np.asarray([0.08, 0.035, 0.015], dtype=np.float32),
@@ -580,6 +645,9 @@ def _mast3r_tree_tracks(
         )
         offsets = archive["observation_offsets"]
         observation_cameras = archive["observation_camera_indices"]
+        observation_pixels = archive["observation_pixels"]
+        observation_depth = archive["observation_camera_depth"]
+        camera_image_sizes = archive["camera_image_sizes"]
         keep = (
             (
                 archive["role_probabilities"][:, ROLE_CANOPY]
@@ -597,10 +665,16 @@ def _mast3r_tree_tracks(
         result: list[dict[str, Any]] = []
         for index in np.flatnonzero(keep):
             begin, end = int(offsets[index]), int(offsets[index + 1])
-            image_ids = mapped_ids[observation_cameras[begin:end]]
-            image_ids = np.unique(image_ids[image_ids >= 0])
+            camera_rows = observation_cameras[begin:end]
+            mapped_observations = mapped_ids[camera_rows]
+            valid_observation = mapped_observations >= 0
+            image_ids = np.unique(
+                mapped_observations[valid_observation]
+            )
             if len(image_ids) < int(minimum_track_observations):
                 continue
+            pixels = observation_pixels[begin:end][valid_observation]
+            sizes = camera_image_sizes[camera_rows][valid_observation]
             result.append(
                 {
                     "id": int(archive["track_id"][index]),
@@ -614,6 +688,16 @@ def _mast3r_tree_tracks(
                         len(image_ids), -1, dtype=np.int64
                     ),
                     "tree_image_ids": image_ids,
+                    "observation_camera_ids": mapped_observations[
+                        valid_observation
+                    ].astype(np.int32),
+                    "observation_uv": (
+                        pixels.astype(np.float32)
+                        / np.maximum(sizes.astype(np.float32), 1.0)
+                    ).astype(np.float32),
+                    "observation_depth": observation_depth[
+                        begin:end
+                    ][valid_observation].astype(np.float32),
                     "tree_sequence_count": int(
                         archive["sequence_count"][index]
                     ),
@@ -941,6 +1025,33 @@ def _chart_foliage_samples(
                         "tree_image_ids": np.asarray(
                             [image_id], dtype=np.int32
                         ),
+                        "observation_camera_ids": np.asarray(
+                            [image_id], dtype=np.int32
+                        ),
+                        "observation_uv": np.asarray(
+                            [
+                                [
+                                    (int(flat) % width) / width,
+                                    (int(flat) // width) / height,
+                                ]
+                            ],
+                            dtype=np.float32,
+                        ),
+                        "observation_depth": np.asarray(
+                            [
+                                (
+                                    value
+                                    @ quaternion_to_rotation(
+                                        images[image_id]["qvec"]
+                                    ).T
+                                    + np.asarray(
+                                        images[image_id]["tvec"],
+                                        dtype=np.float64,
+                                    )
+                                )[2]
+                            ],
+                            dtype=np.float32,
+                        ),
                         "tree_sequence_count": 1,
                         "tree_fraction": (
                             1.0 if active[int(chart_index)] else 0.60
@@ -1172,8 +1283,12 @@ def _dav2_foliage_samples(
             0.06,
             0.35,
         )
-        for point, row, column, point_scale in zip(
-            world_points, selected_rows, selected_columns, footprint
+        for point, row, column, point_scale, depth_value in zip(
+            world_points,
+            selected_rows,
+            selected_columns,
+            footprint,
+            selected_depth,
         ):
             output.append(
                 {
@@ -1191,6 +1306,21 @@ def _dav2_foliage_samples(
                     ),
                     "tree_image_ids": np.asarray(
                         [image_id], dtype=np.int32
+                    ),
+                    "observation_camera_ids": np.asarray(
+                        [image_id], dtype=np.int32
+                    ),
+                    "observation_uv": np.asarray(
+                        [
+                            [
+                                float(column) / width,
+                                float(row) / height,
+                            ]
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "observation_depth": np.asarray(
+                        [depth_value], dtype=np.float32
                     ),
                     "tree_sequence_count": 1,
                     "tree_fraction": float(
@@ -1271,6 +1401,7 @@ def _merge_foliage(
     track_instances: np.ndarray,
     *,
     skeleton_linearity: float,
+    maximum_reprojection_error: float,
 ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
     xyz = np.stack([point["xyz"] for point in tracks]).astype(np.float32)
     rgb = (
@@ -1307,9 +1438,35 @@ def _merge_foliage(
     support_camera_ids = np.full(
         (track_count, capacity), -1, dtype=np.int32
     )
+    observation_camera_ids = np.full(
+        (track_count, capacity), -1, dtype=np.int32
+    )
+    observation_uv = np.full(
+        (track_count, capacity, 2), np.nan, dtype=np.float32
+    )
+    observation_depth = np.full(
+        (track_count, capacity), np.nan, dtype=np.float32
+    )
     for index, point in enumerate(tracks):
         values = np.unique(point["tree_image_ids"])[:capacity]
         support_camera_ids[index, : len(values)] = values
+        cameras = np.asarray(
+            point.get("observation_camera_ids", []), dtype=np.int32
+        )[:capacity]
+        uv = np.asarray(
+            point.get("observation_uv", []), dtype=np.float32
+        ).reshape(-1, 2)[:capacity]
+        depth = np.asarray(
+            point.get("observation_depth", []), dtype=np.float32
+        ).reshape(-1)[:capacity]
+        observation_count = min(len(cameras), len(uv), len(depth), capacity)
+        observation_camera_ids[index, :observation_count] = cameras[
+            :observation_count
+        ]
+        observation_uv[index, :observation_count] = uv[:observation_count]
+        observation_depth[index, :observation_count] = depth[
+            :observation_count
+        ]
     error = np.asarray(
         [point["error"] for point in tracks], dtype=np.float32
     )
@@ -1325,12 +1482,15 @@ def _merge_foliage(
     # supported only inside one traversal are useful high-frequency leaf
     # evidence, but must enter the sequence-conditioned branch rather than
     # contaminating canonical localization geometry.
-    strongly_linear = linearity >= 1.5 * float(skeleton_linearity)
+    # PCA linearity is a proposal, not semantic trunk/branch evidence.
+    # Until a cross-sequence line/cylinder inlier builder supplies that
+    # evidence, emitting no skeleton is safer than inventing static floaters.
+    trunk_or_branch_evidence = np.zeros(len(linearity), dtype=bool)
     layer_role = np.where(
-        (sequence_support >= 2) & (
-            linearity >= float(skeleton_linearity)
-        )
-        | strongly_linear,
+        (sequence_support >= 2)
+        & (linearity >= float(skeleton_linearity))
+        & trunk_or_branch_evidence
+        & (error <= maximum_reprojection_error),
         1,
         np.where(sequence_support < 2, 2, 0),
     ).astype(np.int8)
@@ -1365,6 +1525,9 @@ def _merge_foliage(
         "reprojection_error": error,
         "track_linearity": linearity,
         "support_camera_ids": support_camera_ids,
+        "observation_camera_ids": observation_camera_ids,
+        "observation_uv": observation_uv,
+        "observation_depth": observation_depth,
         "support_view_count": np.asarray(
             [len(point["tree_image_ids"]) for point in tracks],
             dtype=np.int16,
@@ -1377,7 +1540,26 @@ def _merge_foliage(
     merged = {}
     for key, track_value in values.items():
         if key not in hull:
-            raise RuntimeError(f"Canopy hull lacks required field {key}")
+            if key == "observation_camera_ids":
+                hull[key] = np.full(
+                    (len(hull["centers"]), capacity),
+                    -1,
+                    dtype=np.int32,
+                )
+            elif key == "observation_uv":
+                hull[key] = np.full(
+                    (len(hull["centers"]), capacity, 2),
+                    np.nan,
+                    dtype=np.float32,
+                )
+            elif key == "observation_depth":
+                hull[key] = np.full(
+                    (len(hull["centers"]), capacity),
+                    np.nan,
+                    dtype=np.float32,
+                )
+            else:
+                raise RuntimeError(f"Canopy hull lacks required field {key}")
         merged[key] = np.concatenate(
             [hull[key], track_value], axis=0
         )
@@ -1558,11 +1740,13 @@ def build_foliage_seed(
     candidate_count = int(hull.pop("candidate_count"))
     rigid_depth_view_count = int(hull.pop("rigid_depth_view_count"))
     tree_instance_count = int(hull.pop("tree_instance_count"))
+    ray_evidence = hull.pop("ray_evidence")
     merged, counts = _merge_foliage(
         hull,
         tracks,
         instances,
         skeleton_linearity=skeleton_linearity,
+        maximum_reprojection_error=maximum_reprojection_error,
     )
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
@@ -1594,6 +1778,10 @@ def build_foliage_seed(
         **{
             key: torch.from_numpy(value)
             for key, value in merged.items()
+        },
+        "ray_evidence": {
+            key: torch.from_numpy(value)
+            for key, value in ray_evidence.items()
         },
     }
     output = Path(output)

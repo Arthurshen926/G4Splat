@@ -2,7 +2,11 @@ from pathlib import Path
 
 import torch
 
-from outdoor.hybrid_gaussian_renderer import VolumetricFoliageModel
+from outdoor.hybrid_gaussian_renderer import (
+    LAYER_DYNAMIC_LEAF,
+    VolumetricFoliageModel,
+    dynamic_visibility_gate,
+)
 
 
 def test_independent_volume_state_does_not_use_legacy_surfel_geometry():
@@ -22,6 +26,37 @@ def test_independent_volume_state_does_not_use_legacy_surfel_geometry():
     assert torch.allclose(model.opacities.detach(), payload["opacities"])
     assert not hasattr(model, "initialize_from_surfel_residual")
     assert not hasattr(model, "append_from_structural")
+
+
+def test_dynamic_observation_metadata_survives_split_and_legacy_gate_is_safe():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.1, 0.0, 2.0]]),
+        "scales": torch.tensor([[0.1, 0.1, 0.1]]),
+        "colors": torch.tensor([[0.2, 0.4, 0.6]]),
+        "opacities": torch.tensor([[1e-5]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([LAYER_DYNAMIC_LEAF], dtype=torch.int8),
+        "support_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_uv": torch.tensor([[[0.5, 0.5]]]),
+        "observation_depth": torch.tensor([[2.0]]),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+
+    gate = dynamic_visibility_gate(model, 7, None, None)
+    assert gate.tolist() == [0.0]
+    model.split(torch.tensor([0]))
+    assert model.observation_camera_ids.tolist() == [[7], [7]]
+    assert torch.equal(
+        model.observation_uv,
+        payload["observation_uv"].repeat_interleave(2, dim=0),
+    )
+    assert torch.equal(
+        model.observation_depth,
+        payload["observation_depth"].repeat_interleave(2, dim=0),
+    )
 
 
 def test_hybrid_contract_uses_one_rasterizer_and_no_fixed_branch_composite():

@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - stdlib fallback remains supported.
 from matcha.cambridge_masks import CambridgeMaskLookup
 
 
-TRACK_GRAPH_VERSION = "mast3r-fixed-camera-multiview-track-graph-v1"
+TRACK_GRAPH_VERSION = "mast3r-fixed-camera-multiview-track-graph-v2-exact-k"
 ROLE_NAMES = ("rigid", "canopy", "sky", "transient", "unknown")
 ROLE_RIGID, ROLE_CANOPY, ROLE_SKY, ROLE_TRANSIENT, ROLE_UNKNOWN = range(5)
 
@@ -74,35 +74,90 @@ class _PointmapCache:
         return value
 
 
-def _camera_arrays(scene: Path) -> tuple[list[str], np.ndarray, np.ndarray]:
+def _camera_arrays(
+    scene: Path,
+    *,
+    dataset: Path | None = None,
+    image_size: tuple[int, int] | None = None,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Load per-view ``fx, fy, cx, cy`` without inventing a centred camera.
+
+    New MASt3R runs persist ``intrinsics`` directly.  Older chart archives can
+    only be upgraded from the immutable Cambridge camera database; their
+    scalar focal field is deliberately not accepted as an exact-K contract.
+    """
     payload = json.loads((Path(scene) / "cameras.json").read_text())
     paths = payload.get("filepaths")
-    focals = np.asarray(payload.get("focals"), dtype=np.float64)
     c2w = np.asarray(payload.get("cams2world"), dtype=np.float64)
-    if (
-        not isinstance(paths, list)
-        or c2w.shape != (len(paths), 4, 4)
-        or focals.shape != (len(paths),)
-    ):
+    if not isinstance(paths, list) or c2w.shape != (len(paths), 4, 4):
         raise RuntimeError("Unsupported MASt3R pointmap camera contract")
     names = [Path(value).stem for value in paths]
     if len(set(names)) != len(names):
         raise RuntimeError("Pointmap camera stems are not unique")
-    return names, focals, c2w
+    stored = payload.get("intrinsics")
+    if stored is not None:
+        intrinsics = np.asarray(stored, dtype=np.float64)
+        if intrinsics.shape != (len(names), 4):
+            raise RuntimeError("MASt3R intrinsics must have shape [N,4]")
+        return names, intrinsics, c2w
+    if dataset is None or image_size is None:
+        raise RuntimeError(
+            "Legacy scalar-focal cameras.json is not an exact-K contract. "
+            "Pass the calibrated Cambridge dataset or regenerate MASt3R."
+        )
+    # Import lazily so synthetic/unit users of this module do not require the
+    # COLMAP reader. Reading cameras/images is allowed; points3D is never read.
+    from outdoor.scene_contract import _camera_intrinsics
+    from colmap.read_write_model import read_cameras_binary, read_images_binary
+
+    sparse = Path(dataset) / "sparse" / "0"
+    cameras = read_cameras_binary(str(sparse / "cameras.bin"))
+    images = read_images_binary(str(sparse / "images.bin"))
+    by_stem = {Path(image.name).stem: image for image in images.values()}
+    target_width, target_height = map(int, image_size)
+    rows = []
+    for name in names:
+        image = by_stem.get(name)
+        if image is None:
+            raise RuntimeError(f"Exact-K camera missing for Chart view {name}")
+        camera = _camera_intrinsics(cameras[image.camera_id])
+        if camera["fx"] is None or camera["distortion"]:
+            raise RuntimeError(
+                f"Track graph requires an undistorted pinhole camera: {name}"
+            )
+        sx = target_width / float(camera["width"])
+        sy = target_height / float(camera["height"])
+        rows.append(
+            [
+                float(camera["fx"]) * sx,
+                float(camera["fy"]) * sy,
+                float(camera["cx"]) * sx,
+                float(camera["cy"]) * sy,
+            ]
+        )
+    return names, np.asarray(rows, dtype=np.float64), c2w
 
 
 def _project(
     xyz: np.ndarray,
     c2w: np.ndarray,
-    focal: float,
+    intrinsics: np.ndarray | float,
     width: int,
     height: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     w2c = np.linalg.inv(c2w)
     camera = xyz @ w2c[:3, :3].T + w2c[:3, 3]
     z = camera[:, 2]
-    u = focal * camera[:, 0] / np.maximum(z, 1e-8) + width * 0.5
-    v = focal * camera[:, 1] / np.maximum(z, 1e-8) + height * 0.5
+    values = np.asarray(intrinsics, dtype=np.float64).reshape(-1)
+    if len(values) == 1:  # Backwards-compatible synthetic-test shorthand.
+        fx = fy = float(values[0])
+        cx, cy = width * 0.5, height * 0.5
+    elif len(values) == 4:
+        fx, fy, cx, cy = map(float, values)
+    else:
+        raise ValueError("intrinsics must be scalar or [fx,fy,cx,cy]")
+    u = fx * camera[:, 0] / np.maximum(z, 1e-8) + cx
+    v = fy * camera[:, 1] / np.maximum(z, 1e-8) + cy
     valid = (
         np.isfinite(camera).all(axis=1)
         & (z > 0.05)
@@ -118,7 +173,7 @@ def _pointmap_overlap(
     source: dict[str, np.ndarray],
     target: dict[str, np.ndarray],
     c2w: np.ndarray,
-    focal: float,
+    intrinsics: np.ndarray,
     *,
     stride: int,
     confidence_threshold: float,
@@ -129,7 +184,7 @@ def _pointmap_overlap(
     rows, columns = np.mgrid[0:height:stride, 0:width:stride]
     xyz = source["points"][rows, columns].reshape(-1, 3)
     source_conf = source["confidence"][rows, columns].reshape(-1)
-    u, v, depth, valid = _project(xyz, c2w, focal, width, height)
+    u, v, depth, valid = _project(xyz, c2w, intrinsics, width, height)
     target_rows = np.clip(np.rint(v).astype(np.int64), 0, height - 1)
     target_columns = np.clip(np.rint(u).astype(np.int64), 0, width - 1)
     target_xyz = target["points"][target_rows, target_columns]
@@ -148,6 +203,7 @@ def _pointmap_overlap(
 def build_pair_graph(
     scene: Path,
     *,
+    dataset: Path | None = None,
     temporal_neighbours: int = 4,
     cross_sequence_neighbours: int = 8,
     candidate_neighbours: int = 20,
@@ -160,7 +216,16 @@ def build_pair_graph(
 ) -> tuple[list[str], np.ndarray, np.ndarray, dict[int, list[int]], dict[str, Any]]:
     """Build temporal, retrieval-proxy and measured-overlap pair edges."""
     scene = Path(scene)
-    names, focals, c2w = _camera_arrays(scene)
+    camera_payload = json.loads((scene / "cameras.json").read_text())
+    first_name = Path(camera_payload["filepaths"][0]).stem
+    first_map = _PointmapCache(scene / "pointmaps", capacity=2).get(first_name)
+    pointmap_size = (
+        int(first_map["confidence"].shape[1]),
+        int(first_map["confidence"].shape[0]),
+    )
+    names, intrinsics, c2w = _camera_arrays(
+        scene, dataset=dataset, image_size=pointmap_size
+    )
     centers = c2w[:, :3, 3]
     forward = c2w[:, :3, 2]
     extent = max(float(np.linalg.norm(np.ptp(centers, axis=0))), 1e-6)
@@ -208,7 +273,7 @@ def build_pair_graph(
                 source_map,
                 cache.get(names[int(target)]),
                 c2w[int(target)],
-                focals[int(target)],
+                intrinsics[int(target)],
                 stride=overlap_stride,
                 confidence_threshold=confidence_threshold,
                 absolute_gate=absolute_gate,
@@ -229,23 +294,31 @@ def build_pair_graph(
         "minimum_overlap": float(minimum_overlap),
         "edge_overlap": edge_overlap,
     }
-    return names, focals, c2w, graph, audit
+    audit["intrinsics_policy"] = "per_view_exact_fx_fy_cx_cy"
+    return names, intrinsics, c2w, graph, audit
 
 
 def _triangulate(
     pixels: np.ndarray,
     camera_indices: np.ndarray,
     c2w: np.ndarray,
-    focals: np.ndarray,
+    intrinsics: np.ndarray,
     width: int,
     height: int,
     weights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     centers = c2w[camera_indices, :3, 3]
+    camera_k = np.asarray(intrinsics)[camera_indices]
+    if camera_k.ndim == 1:
+        fx = fy = camera_k
+        cx = np.full(len(pixels), width * 0.5)
+        cy = np.full(len(pixels), height * 0.5)
+    else:
+        fx, fy, cx, cy = camera_k.T
     local = np.column_stack(
         [
-            (pixels[:, 0] - width * 0.5) / focals[camera_indices],
-            (pixels[:, 1] - height * 0.5) / focals[camera_indices],
+            (pixels[:, 0] - cx) / fx,
+            (pixels[:, 1] - cy) / fy,
             np.ones(len(pixels)),
         ]
     )
@@ -267,7 +340,7 @@ def _triangulate(
     reprojection = []
     for pixel, index in zip(pixels, camera_indices):
         u, v, _, valid = _project(
-            xyz[None], c2w[int(index)], focals[int(index)], width, height
+            xyz[None], c2w[int(index)], intrinsics[int(index)], width, height
         )
         reprojection.append(
             float(np.linalg.norm(np.asarray([u[0], v[0]]) - pixel))
@@ -283,7 +356,7 @@ def _triangulate(
     )
     residual = max(float(np.median(reprojection)), 0.25)
     angular_sigma = residual / max(
-        float(np.median(focals[camera_indices])), 1.0
+        float(np.median(np.sqrt(fx * fy))), 1.0
     )
     covariance = (
         np.linalg.pinv(information + identity * 1e-8)
@@ -365,8 +438,11 @@ def build_multiview_tracks(
     """Construct and persist auditable global and sequence-local tracks."""
     scene = Path(scene).resolve()
     output = Path(output).resolve()
-    names, focals, c2w, graph, graph_audit = build_pair_graph(
-        scene, cache_size=cache_size, **(pair_graph_kwargs or {})
+    names, intrinsics, c2w, graph, graph_audit = build_pair_graph(
+        scene,
+        dataset=dataset,
+        cache_size=cache_size,
+        **(pair_graph_kwargs or {}),
     )
     cache = _PointmapCache(scene / "pointmaps", capacity=cache_size)
     first = cache.get(names[0])
@@ -419,7 +495,7 @@ def build_multiview_tracks(
             target_map = cache.get(names[target])
             anchor_xyz = xyz[candidate_indices]
             u, v, depth, projected = _project(
-                anchor_xyz, c2w[target], focals[target], width, height
+                anchor_xyz, c2w[target], intrinsics[target], width, height
             )
             tr = np.clip(np.rint(v).astype(np.int64), 0, height - 1)
             tc = np.clip(np.rint(u).astype(np.int64), 0, width - 1)
@@ -477,7 +553,7 @@ def build_multiview_tracks(
                 obs_pixels,
                 camera_indices,
                 c2w,
-                focals,
+                intrinsics,
                 width,
                 height,
                 np.clip(obs_conf / np.median(obs_conf), 0.25, 4.0),
@@ -511,6 +587,44 @@ def build_multiview_tracks(
                     "pixels": obs_pixels,
                     "confidence": obs_conf,
                     "residuals": residuals,
+                    "camera_depths": np.asarray(
+                        [
+                            _project(
+                                tri_xyz[None],
+                                c2w[int(camera_index)],
+                                intrinsics[int(camera_index)],
+                                width,
+                                height,
+                            )[2][0]
+                            for camera_index in camera_indices
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "centered_residuals": np.asarray(
+                        [
+                            np.linalg.norm(
+                                np.asarray(
+                                    _project(
+                                        tri_xyz[None],
+                                        c2w[int(camera_index)],
+                                        float(
+                                            np.sqrt(
+                                                intrinsics[int(camera_index), 0]
+                                                * intrinsics[int(camera_index), 1]
+                                            )
+                                        ),
+                                        width,
+                                        height,
+                                    )[:2]
+                                ).reshape(2)
+                                - pixel
+                            )
+                            for pixel, camera_index in zip(
+                                obs_pixels, camera_indices
+                            )
+                        ],
+                        dtype=np.float32,
+                    ),
                     "median_error": median_error,
                     "angle": tri[:3],
                     "covariance_diag": np.maximum(
@@ -580,7 +694,16 @@ def build_multiview_tracks(
         "observation_reprojection_error": np.concatenate(
             [record["residuals"] for record in records]
         ).astype(np.float32),
+        "observation_camera_depth": np.concatenate(
+            [record["camera_depths"] for record in records]
+        ).astype(np.float32),
+        "observation_centered_reprojection_error": np.concatenate(
+            [record["centered_residuals"] for record in records]
+        ).astype(np.float32),
         "camera_names": np.asarray(names),
+        "camera_image_sizes": np.tile(
+            np.asarray([[width, height]], dtype=np.int32), (len(names), 1)
+        ),
         # Compatibility aliases consumed by the current teacher.
         "support_camera_offsets": offsets,
         "support_camera_ids": np.concatenate(
@@ -609,6 +732,12 @@ def build_multiview_tracks(
         ).tolist(),
         "reprojection_error_percentiles": np.percentile(
             arrays["reprojection_error"], [10, 50, 90, 99]
+        ).tolist(),
+        "exact_k_observation_reprojection_percentiles": np.percentile(
+            arrays["observation_reprojection_error"], [50, 90, 99]
+        ).tolist(),
+        "centered_k_observation_reprojection_percentiles": np.percentile(
+            arrays["observation_centered_reprojection_error"], [50, 90, 99]
         ).tolist(),
         "triangulation_angle_median_percentiles": np.percentile(
             arrays["triangulation_angle_median"], [10, 50, 90]

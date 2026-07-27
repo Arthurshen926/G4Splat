@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from outdoor.mast3r_track_graph import _triangulate, validate_track_gate
+from outdoor.mast3r_track_graph import _project, _triangulate, validate_track_gate
 
 
 def _archive(path, *, count=20, observations=3, sequences=2, error=0.4, angle=2.0):
@@ -56,3 +56,18 @@ def test_triangulation_covariance_converts_pixels_to_ray_angle():
     )
     assert np.allclose(xyz, [0, 0, 5], atol=1e-4)
     assert np.sqrt(angle_and_covariance[3:]).max() < 0.02
+
+
+def test_projection_uses_anisotropic_offcenter_exact_k():
+    xyz = np.asarray([[1.0, 1.0, 4.0]], dtype=np.float64)
+    u, v, depth, valid = _project(
+        xyz,
+        np.eye(4, dtype=np.float64),
+        np.asarray([800.0, 600.0, 301.0, 199.0]),
+        640,
+        480,
+    )
+    assert valid[0]
+    assert depth[0] == pytest.approx(4.0)
+    assert u[0] == pytest.approx(501.0)
+    assert v[0] == pytest.approx(349.0)
