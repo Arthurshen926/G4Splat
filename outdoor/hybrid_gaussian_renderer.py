@@ -393,12 +393,13 @@ class VolumetricFoliageModel(nn.Module):
         indices: torch.Tensor,
         *,
         shrink: float = 1.6,
+        allow_static_skeleton: bool = False,
     ) -> dict[str, int]:
-        """Replace selected non-skeleton volumes with two oriented children."""
+        """Replace selected volumes with two oriented role-preserving children."""
         indices = torch.as_tensor(
             indices, device=self.xyz.device, dtype=torch.long
         ).unique()
-        if indices.numel():
+        if indices.numel() and not allow_static_skeleton:
             indices = indices[~self.static_skeleton_mask[indices]]
         if not indices.numel():
             return {"split_parents": 0, "children": 0}

@@ -20,7 +20,7 @@ from outdoor.evidence_store import load_evidence_store  # noqa: E402
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
 
 
-PIPELINE_VERSION = "cambridge-native-hybrid-teacher-mainline-v1"
+PIPELINE_VERSION = "cambridge-native-hybrid-teacher-mainline-v3-causal-repair"
 STAGES = (
     "prepare_cameras",
     "build_mast3r_tracks",
@@ -91,9 +91,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--gpu", default="2")
     parser.add_argument("--minimum-free-gpu-memory-mib", type=int, default=20_000)
-    parser.add_argument("--maximum-surface-gaussians", type=int, default=1_200_000)
+    parser.add_argument("--maximum-surface-gaussians", type=int, default=200_000)
     parser.add_argument(
-        "--maximum-surface-growth-per-event", type=int, default=20_000
+        "--maximum-surface-growth-per-event", type=int, default=500
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -181,7 +181,7 @@ def main() -> None:
     profile = PROFILES[args.profile]
     run = (
         args.run_root.expanduser().resolve()
-        / f"{args.scene}_hybrid_teacher_{args.profile}_v1"
+        / f"{args.scene}_hybrid_teacher_{args.profile}_v3"
     )
     run.mkdir(parents=True, exist_ok=True)
     manifest_path = run / "pipeline_manifest.json"
@@ -315,12 +315,54 @@ def main() -> None:
 
     evidence = run / "evidence"
     if "build_evidence" in selected:
+        dav2_root = (
+            args.dav2_root.expanduser().resolve()
+            if args.dav2_root is not None
+            else None
+        )
+        packed_candidates = (
+            dataset / "depth_anything_vitl_fp16.pt",
+            dataset.parent / "depth_anything_vitl_fp16.pt",
+        )
+        packed_dav2 = next(
+            (path for path in packed_candidates if path.is_file()),
+            packed_candidates[0],
+        )
+        if dav2_root is None and packed_dav2.is_file():
+            dav2_root = run / "dav2_real_views"
+            dav2_manifest = dav2_root / "dav2_cache_manifest.json"
+            if not dav2_manifest.is_file():
+                _run(
+                    [
+                        python,
+                        str(
+                            REPO_ROOT
+                            / "scripts/unpack_dav2_real_view_cache.py"
+                        ),
+                        "--packed-cache",
+                        str(packed_dav2),
+                        "--output",
+                        str(dav2_root),
+                    ],
+                    env=env,
+                    log=run / "logs/unpack_dav2.log",
+                    dry_run=args.dry_run,
+                )
         rebuild_evidence = not (
             evidence / "evidence_manifest.json"
         ).is_file()
         if not rebuild_evidence:
             try:
-                load_evidence_store(evidence)
+                current_store = load_evidence_store(evidence)
+                artifact_names = {
+                    item["name"]
+                    for item in current_store.get("artifacts", [])
+                }
+                if (
+                    dav2_root is not None
+                    and "dav2_index" not in artifact_names
+                ):
+                    rebuild_evidence = True
             except (FileNotFoundError, RuntimeError):
                 rebuild_evidence = True
         if rebuild_evidence:
@@ -342,8 +384,8 @@ def main() -> None:
             ]
             if evidence.exists():
                 command.append("--replace")
-            if args.dav2_root is not None:
-                command.extend(["--dav2-root", str(args.dav2_root.resolve())])
+            if dav2_root is not None:
+                command.extend(["--dav2-root", str(dav2_root)])
             _run(
                 command,
                 env=env,

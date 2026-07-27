@@ -31,6 +31,9 @@ class GaussianModel:
 
     SOURCE_SFM_OR_BASE = 0
     SOURCE_CANOPY_RESIDUAL = 1
+    # Unified Teacher initialization uses explicit evidence source codes.
+    SOURCE_MAST3R_TRACK = 1
+    SOURCE_CHART_RESIDUAL = 2
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -1220,7 +1223,10 @@ class GaussianModel:
             new_scaling,
             new_rotation,
             metadata=self._point_metadata_from_indices(
-                selected_indices, repeat=N, track_id=-1
+                selected_indices,
+                repeat=N,
+                track_id=-1,
+                protected_flag=False,
             ),
         )
 
@@ -1249,7 +1255,9 @@ class GaussianModel:
             new_scaling,
             new_rotation,
             metadata=self._point_metadata_from_indices(
-                selected_indices, track_id=-1
+                selected_indices,
+                track_id=-1,
+                protected_flag=False,
             ),
         )
 
@@ -1553,6 +1561,13 @@ class GaussianModel:
                 grads.squeeze(-1) >= max_grad,
                 max_scale > self.percent_dense * extent,
             )
+            if len(self._protected_flag) == point_count:
+                # Metric anchors may seed conservative clones, but a native
+                # split retires its parent. Never replace a fixed SfM/MAtCha
+                # measurement with unanchored children.
+                split_candidates = torch.logical_and(
+                    split_candidates, ~self._protected_flag
+                )
             candidate_mask = torch.logical_or(
                 clone_candidates, split_candidates
             )

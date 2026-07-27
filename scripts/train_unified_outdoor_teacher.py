@@ -50,7 +50,7 @@ from scene import GaussianModel  # noqa: E402
 from utils.loss_utils import ssim  # noqa: E402
 
 
-PROTOCOL = "cambridge_native_hybrid_teacher_v2"
+PROTOCOL = "cambridge_native_hybrid_teacher_v4_causal_repair"
 # Exact hashes of the checkpoint implementation that preceded the
 # I/O/allocator-only fast path.  This narrow allow-list lets the active formal
 # run resume without weakening the normal implementation/CUDA provenance
@@ -127,6 +127,7 @@ def _parse_args():
         data_device="cpu",
         white_background=True,
         densify_until_iter=None,
+        densification_interval=200,
         opacity_cull=0.004,
         lambda_dssim=0.20,
     )
@@ -148,16 +149,19 @@ def _parse_args():
     parser.add_argument("--dynamic-lr", type=float, default=3e-4)
     parser.add_argument("--appearance-lr", type=float, default=8e-4)
     parser.add_argument("--sky-lr", type=float, default=2e-3)
-    parser.add_argument("--geometry-every", type=int, default=4)
+    parser.add_argument("--geometry-every", type=int, default=2)
     parser.add_argument("--topology-every", type=int, default=8)
     parser.add_argument("--replacement-every", type=int, default=20)
-    parser.add_argument("--geometry-weight", type=float, default=0.08)
-    parser.add_argument("--plane-weight", type=float, default=0.06)
-    parser.add_argument("--normal-weight", type=float, default=0.025)
+    parser.add_argument("--geometry-weight", type=float, default=0.12)
+    parser.add_argument("--plane-weight", type=float, default=0.10)
+    parser.add_argument("--normal-weight", type=float, default=0.04)
     parser.add_argument("--ordinal-weight", type=float, default=0.015)
-    parser.add_argument("--track-weight", type=float, default=0.01)
-    parser.add_argument("--structure-weight", type=float, default=0.01)
+    parser.add_argument("--track-weight", type=float, default=0.05)
+    parser.add_argument("--structure-weight", type=float, default=0.03)
     parser.add_argument("--ownership-weight", type=float, default=0.08)
+    parser.add_argument(
+        "--conditioned-ownership-weight", type=float, default=0.20
+    )
     parser.add_argument("--occupancy-weight", type=float, default=0.06)
     parser.add_argument("--dynamic-weight", type=float, default=0.65)
     parser.add_argument("--appearance-weight", type=float, default=0.06)
@@ -165,18 +169,35 @@ def _parse_args():
     parser.add_argument(
         "--maximum-surface-gaussians",
         type=int,
-        default=1_200_000,
+        default=200_000,
     )
     parser.add_argument(
         "--maximum-surface-growth-per-event",
         type=int,
-        default=20_000,
+        default=500,
+    )
+    parser.add_argument(
+        "--maximum-surface-growth-multiplier", type=float, default=2.0
+    )
+    # Surface seeds are generated with a 0.18 m physical cap.  A small
+    # optimization margin is enough; larger values turn sparse surfels into
+    # metre-scale screen-space paint blobs.
+    parser.add_argument("--maximum-surface-scale", type=float, default=0.20)
+    parser.add_argument("--maximum-volume-scale", type=float, default=0.60)
+    parser.add_argument(
+        "--maximum-dynamic-volume-scale", type=float, default=0.35
     )
     parser.add_argument("--maximum-volume-gaussians", type=int, default=300_000)
-    parser.add_argument("--maximum-volume-splits", type=int, default=4000)
-    parser.add_argument("--volume-split-radius", type=float, default=8.0)
+    parser.add_argument("--maximum-volume-splits", type=int, default=500)
+    parser.add_argument(
+        "--maximum-volume-growth-multiplier", type=float, default=2.0
+    )
+    parser.add_argument("--volume-split-radius", type=float, default=3.0)
     parser.add_argument("--volume-densify-every", type=int, default=600)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument(
+        "--appearance-maximum-rgb-residual", type=float, default=0.04
+    )
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--eval-indices", default="408,409,410")
     parser.add_argument("--view-cache-size", type=int, default=4)
@@ -197,6 +218,16 @@ def _parse_args():
         parser.error(
             "--maximum-surface-growth-per-event must be positive"
         )
+    if args.maximum_surface_growth_multiplier < 1.0:
+        parser.error("--maximum-surface-growth-multiplier must be >= 1")
+    if args.maximum_volume_growth_multiplier < 1.0:
+        parser.error("--maximum-volume-growth-multiplier must be >= 1")
+    if args.maximum_surface_scale <= 0:
+        parser.error("--maximum-surface-scale must be positive")
+    if args.maximum_volume_scale <= 0:
+        parser.error("--maximum-volume-scale must be positive")
+    if args.maximum_dynamic_volume_scale <= 0:
+        parser.error("--maximum-dynamic-volume-scale must be positive")
     if args.image_prefetch_workers < 0:
         parser.error("--image-prefetch-workers must be non-negative")
     if args.image_prefetch_depth < 0:
@@ -479,11 +510,23 @@ def _initialize_surface(
     surface._track_id = track_id
     surface._geometry_confidence = confidence
     surface._primitive_class.fill_(GaussianModel.PRIMITIVE_STRUCTURAL)
-    surface._protected_flag.zero_()
+    # Metric MASt3R tracks and MAtCha residual seeds are the persistent
+    # geometric skeleton. Photometric topology may add descendants around
+    # them, but routine opacity/size pruning must never erase the evidence
+    # that defines the reconstruction coordinate frame.
+    protected = (track_id >= 0) | (
+        source_type == GaussianModel.SOURCE_CHART_RESIDUAL
+    )
+    surface._protected_flag.copy_(protected)
     surface._block_id.fill_(-1)
     surface.training_setup(opt)
     return {
         "surface_count": len(surface.get_xyz),
+        "protected_anchor_count": int(protected.sum()),
+        "track_anchor_count": int((track_id >= 0).sum()),
+        "chart_anchor_count": int(
+            (source_type == GaussianModel.SOURCE_CHART_RESIDUAL).sum()
+        ),
         "source_counts": {
             str(int(value)): int((source_type == value).sum())
             for value in source_type.unique().cpu()
@@ -625,7 +668,7 @@ def _accumulate_volume_stats(stats, package) -> None:
 
 
 @torch.no_grad()
-def _adapt_volume(args, foliage, stats):
+def _adapt_volume(args, foliage, stats, *, volume_budget: int | None = None):
     """Prune contradictions first, then split residuals in one mutation.
 
     The returned mapping always addresses the topology that entered this
@@ -669,33 +712,56 @@ def _adapt_volume(args, foliage, stats):
         / working_stats["contribution"].clamp_min(1e-8)
     )
     common_eligible = (
-        ~foliage.static_skeleton_mask
-        & (working_stats["radius"] >= args.volume_split_radius)
+        (working_stats["radius"] >= args.volume_split_radius)
         & (working_stats["contribution"] > 0)
         & (rigid < 0.15)
+    )
+    skeleton_eligible = (
+        common_eligible
+        & foliage.static_skeleton_mask
+        & (foliage.support_sequence_count >= 2)
     )
     canonical_eligible = (
         common_eligible
         & foliage.canonical_crown_mask
-        & (foliage.support_sequence_count >= 2)
+        & (
+            (foliage.support_sequence_count >= 2)
+            | (
+                (foliage.support_view_count >= 3)
+                & (foliage.occupancy_probability >= 0.70)
+            )
+        )
     )
     dynamic_eligible = (
         common_eligible
         & foliage.dynamic_leaf_mask
         & (foliage.support_view_count >= 2)
     )
+    effective_budget = (
+        args.maximum_volume_gaussians
+        if volume_budget is None
+        else min(args.maximum_volume_gaussians, volume_budget)
+    )
     capacity = min(
         args.maximum_volume_splits,
-        max(args.maximum_volume_gaussians - count, 0),
+        max(effective_budget - count, 0),
     )
     split_parents = 0
     children = 0
     final_to_kept = torch.arange(count, device=foliage.xyz.device)
-    role_split_counts = {"canonical_crown": 0, "dynamic_leaf": 0}
-    if bool((canonical_eligible | dynamic_eligible).any()) and capacity > 0:
+    role_split_counts = {
+        "static_skeleton": 0,
+        "canonical_crown": 0,
+        "dynamic_leaf": 0,
+    }
+    all_eligible_mask = (
+        skeleton_eligible | canonical_eligible | dynamic_eligible
+    )
+    if bool(all_eligible_mask.any()) and capacity > 0:
         selected_parts = []
         for name, mask, fraction in (
-            ("canonical_crown", canonical_eligible, 0.60),
+            ("static_skeleton", skeleton_eligible, 0.15),
+            ("canonical_crown", canonical_eligible, 0.45),
             ("dynamic_leaf", dynamic_eligible, 0.40),
         ):
             indices = torch.nonzero(mask, as_tuple=False).flatten()
@@ -717,7 +783,7 @@ def _adapt_volume(args, foliage, stats):
         )
         if len(selected) < capacity:
             all_eligible = torch.nonzero(
-                canonical_eligible | dynamic_eligible,
+                all_eligible_mask,
                 as_tuple=False,
             ).flatten()
             remaining_mask = ~torch.isin(all_eligible, selected)
@@ -734,7 +800,9 @@ def _adapt_volume(args, foliage, stats):
         if len(selected) > capacity:
             score = gradient[selected] * residual[selected]
             selected = selected[torch.topk(score, capacity).indices]
-        split_event = foliage.split(selected)
+        split_event = foliage.split(
+            selected, allow_static_skeleton=True
+        )
         split_parents = int(split_event["split_parents"])
         children = int(split_event["children"])
         final_to_kept = split_event["_new_to_old"]
@@ -746,6 +814,8 @@ def _adapt_volume(args, foliage, stats):
         "split_parents": split_parents,
         "children": children,
         "pruned": pruned,
+        "budget": int(effective_budget),
+        "remaining": int(max(effective_budget - len(foliage), 0)),
         "role_split_parents": role_split_counts,
         "_new_to_old": final_to_old if mutated else None,
     }
@@ -823,12 +893,29 @@ def _geometry_losses(
         has_chart = torch.zeros_like(rigid, dtype=torch.bool)
         has_mono = torch.zeros_like(rigid, dtype=torch.bool)
     # Exactly one dense metric source owns each pixel: plane beats Chart,
-    # Chart beats calibrated mono. Raw Chart depth is a fallback only when no
-    # fused inverse-depth source is available.
+    # Chart beats calibrated mono.  When the versioned fused cache exists it
+    # is the only Chart-derived metric target.  A per-pixel fallback to the
+    # separately resampled atlas creates a boundary-only second target whose
+    # validity interpolation does not match rho validity.
     plane_owner = has_plane
     chart_owner = has_chart & ~plane_owner
     mono_owner = has_mono & ~plane_owner & ~chart_owner
     fused_available = source_bits is not None and "rho_mean" in evidence
+    inverse_valid = torch.zeros_like(rigid, dtype=torch.bool)
+    inverse_support = torch.zeros_like(rigid)
+    if fused_available:
+        raw_rho = evidence["rho_mean"][0]
+        raw_variance = evidence["rho_variance"][0]
+        inverse_support = (
+            evidence["support_view_count"][0] >= 1
+        ).to(rigid.dtype)
+        inverse_valid = (
+            torch.isfinite(raw_rho)
+            & (raw_rho > 0)
+            & torch.isfinite(raw_variance)
+            & (raw_variance > 0)
+            & (inverse_support > 0)
+        )
     if "chart_depth" in evidence:
         raw_target = evidence["chart_depth"][0]
         valid_target = torch.isfinite(raw_target) & (raw_target > 0)
@@ -841,8 +928,13 @@ def _geometry_losses(
             * valid_prediction
             * valid_target.float()
         )
-        if fused_available:
-            weight = weight * (~(plane_owner | chart_owner)).float()
+        if source_bits is not None:
+            chart_fallback = (
+                chart_owner
+                if not fused_available
+                else torch.zeros_like(chart_owner)
+            )
+            weight = weight * chart_fallback.float()
         relative = (
             safe_predicted_depth - target
         ).abs() / target.clamp_min(0.1)
@@ -921,10 +1013,9 @@ def _geometry_losses(
             raw_variance.clamp_min(1e-6),
             torch.ones_like(raw_variance),
         )
-        support = (evidence["support_view_count"][0] >= 2).float()
         weight = (
             geometry_weight
-            * support
+            * inverse_support
             * valid_prediction
             * valid_target.float()
         )
@@ -985,9 +1076,20 @@ def _geometry_losses(
         + args.normal_weight * losses["normal"]
         + args.ordinal_weight * losses["ordinal"]
     )
-    return total, {
+    values = {
         name: float(value.detach()) for name, value in losses.items()
     }
+    values.update(
+        {
+            "plane_pixels": int(plane_owner.sum()),
+            "chart_pixels": int(chart_owner.sum()),
+            "inverse_pixels": int((chart_owner & inverse_valid).sum()),
+            "raw_chart_fallback_pixels": int(
+                chart_owner.sum() if not fused_available else 0
+            ),
+        }
+    )
+    return total, values
 
 
 def _replacement_stats(count: int, device) -> dict[str, torch.Tensor]:
@@ -1015,6 +1117,7 @@ def _replacement_audit(
     task,
     target,
     prediction,
+    sky_color,
     package,
     stats,
     sequence_bits,
@@ -1065,7 +1168,12 @@ def _replacement_audit(
         * posterior_valid
     ).clamp(0, 1)
     full_error = (prediction - target).abs().mean(0)
-    volume_error = (volume_only.render - target).abs().mean(0)
+    volume_only_prediction = composite_white_background(
+        volume_only.render, volume_only.alpha, sky_color
+    )
+    volume_error = (
+        volume_only_prediction - target
+    ).abs().mean(0)
     improvement = torch.sigmoid(
         (full_error - volume_error) / 0.02
     )
@@ -1089,6 +1197,7 @@ def _replacement_audit(
         return {"observed": 0, "newly_retired": 0}
     surface = audit[: package.structural_count]
     observed = surface[:, 0] > 0.02
+    observed = observed & ~stats["retired"]
     stats["evidence"] += surface[:, 1:5]
     stats["weight"] += surface[:, 0]
     stats["observations"][observed] += 1
@@ -1111,15 +1220,18 @@ def _replacement_audit(
         & (stats["observations"] >= 3)
         & (sequence_count >= 2)
         & ~stats["retired"]
+        & ~structural._protected_flag
     )
     # Per-candidate replace-and-retire: a candidate is attenuated only after
     # its own cross-sequence ray/depth and RGB counterfactual proof passes.
-    structural._opacity[eligible] -= 0.45
     newly = int(eligible.sum())
-    stats["retired"] |= eligible & (
-        structural.get_opacity.reshape(-1) < 0.02
-    )
-    return {"observed": int(observed.sum()), "newly_retired": newly}
+    structural._opacity[eligible] = -12.0
+    stats["retired"] |= eligible
+    return {
+        "observed": int(observed.sum()),
+        "newly_retired": newly,
+        "retired_total": int(stats["retired"].sum()),
+    }
 
 
 @torch.no_grad()
@@ -1288,6 +1400,18 @@ def main():
             f"{len(surface.get_xyz)} > {args.maximum_surface_gaussians}. "
             "Use a clean pre-topology checkpoint or compact it before resume."
         )
+    surface_budget = min(
+        int(args.maximum_surface_gaussians),
+        max(
+            len(surface.get_xyz),
+            int(
+                np.ceil(
+                    float(surface_audit["surface_count"])
+                    * float(args.maximum_surface_growth_multiplier)
+                )
+            ),
+        ),
+    )
 
     foliage = VolumetricFoliageModel(
         dataset.sh_degree, dynamic_rank=args.dynamic_rank
@@ -1312,6 +1436,19 @@ def main():
     else:
         foliage.restore(resume["foliage"])
         dynamic_seed_count = int(resume["dynamic_seed_count"])
+    initial_volume_count = int(seed_payload["centers"].shape[0])
+    volume_budget = min(
+        int(args.maximum_volume_gaussians),
+        max(
+            len(foliage),
+            int(
+                np.ceil(
+                    initial_volume_count
+                    * float(args.maximum_volume_growth_multiplier)
+                )
+            ),
+        ),
+    )
 
     semantic_contract = Path(evidence_store["semantic_contract"])
     semantic_payload = json.loads(
@@ -1328,6 +1465,7 @@ def main():
         [view.image_name for view in views],
         rank=args.dynamic_rank,
         spatial_grid_size=24,
+        maximum_rgb_residual=args.appearance_maximum_rgb_residual,
         device="cuda",
     )
     sky = CanonicalDirectionalSky(degree=2).cuda()
@@ -1347,11 +1485,31 @@ def main():
         Path(str(view.image_name)).stem: index
         for index, view in enumerate(views)
     }
-    geometry_indices = [
+    metric_geometry_indices = [
         by_stem[stem]
-        for stem in geometry.geometry_view_stems
+        for stem in geometry.metric_view_stems
         if stem in by_stem
     ]
+    ordinal_geometry_indices = [
+        by_stem[stem]
+        for stem in geometry.ordinal_view_stems
+        if stem in by_stem
+    ]
+    if metric_geometry_indices and ordinal_geometry_indices:
+        metric_repeat = int(
+            np.ceil(
+                len(ordinal_geometry_indices)
+                / len(metric_geometry_indices)
+            )
+        )
+        geometry_indices = (
+            metric_geometry_indices * metric_repeat
+            + ordinal_geometry_indices
+        )
+    else:
+        geometry_indices = (
+            metric_geometry_indices or ordinal_geometry_indices
+        )
     geometry_schedule = _cycle_schedule(
         geometry_indices, args.iterations, args.seed + 2
     )
@@ -1459,12 +1617,12 @@ def main():
         resume_budget = resume.get("maximum_surface_gaussians")
         if (
             resume_budget is not None
-            and int(resume_budget) != args.maximum_surface_gaussians
+            and int(resume_budget) != surface_budget
         ):
             raise RuntimeError(
                 "Resume surface budget changed: "
                 f"{resume_budget} != "
-                f"{args.maximum_surface_gaussians}"
+                f"{surface_budget}"
             )
         resume_growth = resume.get(
             "maximum_surface_growth_per_event"
@@ -1478,6 +1636,28 @@ def main():
                 "Resume per-event surface budget changed: "
                 f"{resume_growth} != "
                 f"{args.maximum_surface_growth_per_event}"
+            )
+        resume_volume_budget = resume.get("maximum_volume_gaussians")
+        if (
+            resume_volume_budget is not None
+            and int(resume_volume_budget) != volume_budget
+        ):
+            raise RuntimeError(
+                "Resume volume budget changed: "
+                f"{resume_volume_budget} != {volume_budget}"
+            )
+        resume_volume_growth = resume.get(
+            "maximum_volume_splits_per_event"
+        )
+        if (
+            resume_volume_growth is not None
+            and int(resume_volume_growth)
+            != args.maximum_volume_splits
+        ):
+            raise RuntimeError(
+                "Resume per-event volume budget changed: "
+                f"{resume_volume_growth} != "
+                f"{args.maximum_volume_splits}"
             )
 
     background = torch.ones(3, device="cuda")
@@ -1598,7 +1778,7 @@ def main():
         canonical_weight = canonical_weight * (
             task["p_rigid"]
             + task["p_sky"]
-            + 0.25 * task["p_canopy"]
+            + 0.50 * task["p_canopy"]
         ).clamp(0, 1)
         static_confidence_mean = canonical_weight.new_tensor(1.0)
         if dynamic_active:
@@ -1613,7 +1793,7 @@ def main():
             ).detach()
             canopy_confidence = (
                 0.10 / (sigma[0] + 0.05)
-            ).clamp(0.15, 1.0)
+            ).clamp(0.35, 1.0)
             sky_confidence = (
                 0.10 / (sigma[1] + 0.05)
             ).clamp(0.25, 1.0)
@@ -1749,7 +1929,8 @@ def main():
         conditioned_loss = canonical_loss.new_zeros(())
         uncertainty_loss = canonical_loss.new_zeros(())
         high_frequency_loss = canonical_loss.new_zeros(())
-        if dynamic_active and phase != "canonical_polish":
+        conditioned_ownership = canonical_loss.new_zeros(())
+        if dynamic_active:
             conditioned_package = render_hybrid(
                 view,
                 surface,
@@ -1774,6 +1955,19 @@ def main():
             conditioned = appearance(
                 conditioned_base, view, task
             )
+            conditioned_ownership = (
+                _weighted_mean(
+                    conditioned_package.volume_alpha,
+                    task["p_rigid"]
+                    * (1.0 - task["p_boundary_uncertain"]),
+                )
+                + _weighted_mean(
+                    conditioned_package.surface_alpha
+                    + conditioned_package.volume_alpha,
+                    task["p_sky"]
+                    * (1.0 - task["p_boundary_uncertain"]),
+                )
+            )
             conditioned_photo = _photo_loss(
                 conditioned,
                 target,
@@ -1791,7 +1985,7 @@ def main():
                 image_name=view.image_name,
             )
             high_frequency_loss = _high_frequency_loss(
-                conditioned,
+                conditioned_base,
                 target,
                 task["p_canopy_core"]
                 * (1.0 - task["p_transient"])
@@ -1808,6 +2002,8 @@ def main():
                 args.dynamic_weight * conditioned_photo
                 + args.appearance_weight * uncertainty_loss
                 + args.high_frequency_weight * high_frequency_loss
+                + args.conditioned_ownership_weight
+                * conditioned_ownership
                 + 1e-3 * appearance.regularization()
                 + 0.02 * dynamic_regularization
             )
@@ -1828,6 +2024,9 @@ def main():
             "track_matched": 0,
             "structure": 0.0,
             "structure_matched": 0,
+            "plane_pixels": 0,
+            "chart_pixels": 0,
+            "inverse_pixels": 0,
         }
         if (
             args.geometry_every > 0
@@ -1870,6 +2069,28 @@ def main():
                     geometry_weight=geometry_task["w_geometry"],
                     plane_task_weight=geometry_task["w_plane"],
                 )
+                if (
+                    geometry_values["chart_pixels"] > 0
+                    and geometry_values["inverse_pixels"] <= 0
+                ):
+                    raise RuntimeError(
+                        "Chart owner has zero effective inverse-depth pixels "
+                        f"for {geometry_view.image_name}"
+                    )
+                if (
+                    geometry_values["chart_pixels"] > 0
+                    and (
+                        geometry_values["inverse_pixels"]
+                        / geometry_values["chart_pixels"]
+                    )
+                    < 0.95
+                ):
+                    raise RuntimeError(
+                        "Effective inverse-depth coverage fell below 95% "
+                        f"after resizing for {geometry_view.image_name}: "
+                        f"{geometry_values['inverse_pixels']}/"
+                        f"{geometry_values['chart_pixels']}"
+                    )
                 del geometry_package
             track_loss, track_audit = geometry.track_factor(surface)
             structure_loss, structure_audit = geometry.structure_factor(
@@ -1892,7 +2113,7 @@ def main():
             phase_floor = (
                 1.0
                 if phase in {"canonical_bootstrap", "topology"}
-                else 0.35
+                else 0.65
             )
             geometry_loss = phase_floor * geometry_loss
             if geometry_loss.requires_grad:
@@ -1989,6 +2210,7 @@ def main():
                         task,
                         target,
                         canonical.detach(),
+                        sky(view).detach(),
                         package,
                         replacement_stats,
                         sequence_bits,
@@ -2023,6 +2245,22 @@ def main():
             )
             foliage.opacity_logits.clamp_(-10, 2)
             surface._opacity.clamp_(-12, 4)
+            surface_scale_ceiling = surface._scaling.new_tensor(
+                float(args.maximum_surface_scale)
+            ).log()
+            surface._scaling.clamp_(max=surface_scale_ceiling)
+            volume_limit = torch.full(
+                (len(foliage), 1),
+                float(args.maximum_volume_scale),
+                device=foliage.log_scales.device,
+                dtype=foliage.log_scales.dtype,
+            )
+            volume_limit[foliage.dynamic_leaf_mask] = float(
+                args.maximum_dynamic_volume_scale
+            )
+            foliage.log_scales.copy_(
+                torch.minimum(foliage.log_scales, volume_limit.log())
+            )
 
         topology_event = None
         if (
@@ -2037,7 +2275,7 @@ def main():
                     args.opacity_cull,
                     scene.cameras_extent,
                     64,
-                    max_points=args.maximum_surface_gaussians,
+                    max_points=surface_budget,
                     max_growth=args.maximum_surface_growth_per_event,
                 )
                 topology_event = {
@@ -2046,11 +2284,47 @@ def main():
                     "surface_after": len(surface.get_xyz),
                     "surface": surface_event,
                 }
+                current_track_anchors = int(
+                    (surface._track_id >= 0).sum()
+                )
+                current_chart_anchors = int(
+                    (
+                        surface._source_type
+                        == GaussianModel.SOURCE_CHART_RESIDUAL
+                    )
+                    .logical_and(surface._protected_flag)
+                    .sum()
+                )
+                current_protected = int(
+                    surface._protected_flag.sum()
+                )
+                if (
+                    current_track_anchors
+                    < int(surface_audit["track_anchor_count"])
+                    or current_chart_anchors
+                    < int(surface_audit["chart_anchor_count"])
+                    or current_protected
+                    < int(surface_audit["protected_anchor_count"])
+                ):
+                    raise RuntimeError(
+                        "Protected metric anchors were lost during topology: "
+                        f"track={current_track_anchors}/"
+                        f"{surface_audit['track_anchor_count']}, "
+                        f"chart={current_chart_anchors}/"
+                        f"{surface_audit['chart_anchor_count']}, "
+                        f"protected={current_protected}/"
+                        f"{surface_audit['protected_anchor_count']}"
+                    )
             if (
                 (step + 1) % args.volume_densify_every == 0
                 and len(foliage)
             ):
-                event = _adapt_volume(args, foliage, volume_stats)
+                event = _adapt_volume(
+                    args,
+                    foliage,
+                    volume_stats,
+                    volume_budget=volume_budget,
+                )
                 new_to_old = event.pop("_new_to_old", None)
                 if new_to_old is not None:
                     volume_optimizer = _migrate_volume_optimizer(
@@ -2102,10 +2376,27 @@ def main():
                     static_confidence_mean.detach()
                 ),
                 "ownership": float(ownership.detach()),
+                "conditioned_ownership": float(
+                    conditioned_ownership.detach()
+                ),
                 "occupancy": float(occupancy.detach()),
                 "geometry": geometry_values,
                 "gradient_norms": gradient_audit,
                 "surface_count": len(surface.get_xyz),
+                "surface_track_anchors": int(
+                    (surface._track_id >= 0).sum()
+                ),
+                "surface_chart_anchors": int(
+                    (
+                        surface._source_type
+                        == GaussianModel.SOURCE_CHART_RESIDUAL
+                    )
+                    .logical_and(surface._protected_flag)
+                    .sum()
+                ),
+                "surface_protected": int(
+                    surface._protected_flag.sum()
+                ),
                 "foliage_count": len(foliage),
                 "static_skeleton": int(
                     foliage.static_skeleton_mask.sum()
@@ -2141,11 +2432,13 @@ def main():
                     "phase_schedule": TRAINING_PROFILES[
                         args.training_profile
                     ]["phases"],
-                    "maximum_surface_gaussians": (
-                        args.maximum_surface_gaussians
-                    ),
+                    "maximum_surface_gaussians": surface_budget,
                     "maximum_surface_growth_per_event": (
                         args.maximum_surface_growth_per_event
+                    ),
+                    "maximum_volume_gaussians": volume_budget,
+                    "maximum_volume_splits_per_event": (
+                        args.maximum_volume_splits
                     ),
                     "evidence_hash": evidence_store["evidence_hash"],
                     "schedule_hash": schedule_hash,
@@ -2186,6 +2479,57 @@ def main():
         if topology_event is not None:
             torch.cuda.empty_cache()
 
+    # Export is a geometric model, not an optimizer graveyard. Physically
+    # remove proven replacements and unprotected transparent descendants so
+    # downstream point-cloud tools do not expose retired floaters as vertices.
+    with torch.no_grad():
+        final_remove = (
+            surface.get_opacity.reshape(-1) < float(args.opacity_cull)
+        ) & ~surface._protected_flag
+        retired_before_compaction = 0
+        if replacement_stats is not None:
+            retired_before_compaction = int(
+                replacement_stats["retired"].sum()
+            )
+            final_remove |= replacement_stats["retired"]
+        final_cleanup = {
+            "before": len(surface.get_xyz),
+            "retired": retired_before_compaction,
+            "transparent_unprotected": int(final_remove.sum()),
+        }
+        if bool(final_remove.any()):
+            surface.prune_points(final_remove)
+        final_cleanup["after"] = len(surface.get_xyz)
+        final_cleanup["removed"] = (
+            final_cleanup["before"] - final_cleanup["after"]
+        )
+        final_scale = surface.get_scaling.max(dim=1).values
+        final_surface_health = {
+            "count": len(surface.get_xyz),
+            "track_anchors": int((surface._track_id >= 0).sum()),
+            "chart_anchors": int(
+                (
+                    surface._source_type
+                    == GaussianModel.SOURCE_CHART_RESIDUAL
+                )
+                .logical_and(surface._protected_flag)
+                .sum()
+            ),
+            "protected": int(surface._protected_flag.sum()),
+            "unprotected": int((~surface._protected_flag).sum()),
+            "maximum_scale": (
+                float(final_scale.max()) if len(final_scale) else 0.0
+            ),
+            "scale_over_half_meter": int(
+                (final_scale > 0.5).sum()
+            ),
+            "minimum_opacity": (
+                float(surface.get_opacity.min())
+                if len(surface.get_xyz)
+                else 0.0
+            ),
+        }
+
     teacher_state = output / "hybrid_teacher_state.pth"
     torch.save(
         {
@@ -2195,11 +2539,13 @@ def main():
             "phase_schedule": TRAINING_PROFILES[
                 args.training_profile
             ]["phases"],
-            "maximum_surface_gaussians": (
-                args.maximum_surface_gaussians
-            ),
+            "maximum_surface_gaussians": surface_budget,
             "maximum_surface_growth_per_event": (
                 args.maximum_surface_growth_per_event
+            ),
+            "maximum_volume_gaussians": volume_budget,
+            "maximum_volume_splits_per_event": (
+                args.maximum_volume_splits
             ),
             "evidence_hash": evidence_store["evidence_hash"],
             "runtime_provenance": runtime_provenance,
@@ -2212,6 +2558,8 @@ def main():
             "appearance": appearance.capture(),
             "topology_events": topology_events,
             "replacement_events": replacement_events,
+            "final_cleanup": final_cleanup,
+            "final_surface_health": final_surface_health,
         },
         teacher_state,
     )
@@ -2240,10 +2588,12 @@ def main():
         "phase_schedule": TRAINING_PROFILES[
             args.training_profile
         ]["phases"],
-        "maximum_surface_gaussians": args.maximum_surface_gaussians,
+        "maximum_surface_gaussians": surface_budget,
         "maximum_surface_growth_per_event": (
             args.maximum_surface_growth_per_event
         ),
+        "maximum_volume_gaussians": volume_budget,
+        "maximum_volume_splits_per_event": args.maximum_volume_splits,
         "evidence_hash": evidence_store["evidence_hash"],
         "teacher_state": str(teacher_state),
         "authoritative_final_model": "native_hybrid_teacher",
@@ -2271,11 +2621,13 @@ def main():
         "runtime_provenance": runtime_provenance,
         "topology_events": topology_events,
         "replacement_events": replacement_events,
+        "final_cleanup": final_cleanup,
+        "final_surface_health": final_surface_health,
         "targeted_evaluation": evaluation,
         "historical_parent_ply_used": False,
         "colmap_points_or_tracks_used": False,
         "all_real_rgb_from_iteration_one": True,
-        "canopy_structural_topology_gradient": False,
+        "canopy_structural_topology_gradient": True,
         "elapsed_sec": time.time() - started,
     }
     (output / "result.json").write_text(

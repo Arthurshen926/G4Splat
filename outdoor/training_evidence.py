@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from outdoor.evidence_store import artifact_path, load_evidence_store
+from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION
 
 
 class OutdoorGeometryEvidence:
@@ -81,6 +83,23 @@ class OutdoorGeometryEvidence:
         self.inverse_root = (
             inverse_marker.parent if inverse_marker is not None else None
         )
+        self.inverse_manifest = None
+        inverse_manifest_path = artifact_path(
+            self.store, "inverse_depth_manifest", required=False
+        )
+        if inverse_manifest_path is not None:
+            self.inverse_manifest = json.loads(
+                inverse_manifest_path.read_text(encoding="utf-8")
+            )
+            version = self.inverse_manifest.get("schema_version")
+            if version != INVERSE_DEPTH_FUSION_VERSION:
+                raise RuntimeError(
+                    "Refusing a mixed/unknown-unit inverse-depth cache: "
+                    f"{version!r}; expected {INVERSE_DEPTH_FUSION_VERSION!r}. "
+                    "Rebuild the hybrid Teacher evidence store."
+                )
+        self._verify_array_index("plane_array_index")
+        self._verify_array_index("inverse_depth_array_index")
         dav2_index_path = artifact_path(
             self.store, "dav2_index", required=False
         )
@@ -136,6 +155,142 @@ class OutdoorGeometryEvidence:
             "dav2": 0,
             "track_factor": 0,
             "structure_factor": 0,
+        }
+        self.preflight = self._metric_preflight()
+
+    def _verify_array_index(self, artifact_name: str) -> None:
+        index_path = artifact_path(
+            self.store, artifact_name, required=False
+        )
+        if index_path is None:
+            raise RuntimeError(
+                f"Evidence store is missing {artifact_name}; rebuild it"
+            )
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        records = payload.get("records", [])
+        if not records:
+            raise RuntimeError(f"{artifact_name} has no records")
+        for record in records:
+            path = Path(record["path"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != int(record["bytes"])
+            ):
+                raise RuntimeError(
+                    f"Geometry array changed or disappeared: {path}"
+                )
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+            if digest.hexdigest() != record["sha256"]:
+                raise RuntimeError(
+                    f"Geometry array hash mismatch: {path}"
+                )
+
+    def _metric_preflight(self) -> dict:
+        """Prove source units and non-empty owner support before optimization."""
+        if self.chart is None or self.inverse_root is None:
+            raise RuntimeError(
+                "Hybrid Teacher requires Chart and world-metric inverse depth"
+            )
+        chart_owner_pixels = 0
+        chart_effective_pixels = 0
+        plane_owner_pixels = 0
+        plane_chart_ratios: list[float] = []
+        frame_count = int(self.chart["depth"].shape[0])
+        for frame in range(frame_count):
+            inverse = self.inverse_root
+            source_path = inverse / f"source_bitmask_frame{frame:06d}.npy"
+            support_path = inverse / f"support_view_count_frame{frame:06d}.npy"
+            rho_path = inverse / f"rho_mean_frame{frame:06d}.npy"
+            variance_path = inverse / f"rho_variance_frame{frame:06d}.npy"
+            if not all(
+                path.is_file()
+                for path in (
+                    source_path,
+                    support_path,
+                    rho_path,
+                    variance_path,
+                )
+            ):
+                raise FileNotFoundError(
+                    f"Incomplete inverse-depth frame {frame:06d}"
+                )
+            source = np.load(source_path).astype(np.uint8, copy=False)
+            support = np.load(support_path)
+            rho = np.load(rho_path)
+            variance = np.load(variance_path)
+            plane_owner = (source & 1) != 0
+            chart_owner = ((source & 2) != 0) & ~plane_owner
+            valid_inverse = (
+                np.isfinite(rho)
+                & (rho > 0)
+                & np.isfinite(variance)
+                & (variance > 0)
+            )
+            chart_owner_pixels += int(chart_owner.sum())
+            chart_effective_pixels += int(
+                (chart_owner & (support >= 1) & valid_inverse).sum()
+            )
+            plane_owner_pixels += int(plane_owner.sum())
+
+            plane_path = (
+                self.plane_root
+                / f"plane_depth_frame{frame:06d}.npy"
+                if self.plane_root is not None
+                else None
+            )
+            if (
+                plane_path is not None
+                and plane_path.is_file()
+                and bool(plane_owner.any())
+                and self.chart["active"][frame]
+            ):
+                plane = np.load(plane_path).astype(np.float32, copy=False)
+                chart = self.chart["depth"][frame]
+                chart = np.asarray(
+                    Image.fromarray(chart, mode="F").resize(
+                        (source.shape[1], source.shape[0]),
+                        Image.Resampling.BILINEAR,
+                    ),
+                    dtype=np.float32,
+                )
+                valid = (
+                    plane_owner
+                    & np.isfinite(plane)
+                    & (plane > 0)
+                    & np.isfinite(chart)
+                    & (chart > 0)
+                )
+                if bool(valid.any()):
+                    plane_chart_ratios.append(
+                        float(np.median(plane[valid] / chart[valid]))
+                    )
+        if chart_owner_pixels <= 0 or chart_effective_pixels <= 0:
+            raise RuntimeError(
+                "Chart inverse-depth owner has zero effective pixels; "
+                "source support/arbitration is invalid"
+            )
+        ratio = (
+            float(np.median(plane_chart_ratios))
+            if plane_chart_ratios
+            else None
+        )
+        if ratio is not None and not 0.5 <= ratio <= 2.0:
+            raise RuntimeError(
+                "Plane/Chart metric depth scale mismatch: median ratio "
+                f"{ratio:.6g}; expected the same Cambridge camera scale"
+            )
+        return {
+            "frame_count": frame_count,
+            "plane_owner_pixels": plane_owner_pixels,
+            "chart_owner_pixels": chart_owner_pixels,
+            "chart_effective_inverse_pixels": chart_effective_pixels,
+            "chart_effective_fraction": (
+                chart_effective_pixels / chart_owner_pixels
+            ),
+            "plane_chart_depth_ratio_median": ratio,
         }
 
     def track_factor(
@@ -210,13 +365,19 @@ class OutdoorGeometryEvidence:
                 for name, value in self.structure.items()
             }
         structure = self._structure_device_cache[key]
-        # Surface initialization is rigid-only by contract, including
-        # chart-bound source_type=2 surfels.
-        rigid = torch.arange(len(surface.get_xyz), device=device)
-        if len(rigid) > maximum_points:
-            stride = int(np.ceil(len(rigid) / maximum_points))
-            rigid = rigid[::stride][:maximum_points]
-        points = surface.get_xyz[rigid]
+        # Structural units come from the MAtCha/Chart atlas and own only its
+        # residual seeds (source_type=2). MASt3R track anchors already have a
+        # covariance-aware track factor; applying both factors to them is an
+        # ownership conflict.
+        owned = torch.nonzero(
+            surface._source_type == 2, as_tuple=False
+        ).flatten()
+        if not len(owned):
+            return zero, {"matched": 0, "blocks": 0}
+        if len(owned) > maximum_points:
+            stride = int(np.ceil(len(owned) / maximum_points))
+            owned = owned[::stride][:maximum_points]
+        points = surface.get_xyz[owned]
         # 2k x 2.2k is bounded and keeps the selected unit differentiable
         # with respect to the surfel position.
         distance = torch.cdist(points, structure["centers"])
@@ -244,6 +405,14 @@ class OutdoorGeometryEvidence:
         return tuple(
             sorted(set(self.frame_by_stem) | set(self.dav2_records))
         )
+
+    @property
+    def metric_view_stems(self) -> tuple[str, ...]:
+        return tuple(sorted(self.frame_by_stem))
+
+    @property
+    def ordinal_view_stems(self) -> tuple[str, ...]:
+        return tuple(sorted(self.dav2_records))
 
     @staticmethod
     def _load_monocular_depth(path: Path) -> np.ndarray:
@@ -347,7 +516,6 @@ class OutdoorGeometryEvidence:
             )
             if plane_depth.is_file() and plane_confidence.is_file():
                 depth = np.load(plane_depth)
-                depth = depth / self.chart_scale_factor
                 confidence = np.load(plane_confidence)
                 valid = (
                     np.isfinite(depth)
@@ -400,14 +568,6 @@ class OutdoorGeometryEvidence:
                         else "bilinear"
                     )
                     value = np.load(path)
-                    if name == "rho_mean":
-                        value = value * self.chart_scale_factor
-                    elif name == "rho_variance":
-                        value = (
-                            value
-                            * self.chart_scale_factor
-                            * self.chart_scale_factor
-                        )
                     result[name] = self._tensor(
                         value,
                         device=device,
@@ -435,5 +595,12 @@ class OutdoorGeometryEvidence:
             "chart_to_cambridge_world_scale": float(
                 1.0 / self.chart_scale_factor
             ),
+            "metric_depth_coordinate_frame": "cambridge_fixed_camera_depth",
+            "inverse_depth_schema": (
+                None
+                if self.inverse_manifest is None
+                else self.inverse_manifest.get("schema_version")
+            ),
+            "metric_preflight": dict(self.preflight),
             "all_metric_depth_factors_use_cambridge_world_scale": True,
         }

@@ -103,6 +103,48 @@ def test_teacher_prunes_then_splits_and_migrates_adam_state():
     assert not torch.equal(before, model.xyz)
 
 
+def test_teacher_can_split_static_skeleton_and_canonical_crown():
+    model = _model(4)
+    model.layer_role.copy_(
+        torch.tensor([1, 0, 0, 2], dtype=torch.int8)
+    )
+    appearance = torch.nn.Linear(1, 1)
+    sky = torch.nn.Linear(1, 1)
+    args = SimpleNamespace(
+        volume_position_lr=1e-3,
+        volume_feature_lr=1e-3,
+        volume_opacity_lr=1e-3,
+        volume_scale_lr=1e-3,
+        volume_rotation_lr=1e-3,
+        dynamic_lr=1e-3,
+        appearance_lr=1e-3,
+        sky_lr=1e-3,
+        maximum_volume_splits=4,
+        maximum_volume_gaussians=16,
+        volume_split_radius=3.0,
+    )
+    event = _adapt_volume(args, model, _stats(4))
+    assert event["role_split_parents"]["static_skeleton"] == 1
+    assert event["role_split_parents"]["canonical_crown"] > 0
+    assert int(model.static_skeleton_mask.sum()) == 2
+
+
+def test_teacher_volume_budget_caps_net_growth():
+    model = _model(4)
+    args = SimpleNamespace(
+        maximum_volume_splits=10,
+        maximum_volume_gaussians=100,
+        volume_split_radius=3.0,
+    )
+    event = _adapt_volume(
+        args, model, _stats(4), volume_budget=5
+    )
+    assert event["split_parents"] == 1
+    assert event["new_count"] == 5
+    assert event["budget"] == 5
+    assert event["remaining"] == 0
+
+
 def test_student_density_control_protects_sky_and_splits_crown():
     model = _model(3)
     model.primitive_role.copy_(

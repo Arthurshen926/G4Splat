@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 
-INVERSE_DEPTH_FUSION_VERSION = "outdoor-inverse-depth-fusion-v2"
+INVERSE_DEPTH_FUSION_VERSION = "outdoor-inverse-depth-fusion-v3-world-metric"
 
 
 def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -183,14 +183,35 @@ def fuse_inverse_depth_directory(
     if not plane_root.is_dir():
         raise FileNotFoundError(plane_root)
     charts = np.load(charts_path)
-    chart_depths = charts["depths"] if "depths" in charts.files else None
+    # Synthetic/unit-level archives historically omitted scale_factor and are
+    # already metric. Production MAtCha archives always provide it.
+    scale_factor = float(
+        charts["scale_factor"] if "scale_factor" in charts.files else 1.0
+    )
+    if not np.isfinite(scale_factor) or scale_factor <= 0:
+        raise RuntimeError(
+            f"Invalid MAtCha chart scale_factor {scale_factor}"
+        )
+    # Plane refinement is emitted in the fixed Cambridge camera/world scale.
+    # MAtCha keeps its atlas depths in the normalized optimization scale.
+    # Convert every optional dense source to Cambridge metric depth *before*
+    # inverse-depth fusion; a mixed-unit rho cache cannot be repaired later.
+    chart_depths = (
+        charts["depths"].astype(np.float32) / scale_factor
+        if "depths" in charts.files
+        else None
+    )
     chart_confs = charts["confs"] if "confs" in charts.files else None
     chart_support_counts = None
     for key in ("support_view_count", "support_view_counts", "chart_support_view_count"):
         if key in charts.files:
             chart_support_counts = charts[key]
             break
-    mono_depths = charts["prior_depths"] if "prior_depths" in charts.files else None
+    mono_depths = (
+        charts["prior_depths"].astype(np.float32) / scale_factor
+        if "prior_depths" in charts.files
+        else None
+    )
     count = int(chart_depths.shape[0]) if chart_depths is not None else 0
     if count <= 0:
         raise RuntimeError("charts_data has no camera-indexed depth tensor")
@@ -268,6 +289,11 @@ def fuse_inverse_depth_directory(
         "plane_root": str(plane_root),
         "source_priority": ["bounded_plane_residual_core", "aligned_chart", "calibrated_mono"],
         "fusion_space": "inverse_depth",
+        "metric_coordinate_frame": "cambridge_fixed_camera_depth",
+        "rho_units": "inverse_cambridge_world_unit",
+        "plane_depth_input_units": "cambridge_fixed_camera_depth",
+        "chart_depth_input_units": "matcha_normalized_camera_depth",
+        "chart_to_cambridge_depth_multiplier": float(1.0 / scale_factor),
         "plane_source_contract": "explicit_residual_plane_depth_mask_confidence_support_v2",
         "support_view_count_contract": "maximum_proven_distinct_camera_support_not_source_family_count",
         "fixed_absolute_depth_limit": None,

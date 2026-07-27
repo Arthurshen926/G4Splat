@@ -132,3 +132,72 @@ def test_geometry_losses_do_not_propagate_invalid_evidence():
     assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
     loss.backward()
     assert torch.isfinite(depth.grad).all()
+
+
+def test_chart_owner_uses_single_support_metric_inverse_depth():
+    depth = torch.full((1, 2, 2), 4.0, requires_grad=True)
+    package = SimpleNamespace(
+        depth=depth,
+        normal_world=torch.zeros(3, 2, 2),
+    )
+    evidence = {
+        "chart_depth": torch.full((1, 2, 2), 2.0),
+        "chart_weight": torch.ones(1, 2, 2),
+        "rho_mean": torch.full((1, 2, 2), 0.5),
+        "rho_variance": torch.full((1, 2, 2), 0.01),
+        "source_bitmask": torch.full(
+            (1, 2, 2), 2, dtype=torch.uint8
+        ),
+        # A calibrated Chart is a valid metric observation even when it has
+        # no second independent camera in the cache.
+        "support_view_count": torch.ones(1, 2, 2),
+    }
+    args = SimpleNamespace(
+        geometry_weight=0.12,
+        plane_weight=0.10,
+        normal_weight=0.04,
+        ordinal_weight=0.015,
+    )
+    loss, values = _geometry_losses(
+        package, evidence, torch.ones(2, 2), args
+    )
+    assert values["chart"] == 0.0
+    assert values["inverse"] > 0.0
+    assert values["chart_pixels"] == 4
+    assert values["inverse_pixels"] == 4
+    assert values["raw_chart_fallback_pixels"] == 0
+    loss.backward()
+    assert depth.grad.abs().sum() > 0
+
+
+def test_fused_cache_drops_invalid_boundary_instead_of_raw_fallback():
+    depth = torch.full((1, 2, 2), 4.0, requires_grad=True)
+    package = SimpleNamespace(
+        depth=depth,
+        normal_world=torch.zeros(3, 2, 2),
+    )
+    evidence = {
+        # If this atlas edge leaked into the loss it would dominate.
+        "chart_depth": torch.full((1, 2, 2), 1e-5),
+        "chart_weight": torch.ones(1, 2, 2),
+        "rho_mean": torch.full((1, 2, 2), 0.5),
+        "rho_variance": torch.full((1, 2, 2), 0.01),
+        "source_bitmask": torch.full(
+            (1, 2, 2), 2, dtype=torch.uint8
+        ),
+        "support_view_count": torch.ones(1, 2, 2),
+    }
+    evidence["rho_mean"][0, 0, 0] = 0
+    args = SimpleNamespace(
+        geometry_weight=0.12,
+        plane_weight=0.10,
+        normal_weight=0.04,
+        ordinal_weight=0.015,
+    )
+    loss, values = _geometry_losses(
+        package, evidence, torch.ones(2, 2), args
+    )
+    assert torch.isfinite(loss)
+    assert values["inverse_pixels"] == 3
+    assert values["chart"] == 0.0
+    assert values["raw_chart_fallback_pixels"] == 0

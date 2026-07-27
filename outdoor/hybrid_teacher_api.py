@@ -25,6 +25,14 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
 from scene import GaussianModel  # noqa: E402
 
 
+SUPPORTED_TEACHER_PROTOCOLS = {
+    "cambridge_native_hybrid_teacher_v2",
+    "cambridge_native_hybrid_teacher_v3_causal_repair",
+    "cambridge_native_hybrid_teacher_v4_causal_repair",
+    "unified_outdoor_mixed_teacher_v1",
+}
+
+
 @dataclass
 class HybridTeacher:
     surface: GaussianModel
@@ -119,10 +127,7 @@ def load_hybrid_teacher(
     except TypeError:
         state = torch.load(Path(state_path), map_location="cpu")
     protocol = str(state.get("protocol", ""))
-    if protocol not in {
-        "cambridge_native_hybrid_teacher_v2",
-        "unified_outdoor_mixed_teacher_v1",
-    }:
+    if protocol not in SUPPORTED_TEACHER_PROTOCOLS:
         raise RuntimeError(f"Unsupported hybrid Teacher protocol {protocol!r}")
     surface = GaussianModel(sh_degree)
     _restore_surface(surface, state["surface"])

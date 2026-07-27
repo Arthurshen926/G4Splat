@@ -16,6 +16,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from outdoor.evidence_store import EvidenceStoreBuilder  # noqa: E402
+from outdoor.inverse_depth import (  # noqa: E402
+    INVERSE_DEPTH_FUSION_VERSION,
+    fuse_inverse_depth_directory,
+)
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
 from outdoor.scene_contract import build_scene_contract  # noqa: E402
 from outdoor.task_semantics import build_task_semantic_manifest  # noqa: E402
@@ -55,6 +59,40 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _write_array_index(
+    destination: Path,
+    *,
+    schema_version: str,
+    roots: list[Path],
+) -> Path:
+    records = []
+    for root in roots:
+        for path in sorted(root.glob("*.npy")):
+            records.append(
+                {
+                    "path": str(path.resolve()),
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256(path),
+                }
+            )
+    if not records:
+        raise RuntimeError(
+            f"No geometry arrays found for {schema_version}"
+        )
+    destination.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "records": records,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
 
 
 def main() -> None:
@@ -268,7 +306,23 @@ def main() -> None:
         "documented_per_unit",
     )
     plane = mast3r / "plane-refine-depths"
-    inverse = mast3r / "inverse_depth_fusion"
+    # Never inherit an opaque frontend rho cache. Rebuild the cache inside the
+    # immutable evidence store from source-specific metric contracts so its
+    # hash proves the exact unit conversion consumed by this Teacher.
+    inverse = output / "metric_inverse_depth"
+    inverse_manifest = fuse_inverse_depth_directory(mast3r, plane, inverse)
+    if inverse_manifest["schema_version"] != INVERSE_DEPTH_FUSION_VERSION:
+        raise RuntimeError("World-metric inverse-depth cache was not produced")
+    plane_index = _write_array_index(
+        output / "plane_array_index.json",
+        schema_version="cambridge-plane-array-index-v1",
+        roots=[plane],
+    )
+    inverse_index = _write_array_index(
+        output / "inverse_depth_array_index.json",
+        schema_version="cambridge-inverse-depth-array-index-v1",
+        roots=[inverse],
+    )
     _optional(
         builder,
         "plane_source_manifest",
@@ -285,23 +339,43 @@ def main() -> None:
         "rho mean/variance/source bits/support cache",
         "per_pixel_rho_variance",
     )
+    builder.add_file(
+        "plane_array_index",
+        "g4_plane_factor_index",
+        plane_index,
+        measurement="content-addressed plane depth/confidence/support arrays",
+        coordinate_frame="cambridge_fixed_camera_depth",
+        covariance="per_plane_source_array",
+        semantic_role="rigid_only",
+        validity="every plane numpy array hashed",
+    )
+    builder.add_file(
+        "inverse_depth_array_index",
+        "source_aware_inverse_depth_index",
+        inverse_index,
+        measurement="content-addressed world-metric inverse-depth arrays",
+        coordinate_frame="inverse_cambridge_fixed_camera_depth",
+        covariance="per_pixel_rho_variance",
+        semantic_role="rigid_only",
+        validity="every inverse-depth numpy array hashed",
+    )
     _optional(
         builder,
         "plane_depth_root_marker",
         "g4_plane_factor",
         plane / "plane_depth_frame000000.npy",
-        "plane frame-array root marker in normalized chart depth",
+        "plane frame-array root marker in Cambridge fixed-camera depth",
         "per_pixel_plane_confidence",
-        coordinate_frame="matcha_normalized_camera_depth",
+        coordinate_frame="cambridge_fixed_camera_depth",
     )
     _optional(
         builder,
         "inverse_depth_root_marker",
         "source_aware_inverse_depth",
         inverse / "rho_mean_frame000000.npy",
-        "inverse-depth frame-array root marker in normalized chart scale",
+        "inverse-depth frame-array root marker in Cambridge metric scale",
         "per_pixel_rho_variance",
-        coordinate_frame="inverse_matcha_normalized_camera_depth",
+        coordinate_frame="inverse_cambridge_fixed_camera_depth",
     )
 
     if args.dav2_root is not None:
