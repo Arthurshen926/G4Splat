@@ -10,7 +10,9 @@ import numpy as np
 from PIL import Image
 
 
-INVERSE_DEPTH_FUSION_VERSION = "outdoor-inverse-depth-fusion-v3-world-metric"
+INVERSE_DEPTH_FUSION_VERSION = (
+    "outdoor-inverse-depth-fusion-v4-crossview-confirmed-world-metric"
+)
 
 
 def _resize_float(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -172,6 +174,8 @@ def fuse_inverse_depth_directory(
     mast3r_scene: Path,
     plane_root: Path,
     output: Path,
+    *,
+    chart_consensus: Path | None = None,
 ) -> dict[str, Any]:
     """Fuse every real Chart depth map and write train-compatible TIFF/PNG maps."""
     mast3r_scene = Path(mast3r_scene).resolve()
@@ -207,6 +211,71 @@ def fuse_inverse_depth_directory(
         if key in charts.files:
             chart_support_counts = charts[key]
             break
+    chart_consensus_contract = None
+    if chart_consensus is not None:
+        chart_consensus = Path(chart_consensus).resolve()
+        with np.load(chart_consensus, allow_pickle=False) as sidecar:
+            required = {
+                "depths",
+                "support_counts",
+                "consistency_weights",
+                "correction_mask",
+                "image_names",
+            }
+            missing = required - set(sidecar.files)
+            if missing:
+                raise RuntimeError(
+                    "Chart consensus lacks required arrays: "
+                    + ", ".join(sorted(missing))
+                )
+            candidate_depths = sidecar["depths"].astype(np.float32)
+            support = sidecar["support_counts"].astype(np.uint8)
+            accepted = sidecar["correction_mask"].astype(bool)
+            consistency = sidecar["consistency_weights"].astype(np.float32)
+            minimum_support = int(
+                sidecar["minimum_consensus_views"].item()
+                if "minimum_consensus_views" in sidecar
+                else 2
+            )
+            consensus_names = [
+                Path(str(value)).stem for value in sidecar["image_names"]
+            ]
+        camera_names = [
+            Path(str(value)).stem
+            for value in json.loads(
+                (mast3r_scene / "cameras.json").read_text(encoding="utf-8")
+            )["filepaths"]
+        ]
+        if consensus_names != camera_names:
+            raise RuntimeError(
+                "Chart consensus camera order does not match Chart atlas"
+            )
+        if chart_depths is None or candidate_depths.shape != chart_depths.shape:
+            raise RuntimeError("Chart consensus depth shape does not match atlas")
+        confirmed = accepted & (support >= minimum_support)
+        chart_depths = candidate_depths / scale_factor
+        base_confidence = (
+            np.asarray(chart_confs, dtype=np.float32)
+            if chart_confs is not None
+            else np.ones_like(chart_depths, dtype=np.float32)
+        )
+        chart_confs = (
+            base_confidence
+            * np.clip(consistency, 0.0, 1.0)
+            * confirmed.astype(np.float32)
+        )
+        chart_support_counts = np.where(
+            confirmed, support, 0
+        ).astype(np.uint8)
+        chart_consensus_contract = {
+            "path": str(chart_consensus),
+            "minimum_consensus_views": minimum_support,
+            "confirmed_pixel_count": int(confirmed.sum()),
+            "contradicted_supported_pixel_count": int(
+                ((support >= minimum_support) & ~accepted).sum()
+            ),
+            "unsupported_chart_pixels_are_metric_targets": False,
+        }
     mono_depths = (
         charts["prior_depths"].astype(np.float32) / scale_factor
         if "prior_depths" in charts.files
@@ -294,6 +363,7 @@ def fuse_inverse_depth_directory(
         "plane_depth_input_units": "cambridge_fixed_camera_depth",
         "chart_depth_input_units": "matcha_normalized_camera_depth",
         "chart_to_cambridge_depth_multiplier": float(1.0 / scale_factor),
+        "chart_crossview_consensus": chart_consensus_contract,
         "plane_source_contract": "explicit_residual_plane_depth_mask_confidence_support_v2",
         "support_view_count_contract": "maximum_proven_distinct_camera_support_not_source_family_count",
         "fixed_absolute_depth_limit": None,

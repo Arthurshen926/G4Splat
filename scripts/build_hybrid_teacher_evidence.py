@@ -102,6 +102,7 @@ def main() -> None:
     parser.add_argument("--tree-mask-pickle", type=Path, required=True)
     parser.add_argument("--mast3r-scene", type=Path, required=True)
     parser.add_argument("--mast3r-tracks", type=Path, required=True)
+    parser.add_argument("--chart-consensus", type=Path, required=True)
     parser.add_argument("--dav2-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replace", action="store_true")
@@ -115,6 +116,7 @@ def main() -> None:
     dataset = args.dataset.expanduser().resolve()
     mast3r = args.mast3r_scene.expanduser().resolve()
     tracks = args.mast3r_tracks.expanduser().resolve()
+    chart_consensus = args.chart_consensus.expanduser().resolve()
     mask = args.mask_pickle.expanduser().resolve()
     tree_mask = args.tree_mask_pickle.expanduser().resolve()
 
@@ -210,6 +212,32 @@ def main() -> None:
         covariance="not_applicable",
         semantic_role="audit",
         validity="passed_true",
+    )
+    builder.add_file(
+        "chart_crossview_consensus",
+        "matcha_crossview_consensus",
+        chart_consensus,
+        measurement=(
+            "camera-indexed consensus depth, independent support, "
+            "per-pixel contradiction and trust"
+        ),
+        coordinate_frame="matcha_normalized_camera_depth",
+        covariance="peer_reprojection_relative_depth_error",
+        semantic_role="rigid_only",
+        validity="minimum_two_independent_chart_views",
+    )
+    consensus_summary = chart_consensus.with_suffix(".json")
+    if not consensus_summary.is_file():
+        raise FileNotFoundError(consensus_summary)
+    builder.add_file(
+        "chart_crossview_consensus_summary",
+        "matcha_crossview_consensus",
+        consensus_summary,
+        measurement="cross-view consensus audit and immutable input hashes",
+        coordinate_frame="metadata",
+        covariance="documented_in_summary",
+        semantic_role="audit",
+        validity="generated_with_consensus_archive",
     )
 
     chart_camera_path = mast3r / "cameras.json"
@@ -310,7 +338,12 @@ def main() -> None:
     # immutable evidence store from source-specific metric contracts so its
     # hash proves the exact unit conversion consumed by this Teacher.
     inverse = output / "metric_inverse_depth"
-    inverse_manifest = fuse_inverse_depth_directory(mast3r, plane, inverse)
+    inverse_manifest = fuse_inverse_depth_directory(
+        mast3r,
+        plane,
+        inverse,
+        chart_consensus=chart_consensus,
+    )
     if inverse_manifest["schema_version"] != INVERSE_DEPTH_FUSION_VERSION:
         raise RuntimeError("World-metric inverse-depth cache was not produced")
     plane_index = _write_array_index(

@@ -41,6 +41,7 @@ sys.path.insert(0, str(SURFEL_ROOT))
 
 from arguments import ModelParams, OptimizationParams, PipelineParams  # noqa: E402
 from gaussian_renderer import render  # noqa: E402
+from outdoor.lazy_scene import LazyScene  # noqa: E402
 from scene import GaussianModel, Scene  # noqa: E402
 from scene.colmap_loader import read_extrinsics_binary  # noqa: E402
 from utils.loss_utils import l1_loss, ssim  # noqa: E402
@@ -450,12 +451,14 @@ def _implementation_audit() -> dict:
         REPO_ROOT / "scripts" / "train_standard_full_2dgs.py",
         REPO_ROOT / "matcha" / "cambridge_masks.py",
         REPO_ROOT / "matcha" / "cambridge_training.py",
+        REPO_ROOT / "outdoor" / "lazy_scene.py",
         SURFEL_ROOT / "arguments" / "__init__.py",
         SURFEL_ROOT / "gaussian_renderer" / "__init__.py",
         SURFEL_ROOT / "scene" / "__init__.py",
         SURFEL_ROOT / "scene" / "dataset_readers.py",
         SURFEL_ROOT / "scene" / "gaussian_model.py",
         SURFEL_ROOT / "utils" / "camera_utils.py",
+        SURFEL_ROOT / "utils" / "intrinsics_utils.py",
         SURFEL_ROOT / "utils" / "loss_utils.py",
         SURFEL_ROOT
         / "submodules"
@@ -495,6 +498,123 @@ def _implementation_audit() -> dict:
             "cudnn": torch.backends.cudnn.version(),
         },
     }
+
+
+def _write_rigid_surface_handoff(
+    *,
+    model_path: Path,
+    iteration: int,
+    point_count: int,
+    input_audit: dict,
+    init_ply: Path | None,
+) -> Path:
+    """Write a closed provenance chain for rigid-to-hybrid continuation."""
+    surface_ply = (
+        model_path
+        / "point_cloud"
+        / f"iteration_{int(iteration)}"
+        / "point_cloud.ply"
+    ).resolve()
+    if not surface_ply.is_file():
+        raise FileNotFoundError(
+            f"Final rigid surface PLY was not persisted: {surface_ply}"
+        )
+    input_manifest = (model_path / "input_manifest.json").resolve()
+    camera_contract_path = (
+        model_path / "camera_intrinsics_contract.json"
+    ).resolve()
+    camera_contract = json.loads(
+        camera_contract_path.read_text(encoding="utf-8")
+    )
+    seed_manifest_path = (
+        init_ply.with_suffix(".manifest.json").resolve()
+        if init_ply is not None
+        else None
+    )
+    seed_manifest = (
+        json.loads(seed_manifest_path.read_text(encoding="utf-8"))
+        if seed_manifest_path is not None and seed_manifest_path.is_file()
+        else {}
+    )
+    rejection_reasons = []
+    if not bool(input_audit.get("camera_container_only")):
+        rejection_reasons.append("scene was not opened camera-only")
+    if bool(input_audit.get("colmap_points_or_tracks_used", True)):
+        rejection_reasons.append("COLMAP point/track geometry was used")
+    if input_audit.get("initialization") != "ply_warm_start":
+        rejection_reasons.append("rigid run did not start from an explicit PLY")
+    if (
+        input_audit.get("surface_ownership_contract")
+        != "rigid_pixels_tree_sky_transient_excluded"
+    ):
+        rejection_reasons.append(
+            "surface RGB ownership was not rigid-only/tree-excluded"
+        )
+    if (
+        seed_manifest.get("protocol")
+        != "role-aware-surface-seed-to-native-2dgs-v1"
+    ):
+        rejection_reasons.append(
+            "initial PLY lacks the role-aware MASt3R/MAtCha export contract"
+        )
+    if bool(seed_manifest.get("historical_gaussian_input_used", True)):
+        rejection_reasons.append("historical Gaussian input is not excluded")
+    if bool(seed_manifest.get("colmap_points_or_tracks_used", True)):
+        rejection_reasons.append(
+            "seed export does not exclude COLMAP point/track geometry"
+        )
+    handoff = {
+        "protocol": "native-rigid-surface-handoff-v1",
+        "eligible_for_hybrid_surface_handoff": not rejection_reasons,
+        "rejection_reasons": rejection_reasons,
+        "surface_ply": str(surface_ply),
+        "surface_ply_sha256": _file_digest(surface_ply),
+        "surface_iteration": int(iteration),
+        "surface_point_count": int(point_count),
+        "input_manifest": str(input_manifest),
+        "input_manifest_sha256": _file_digest(input_manifest),
+        "camera_intrinsics_contract": str(camera_contract_path),
+        "camera_intrinsics_contract_sha256": _file_digest(
+            camera_contract_path
+        ),
+        "camera_geometry_sha256": camera_contract[
+            "camera_geometry_sha256"
+        ],
+        "seed_export_manifest": (
+            str(seed_manifest_path)
+            if seed_manifest_path is not None
+            and seed_manifest_path.is_file()
+            else None
+        ),
+        "seed_export_manifest_sha256": (
+            _file_digest(seed_manifest_path)
+            if seed_manifest_path is not None
+            and seed_manifest_path.is_file()
+            else None
+        ),
+        "historical_gaussian_input_used": bool(
+            seed_manifest.get("historical_gaussian_input_used", True)
+        ),
+        "colmap_points_or_tracks_used": bool(
+            input_audit.get("colmap_points_or_tracks_used", True)
+            or seed_manifest.get("colmap_points_or_tracks_used", True)
+        ),
+        "all_real_rgb_from_iteration_one": (
+            input_audit.get("objective")
+            == "all_real_RGB_from_iteration_1"
+        ),
+        "surface_ownership_contract": input_audit.get(
+            "surface_ownership_contract"
+        ),
+        "rgb_source_control_manifest_sha256": input_audit.get(
+            "source_control_manifest_sha256"
+        ),
+    }
+    destination = model_path / "rigid_surface_handoff.json"
+    destination.write_text(
+        json.dumps(handoff, indent=2) + "\n", encoding="utf-8"
+    )
+    return destination
 
 
 def _scene_input_ply_audit(model_path: Path) -> dict:
@@ -752,6 +872,35 @@ def _ulfloc_masks(
     )
 
 
+def _rigid_tree_excluded_mask(
+    lookup: CambridgeMaskLookup,
+    image_name: str,
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return pixels owned exclusively by the native rigid surface.
+
+    Cambridge's first three protocol channels do not classify a static tree
+    as invalid.  A model trained with only those channels is a strong standard
+    2DGS baseline, but it is not a rigid-only scaffold for a later 3D foliage
+    owner.  The fourth channel in ``masks_with_tree.pkl`` is true outside tree
+    pixels; intersecting all four channels makes surface ownership explicit
+    from iteration one.
+    """
+    source_name = lookup.source_name_for(image_name)
+    masks = lookup.masks[source_name]
+    if len(masks) < 4:
+        raise RuntimeError(
+            "rigid_tree_excluded supervision requires object/sky/distortion/"
+            f"tree channels [0,1,2,3], but {source_name} has {len(masks)}"
+        )
+    keep = [
+        tensor_to_resized_mask(masks[index], shape, device)
+        for index in (0, 1, 2, 3)
+    ]
+    return keep[0] & keep[1] & keep[2] & keep[3]
+
+
 def _mask_resolution_audit(
     lookup: CambridgeMaskLookup,
     views: list,
@@ -851,9 +1000,14 @@ def _evaluate(
             mse = torch.mean((image - target).square()).item()
             per_view[view.image_name] = {"psnr": _psnr(image, target), "mse": mse}
             total_mse += mse
-            if not evaluate_all or view.image_name in target_stems:
-                _save_image(image, renders_dir / f"{view.image_name}.png")
-                _save_image(target, gt_dir / f"{view.image_name}.png")
+            # ``selected`` already is the exact requested population: all
+            # cameras for ``--evaluate-all`` and only the named diagnostics
+            # otherwise.  The former inverted condition saved no full-view
+            # renders when the diagnostic list was empty, leaving scalar
+            # PSNR without the image corpus required by strict region/SSIM/
+            # MAE evaluation.  Persist every selected pair.
+            _save_image(image, renders_dir / f"{view.image_name}.png")
+            _save_image(target, gt_dir / f"{view.image_name}.png")
     return {
         "evaluated_views": len(selected),
         "mean_mse": total_mse / len(selected),
@@ -919,6 +1073,15 @@ def _parse_args() -> tuple[argparse.Namespace, object, object, object]:
             "Optional all-real 2DGS warm start. The PLY parameters are loaded "
             "before training; optimizer and densification statistics are "
             "intentionally reinitialized, matching a refinement-stage handoff."
+        ),
+    )
+    parser.add_argument(
+        "--camera-only-scene",
+        action="store_true",
+        help=(
+            "Load fixed COLMAP cameras and RGB only, without opening or "
+            "copying points3D. This requires --init-ply and is the no-COLMAP-"
+            "geometry rigid-first path."
         ),
     )
     parser.add_argument(
@@ -999,14 +1162,22 @@ def _parse_args() -> tuple[argparse.Namespace, object, object, object]:
     )
     parser.add_argument(
         "--supervision-profile",
-        choices=("rgb", "ulfloc_masked", "g4_hard_masked", "g4_static_hybrid"),
+        choices=(
+            "rgb",
+            "ulfloc_masked",
+            "g4_hard_masked",
+            "g4_static_hybrid",
+            "rigid_tree_excluded",
+        ),
         default="rgb",
         help=(
             "rgb is a pure real-RGB control; ulfloc_masked exactly reproduces "
             "ULF-Loc's object/distortion/sky operation order after any needed "
             "mask resizing; g4_hard_masked "
             "reproduces G4's hard [0,1,2] masked RGB objective without Charts; "
-            "g4_static_hybrid mixes the RGB and hard-static objectives."
+            "g4_static_hybrid mixes the RGB and hard-static objectives; "
+            "rigid_tree_excluded requires a four-channel tree pickle and "
+            "trains only object/sky/distortion/tree-valid rigid pixels."
         ),
     )
     parser.add_argument(
@@ -1079,6 +1250,8 @@ def _parse_args() -> tuple[argparse.Namespace, object, object, object]:
         parser.error("--iterations must be positive")
     if args.resume_training_state is not None and args.init_ply is not None:
         parser.error("--resume-training-state and --init-ply are mutually exclusive")
+    if args.camera_only_scene and args.init_ply is None:
+        parser.error("--camera-only-scene requires --init-ply")
     invalid_state_iterations = [
         iteration
         for iteration in args.state_checkpoint_iterations
@@ -1150,13 +1323,30 @@ def main() -> None:
         torch.backends.cudnn.benchmark = False
 
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, shuffle=False)
+    scene = (
+        LazyScene(
+            dataset,
+            gaussians,
+            image_cache_size=8,
+            image_prefetch_workers=2,
+        )
+        if args.camera_only_scene
+        else Scene(dataset, gaussians, shuffle=False)
+    )
     views = scene.getTrainCameras()
     input_audit = _input_audit(source_path, views)
     train_image_names = [str(view.image_name) for view in views]
     if len(train_image_names) != len(set(train_image_names)):
         raise RuntimeError("Loaded training cameras do not have unique image names")
-    sparse_ply_audit = _scene_input_ply_audit(model_path)
+    sparse_ply_audit = (
+        {
+            "scene_sparse_ply": None,
+            "scene_sparse_ply_sha256": None,
+            "scene_sparse_ply_bytes": 0,
+        }
+        if args.camera_only_scene
+        else _scene_input_ply_audit(model_path)
+    )
     input_audit.update(sparse_ply_audit)
     fixed_camera_schedule = None
     if args.camera_schedule_protocol == "clean_ulfloc_main":
@@ -1227,8 +1417,14 @@ def main() -> None:
             (gaussians.get_xyz.shape[0],),
             device=gaussians.get_xyz.device,
         )
-    effective_init_ply = init_ply or Path(sparse_ply_audit["scene_sparse_ply"])
-    effective_init_ply_digest = init_ply_digest or sparse_ply_audit["scene_sparse_ply_sha256"]
+    effective_init_ply = (
+        init_ply
+        if init_ply is not None
+        else Path(sparse_ply_audit["scene_sparse_ply"])
+    )
+    effective_init_ply_digest = (
+        init_ply_digest or sparse_ply_audit["scene_sparse_ply_sha256"]
+    )
     mask_lookup = None
     mask_dataset_path = None
     mask_resolution_audit = None
@@ -1239,9 +1435,14 @@ def main() -> None:
             else source_path
         )
         mask_indices = (
-            [0, 1, 2]
-            if args.supervision_profile in {"g4_hard_masked", "g4_static_hybrid"}
-            else [0]
+            [0, 1, 2, 3]
+            if args.supervision_profile == "rigid_tree_excluded"
+            else (
+                [0, 1, 2]
+                if args.supervision_profile
+                in {"g4_hard_masked", "g4_static_hybrid"}
+                else [0]
+            )
         )
         mask_lookup = CambridgeMaskLookup(
             mask_dataset_path,
@@ -1281,6 +1482,10 @@ def main() -> None:
         {
             "experiment": "standard_full_view_2dgs",
             "objective": "all_real_RGB_from_iteration_1",
+            "camera_container_only": bool(args.camera_only_scene),
+            "colmap_points_or_tracks_used": not bool(
+                args.camera_only_scene
+            ),
             "initialization": (
                 "training_state_resume"
                 if resume_state_payload is not None
@@ -1310,10 +1515,20 @@ def main() -> None:
                 else (
                     "ulfloc_object_distortion_sky_operation_order_channels_0_1_2"
                     if args.supervision_profile == "ulfloc_masked"
-                    else "g4_hard_and_channels_0_1_2"
+                    else (
+                        "rigid_intersection_channels_0_1_2_3_tree_excluded"
+                        if args.supervision_profile
+                        == "rigid_tree_excluded"
+                        else "g4_hard_and_channels_0_1_2"
+                    )
                 )
             ),
             "supervision_profile": args.supervision_profile,
+            "surface_ownership_contract": (
+                "rigid_pixels_tree_sky_transient_excluded"
+                if args.supervision_profile == "rigid_tree_excluded"
+                else "standard_profile_may_include_static_tree"
+            ),
             "static_loss_mix": (
                 args.static_loss_mix
                 if args.supervision_profile == "g4_static_hybrid"
@@ -1522,6 +1737,20 @@ def main() -> None:
             rgb_l1 = l1_loss(image_for_loss, target_for_loss)
             rgb_loss = (1.0 - opt.lambda_dssim) * rgb_l1 + opt.lambda_dssim * (
                 1.0 - ssim(image_for_loss, target_for_loss)
+            )
+        elif args.supervision_profile == "rigid_tree_excluded":
+            standard_mask = _rigid_tree_excluded_mask(
+                mask_lookup,
+                view.image_name,
+                image.shape[-2:],
+                image.device,
+            )
+            rgb_l1, rgb_loss = compute_rgb_loss(
+                image_for_loss,
+                target,
+                mask=standard_mask,
+                lambda_dssim=opt.lambda_dssim,
+                ssim_fn=ssim,
             )
         elif args.supervision_profile in {"g4_hard_masked", "g4_static_hybrid"}:
             standard_mask = mask_lookup.get_mask(
@@ -1755,7 +1984,18 @@ def main() -> None:
     metrics["input"] = input_audit
     metrics["final_gaussians"] = int(gaussians.get_xyz.shape[0])
     metrics["elapsed_sec"] = time.time() - start
-    (evaluation_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    metrics["rigid_surface_handoff"] = str(
+        _write_rigid_surface_handoff(
+            model_path=model_path,
+            iteration=opt.iterations,
+            point_count=int(gaussians.get_xyz.shape[0]),
+            input_audit=input_audit,
+            init_ply=init_ply,
+        )
+    )
+    (evaluation_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2) + "\n"
+    )
     print(json.dumps(metrics, indent=2))
 
 

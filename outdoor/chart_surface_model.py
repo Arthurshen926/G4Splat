@@ -12,18 +12,23 @@ from outdoor.training_evidence import EvidenceEpochSampler
 
 
 class ChartSurfaceModel:
-    """UV-atlas geometry factor independent of render primitive topology.
+    """Immutable Chart evidence plus a short-lived renderer-seed prior.
 
-    The Gaussian renderer may clone, split, or retire residual primitives.
-    This object keeps the original Chart measurement alive and groups every
-    descendant by its negative evidence id, preventing topology from changing
-    the factor weight.
+    The permanent source-resolution Chart depth factor is evaluated by
+    ``OutdoorGeometryEvidence.chart_native_factor`` and never depends on a
+    Gaussian identity.  This class retains UV/adjacency metadata and supplies
+    only the bootstrap centre/Jacobian prior before renderer witnesses are
+    released for normal local replacement.
     """
 
     def __init__(self, surface_seed: Path, *, seed: int = 3253):
         with np.load(surface_seed, allow_pickle=False) as archive:
             source = archive["source_type"].astype(np.int8)
             selected = source == 2
+            if "persistent_geometry_evidence" in archive:
+                selected &= archive[
+                    "persistent_geometry_evidence"
+                ].astype(bool)
             self.xyz = archive["xyz"][selected].astype(np.float32)
             self.sigma = archive["position_sigma"][selected].astype(np.float32)
             self.footprint = archive["scales"][selected].max(axis=1).astype(
@@ -32,6 +37,15 @@ class ChartSurfaceModel:
             self.evidence_id = archive["track_id"][selected].astype(np.int64)
             self.chart_id = archive["chart_id"][selected].astype(np.int32)
             self.uv = archive["chart_uv"][selected].astype(np.float32)
+            self.coverage_only_seed_count = int(
+                (
+                    (source == 2)
+                    & ~archive.get(
+                        "persistent_geometry_evidence",
+                        np.ones(len(source), dtype=bool),
+                    ).astype(bool)
+                ).sum()
+            )
         if len(self.xyz) and (
             np.any(self.evidence_id >= -1)
             or len(np.unique(self.evidence_id)) != len(self.evidence_id)
@@ -61,6 +75,16 @@ class ChartSurfaceModel:
         self.edge_sampler = EvidenceEpochSampler(
             len(self.edges), seed=seed + 1
         )
+        # ``persistent_geometry_evidence`` is a subset of the renderer seed
+        # rows. Its negative evidence ids consequently contain gaps whenever
+        # an unsupported coverage-only Chart sample lies between two
+        # confirmed samples. Never decode an id as ``-(row + 2)`` after this
+        # filtering: that aliases a confirmed observation to the wrong atlas
+        # row. Keep an explicit sorted id -> compact evidence-row lookup.
+        self.evidence_id_order = np.argsort(self.evidence_id)
+        self.sorted_evidence_id = self.evidence_id[
+            self.evidence_id_order
+        ].copy()
         self._cache = {}
 
     def _device(self, device):
@@ -71,6 +95,12 @@ class ChartSurfaceModel:
                 "sigma": torch.from_numpy(self.sigma).to(device),
                 "footprint": torch.from_numpy(self.footprint).to(device),
                 "evidence_id": torch.from_numpy(self.evidence_id).to(device),
+                "sorted_evidence_id": torch.from_numpy(
+                    self.sorted_evidence_id
+                ).to(device),
+                "evidence_id_order": torch.from_numpy(
+                    self.evidence_id_order
+                ).to(device),
                 "edges": torch.from_numpy(self.edges).to(device),
             }
         return self._cache[key]
@@ -97,10 +127,17 @@ class ChartSurfaceModel:
         ).flatten()
         if not len(primitive_indices):
             return zero, {"matched": 0, "coverage": self.sampler.audit()}
-        # ids are -(row + 2), so lookup is exact and O(N).
-        rows = -surface._track_id[primitive_indices] - 2
-        valid = (rows >= 0) & (rows < len(self.xyz))
-        safe_rows = rows.clamp(0, max(len(self.xyz) - 1, 0))
+        primitive_ids = surface._track_id[primitive_indices]
+        positions = torch.searchsorted(
+            archive["sorted_evidence_id"], primitive_ids
+        )
+        in_range = positions < len(self.xyz)
+        safe_positions = positions.clamp_max(max(len(self.xyz) - 1, 0))
+        valid = in_range & (
+            archive["sorted_evidence_id"][safe_positions]
+            == primitive_ids
+        )
+        safe_rows = archive["evidence_id_order"][safe_positions]
         valid &= chosen[safe_rows]
         primitive_indices = primitive_indices[valid]
         rows = safe_rows[valid]
@@ -114,13 +151,18 @@ class ChartSurfaceModel:
         unique_rows, inverse = torch.unique(
             rows, sorted=False, return_inverse=True
         )
-        grouped = torch.zeros(
-            len(unique_rows), device=device, dtype=primitive_loss.dtype
+        grouped = torch.full(
+            (len(unique_rows),),
+            float("inf"),
+            device=device,
+            dtype=primitive_loss.dtype,
         )
-        counts = torch.zeros_like(grouped)
-        grouped.scatter_add_(0, inverse, primitive_loss)
-        counts.scatter_add_(0, inverse, torch.ones_like(primitive_loss))
-        loss = (grouped / counts.clamp_min(1)).mean()
+        # A Chart measurement needs one bootstrap witness.  This factor is
+        # disabled before topology can replace that witness.
+        grouped.scatter_reduce_(
+            0, inverse, primitive_loss, reduce="amin", include_self=True
+        )
+        loss = grouped.mean()
         # Preserve the differential structure of each Chart in UV space. This
         # is the discrete atlas Jacobian factor missing from the former
         # independent point-anchor implementation.
@@ -136,7 +178,17 @@ class ChartSurfaceModel:
             by_row = torch.full(
                 (len(self.xyz),), -1, dtype=torch.long, device=device
             )
-            by_row[rows] = primitive_indices
+            best_residual = torch.full(
+                (len(self.xyz),),
+                float("inf"),
+                dtype=residual.dtype,
+                device=device,
+            )
+            best_residual.scatter_reduce_(
+                0, rows, residual, reduce="amin", include_self=True
+            )
+            nearest = residual <= best_residual[rows] + 1e-8
+            by_row[rows[nearest]] = primitive_indices[nearest]
             pair = by_row[edges]
             valid_pair = (pair >= 0).all(dim=1)
             if bool(valid_pair.any()):
@@ -162,7 +214,19 @@ class ChartSurfaceModel:
 
     def audit(self) -> dict:
         return {
+            # Be explicit about the remaining architectural gap.  UV-bound
+            # samples plus a local Jacobian prior are materially stronger than
+            # independent XYZ anchors, but they are not MAtCha's learnable
+            # inverse-depth atlas and must never be reported as such.
+            "representation": "discrete_chart_observation_graph",
+            "continuous_learnable_inverse_depth_atlas": False,
+            "uv_domain_quadtree_densification": False,
+            "renderer_seed_binding": "bootstrap_only",
+            "permanent_factor": (
+                "source_resolution_rendered_inverse_depth_observation"
+            ),
             "anchor_count": len(self.xyz),
+            "coverage_only_seed_count": self.coverage_only_seed_count,
             "chart_count": int(len(np.unique(self.chart_id))),
             "uv_bound": True,
             "uv_edge_count": int(len(self.edges)),

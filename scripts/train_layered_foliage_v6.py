@@ -578,10 +578,11 @@ def _adaptive_topology(args, foliage, stats):
         weak_contribution = stats["contribution"] <= torch.quantile(
             stats["contribution"], 0.10
         )
-        support = foliage.support_view_count.float().clamp_min(1)
-        free_space_rate = (
-            foliage.free_space_violation_count.float() / support
-        )
+        positive = foliage.support_view_count.float()
+        confirmed_free = foliage.free_space_violation_count.float()
+        free_space_rate = confirmed_free / (
+            positive + confirmed_free
+        ).clamp_min(1)
         finite_depth = torch.isfinite(foliage.ray_depth_nll)
         depth_threshold = (
             torch.quantile(foliage.ray_depth_nll[finite_depth], 0.90)
@@ -1223,9 +1224,11 @@ def main():
             1.0 + finite_ray_nll / 5.0
         )
         depth_prior = (position_nll * position_weight).mean()
-        metadata_support = foliage.support_view_count.float().clamp_min(1)
+        metadata_support = foliage.support_view_count.float()
+        metadata_free = foliage.free_space_violation_count.float()
         free_space_rate = (
-            foliage.free_space_violation_count.float() / metadata_support
+            metadata_free
+            / (metadata_support + metadata_free).clamp_min(1)
         ).clamp(0, 1)
         free_space_loss = (
             foliage.opacities * free_space_rate

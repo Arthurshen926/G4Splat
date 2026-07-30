@@ -107,6 +107,45 @@ def test_zero_volume_is_exactly_the_native_surfel_path():
     assert gate_audit.numel() == 0
 
 
+def test_zero_opacity_volume_is_removed_before_tile_emission():
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings()
+    surface = torch.tensor([[0.0, 0.0, 2.0]], device="cuda")
+    volume = torch.tensor([[0.0, 0.0, 1.0]], device="cuda")
+    common = (
+        surface,
+        torch.zeros_like(surface, requires_grad=True),
+        torch.tensor([[0.2, 0.15]], device="cuda"),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda"),
+    )
+    colors = torch.tensor(
+        [[0.1, 0.7, 0.2], [0.9, 0.1, 0.1]], device="cuda"
+    )
+    opacity = torch.tensor([[0.7], [0.0]], device="cuda")
+    rgb, radii, aux, _, _ = MixedGaussianRasterizer(settings)(
+        *common,
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        torch.tensor([[2.0, 2.0, 2.0]], device="cuda"),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda"),
+        colors,
+        opacity,
+    )
+    reference, _, reference_aux, _, _ = MixedGaussianRasterizer(settings)(
+        *common,
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 4),
+        colors[:1],
+        opacity[:1],
+    )
+
+    assert radii[-1].item() == 0
+    assert torch.equal(rgb, reference)
+    assert torch.equal(aux, reference_aux)
+
+
 @pytest.mark.parametrize("surface_depth,volume_depth,expected_red", [(2.0, 3.0, 0.0), (3.0, 2.0, 1.0)])
 def test_surface_and_volume_share_one_depth_order(surface_depth, volume_depth, expected_red):
     _, _, MixedGaussianRasterizer = _api()

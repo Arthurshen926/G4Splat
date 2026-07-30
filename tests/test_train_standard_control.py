@@ -1,5 +1,8 @@
 import copy
+import hashlib
+import json
 import random
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -17,6 +20,7 @@ from scripts.train_standard_full_2dgs import (
     _loaded_camera_filenames,
     _mask_resolution_audit,
     _optimization_audit,
+    _rigid_tree_excluded_mask,
     _scene_input_ply_audit,
     _source_control_manifest_path,
     _staged_names,
@@ -25,6 +29,7 @@ from scripts.train_standard_full_2dgs import (
     _restore_rng_state,
     _training_state_contract,
     _ulfloc_clean_main_camera_schedule,
+    _write_rigid_surface_handoff,
 )
 
 
@@ -403,6 +408,40 @@ def test_staged_name_audit_ignores_external_mask_sidecars(tmp_path):
     assert _staged_names(tmp_path) == {"frame.png"}
 
 
+def test_rigid_tree_excluded_mask_intersects_all_four_owner_channels():
+    lookup = _Lookup((3, 4))
+    lookup.masks["source.png"] = (
+        torch.tensor(
+            [[1, 1, 1, 1], [1, 0, 1, 1], [1, 1, 1, 1]],
+            dtype=torch.bool,
+        ),
+        torch.tensor(
+            [[1, 1, 1, 1], [1, 1, 0, 1], [1, 1, 1, 1]],
+            dtype=torch.bool,
+        ),
+        torch.tensor(
+            [[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 1, 1]],
+            dtype=torch.bool,
+        ),
+        torch.tensor(
+            [[1, 0, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]],
+            dtype=torch.bool,
+        ),
+    )
+
+    keep = _rigid_tree_excluded_mask(
+        lookup,
+        "frame",
+        (3, 4),
+        torch.device("cpu"),
+    )
+
+    expected = torch.ones(3, 4, dtype=torch.bool)
+    expected[0, 1] = False
+    expected[1, 1:] = False
+    assert torch.equal(keep, expected)
+
+
 def test_loaded_camera_audit_recovers_real_filename_extensions():
     cameras = [SimpleNamespace(image_name="first"), SimpleNamespace(image_name="second")]
 
@@ -427,3 +466,142 @@ def test_empty_diagnostic_evaluation_still_creates_metrics_directory(tmp_path):
 
     assert result == {"evaluated_views": 0, "per_view": {}}
     assert (tmp_path / "evaluation").is_dir()
+
+
+def test_evaluate_all_persists_every_selected_render(tmp_path, monkeypatch):
+    """Full scalar metrics and strict render metrics share one population."""
+    views = [
+        SimpleNamespace(
+            image_name=name,
+            original_image=torch.zeros(3, 2, 2),
+        )
+        for name in ("a", "b")
+    ]
+    scene = SimpleNamespace(getTrainCameras=lambda: views)
+    module = sys.modules[_evaluate.__module__]
+    monkeypatch.setattr(
+        module,
+        "render",
+        lambda *args, **kwargs: {"render": torch.zeros(3, 2, 2)},
+    )
+    saved = []
+    monkeypatch.setattr(
+        module,
+        "_save_image",
+        lambda image, path: saved.append(path),
+    )
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+
+    result = _evaluate(
+        scene=scene,
+        gaussians=object(),
+        pipe=object(),
+        background=torch.zeros(3),
+        output_dir=tmp_path / "evaluation",
+        target_stems=set(),
+        evaluate_all=True,
+    )
+
+    assert result["evaluated_views"] == 2
+    assert len(saved) == 4
+    assert {path.name for path in saved} == {"a.png", "b.png"}
+
+
+def test_rigid_surface_handoff_closes_no_colmap_provenance(tmp_path):
+    model = tmp_path / "rigid"
+    surface = model / "point_cloud" / "iteration_40" / "point_cloud.ply"
+    surface.parent.mkdir(parents=True)
+    surface.write_bytes(b"native rigid 2dgs")
+    (model / "input_manifest.json").write_text("{}", encoding="utf-8")
+    (model / "camera_intrinsics_contract.json").write_text(
+        json.dumps({"camera_geometry_sha256": "camera-digest"}),
+        encoding="utf-8",
+    )
+    seed = tmp_path / "seed.ply"
+    seed.write_bytes(b"role-aware seed")
+    seed.with_suffix(".manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": "role-aware-surface-seed-to-native-2dgs-v1",
+                "historical_gaussian_input_used": False,
+                "colmap_points_or_tracks_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    destination = _write_rigid_surface_handoff(
+        model_path=model,
+        iteration=40,
+        point_count=123,
+        input_audit={
+            "camera_container_only": True,
+            "colmap_points_or_tracks_used": False,
+            "initialization": "ply_warm_start",
+            "objective": "all_real_RGB_from_iteration_1",
+            "surface_ownership_contract": (
+                "rigid_pixels_tree_sky_transient_excluded"
+            ),
+        },
+        init_ply=seed,
+    )
+
+    handoff = json.loads(destination.read_text(encoding="utf-8"))
+    assert handoff["eligible_for_hybrid_surface_handoff"]
+    assert not handoff["historical_gaussian_input_used"]
+    assert not handoff["colmap_points_or_tracks_used"]
+    assert handoff["surface_point_count"] == 123
+    assert (
+        handoff["surface_ownership_contract"]
+        == "rigid_pixels_tree_sky_transient_excluded"
+    )
+    assert handoff["surface_ply_sha256"] == hashlib.sha256(
+        surface.read_bytes()
+    ).hexdigest()
+
+
+def test_standard_static_tree_surface_is_not_hybrid_handoff_eligible(tmp_path):
+    model = tmp_path / "standard"
+    surface = model / "point_cloud" / "iteration_40" / "point_cloud.ply"
+    surface.parent.mkdir(parents=True)
+    surface.write_bytes(b"standard static 2dgs")
+    (model / "input_manifest.json").write_text("{}", encoding="utf-8")
+    (model / "camera_intrinsics_contract.json").write_text(
+        json.dumps({"camera_geometry_sha256": "camera-digest"}),
+        encoding="utf-8",
+    )
+    seed = tmp_path / "seed.ply"
+    seed.write_bytes(b"role-aware seed")
+    seed.with_suffix(".manifest.json").write_text(
+        json.dumps(
+            {
+                "protocol": "role-aware-surface-seed-to-native-2dgs-v1",
+                "historical_gaussian_input_used": False,
+                "colmap_points_or_tracks_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    destination = _write_rigid_surface_handoff(
+        model_path=model,
+        iteration=40,
+        point_count=123,
+        input_audit={
+            "camera_container_only": True,
+            "colmap_points_or_tracks_used": False,
+            "initialization": "ply_warm_start",
+            "objective": "all_real_RGB_from_iteration_1",
+            "surface_ownership_contract": (
+                "standard_profile_may_include_static_tree"
+            ),
+        },
+        init_ply=seed,
+    )
+
+    handoff = json.loads(destination.read_text(encoding="utf-8"))
+    assert not handoff["eligible_for_hybrid_surface_handoff"]
+    assert any(
+        "rigid-only/tree-excluded" in reason
+        for reason in handoff["rejection_reasons"]
+    )

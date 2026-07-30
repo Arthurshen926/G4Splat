@@ -29,8 +29,15 @@ from outdoor.foliage_view_graph import sequence_id
 from outdoor.scene_contract import sha256_file
 
 
-EVIDENCE_STORE_VERSION = "outdoor-hybrid-teacher-evidence-v2"
-LEGACY_EVIDENCE_STORE_VERSIONS = {"outdoor-unified-evidence-v1"}
+EVIDENCE_STORE_VERSION = (
+    "outdoor-hybrid-teacher-evidence-v5-target-raster-tracks"
+)
+LEGACY_EVIDENCE_STORE_VERSIONS = {
+    "outdoor-hybrid-teacher-evidence-v4-crossview-consensus",
+    "outdoor-hybrid-teacher-evidence-v3-contract-closed",
+    "outdoor-hybrid-teacher-evidence-v2",
+    "outdoor-unified-evidence-v1",
+}
 TRACK_EVIDENCE_VERSION = "outdoor-source-track-evidence-v1"
 
 ROLE_RIGID = 0
@@ -451,6 +458,10 @@ class EvidenceStoreBuilder:
                 "points3D.bin or COLMAP track geometry is consumed"
             ),
             "geometry_source": self.geometry_source,
+            "colmap_points_or_tracks_used": (
+                self.geometry_source != "mast3r_only"
+            ),
+            "historical_gaussian_initialization_used": False,
             "final_model": self.final_model,
             "scene_contract": str(self.scene_contract),
             "scene_contract_sha256": sha256_file(self.scene_contract),

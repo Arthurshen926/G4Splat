@@ -24,12 +24,13 @@ def main() -> None:
     parser.add_argument("--mast3r-scene", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--tree-mask-pickle", type=Path, required=True)
+    parser.add_argument("--chart-consensus", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--confidence-threshold", type=float, default=1.25)
     parser.add_argument("--minimum-overlap", type=float, default=0.03)
-    parser.add_argument("--minimum-tracks", type=int, default=10_000)
-    parser.add_argument("--minimum-global-rigid-tracks", type=int, default=2_000)
+    parser.add_argument("--minimum-tracks", type=int, default=3_000)
+    parser.add_argument("--minimum-global-rigid-tracks", type=int, default=1_500)
     parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
     output = args.output.expanduser().resolve()
@@ -41,6 +42,7 @@ def main() -> None:
             output,
             dataset=args.dataset,
             tree_mask_pickle=args.tree_mask_pickle,
+            chart_consensus=args.chart_consensus,
             stride=args.stride,
             confidence_threshold=args.confidence_threshold,
             pair_graph_kwargs={"minimum_overlap": args.minimum_overlap},

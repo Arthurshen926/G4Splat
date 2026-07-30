@@ -9,6 +9,7 @@ runtime tensors and are consumed directly by loss and topology allocation.
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import OrderedDict
 from pathlib import Path
 
@@ -78,6 +79,25 @@ class OutdoorTaskFieldLookup:
         if availability.get("canopy") != "tree_mask_index_3":
             raise RuntimeError(
                 "Residual task fields require a real tree mask at channel index 3"
+            )
+        expected_tree_hash = self.semantic_manifest.get(
+            "input_hashes", {}
+        ).get("tree_mask_pickle")
+        if not expected_tree_hash:
+            raise RuntimeError(
+                "Semantic manifest does not bind its tree mask content hash"
+            )
+        digest = hashlib.sha256()
+        with self.tree_mask_pickle.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        self.tree_mask_sha256 = digest.hexdigest()
+        if self.tree_mask_sha256 != expected_tree_hash:
+            raise RuntimeError(
+                "Runtime tree mask differs from the immutable semantic "
+                f"contract: expected={expected_tree_hash}, "
+                f"actual={self.tree_mask_sha256}, "
+                f"path={self.tree_mask_pickle}"
             )
         self.lookup = CambridgeMaskLookup(
             self.dataset_path,
@@ -265,6 +285,7 @@ class OutdoorTaskFieldLookup:
             "version": TASK_FIELD_VERSION,
             "materialization": "deterministic_runtime_per_sample",
             "source_mask_pickle": str(self.tree_mask_pickle),
+            "source_mask_pickle_sha256": self.tree_mask_sha256,
             "semantic_manifest": str(self.semantic_manifest_path),
             "mask_channel_contract": {
                 "transient": "inverse_keep_channel_0",

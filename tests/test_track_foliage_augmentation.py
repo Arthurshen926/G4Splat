@@ -31,3 +31,44 @@ def test_tree_instances_do_not_merge_spatially_separate_tracks():
     assert len(np.unique(labels[:10])) == 1
     assert len(np.unique(labels[10:])) == 1
     assert labels[0] != labels[10]
+
+
+def test_tree_instances_do_not_chain_across_an_unphysical_extent():
+    # Every adjacent pair is within the radius, but the full chain is not one
+    # physical crown and must not collapse to one latent/replacement group.
+    xyz = np.stack(
+        [np.arange(30, dtype=np.float64), np.zeros(30), np.zeros(30)],
+        axis=1,
+    )
+    labels = cluster_tree_instances(
+        xyz,
+        connection_radius=1.1,
+        minimum_tracks=4,
+        maximum_component_extent=6.0,
+    )
+    assert len(np.unique(labels)) >= 4
+    for label in np.unique(labels):
+        component = xyz[labels == label]
+        assert np.linalg.norm(component.ptp(axis=0)) <= 6.0 + 1e-8
+
+
+def test_dense_tree_instance_uses_bounded_neighbour_graph():
+    grid = np.stack(
+        np.meshgrid(
+            np.arange(18),
+            np.arange(18),
+            np.arange(3),
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    xyz = grid.astype(np.float64) * 0.12
+
+    labels = cluster_tree_instances(
+        xyz,
+        connection_radius=1.5,
+        maximum_component_extent=12.0,
+        maximum_neighbours=12,
+    )
+
+    assert len(np.unique(labels)) == 1

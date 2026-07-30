@@ -721,6 +721,14 @@ __global__ void mixedPreprocessVolumesCUDA(
 	const int idx = surface_count + local_idx;
 	radii[idx] = 0;
 	tiles_touched[idx] = 0;
+	// Sequence/time ownership gates produce exact zero opacity for every
+	// non-owner volume.  Such a primitive is mathematically absent from the
+	// front-to-back integral; projecting it and emitting tile entries only
+	// inflates sort memory/work (catastrophically for dense per-view leaves).
+	// Keep the comparison strict so every positive contribution, however
+	// small, retains bit-identical rendering semantics.
+	if (!(opacities[local_idx] > 0.0f))
+		return;
 	float3 p_view;
 	if (!in_frustum(
 		local_idx,

@@ -198,7 +198,11 @@ def export_rgb_stream(
             )
 
 
-def _colmap_camera_metadata(dataset) -> list[SimpleNamespace]:
+def _colmap_camera_metadata(
+    dataset,
+    *,
+    load_point_cloud: bool = True,
+) -> list[SimpleNamespace]:
     """Read ordered COLMAP camera metadata without opening every RGB image.
 
     The normal :class:`Scene` constructor retains a PIL image and a tensor for
@@ -267,11 +271,13 @@ def _colmap_camera_metadata(dataset) -> list[SimpleNamespace]:
     # ``assign_adaptive_camera_zfar`` only needs the pose and image geometry,
     # so a metadata-only CameraInfo keeps this RGB-only path lazy with respect
     # to the 1,487 source photographs.
-    support_ply = source_path / "sparse" / "0" / "points3D.ply"
-    try:
-        sparse_points = fetchPly(str(support_ply)).points
-    except Exception:
-        sparse_points = None
+    sparse_points = None
+    if load_point_cloud:
+        support_ply = source_path / "sparse" / "0" / "points3D.ply"
+        try:
+            sparse_points = fetchPly(str(support_ply)).points
+        except Exception:
+            sparse_points = None
     camera_infos = [
         CameraInfo(
             uid=record.uid,
@@ -487,7 +493,17 @@ if __name__ == "__main__":
         raw_train_dir = getattr(args, "raw_output_dir", None)
         if raw_train_dir is not None and os.path.abspath(raw_train_dir) == os.path.abspath(train_dir):
             raise ValueError("--raw_output_dir must differ from --output_dir")
-        records = _colmap_camera_metadata(dataset)
+        # A camera-only rigid model was trained with the renderer fallback
+        # far plane and explicitly excluded COLMAP point geometry.  Reopening
+        # points3D.ply only during evaluation changes clipping and violates
+        # the no-COLMAP handoff contract.  Ordinary upstream checkpoints keep
+        # their historical sparse-support zfar policy.
+        records = _colmap_camera_metadata(
+            dataset,
+            load_point_cloud=not bool(
+                getattr(args, "camera_only_scene", False)
+            ),
+        )
         start = int(getattr(args, "train_view_start", 0))
         train_view_end = getattr(args, "train_view_end", None)
         end = len(records) if train_view_end is None else int(train_view_end)

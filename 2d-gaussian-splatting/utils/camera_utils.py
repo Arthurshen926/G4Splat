@@ -14,6 +14,7 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal, focal2fov
+from utils.intrinsics_utils import scale_calibrated_intrinsics
 
 WARNED = False
 
@@ -54,32 +55,10 @@ def loadCam(args, id, cam_info, resolution_scale):
     # Intrinsics must be scaled with the image.  Reusing an FoV alone loses an
     # off-centre principal point and makes Chart/plane/renderer rays disagree
     # after a requested image resize.
-    scale_x = float(resolution[0]) / float(orig_w)
-    scale_y = float(resolution[1]) / float(orig_h)
-    source_fx = getattr(cam_info, "fx", None)
-    source_fy = getattr(cam_info, "fy", None)
-    source_cx = getattr(cam_info, "cx", None)
-    source_cy = getattr(cam_info, "cy", None)
-    fx = (
-        float(source_fx) * scale_x
-        if source_fx is not None
-        else fov2focal(cam_info.FovX, orig_w) * scale_x
-    )
-    fy = (
-        float(source_fy) * scale_y
-        if source_fy is not None
-        else fov2focal(cam_info.FovY, orig_h) * scale_y
-    )
-    cx = (
-        float(source_cx) * scale_x
-        if source_cx is not None
-        else float(resolution[0]) / 2.0
-    )
-    cy = (
-        float(source_cy) * scale_y
-        if source_cy is not None
-        else float(resolution[1]) / 2.0
-    )
+    # The loaded RGB can be a pre-materialized target raster whose dimensions
+    # differ from cameras.bin.  Explicit COLMAP K is defined in the latter,
+    # so scale it from calibration dimensions rather than from the RGB raster.
+    fx, fy, cx, cy = scale_calibrated_intrinsics(cam_info, resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=focal2fov(fx, resolution[0]), FoVy=focal2fov(fy, resolution[1]),

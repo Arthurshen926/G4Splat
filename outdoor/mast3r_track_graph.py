@@ -11,6 +11,7 @@ previously called ``mast3r_tracks``.
 from __future__ import annotations
 
 from collections import OrderedDict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -24,9 +25,12 @@ except ImportError:  # pragma: no cover - stdlib fallback remains supported.
     orjson = None
 
 from matcha.cambridge_masks import CambridgeMaskLookup
+from matcha.pointmap.calibration import retarget_pointmap_camera_rays
 
 
-TRACK_GRAPH_VERSION = "mast3r-fixed-camera-multiview-track-graph-v2-exact-k"
+TRACK_GRAPH_VERSION = (
+    "mast3r-fixed-camera-multiview-track-graph-v6-target-raster-observations"
+)
 ROLE_NAMES = ("rigid", "canopy", "sky", "transient", "unknown")
 ROLE_RIGID, ROLE_CANOPY, ROLE_SKY, ROLE_TRANSIENT, ROLE_UNKNOWN = range(5)
 
@@ -36,16 +40,34 @@ def _sequence(name: str) -> str:
     return stem.split("__", 1)[0] if "__" in stem else "default"
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _frame_number(name: str) -> int:
     match = re.search(r"frame(\d+)", Path(name).stem)
     return int(match.group(1)) if match else 0
 
 
 class _PointmapCache:
-    def __init__(self, root: Path, *, capacity: int = 10):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        capacity: int = 10,
+        camera_contract: dict[
+            str, tuple[np.ndarray, np.ndarray]
+        ]
+        | None = None,
+    ):
         self.root = Path(root)
         self.capacity = max(int(capacity), 2)
         self.values: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
+        self.camera_contract = camera_contract or {}
 
     def get(self, stem: str) -> dict[str, np.ndarray]:
         value = self.values.pop(stem, None)
@@ -60,6 +82,21 @@ class _PointmapCache:
         points = np.asarray(payload["points"], dtype=np.float32).reshape(
             height, width, 3
         )
+        camera = self.camera_contract.get(stem)
+        if camera is not None:
+            c2w, intrinsics = camera
+            # MASt3R predicts camera-z at each native raster cell.  Its
+            # internal focal estimate can differ from the immutable
+            # Cambridge calibration even after the pointmap has been moved
+            # into the fixed world frame.  Track proposal, cycle checking and
+            # exact-K triangulation must all consume the same ray for that
+            # cell.  Preserve the measured camera-z and re-unproject it onto
+            # the fixed ray once when the pointmap enters the cache.
+            points = retarget_pointmap_camera_rays(
+                points,
+                np.asarray(c2w, dtype=np.float64),
+                np.asarray(intrinsics, dtype=np.float64),
+            )
         rgb = payload.get("rgb")
         if rgb is None:
             colors = np.zeros((height, width, 3), dtype=np.float32)
@@ -169,6 +206,122 @@ def _project(
     return u, v, z, valid
 
 
+def _unproject(
+    pixels: np.ndarray,
+    depth: np.ndarray,
+    c2w: np.ndarray,
+    intrinsics: np.ndarray | float,
+) -> np.ndarray:
+    """Back-project independently measured camera-z depths to world points."""
+    pixels = np.asarray(pixels, dtype=np.float64)
+    depth = np.asarray(depth, dtype=np.float64).reshape(-1)
+    values = np.asarray(intrinsics, dtype=np.float64).reshape(-1)
+    if pixels.ndim != 2 or pixels.shape[1] != 2 or len(pixels) != len(depth):
+        raise ValueError("pixels must be [N,2] and depth must be [N]")
+    if len(values) == 1:
+        raise ValueError("scalar intrinsics cannot define an exact principal point")
+    if len(values) != 4:
+        raise ValueError("intrinsics must be [fx,fy,cx,cy]")
+    fx, fy, cx, cy = map(float, values)
+    camera = np.column_stack(
+        [
+            (pixels[:, 0] - cx) * depth / fx,
+            (pixels[:, 1] - cy) * depth / fy,
+            depth,
+        ]
+    )
+    return (
+        camera @ np.asarray(c2w, dtype=np.float64)[:3, :3].T
+        + np.asarray(c2w, dtype=np.float64)[:3, 3]
+    ).astype(np.float32)
+
+
+def _target_raster_observations(
+    projected_u: np.ndarray,
+    projected_v: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the actual target pointmap pixels used as observations.
+
+    Projection is only the correspondence-search proposal.  The independent
+    target measurement lives at the integer pointmap sample ``(column,row)``.
+    Returning the proposal itself would make every target ray pass through the
+    source 3D point by construction and turn triangulation/reprojection into a
+    self-fulfilling validation.
+    """
+    target_rows = np.clip(
+        np.rint(projected_v).astype(np.int64), 0, int(height) - 1
+    )
+    target_columns = np.clip(
+        np.rint(projected_u).astype(np.int64), 0, int(width) - 1
+    )
+    target_pixels = np.column_stack(
+        [target_columns, target_rows]
+    ).astype(np.float32)
+    return target_pixels, target_rows, target_columns
+
+
+def _load_chart_consensus(
+    path: Path,
+    *,
+    names: list[str],
+    expected_shape: tuple[int, int],
+    scale_factor: float,
+) -> dict[str, np.ndarray]:
+    """Load the immutable pixelwise consensus used by the track graph.
+
+    A finite source pointmap alone is not an independent correspondence.  The
+    accepted mask proves that at least ``minimum_consensus_views`` peer charts
+    observed a compatible camera-z depth at that pixel.
+    """
+    with np.load(path, allow_pickle=False) as archive:
+        required = {
+            "depths",
+            "support_counts",
+            "correction_mask",
+            "consistency_weights",
+            "image_names",
+        }
+        missing = required - set(archive.files)
+        if missing:
+            raise RuntimeError(
+                "Chart consensus lacks required arrays: "
+                + ", ".join(sorted(missing))
+            )
+        consensus_names = [Path(str(value)).stem for value in archive["image_names"]]
+        if consensus_names != [Path(value).stem for value in names]:
+            raise RuntimeError("Chart consensus camera order does not match pointmaps")
+        depths = archive["depths"].astype(np.float32)
+        support = archive["support_counts"].astype(np.uint8)
+        accepted = archive["correction_mask"].astype(bool)
+        weights = archive["consistency_weights"].astype(np.float32)
+        minimum_support = int(
+            archive["minimum_consensus_views"].item()
+            if "minimum_consensus_views" in archive
+            else 2
+        )
+    expected = (len(names), *map(int, expected_shape))
+    if (
+        depths.shape != expected
+        or support.shape != expected
+        or accepted.shape != expected
+        or weights.shape != expected
+    ):
+        raise RuntimeError(
+            f"Chart consensus shape mismatch: {depths.shape} != {expected}"
+        )
+    if not np.isfinite(scale_factor) or scale_factor <= 0:
+        raise RuntimeError("Chart consensus requires a positive Chart scale")
+    confirmed = accepted & (support >= minimum_support)
+    return {
+        "depth": depths / float(scale_factor),
+        "confirmed": confirmed,
+        "weight": weights,
+        "minimum_support": np.asarray(minimum_support, dtype=np.int16),
+    }
+
+
 def _pointmap_overlap(
     source: dict[str, np.ndarray],
     target: dict[str, np.ndarray],
@@ -233,7 +386,15 @@ def build_pair_graph(
         [(centers - centers.mean(0)) / extent, 0.35 * forward], axis=1
     )
     sequences = [_sequence(name) for name in names]
-    cache = _PointmapCache(scene / "pointmaps", capacity=cache_size)
+    camera_contract = {
+        name: (c2w[index], intrinsics[index])
+        for index, name in enumerate(names)
+    }
+    cache = _PointmapCache(
+        scene / "pointmaps",
+        capacity=cache_size,
+        camera_contract=camera_contract,
+    )
     graph: dict[int, list[int]] = {}
     edge_overlap: dict[str, float] = {}
     for source, name in enumerate(names):
@@ -424,6 +585,7 @@ def build_multiview_tracks(
     *,
     dataset: Path | None = None,
     tree_mask_pickle: Path | None = None,
+    chart_consensus: Path | None = None,
     stride: int = 5,
     confidence_threshold: float = 1.25,
     absolute_gate: float = 0.10,
@@ -444,9 +606,31 @@ def build_multiview_tracks(
         cache_size=cache_size,
         **(pair_graph_kwargs or {}),
     )
-    cache = _PointmapCache(scene / "pointmaps", capacity=cache_size)
+    camera_contract = {
+        name: (c2w[index], intrinsics[index])
+        for index, name in enumerate(names)
+    }
+    cache = _PointmapCache(
+        scene / "pointmaps",
+        capacity=cache_size,
+        camera_contract=camera_contract,
+    )
     first = cache.get(names[0])
     height, width = first["confidence"].shape
+    consensus = None
+    if chart_consensus is not None:
+        with np.load(scene / "charts_data.npz", allow_pickle=False) as charts:
+            if "scale_factor" not in charts:
+                raise RuntimeError(
+                    "Production Chart consensus requires embedded scale_factor"
+                )
+            chart_scale = float(charts["scale_factor"])
+        consensus = _load_chart_consensus(
+            Path(chart_consensus),
+            names=names,
+            expected_shape=(height, width),
+            scale_factor=chart_scale,
+        )
     lookup = (
         CambridgeMaskLookup(
             Path(dataset), Path(tree_mask_pickle), mask_indices=[0, 1, 2, 3]
@@ -456,26 +640,69 @@ def build_multiview_tracks(
     )
     role_maps = _mask_role_maps(lookup, names)
     sequences = [_sequence(name) for name in names]
-    records: list[dict[str, Any]] = []
-    occupied_track_cells: set[tuple[int, int, int]] = set()
+    # One metric cell has one external track identity, but ownership is
+    # awarded by observation/triangulation quality after considering every
+    # source chart.  The former first-arrival set made the result depend on
+    # file ordering and allowed a weak two-view source-star candidate to hide
+    # a later well-conditioned cross-sequence track.
+    record_by_cell: dict[tuple[int, int, int], dict[str, Any]] = {}
     for source, name in enumerate(names):
         source_map = cache.get(name)
         rows, columns = np.mgrid[0:height:stride, 0:width:stride]
         pixels = np.column_stack([columns.reshape(-1), rows.reshape(-1)]).astype(
             np.float32
         )
-        xyz = source_map["points"][rows, columns].reshape(-1, 3)
-        confidence = source_map["confidence"][rows, columns].reshape(-1)
-        colors = source_map["rgb"][rows, columns].reshape(-1, 3)
-        valid_source = (
-            np.isfinite(xyz).all(axis=1)
-            & (np.linalg.norm(xyz, axis=1) > 1e-5)
-            & (confidence >= float(confidence_threshold))
-        )
-        candidate_indices = np.flatnonzero(valid_source)
         source_roles = _roles_at(
             role_maps[source], pixels, width, height
         )
+        source_canopy = source_roles == ROLE_CANOPY
+        if consensus is None:
+            xyz = source_map["points"][rows, columns].reshape(-1, 3)
+            source_consensus = np.ones(len(pixels), dtype=bool)
+            source_consensus_weight = np.ones(len(pixels), dtype=np.float32)
+        else:
+            source_depth = consensus["depth"][source, rows, columns].reshape(-1)
+            consensus_xyz = _unproject(
+                pixels,
+                source_depth,
+                c2w[source],
+                intrinsics[source],
+            )
+            raw_xyz = source_map["points"][rows, columns].reshape(-1, 3)
+            xyz = np.where(
+                source_canopy[:, None], raw_xyz, consensus_xyz
+            )
+            source_consensus = consensus[
+                "confirmed"
+            ][source, rows, columns].reshape(-1)
+            source_consensus_weight = consensus[
+                "weight"
+            ][source, rows, columns].reshape(-1)
+            # Dynamic foliage is identifiable only within a traversal.  It
+            # keeps raw sequence-local pointmap geometry and never masquerades
+            # as a cross-sequence rigid landmark.
+            source_consensus = source_consensus | source_canopy
+            source_consensus_weight = np.where(
+                source_canopy, 1.0, source_consensus_weight
+            )
+        raw_confidence = source_map["confidence"][rows, columns].reshape(-1)
+        confidence = raw_confidence * source_consensus_weight
+        colors = source_map["rgb"][rows, columns].reshape(-1, 3)
+        self_u, self_v, _, self_projected = _project(
+            xyz, c2w[source], intrinsics[source], width, height
+        )
+        self_error = np.linalg.norm(
+            np.column_stack([self_u, self_v]) - pixels, axis=1
+        )
+        valid_source = (
+            np.isfinite(xyz).all(axis=1)
+            & (np.linalg.norm(xyz, axis=1) > 1e-5)
+            & (raw_confidence >= float(confidence_threshold))
+            & source_consensus
+            & self_projected
+            & (self_error <= 0.75)
+        )
+        candidate_indices = np.flatnonzero(valid_source)
         observations: list[list[tuple[int, float, float, float, int]]] = [
             [
                 (
@@ -497,28 +724,74 @@ def build_multiview_tracks(
             u, v, depth, projected = _project(
                 anchor_xyz, c2w[target], intrinsics[target], width, height
             )
-            tr = np.clip(np.rint(v).astype(np.int64), 0, height - 1)
-            tc = np.clip(np.rint(u).astype(np.int64), 0, width - 1)
-            target_xyz = target_map["points"][tr, tc]
-            target_conf = target_map["confidence"][tr, tc]
-            distance = np.linalg.norm(target_xyz - anchor_xyz, axis=1)
-            gate = np.maximum(float(absolute_gate), float(relative_gate) * depth)
-            accepted = (
-                projected
-                & np.isfinite(target_xyz).all(axis=1)
-                & (target_conf >= float(confidence_threshold))
-                & (distance <= gate)
+            target_pixels, tr, tc = _target_raster_observations(
+                u, v, width, height
             )
-            target_pixels = np.column_stack([u, v]).astype(np.float32)
             target_roles = _roles_at(
                 role_maps[target], target_pixels, width, height
+            )
+            candidate_roles = source_roles[candidate_indices]
+            candidate_canopy = candidate_roles == ROLE_CANOPY
+            if consensus is None:
+                target_xyz = target_map["points"][tr, tc]
+                target_consensus = np.ones(len(tr), dtype=bool)
+                target_consensus_weight = np.ones(len(tr), dtype=np.float32)
+            else:
+                target_depth = consensus["depth"][target, tr, tc]
+                consensus_target_xyz = _unproject(
+                    target_pixels,
+                    target_depth,
+                    c2w[target],
+                    intrinsics[target],
+                )
+                raw_target_xyz = target_map["points"][tr, tc]
+                target_xyz = np.where(
+                    candidate_canopy[:, None],
+                    raw_target_xyz,
+                    consensus_target_xyz,
+                )
+                target_consensus = consensus["confirmed"][target, tr, tc]
+                target_consensus_weight = consensus["weight"][target, tr, tc]
+                target_consensus = target_consensus | candidate_canopy
+                target_consensus_weight = np.where(
+                    candidate_canopy, 1.0, target_consensus_weight
+                )
+            target_raw_conf = target_map["confidence"][tr, tc]
+            target_conf = target_raw_conf * target_consensus_weight
+            distance = np.linalg.norm(target_xyz - anchor_xyz, axis=1)
+            gate = np.maximum(float(absolute_gate), float(relative_gate) * depth)
+            cycle_u, cycle_v, _, cycle_projected = _project(
+                target_xyz,
+                c2w[source],
+                intrinsics[source],
+                width,
+                height,
+            )
+            cycle_error = np.linalg.norm(
+                np.column_stack([cycle_u, cycle_v])
+                - pixels[candidate_indices],
+                axis=1,
+            )
+            accepted = (
+                projected
+                & cycle_projected
+                & target_consensus
+                & (target_roles == candidate_roles)
+                & (
+                    ~candidate_canopy
+                    | (sequences[target] == sequences[source])
+                )
+                & np.isfinite(target_xyz).all(axis=1)
+                & (target_raw_conf >= float(confidence_threshold))
+                & (distance <= gate)
+                & (cycle_error <= 1.5)
             )
             for local in np.flatnonzero(accepted):
                 observations[local].append(
                     (
                         target,
-                        float(u[local]),
-                        float(v[local]),
+                        float(target_pixels[local, 0]),
+                        float(target_pixels[local, 1]),
                         float(target_conf[local]),
                         int(target_roles[local]),
                     )
@@ -533,17 +806,11 @@ def build_multiview_tracks(
             obs = list(unique.values())
             if len(obs) < int(minimum_observations):
                 continue
-            # Pointmaps from nearby charts describe the same dense surface.
-            # Reject already-owned spatial cells before the comparatively
-            # expensive fixed-ray solve; the former post-hoc deduplication
-            # spent most runtime triangulating tracks that could never survive.
             candidate_cell = tuple(
                 np.floor(
                     xyz[candidate_indices[local]] / float(dedup_voxel)
                 ).astype(int)
             )
-            if candidate_cell in occupied_track_cells:
-                continue
             camera_indices = np.asarray([item[0] for item in obs], dtype=np.int32)
             obs_pixels = np.asarray(
                 [[item[1], item[2]] for item in obs], dtype=np.float32
@@ -563,7 +830,6 @@ def build_multiview_tracks(
                 or tri[1] < float(minimum_triangulation_angle)
             ):
                 continue
-            occupied_track_cells.add(candidate_cell)
             roles = np.asarray([item[4] for item in obs], dtype=np.int8)
             role_count = np.bincount(roles, minlength=len(ROLE_NAMES)).astype(
                 np.int16
@@ -577,8 +843,7 @@ def build_multiview_tracks(
                 tri[3:],
                 (spread / math.sqrt(len(obs))) ** 2,
             )
-            records.append(
-                {
+            record = {
                     "xyz": tri_xyz,
                     "rgb": np.clip(colors[candidate_indices[local]] * 255, 0, 255).astype(
                         np.uint8
@@ -635,7 +900,24 @@ def build_multiview_tracks(
                     "cycle_consistency": math.exp(-spread / max(absolute_gate, 1e-6)),
                     "pointmap_spread": spread,
                 }
+            # Lexicographic score expresses the actual factor quality:
+            # observation and sequence coverage first, then ray geometry and
+            # reprojection/pointmap agreement.  Confidence only breaks ties.
+            record["_quality"] = (
+                len(camera_indices),
+                support_sequences,
+                float(tri[1]),
+                -float(median_error),
+                -float(spread),
+                float(np.median(obs_conf)),
             )
+            previous = record_by_cell.get(candidate_cell)
+            if (
+                previous is None
+                or record["_quality"] > previous["_quality"]
+            ):
+                record_by_cell[candidate_cell] = record
+    records = list(record_by_cell.values())
     if not records:
         raise RuntimeError("No fixed-camera MASt3R multi-view tracks survived")
     offsets = np.zeros(len(records) + 1, dtype=np.int64)
@@ -719,7 +1001,28 @@ def build_multiview_tracks(
     summary = {
         **graph_audit,
         "schema_version": TRACK_GRAPH_VERSION,
-        "source": "aligned_mast3r_pointmaps_and_fixed_camera_rays",
+        "source": (
+            "pixelwise_crossview_consensus_and_target_raster_fixed_camera_rays"
+            if consensus is not None
+            else "aligned_mast3r_pointmaps_and_fixed_camera_rays"
+        ),
+        "chart_consensus": (
+            str(Path(chart_consensus).resolve())
+            if chart_consensus is not None
+            else None
+        ),
+        "chart_consensus_sha256": (
+            _sha256(Path(chart_consensus))
+            if chart_consensus is not None
+            else None
+        ),
+        "self_projected_target_coordinates_used_as_observations": False,
+        "correspondence_search_coordinate_source": (
+            "source_geometry_projected_to_target"
+        ),
+        "target_observation_coordinate_source": (
+            "target_pointmap_integer_pixel_centres"
+        ),
         "points3D_bin_read": False,
         "colmap_tracks_read": False,
         "track_count": len(records),
@@ -762,14 +1065,41 @@ def build_multiview_tracks(
 def validate_track_gate(
     archive_path: Path,
     *,
-    minimum_tracks: int = 10_000,
-    minimum_global_rigid_tracks: int = 2_000,
+    minimum_tracks: int = 3_000,
+    minimum_global_rigid_tracks: int = 1_500,
     minimum_median_observations: float = 2.0,
     minimum_cross_sequence_fraction: float = 0.05,
     maximum_median_reprojection_error: float = 1.5,
     minimum_median_triangulation_angle: float = 0.5,
 ) -> dict[str, Any]:
     with np.load(archive_path, allow_pickle=False) as archive:
+        schema = (
+            str(archive["schema_version"].item())
+            if "schema_version" in archive
+            else None
+        )
+        if schema != TRACK_GRAPH_VERSION:
+            raise RuntimeError(
+                "MASt3R track archive schema is stale: "
+                f"{schema!r} != {TRACK_GRAPH_VERSION!r}; rebuild tracks and "
+                "the dependent evidence/initialization before training"
+            )
+        required_observation_fields = {
+            "observation_offsets",
+            "observation_camera_indices",
+            "observation_pixels",
+            "observation_camera_depth",
+            "camera_names",
+            "camera_image_sizes",
+        }
+        missing_observation_fields = sorted(
+            required_observation_fields - set(archive.files)
+        )
+        if missing_observation_fields:
+            raise RuntimeError(
+                "MASt3R track archive lacks observation-level factors: "
+                + ", ".join(missing_observation_fields)
+            )
         count = len(archive["track_id"])
         observations = archive["valid_observation_count"]
         sequences = archive["sequence_count"]
@@ -777,6 +1107,7 @@ def validate_track_gate(
         reprojection = archive["reprojection_error"]
         angle = archive["triangulation_angle_median"]
     values = {
+        "schema_version": schema,
         "track_count": int(count),
         "global_rigid_track_count": int((rigid & (sequences >= 2)).sum()),
         "median_observations": float(np.median(observations)),

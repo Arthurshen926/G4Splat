@@ -18,6 +18,7 @@ initialized Gaussian set.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -42,6 +43,19 @@ for path in (str(REPO_ROOT), str(REPO_ROOT / "mast3r")):
 from colmap.read_write_model import read_cameras_binary, read_images_binary  # noqa: E402
 from matcha.cambridge_masks import CambridgeMaskLookup  # noqa: E402
 from view_quality_control.poses import qvec_to_rotmat  # noqa: E402
+
+
+CONSENSUS_VERSION = (
+    "chart-crossview-consensus-v2-independent-supported-camera-depth"
+)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _canonical_name(value: str) -> str:
@@ -617,14 +631,20 @@ def build_consensus(args: argparse.Namespace) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output,
+        schema_version=np.asarray(CONSENSUS_VERSION),
         depths=candidate_depths,
         support_counts=support_counts,
         relative_errors=relative_errors,
         consistency_weights=consistency_weights,
         correction_mask=correction_masks,
+        active_mask=active_mask,
+        minimum_consensus_views=np.asarray(
+            args.min_consensus_views, dtype=np.int16
+        ),
         image_names=np.asarray(image_names),
     )
     summary = {
+        "schema_version": CONSENSUS_VERSION,
         "method": "hard_gated_selection_filtered_neighbour_reprojection_zbuffer_median",
         "scene_path": str(scene_path),
         "gate_report": str(gate_path),
@@ -659,6 +679,21 @@ def build_consensus(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
         "mask_indices": args.mask_indices if args.mask_pickle is not None else None,
+        "input_sha256": {
+            "charts_data": _sha256(chart_path),
+            "chart_cameras": _sha256(scene_path / "cameras.json"),
+            "gate_report": _sha256(gate_path),
+            "chart_selection": (
+                _sha256(args.chart_selection_json)
+                if args.chart_selection_json is not None
+                else None
+            ),
+            "mask_pickle": (
+                _sha256(args.mask_pickle)
+                if args.mask_pickle is not None
+                else None
+            ),
+        },
         "records": records,
     }
     summary_path = output.with_suffix(".json")

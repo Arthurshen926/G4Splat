@@ -30,7 +30,11 @@ from dust3r.demo import get_args_parser as dust3r_get_args_parser
 import cv2
 from matcha.dm_utils.dataset_readers import read_intrinsics_binary, read_extrinsics_binary, qvec2rotmat, read_intrinsics_text, read_extrinsics_text
 from matcha.pointmap.pose_contract import calibrated_pose_contract
-from matcha.pointmap.calibration import rectification_is_identity
+from matcha.pointmap.calibration import (
+    calibrated_camera_to_world_for_output,
+    rectification_is_identity,
+    retarget_pointmap_camera_rays,
+)
 # from colmap.read_write_model import read_cameras_binary, read_images_binary, read_points3D_binary
 from colmap.read_write_model import Camera, Image, Point3D,  write_cameras_binary, write_images_binary, write_points3D_binary, write_points3D_text, rotmat2qvec
 from colmap.read_write_model import write_cameras_text, write_images_text, write_points3D_text
@@ -767,7 +771,9 @@ if __name__ == "__main__":
             image_names,
         )
         pose_contract["stage"] = "post_sparse_ga_pre_output_pose_alignment"
-        pose_contract_path = os.path.join(output_dir, 'calibrated_pose_contract.json')
+        pose_contract_path = os.path.join(
+            output_dir, 'calibrated_pose_contract_internal.json'
+        )
         with open(pose_contract_path, 'w', encoding='utf-8') as f:
             json.dump(pose_contract, f, indent=2)
             f.write('\n')
@@ -819,12 +825,40 @@ if __name__ == "__main__":
             # Modify rotation, scale, and translaion
             raise NotImplementedError()
 
-        if fix_rotation and fix_translation:
-            cams2world = torch.from_numpy(np.linalg.inv(extrinsics))
-        elif fix_translation:
-            cams2world[:,:3,3] = torch.from_numpy(np.linalg.inv(extrinsics))[:,:3,3]
-        elif fix_rotation:
-            cams2world[:,:3,:3] = torch.from_numpy(np.linalg.inv(extrinsics))[:,:3,:3]
+        # Replacing an estimated camera pose without applying the same frame
+        # change to its dense pointmap breaks the defining pointmap contract:
+        # pixel (u, v)'s 3-D point no longer reprojects to (u, v).  Several
+        # otherwise exact-camera Cambridge runs therefore wrote cameras in
+        # the calibrated world while leaving points in the estimated world.
+        # Retarget every pointmap through its old camera frame whenever any
+        # calibrated pose component is forced.
+        if fix_rotation or fix_translation:
+            source_cams2world = cams2world.detach().cpu().numpy().copy()
+            calibrated_cams2world = np.linalg.inv(extrinsics)
+            target_cams2world = source_cams2world.copy()
+            if fix_rotation:
+                target_cams2world[:, :3, :3] = calibrated_cams2world[
+                    :, :3, :3
+                ]
+            if fix_translation:
+                target_cams2world[:, :3, 3] = calibrated_cams2world[
+                    :, :3, 3
+                ]
+            for i_ in range(len(pts3d)):
+                source_world_to_camera = np.linalg.inv(
+                    source_cams2world[i_]
+                )
+                source_to_target = (
+                    target_cams2world[i_] @ source_world_to_camera
+                )
+                pts3d[i_] = (
+                    pts3d[i_] @ source_to_target[:3, :3].T
+                    + source_to_target[:3, 3]
+                )
+            cams2world = torch.from_numpy(target_cams2world).to(
+                device=cams2world.device,
+                dtype=cams2world.dtype,
+            )
 
         print_debug('output extrinsics:')
         print_debug(torch.inverse(cams2world).numpy())
@@ -837,11 +871,78 @@ if __name__ == "__main__":
                 new_cam_location = (S[:3,:3] @ cam_location.T + S[:3,3:4]).T
                 cams2world[i_:i_+1,:3,3] = torch.from_numpy(new_cam_location).to(cams2world.device)
                 pts3d[i_] = (S[:3,:3] @ pts3d[i_].T + S[:3,3:4]).T
+
+    if use_calibrated_poses:
+        # Dense depth may still have been unprojected through SparseGA's
+        # internal focal estimate.  Retarget the rays after every pose/scale
+        # operation so the saved point at raster pixel (u,v) is exactly the
+        # camera-z measurement of the advertised calibrated K at (u,v).
+        advertised_cams2world = calibrated_camera_to_world_for_output(
+            cams2world.detach().cpu().numpy(),
+            extrinsics,
+            strict=bool(strict_calibrated_poses),
+        )
+        for i_ in range(len(pts3d)):
+            pts3d[i_] = retarget_pointmap_camera_rays(
+                np.asarray(pts3d[i_]),
+                advertised_cams2world[i_],
+                np.asarray(
+                    [
+                        intrinsics[i_][0, 0],
+                        intrinsics[i_][1, 1],
+                        intrinsics[i_][0, 2],
+                        intrinsics[i_][1, 2],
+                    ],
+                    dtype=np.float64,
+                ),
+                raster_shape=tuple(
+                    map(int, np.asarray(confs[i_]).shape)
+                ),
+            )
+        # Persist the same float64 camera matrices used by the final ray
+        # retarget.  Serializing SparseGA's float32 pose tensor here used to
+        # leave a 1e-6 discrepancy against the immutable Cambridge contract
+        # even in strict mode.
+        cams2world = torch.from_numpy(advertised_cams2world)
+        advertised_pose_contract = calibrated_pose_contract(
+            advertised_cams2world,
+            np.linalg.inv(extrinsics),
+            image_names,
+        )
+        advertised_pose_contract["stage"] = "advertised_fixed_camera_output"
+        if strict_calibrated_poses:
+            advertised_pose_contract["internal_sparse_ga_contract"] = {
+                "path": "calibrated_pose_contract_internal.json",
+                "passed": bool(pose_contract["passed"]),
+                "relative_center_error": pose_contract[
+                    "relative_center_error"
+                ],
+                "rotation_error_deg": pose_contract["rotation_error_deg"],
+            }
+        with open(
+            os.path.join(output_dir, 'calibrated_pose_contract.json'),
+            'w',
+            encoding='utf-8',
+        ) as f:
+            json.dump(advertised_pose_contract, f, indent=2)
+            f.write('\n')
     
     # Save cameras    
     output_cameras = {
         'filepaths': [img['instance'] for img in imgs],
-        'focals': focals.numpy().tolist(),
+        'focals': (
+            [
+                float(
+                    np.sqrt(
+                        intrinsics[index][0, 0]
+                        * intrinsics[index][1, 1]
+                    )
+                )
+                for index in range(len(imgs))
+            ]
+            if use_calibrated_poses
+            else focals.numpy().tolist()
+        ),
         # The scalar ``focals`` field is retained for old MAtCha readers only.
         # Geometry consumers must use this exact per-view pinhole contract.
         'intrinsics': [
@@ -886,17 +987,39 @@ if __name__ == "__main__":
 
         scale_w = width_original / width_resized_simple
         scale_h = height_original / height_resized_simple
+        if use_calibrated_poses:
+            # The sparse COLMAP sidecar is consumed by downstream track
+            # builders as well as by the coordinate audit.  Advertising
+            # SparseGA's optimized scalar focal here while the pointmap and
+            # cameras.json use fixed calibration silently reintroduced a
+            # second camera model.  Use the exact output-resolution pinhole
+            # contract instead.
+            export_K = output_intrinsics[image_names[idx_img]]
+            export_camera_params = np.asarray(
+                [
+                    export_K[0, 0],
+                    export_K[1, 1],
+                    export_K[0, 2],
+                    export_K[1, 2],
+                ],
+                dtype=np.float64,
+            )
+        else:
+            export_camera_params = np.asarray(
+                [
+                    focals[idx_img].item() * scale_w,
+                    focals[idx_img].item() * scale_h,
+                    (pps[idx_img][0].item() + ofs_u) * scale_w,
+                    (pps[idx_img][1].item() + ofs_v) * scale_h,
+                ],
+                dtype=np.float64,
+            )
         cameras_colmap[camera_id] = Camera(
             int(camera_id), 
             'PINHOLE', 
             width=width_original, 
             height=height_original, 
-            params=np.array([
-                focals[idx_img].item() * scale_w,
-                focals[idx_img].item() * scale_h,
-                (pps[idx_img][0].item() + ofs_u) * scale_w,
-                (pps[idx_img][1].item() + ofs_v) * scale_h,
-            ])
+            params=export_camera_params,
         )
 
         # extrinsics
@@ -920,7 +1043,9 @@ if __name__ == "__main__":
                 ((pixels[:, 1] % sparse_export_stride) == 0)
                 | (pixels[:, 1] == height_resized - 1)
             )
-        pixels_original = pixels * np.array([scale_w, scale_h])
+        pixels_original = (
+            pixels + np.array([ofs_u, ofs_v], dtype=np.float64)
+        ) * np.array([scale_w, scale_h], dtype=np.float64)
         point3d_ids = []
         xys = []
         img_original = cv2.imread(imgs[idx_img]['instance'],1)[...,::-1]

@@ -184,6 +184,12 @@ def main():
         for view in hull.pop("selected_views")
     ]
     candidate_count = int(hull.pop("candidate_count"))
+    dense_observation_ray_count = int(
+        hull.pop("dense_observation_ray_count", 0)
+    )
+    dense_hole_proposal_count = int(
+        hull.pop("dense_hole_proposal_count", 0)
+    )
     rigid_depth_view_count = int(hull.pop("rigid_depth_view_count"))
     tree_instance_count = int(hull.pop("tree_instance_count"))
     merged, counts = _merge(
@@ -197,6 +203,11 @@ def main():
             "tree_instances": tree_instance_count,
             "selected_views": selected_audit,
             "candidate_voxels": candidate_count,
+            "dense_observation_ray_count": (
+                dense_observation_ray_count
+            ),
+            "dense_hole_proposal_count": dense_hole_proposal_count,
+            "ray_posterior_candidate_independent": True,
             "rigid_depth_view_count": rigid_depth_view_count,
             "positive_negative_unknown_evidence": True,
             "depth_posterior": "local_same-instance_SfM_track_ray_likelihood",

@@ -214,6 +214,7 @@ def readColmapSceneInfo(
     llffhold=8,
     *,
     load_images=True,
+    load_point_cloud=True,
 ):
 
     if eval:
@@ -237,7 +238,7 @@ def readColmapSceneInfo(
 
     else:
         dense_sparse_point3d_file = os.path.join(path, "dense-view-sparse/0/points3D.ply")
-        if os.path.exists(dense_sparse_point3d_file):
+        if load_point_cloud and os.path.exists(dense_sparse_point3d_file):
             print(f'[INFO]: Load cameras from dense-view-sparse for dense view training')
             try:
                 cameras_extrinsic_file = os.path.join(path, "dense-view-sparse/0", "images.bin")
@@ -281,26 +282,34 @@ def readColmapSceneInfo(
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    if load_point_cloud:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
+            pcd = None
+        cam_infos = assign_adaptive_camera_zfar(
+            cam_infos,
+            None if pcd is None else pcd.points,
+        )
+        train_cam_infos = cam_infos
+    else:
+        # Fixed Cambridge intrinsics/extrinsics are a camera container only in
+        # the native hybrid mainline.  Do not even open points3D.ply/bin:
+        # geometry, z ranges and initialization must come from the explicit
+        # MASt3R/MAtCha evidence contract.  A missing per-camera zfar falls
+        # back to the renderer's stable 100 m convention.
+        ply_path = None
         pcd = None
-
-    cam_infos = assign_adaptive_camera_zfar(
-        cam_infos,
-        None if pcd is None else pcd.points,
-    )
-    train_cam_infos = cam_infos
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

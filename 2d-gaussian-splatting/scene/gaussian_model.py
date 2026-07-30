@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
+
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -34,6 +36,15 @@ class GaussianModel:
     # Unified Teacher initialization uses explicit evidence source codes.
     SOURCE_MAST3R_TRACK = 1
     SOURCE_CHART_RESIDUAL = 2
+    # A renderer-owned residual has no external evidence identity.  New
+    # residuals without a parent use this code; split/clone children retain
+    # the parent's source provenance while clearing direct track ownership.
+    SOURCE_FREE_RESIDUAL = 3
+    # Low-opacity monocular hole-completion births are calibrated to the
+    # MASt3R/MAtCha metric scaffold but are not themselves metric anchors.
+    # Their source role must remain distinguishable from renderer-created
+    # residuals until a local split deliberately replaces the parent.
+    SOURCE_DAV2_RIGID_HOLE = 4
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -70,6 +81,11 @@ class GaussianModel:
         self._geometry_confidence = torch.empty(0)
         self._protected_flag = torch.empty(0, dtype=torch.bool)
         self._block_id = torch.empty(0, dtype=torch.int32)
+        # Persistent, soft visibility mass.  Unlike ``denom`` this is not
+        # reset after every topology event, so low-opacity evidence births
+        # are not judged before the training sampler has actually exposed
+        # them to a representative set of cameras.
+        self._observation_mass = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -100,6 +116,7 @@ class GaussianModel:
                 "geometry_confidence": self._geometry_confidence,
                 "protected_flag": self._protected_flag,
                 "block_id": self._block_id,
+                "observation_mass": self._observation_mass,
             },
         )
     
@@ -137,6 +154,7 @@ class GaussianModel:
         geometry_confidence=1.0,
         protected_flag=False,
         block_id=-1,
+        observation_mass=0.0,
         device=None,
     ):
         count = int(count)
@@ -158,6 +176,12 @@ class GaussianModel:
         )
         self._block_id = torch.full(
             (count,), int(block_id), dtype=torch.int32, device=device
+        )
+        self._observation_mass = torch.full(
+            (count,),
+            float(observation_mass),
+            dtype=torch.float32,
+            device=device,
         )
 
     def _restore_point_metadata(self, metadata):
@@ -188,6 +212,13 @@ class GaussianModel:
             "_geometry_confidence": (metadata["geometry_confidence"], torch.float32),
             "_protected_flag": (metadata["protected_flag"], torch.bool),
             "_block_id": (metadata["block_id"], torch.int32),
+            "_observation_mass": (
+                metadata.get(
+                    "observation_mass",
+                    torch.zeros(point_count, dtype=torch.float32),
+                ),
+                torch.float32,
+            ),
         }
         for attribute, (value, dtype) in fields.items():
             tensor = torch.as_tensor(value, device=self._xyz.device, dtype=dtype).reshape(-1)
@@ -209,6 +240,7 @@ class GaussianModel:
             "geometry_confidence": self._geometry_confidence[indices],
             "protected_flag": self._protected_flag[indices],
             "block_id": self._block_id[indices],
+            "observation_mass": self._observation_mass[indices],
         }
         dtype_by_name = {
             "primitive_class": torch.int16,
@@ -217,6 +249,7 @@ class GaussianModel:
             "geometry_confidence": torch.float32,
             "protected_flag": torch.bool,
             "block_id": torch.int32,
+            "observation_mass": torch.float32,
         }
         for name, value in overrides.items():
             if value is not None:
@@ -251,6 +284,10 @@ class GaussianModel:
     @property
     def get_block_id(self):
         return self._block_id
+
+    @property
+    def get_observation_mass(self):
+        return self._observation_mass
 
     @torch.no_grad()
     def mark_prefix_protected(self, point_count):
@@ -420,6 +457,12 @@ class GaussianModel:
         colors,
         *,
         initial_opacity=0.05,
+        source_type=SOURCE_SFM_OR_BASE,
+        track_id=-1,
+        geometry_confidence=1.0,
+        protected_flag=False,
+        block_id=-1,
+        observation_mass=0.0,
     ):
         """Append conservative reseed Gaussians before optimizer construction."""
         if self.optimizer is not None:
@@ -442,13 +485,20 @@ class GaussianModel:
             device=self._features_rest.device,
             dtype=self._features_rest.dtype,
         )
-        opacities = self.inverse_opacity_activation(
-            torch.full(
-                (len(means), 1),
-                float(initial_opacity),
-                device=self._opacity.device,
-                dtype=self._opacity.dtype,
+        initial_opacity = torch.as_tensor(
+            initial_opacity,
+            device=self._opacity.device,
+            dtype=self._opacity.dtype,
+        )
+        if initial_opacity.numel() == 1:
+            initial_opacity = initial_opacity.expand(len(means))
+        initial_opacity = initial_opacity.reshape(-1)
+        if len(initial_opacity) != len(means):
+            raise ValueError(
+                "initial_opacity must be scalar or have one value per reseed"
             )
+        opacities = self.inverse_opacity_activation(
+            initial_opacity[:, None].clamp(1e-6, 1.0 - 1e-6)
         )
 
         self._xyz = nn.Parameter(torch.cat([self._xyz.detach(), means], dim=0).requires_grad_(True))
@@ -470,31 +520,53 @@ class GaussianModel:
         old_count = len(self._xyz) - len(means)
         if len(self._primitive_class) != old_count:
             self._initialize_point_metadata(old_count, device=self._xyz.device)
+        def metadata_values(value, dtype, name):
+            value = torch.as_tensor(
+                value, dtype=dtype, device=self._xyz.device
+            )
+            if value.numel() == 1:
+                value = value.expand(len(means))
+            value = value.reshape(-1)
+            if len(value) != len(means):
+                raise ValueError(
+                    f"{name} must be scalar or have one value per reseed"
+                )
+            return value
+
         appended_metadata = {
             "primitive_class": torch.full(
                 (len(means),), self.PRIMITIVE_STRUCTURAL,
                 dtype=torch.int16, device=self._xyz.device
             ),
-            "source_type": torch.full(
-                (len(means),), self.SOURCE_SFM_OR_BASE,
-                dtype=torch.int16, device=self._xyz.device
+            "source_type": metadata_values(
+                source_type, torch.int16, "source_type"
             ),
-            "geometry_confidence": torch.ones(
-                len(means), dtype=torch.float32, device=self._xyz.device
+            "track_id": metadata_values(
+                track_id, torch.int64, "track_id"
             ),
-            "protected_flag": torch.zeros(
-                len(means), dtype=torch.bool, device=self._xyz.device
+            "geometry_confidence": metadata_values(
+                geometry_confidence,
+                torch.float32,
+                "geometry_confidence",
             ),
-            "block_id": torch.full(
-                (len(means),), -1, dtype=torch.int32, device=self._xyz.device
+            "protected_flag": metadata_values(
+                protected_flag, torch.bool, "protected_flag"
+            ),
+            "block_id": metadata_values(
+                block_id, torch.int32, "block_id"
+            ),
+            "observation_mass": metadata_values(
+                observation_mass, torch.float32, "observation_mass"
             ),
         }
         for name, attribute in (
             ("primitive_class", "_primitive_class"),
             ("source_type", "_source_type"),
+            ("track_id", "_track_id"),
             ("geometry_confidence", "_geometry_confidence"),
             ("protected_flag", "_protected_flag"),
             ("block_id", "_block_id"),
+            ("observation_mass", "_observation_mass"),
         ):
             setattr(
                 self,
@@ -745,6 +817,7 @@ class GaussianModel:
                 "geometry_confidence",
                 "protected_flag",
                 "block_id",
+                "observation_mass",
             ]
         )
         return l
@@ -767,6 +840,7 @@ class GaussianModel:
                 self._geometry_confidence.detach().cpu().numpy(),
                 self._protected_flag.detach().cpu().numpy().astype(np.float32),
                 self._block_id.detach().cpu().numpy(),
+                self._observation_mass.detach().cpu().numpy(),
             ],
             axis=1,
         ).astype(np.float32)
@@ -1013,6 +1087,15 @@ class GaussianModel:
                 dtype=torch.int32,
                 device="cuda",
             )
+            self._observation_mass = torch.tensor(
+                (
+                    np.asarray(plydata.elements[0]["observation_mass"])
+                    if "observation_mass" in property_names
+                    else np.zeros(len(xyz), dtype=np.float32)
+                ),
+                dtype=torch.float32,
+                device="cuda",
+            )
         else:
             self._initialize_point_metadata(len(self._xyz), device=self._xyz.device)
         if use_mip_filter:
@@ -1074,6 +1157,7 @@ class GaussianModel:
         self._geometry_confidence = self._geometry_confidence[valid_points_mask]
         self._protected_flag = self._protected_flag[valid_points_mask]
         self._block_id = self._block_id[valid_points_mask]
+        self._observation_mass = self._observation_mass[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -1146,6 +1230,9 @@ class GaussianModel:
                 "block_id": torch.full(
                     (new_count,), -1, dtype=torch.int32, device=self._xyz.device
                 ),
+                "observation_mass": torch.zeros(
+                    new_count, dtype=torch.float32, device=self._xyz.device
+                ),
             }
         for name, attribute in (
             ("primitive_class", "_primitive_class"),
@@ -1154,6 +1241,7 @@ class GaussianModel:
             ("geometry_confidence", "_geometry_confidence"),
             ("protected_flag", "_protected_flag"),
             ("block_id", "_block_id"),
+            ("observation_mass", "_observation_mass"),
         ):
             extension = torch.as_tensor(
                 metadata[name],
@@ -1284,6 +1372,7 @@ class GaussianModel:
         geometry_confidence=None,
         protected_flag=None,
         block_id=None,
+        track_id=None,
     ):
         """Append a bounded, conservative residual clone set without pruning.
 
@@ -1351,6 +1440,7 @@ class GaussianModel:
                 selected_indices,
                 primitive_class=primitive_class,
                 source_type=source_type,
+                track_id=track_id,
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
@@ -1377,6 +1467,7 @@ class GaussianModel:
         geometry_confidence=None,
         protected_flag=None,
         block_id=None,
+        track_id=None,
         replace_parent=False,
     ):
         """Create compact children for large, high-gradient Gaussians.
@@ -1441,13 +1532,51 @@ class GaussianModel:
         rotations = build_rotation(self._rotation[repeated_indices])
         new_xyz = torch.bmm(rotations, offsets.unsqueeze(-1)).squeeze(-1)
         new_xyz = new_xyz + self.get_xyz[repeated_indices]
+        # A replacing split must preserve projected support as well as point
+        # count.  With the legacy 0.8*N shrink, two children cover only
+        # 78.125% of the parent tangent area and therefore require 1.28x
+        # optical depth each.  The caller's opacity ceiling then clipped
+        # high-confidence facade children and made the surface sparser every
+        # time it densified.  sqrt(N) gives N children exactly the parent's
+        # total tangent area, so each child can retain parent opacity.
+        scale_shrink = (
+            math.sqrt(float(children_per_parent))
+            if replace_parent
+            else 0.8 * float(children_per_parent)
+        )
         new_scaling = self.scaling_inverse_activation(
-            parent_scales / (0.8 * children_per_parent)
+            parent_scales / scale_shrink
         )
-        opacity_limit = self.inverse_opacity_activation(
-            torch.full_like(self._opacity[repeated_indices], float(opacity_ceiling))
-        )
-        new_opacities = torch.minimum(self._opacity[repeated_indices], opacity_limit)
+        if replace_parent:
+            # Preserve integrated tangent-plane optical depth after both the
+            # scale reduction and the spatial displacement of the children.
+            # A coincident-transmittance rule divides alpha by N, but each
+            # child also has 1/shrink^2 of the projected area; that retained
+            # only ~39% of a parent's mass for N=2 and shrink=1.6.
+            parent_alpha = self.get_opacity[repeated_indices]
+            parent_tau = -torch.log1p(
+                -parent_alpha.clamp(1e-6, 1 - 1e-6)
+            )
+            child_tau = (
+                parent_tau
+                * (scale_shrink * scale_shrink)
+                / float(children_per_parent)
+            )
+            child_alpha = -torch.expm1(-child_tau)
+            child_alpha = child_alpha.clamp(
+                min=1e-4, max=float(opacity_ceiling)
+            )
+            new_opacities = self.inverse_opacity_activation(child_alpha)
+        else:
+            opacity_limit = self.inverse_opacity_activation(
+                torch.full_like(
+                    self._opacity[repeated_indices],
+                    float(opacity_ceiling),
+                )
+            )
+            new_opacities = torch.minimum(
+                self._opacity[repeated_indices], opacity_limit
+            )
 
         parent_mip_filter = None
         if self.use_mip_filter and hasattr(self, "mip_filter"):
@@ -1464,6 +1593,7 @@ class GaussianModel:
                 repeat=children_per_parent,
                 primitive_class=primitive_class,
                 source_type=source_type,
+                track_id=track_id,
                 geometry_confidence=geometry_confidence,
                 protected_flag=protected_flag,
                 block_id=block_id,
@@ -1483,6 +1613,58 @@ class GaussianModel:
         remove[selected_indices] = True
         self.prune_points(remove)
 
+    def _evidence_mature_opacity_prune_mask(
+        self,
+        min_opacity,
+        *,
+        observation_reference_count=2,
+    ):
+        """Return a continuous, observation-aware opacity cull.
+
+        Metric/Chart surfels start with direct geometric authority and use the
+        ordinary 2DGS opacity threshold.  DAV2 rigid-hole births intentionally
+        start just above that threshold and have only posterior authority.
+        Culling them after one or two random training views confuses "not yet
+        sampled" with "photometrically rejected".  Their threshold therefore
+        approaches the ordinary threshold smoothly with cumulative rendered
+        visibility mass; there is no protected interval or pass/fail count.
+        """
+        opacity = self.get_opacity.reshape(-1)
+        threshold = torch.full_like(opacity, float(min_opacity))
+        maturity = torch.ones_like(opacity)
+        observation_mass = getattr(
+            self, "_observation_mass", torch.empty(0)
+        )
+        if (
+            len(self._source_type) == len(opacity)
+            and len(observation_mass) == len(opacity)
+        ):
+            dav2 = (
+                self._source_type
+                == GaussianModel.SOURCE_DAV2_RIGID_HOLE
+            )
+            if bool(dav2.any()):
+                observations = torch.nan_to_num(
+                    observation_mass.float(),
+                    nan=0.0,
+                    posinf=64.0,
+                    neginf=0.0,
+                ).clamp_min(0.0)
+                # Maturity is measured in weighted database sweeps, not raw
+                # optimizer iterations.  Four reference-set sweeps give
+                # 63.2% of the ordinary threshold and twelve give 95.0%.
+                # Fractional visibility contributes proportionally through
+                # add_densification_stats.
+                maturity_mass = 4.0 * max(
+                    float(observation_reference_count), 1.0
+                )
+                dav2_maturity = -torch.expm1(
+                    -observations[dav2] / maturity_mass
+                )
+                maturity[dav2] = dav2_maturity
+                threshold[dav2] *= dav2_maturity
+        return opacity < threshold, maturity
+
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         use_mip_filter = self.use_mip_filter
         if use_mip_filter:
@@ -1494,7 +1676,11 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask, _ = (
+            GaussianModel._evidence_mature_opacity_prune_mask(
+                self, min_opacity
+            )
+        )
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
@@ -1514,20 +1700,21 @@ class GaussianModel:
         *,
         max_points,
         max_growth,
+        observation_reference_count=2,
     ):
-        """Run anchor-preserving residual topology under a strict budget.
+        """Run evidence-independent renderer topology under a strict budget.
 
         Native 2DGS densification selects every point above the gradient
         threshold.  Large outdoor scenes can therefore add hundreds of
         thousands of surfels in one event and exhaust the mixed rasterizer
-        before the dynamic foliage phases begin.  This variant first applies
-        the native culling rules, then admits only the highest-gradient
-        clone/split candidates that fit both the global and per-event budgets.
-        Large metric anchors are never retired. They remain the permanent
-        low-frequency evidence responsibility while compact, low-opacity
-        children inherit the same external track identity. The corresponding
-        factor normalizes descendants per evidence node, so splitting cannot
-        multiply a measurement's weight.
+        before the dynamic foliage phases begin.  This variant applies the
+        native culling rules, then admits only the highest-gradient candidates
+        that fit both budgets.  ``max_growth`` is deliberately a *net* point
+        budget: a replacing two-child split costs one slot (two children minus
+        one retired parent), just like a clone costs one slot.  Evidence seeds
+        may be protected during a short bootstrap.  After release their
+        children are renderer-owned (direct track identity is cleared), while
+        source provenance and cumulative observation mass remain inherited.
         """
         max_points = int(max_points)
         max_growth = int(max_growth)
@@ -1545,8 +1732,79 @@ class GaussianModel:
             posinf=0.0,
             neginf=0.0,
         )
+        if len(self._geometry_confidence) == before:
+            confidence = torch.nan_to_num(
+                self._geometry_confidence.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            confidence_reliability = (
+                0.40 + 0.60 * confidence / (confidence + 0.25)
+            )
+        else:
+            confidence_reliability = grads.new_ones(before)
+        opacity = self.get_opacity.reshape(-1).detach().clamp(0.0, 1.0)
+        # A newly admitted low-opacity witness first needs enough RGB support
+        # to establish colour, orientation and optical responsibility.  Using
+        # its raw screen gradient immediately made every large DAV2 coverage
+        # birth split at the next 100-step event, turning a prospective
+        # facade into a pointillist cloud before it had been observed by a
+        # useful fraction of the 1,487 cameras.  Maturity is continuous and
+        # has a non-zero floor: it changes priority, never eligibility.
+        optical_maturity = (
+            0.25
+            + 0.75
+            * torch.sqrt(
+                opacity / (opacity + 0.05)
+            )
+        )
+        # Spatial evidence confidence changes topology priority, not whether a
+        # pixel is allowed to train.  This prevents a large low-trust Chart
+        # sheet from consuming the same split budget as independently
+        # supported MASt3R/Chart geometry while retaining a non-zero path for
+        # RGB to validate genuinely novel coverage.
+        priority_grads = (
+            grads
+            * confidence_reliability[:, None]
+            * optical_maturity[:, None]
+        )
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_prune_mask, cull_maturity = (
+            GaussianModel._evidence_mature_opacity_prune_mask(
+                self,
+                min_opacity,
+                observation_reference_count=(
+                    observation_reference_count
+                ),
+            )
+        )
+        prune_mask = opacity_prune_mask.clone()
+        dav2_before_mask = (
+            self._source_type
+            == GaussianModel.SOURCE_DAV2_RIGID_HOLE
+            if len(self._source_type) == before
+            else torch.zeros(
+                before, dtype=torch.bool, device=prune_mask.device
+            )
+        )
+        dav2_before = int(dav2_before_mask.sum())
+        dav2_observation_mass_mean = (
+            float(
+                getattr(
+                    self,
+                    "_observation_mass",
+                    opacity.new_zeros(before),
+                )[dav2_before_mask].mean()
+            )
+            if dav2_before
+            else 0.0
+        )
+        dav2_cull_maturity_mean = (
+            float(cull_maturity[dav2_before_mask].mean())
+            if dav2_before
+            else 1.0
+        )
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = (
@@ -1562,9 +1820,98 @@ class GaussianModel:
             prune_mask = torch.logical_and(
                 prune_mask, ~self._protected_flag
             )
+        routine_pruned = int(prune_mask.sum())
+
+        # A fixed maximum is a memory budget, not a topology stop condition.
+        # At saturation, retire a small number of transparent, low-confidence,
+        # low-gradient primitives so high-gradient coverage deficits can
+        # replace them in the same event.  The model therefore remains
+        # bounded while capacity follows the residual instead of historical
+        # insertion order.
+        grad_norm_before = torch.norm(priority_grads, dim=-1)
+        max_scale_before = self.get_scaling.max(dim=1).values
+        projected_large_before = self.max_radii2D > min(
+            16.0, 0.25 * float(max_screen_size)
+        )
+        finite_scale_before = torch.isfinite(max_scale_before)
+        clone_candidate_before = (
+            (grad_norm_before >= max_grad)
+            & finite_scale_before
+            & (
+                max_scale_before
+                <= self.percent_dense * extent
+            )
+            & ~projected_large_before
+        )
+        split_candidate_before = (
+            (grad_norm_before >= max_grad)
+            & finite_scale_before
+            & (
+                (
+                    max_scale_before
+                    > self.percent_dense * extent
+                )
+                | projected_large_before
+            )
+            & (max_scale_before <= 0.1 * extent)
+        )
+        candidate_before = (
+            clone_candidate_before | split_candidate_before
+        )
+        if len(self._protected_flag) == before:
+            candidate_before &= ~self._protected_flag
+        candidate_before &= ~prune_mask
+        candidate_count_before = int(candidate_before.sum())
+        count_after_routine = before - routine_pruned
+        free_after_routine = max(max_points - count_after_routine, 0)
+        desired_admissions = min(max_growth, candidate_count_before)
+        reallocation_needed = max(
+            desired_admissions - free_after_routine, 0
+        )
+        reallocation_limit = min(
+            max_growth,
+            max(64, int(round(0.00125 * max_points))),
+        )
+        reallocation_target = min(
+            reallocation_needed, reallocation_limit
+        )
+        reallocated_pruned = 0
+        if reallocation_target > 0:
+            alpha = self.get_opacity.reshape(-1)
+            eligible = ~prune_mask & ~candidate_before
+            if len(self._protected_flag) == before:
+                eligible &= ~self._protected_flag
+            # Only weak optical contributors may be displaced.  High-opacity
+            # surfaces remain stable even when their current gradient is low.
+            eligible &= alpha <= max(0.05, 10.0 * float(min_opacity))
+            eligible_indices = torch.nonzero(
+                eligible, as_tuple=False
+            ).flatten()
+            if len(eligible_indices):
+                visibility = torch.nan_to_num(
+                    self.denom.reshape(-1).float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).clamp_min(0.0)
+                visibility = visibility / (visibility + 2.0)
+                utility = (
+                    alpha
+                    * (0.35 + 0.65 * confidence_reliability)
+                    * (0.50 + 0.50 * visibility)
+                )
+                count = min(
+                    reallocation_target, len(eligible_indices)
+                )
+                _, order = torch.topk(
+                    -utility[eligible_indices], k=count
+                )
+                retired = eligible_indices[order]
+                prune_mask[retired] = True
+                reallocated_pruned = int(len(retired))
         pruned = int(prune_mask.sum())
         if pruned:
-            grads = grads[~prune_mask]
+            priority_grads = priority_grads[~prune_mask]
             self.prune_points(prune_mask)
 
         point_count = int(self.get_xyz.shape[0])
@@ -1575,7 +1922,7 @@ class GaussianModel:
         cloned = 0
         split_parents = 0
         if remaining > 0 and point_count:
-            grad_norm = torch.norm(grads, dim=-1)
+            grad_norm = torch.norm(priority_grads, dim=-1)
             max_scale = self.get_scaling.max(dim=1).values
             clone_candidates = torch.logical_and(
                 grad_norm >= max_grad,
@@ -1585,65 +1932,99 @@ class GaussianModel:
                 16.0, 0.25 * float(max_screen_size)
             )
             split_candidates = torch.logical_and(
-                grads.squeeze(-1) >= max_grad,
+                priority_grads.squeeze(-1) >= max_grad,
                 torch.logical_or(
                     max_scale > self.percent_dense * extent,
                     projected_large,
                 ),
             )
-            # Chart topology belongs to its UV atlas. Random 3D splitting
-            # destroys chart adjacency and is therefore forbidden here.
+            # A still-protected Chart seed belongs to the bootstrap atlas and
+            # cannot be randomly replaced.  Once released, it is merely a
+            # renderer seed; tangent-plane splitting is allowed while the
+            # permanent source-resolution Chart factor remains independent.
             if len(self._source_type) == point_count:
-                split_candidates &= self._source_type != 2
-            # Metric anchors are the immutable geometric scaffold.  They may
-            # spawn a low-opacity residual clone, but random child offsets
-            # must never replace the anchor itself.  A later event can split
-            # and retire that unprotected residual locally.
+                chart_seed = self._source_type == self.SOURCE_CHART_RESIDUAL
+                if len(self._protected_flag) == point_count:
+                    split_candidates &= ~(chart_seed & self._protected_flag)
+                else:
+                    split_candidates &= ~chart_seed
+            # Bootstrap evidence seeds cannot be replaced until the trainer
+            # explicitly releases them.
             if len(self._protected_flag) == point_count:
                 split_candidates &= ~self._protected_flag
+                clone_candidates &= ~self._protected_flag
             clone_candidates = torch.logical_and(
                 clone_candidates, ~projected_large
             )
             # Large footprint deficits are the failure mode that creates
             # facade/tree smearing, so reserve capacity for compact children
             # before spending the remainder on same-scale clones.
-            split_capacity = min(
+            split_parent_capacity = min(
                 remaining,
-                int(split_candidates.sum()) * 2,
+                int(split_candidates.sum()),
             )
-            split_capacity -= split_capacity % 2
             # Clone original indices before a replacing split prunes parents
             # and compacts every per-point tensor.  Calling clone afterwards
             # would address the compacted model with stale gradients/masks.
-            clone_capacity = remaining - split_capacity
+            clone_capacity = remaining - split_parent_capacity
             if clone_capacity:
                 cloned = self.densify_and_clone_limited(
-                    grads,
+                    priority_grads,
                     max_grad,
                     extent,
                     clone_capacity,
                     opacity_ceiling=0.015,
                     eligibility_mask=clone_candidates,
+                    # The child is renderer-owned (track_id=-1), but source
+                    # remains its provenance lineage.  Overwriting every
+                    # child with SOURCE_FREE_RESIDUAL erased the measured
+                    # MASt3R/Chart/DAV2 origin after one topology event.
+                    track_id=-1,
                     protected_flag=False,
                 )
-            if split_capacity:
+            if split_parent_capacity:
                 split_children = self.densify_and_split_limited(
-                    grads,
+                    priority_grads,
                     max_grad,
                     extent,
-                    split_capacity,
+                    split_parent_capacity * 2,
                     children_per_parent=2,
-                    opacity_ceiling=0.02,
+                    # With sqrt(N) scale shrink, child opacity equals parent
+                    # opacity.  This ceiling is numerical only; the trainer's
+                    # global logit bound remains authoritative.
+                    opacity_ceiling=1.0 - 1e-6,
                     require_large_world_scale=False,
                     eligibility_mask=split_candidates,
+                    # Preserve source provenance while releasing direct
+                    # observation ownership through track_id=-1.
+                    track_id=-1,
                     protected_flag=False,
                     replace_parent=True,
                 )
                 split_parents = int(split_children // 2)
-                remaining -= int(split_children)
+                # Replacing each selected parent by two compact children adds
+                # exactly one point to the model.  Charging both children was
+                # a hidden 2x under-allocation of surface capacity.
+                remaining -= split_parents
             remaining -= int(cloned)
 
         after = int(self.get_xyz.shape[0])
+        dav2_after = (
+            int(
+                (
+                    self._source_type
+                    == GaussianModel.SOURCE_DAV2_RIGID_HOLE
+                ).sum()
+            )
+            if len(self._source_type) == after
+            else 0
+        )
+        topology_net_growth = after - point_count
+        if topology_net_growth > max_growth:
+            raise RuntimeError(
+                "Bounded densification exceeded its net growth budget: "
+                f"{topology_net_growth} > {max_growth}"
+            )
         if after > max_points:
             raise RuntimeError(
                 f"Bounded densification exceeded its budget: "
@@ -1655,16 +2036,85 @@ class GaussianModel:
         return {
             "before": before,
             "pruned": pruned,
+            "routine_pruned": routine_pruned,
+            "reallocated_pruned": reallocated_pruned,
             "cloned": cloned,
             "split_parents": split_parents,
             "after": after,
+            "net_growth": topology_net_growth,
+            "model_delta": after - before,
             "budget": max_points,
             "remaining": max(max_points - after, 0),
+            "candidate_count_before": candidate_count_before,
+            "capacity_reallocation_requested": reallocation_target,
+            "capacity_saturated_before": (
+                count_after_routine >= max_points
+            ),
+            "dav2_lineage": {
+                "before": dav2_before,
+                "opacity_pruned": int(
+                    (opacity_prune_mask & dav2_before_mask).sum()
+                ),
+                "all_causes_pruned": int(
+                    (prune_mask & dav2_before_mask).sum()
+                ),
+                "after": dav2_after,
+                "observation_mass_mean": dav2_observation_mass_mean,
+                "continuous_cull_maturity_mean": (
+                    dav2_cull_maturity_mean
+                ),
+                "cull_policy": (
+                    "min_opacity_times_one_minus_exp_"
+                    "negative_observation_mass_over_"
+                    "four_reference_set_sweeps"
+                ),
+                "observation_reference_count": int(
+                    observation_reference_count
+                ),
+                "source_provenance_inherited_by_children": True,
+            },
+            "topology_priority": (
+                "screen_gradient_times_spatial_geometry_confidence_times_"
+                "continuous_optical_maturity_and_persistent_source_lineage"
+            ),
         }
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
+        weight = torch.as_tensor(
+            update_filter,
+            device=self.xyz_gradient_accum.device,
+        ).reshape(-1)
+        if len(weight) != len(self.xyz_gradient_accum):
+            raise ValueError(
+                "Densification weight must have one value per Gaussian"
+            )
+        if weight.dtype == torch.bool:
+            weight = weight.to(dtype=self.xyz_gradient_accum.dtype)
+        else:
+            weight = torch.nan_to_num(
+                weight.to(dtype=self.xyz_gradient_accum.dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+        valid = weight > 0
+        if not bool(valid.any()):
+            return
+        gradient = torch.norm(
+            viewspace_point_tensor.grad[valid],
+            dim=-1,
+            keepdim=True,
+        )
+        self.xyz_gradient_accum[valid] += (
+            gradient * weight[valid, None]
+        )
+        self.denom[valid] += weight[valid, None]
+        observation_mass = getattr(self, "_observation_mass", None)
+        if (
+            observation_mass is not None
+            and len(observation_mass) == len(weight)
+        ):
+            observation_mass[valid] += weight[valid]
 
     def gs_scale_loss(self, max_scale_thresh=0.05):
         max_scale = self.get_scaling.max(dim=1).values
@@ -1693,6 +2143,15 @@ def combine_gslist(gslist):
     scaling_list = []
     rotation_list = []
     mip_filter_list = []
+    metadata_lists = {
+        "primitive_class": [],
+        "source_type": [],
+        "track_id": [],
+        "geometry_confidence": [],
+        "protected_flag": [],
+        "block_id": [],
+        "observation_mass": [],
+    }
     # Collect parameters from each model
     for model in gslist:
         xyz_list.append(model.get_xyz.detach())
@@ -1701,6 +2160,21 @@ def combine_gslist(gslist):
         opacity_list.append(model._opacity.detach())
         scaling_list.append(model._scaling.detach())
         rotation_list.append(model._rotation.detach())
+        for name, attribute in (
+            ("primitive_class", "_primitive_class"),
+            ("source_type", "_source_type"),
+            ("track_id", "_track_id"),
+            ("geometry_confidence", "_geometry_confidence"),
+            ("protected_flag", "_protected_flag"),
+            ("block_id", "_block_id"),
+            ("observation_mass", "_observation_mass"),
+        ):
+            value = getattr(model, attribute)
+            if len(value) != len(model.get_xyz):
+                raise RuntimeError(
+                    f"Cannot combine model with incomplete {name} metadata"
+                )
+            metadata_lists[name].append(value.detach())
 
         if hasattr(model, "mip_filter"):
             mip_filter_list.append(model.mip_filter.detach())
@@ -1712,6 +2186,20 @@ def combine_gslist(gslist):
     combined_model._opacity = nn.Parameter(torch.cat(opacity_list, dim=0))
     combined_model._scaling = nn.Parameter(torch.cat(scaling_list, dim=0))
     combined_model._rotation = nn.Parameter(torch.cat(rotation_list, dim=0))
+    for name, attribute in (
+        ("primitive_class", "_primitive_class"),
+        ("source_type", "_source_type"),
+        ("track_id", "_track_id"),
+        ("geometry_confidence", "_geometry_confidence"),
+        ("protected_flag", "_protected_flag"),
+        ("block_id", "_block_id"),
+        ("observation_mass", "_observation_mass"),
+    ):
+        setattr(
+            combined_model,
+            attribute,
+            torch.cat(metadata_lists[name], dim=0),
+        )
 
     if len(mip_filter_list) > 0:
         combined_model.set_mip_filter(True)

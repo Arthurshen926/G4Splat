@@ -1,4 +1,5 @@
 import json
+import hashlib
 import pickle
 from types import SimpleNamespace
 
@@ -35,6 +36,11 @@ def _task_lookup(tmp_path):
     manifest.write_text(
         json.dumps(
             {
+                "input_hashes": {
+                    "tree_mask_pickle": hashlib.sha256(
+                        mask_pickle.read_bytes()
+                    ).hexdigest()
+                },
                 "class_availability": {
                     "canopy": "tree_mask_index_3",
                     "trunk": "unlabelled",

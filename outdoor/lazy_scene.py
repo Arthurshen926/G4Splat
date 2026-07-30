@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,12 +27,89 @@ from scene.dataset_readers import (
     sceneLoadTypeCallbacks,
 )
 from utils.general_utils import PILtoTorch
+from utils.intrinsics_utils import scale_calibrated_intrinsics
 from utils.graphics_utils import (
     focal2fov,
-    fov2focal,
     getProjectionMatrix,
     getWorld2View2,
 )
+
+
+def rgb_source_contract(args) -> dict:
+    """Describe the immutable RGB target raster used by training/evaluation.
+
+    Camera calibration and render resolution do not uniquely identify the
+    optimization target: the historical Cambridge control materializes a
+    shared 640x360 torch-bilinear raster, whereas resizing the 1920x1080
+    source at runtime with Pillow produces different edge pixels.  Persist
+    both the image inventory and the producer manifest so a later evaluator
+    cannot silently compare against a different target raster.
+    """
+    image_root = Path(args.images)
+    if not image_root.is_absolute():
+        image_root = Path(args.source_path) / image_root
+    image_root = image_root.expanduser().resolve()
+    if not image_root.is_dir():
+        raise FileNotFoundError(f"RGB image root does not exist: {image_root}")
+    image_paths = sorted(
+        (
+            path
+            for path in image_root.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        ),
+        key=lambda path: path.name,
+    )
+    names = [path.name for path in image_paths]
+    name_set_sha256 = hashlib.sha256(
+        ("\n".join(names) + "\n").encode("utf-8")
+    ).hexdigest()
+    # A name-set digest does not detect an RGB raster overwritten under the
+    # correct filename (or two named rasters accidentally swapped).  Bind
+    # every camera-facing identity to its exact encoded bytes.  The digest is
+    # deliberately over ``name -> file SHA256`` rather than file iteration
+    # order, so it is stable across filesystems while still detecting a
+    # content/identity permutation.
+    content_mapping = hashlib.sha256()
+    content_bytes = 0
+    for path in image_paths:
+        file_digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                file_digest.update(block)
+                content_bytes += len(block)
+        content_mapping.update(path.name.encode("utf-8"))
+        content_mapping.update(b"\0")
+        content_mapping.update(file_digest.hexdigest().encode("ascii"))
+        content_mapping.update(b"\n")
+    producer_manifest = image_root.parent / "input_manifest.json"
+    producer = {}
+    producer_manifest_sha256 = None
+    if producer_manifest.is_file():
+        raw = producer_manifest.read_bytes()
+        producer_manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        try:
+            producer = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            producer = {}
+    return {
+        "image_root": str(image_root),
+        "image_count": len(names),
+        "name_set_sha256": name_set_sha256,
+        "content_mapping_sha256": content_mapping.hexdigest(),
+        "content_bytes": int(content_bytes),
+        "producer_manifest": (
+            str(producer_manifest)
+            if producer_manifest.is_file()
+            else None
+        ),
+        "producer_manifest_sha256": producer_manifest_sha256,
+        "producer_contract": producer.get("contract"),
+        "target_storage": producer.get("rgb_target_storage"),
+        "canonical_image_size_wh": producer.get(
+            "canonical_image_size_wh"
+        ),
+    }
 
 
 class _ImageLRU:
@@ -85,13 +163,35 @@ class LazyCamera:
         cache: _ImageLRU,
         resolution_scale: float = 1.0,
     ):
-        original_width = int(cam_info.width)
-        original_height = int(cam_info.height)
+        # COLMAP intrinsics are expressed in the calibration raster, while a
+        # materialized training target may deliberately use another raster
+        # (Cambridge's shared target is 640x360 although cameras.bin remains
+        # 1920x1080).  Resolution arguments operate on the RGB raster, but K
+        # must be scaled from the calibration raster.  Conflating these two
+        # coordinate systems made ``--resolution 1`` decode a 640-wide target
+        # at 1920 pixels and, in the eager Scene path, could leave fx three
+        # times too large.
+        calibration_width = int(cam_info.width)
+        calibration_height = int(cam_info.height)
+        with Image.open(cam_info.image_path) as source_image:
+            source_width, source_height = source_image.size
+        source_width = int(source_width)
+        source_height = int(source_height)
+        if min(
+            calibration_width,
+            calibration_height,
+            source_width,
+            source_height,
+        ) <= 0:
+            raise RuntimeError(
+                "Camera calibration and RGB raster dimensions must be positive"
+            )
         width, height = _scaled_resolution(
-            args, original_width, original_height, resolution_scale
+            args, source_width, source_height, resolution_scale
         )
-        scale_x = float(width) / float(original_width)
-        scale_y = float(height) / float(original_height)
+        focal_x, focal_y, principal_x, principal_y = (
+            scale_calibrated_intrinsics(cam_info, (width, height))
+        )
 
         self.uid = int(uid)
         self.colmap_id = cam_info.uid
@@ -99,28 +199,16 @@ class LazyCamera:
         self.T = np.asarray(cam_info.T)
         self.image_name = str(cam_info.image_name)
         self.image_path = str(cam_info.image_path)
+        self.calibration_width = calibration_width
+        self.calibration_height = calibration_height
+        self.source_raster_width = source_width
+        self.source_raster_height = source_height
         self.image_width = int(width)
         self.image_height = int(height)
-        self.focal_x = (
-            float(cam_info.fx) * scale_x
-            if cam_info.fx is not None
-            else fov2focal(cam_info.FovX, original_width) * scale_x
-        )
-        self.focal_y = (
-            float(cam_info.fy) * scale_y
-            if cam_info.fy is not None
-            else fov2focal(cam_info.FovY, original_height) * scale_y
-        )
-        self.cx = (
-            float(cam_info.cx) * scale_x
-            if cam_info.cx is not None
-            else self.image_width / 2.0
-        )
-        self.cy = (
-            float(cam_info.cy) * scale_y
-            if cam_info.cy is not None
-            else self.image_height / 2.0
-        )
+        self.focal_x = focal_x
+        self.focal_y = focal_y
+        self.cx = principal_x
+        self.cy = principal_y
         self.FoVx = focal2fov(self.focal_x, self.image_width)
         self.FoVy = focal2fov(self.focal_y, self.image_height)
         self.znear = 0.01
@@ -255,6 +343,37 @@ def _camera_json(camera: LazyCamera) -> dict:
     }
 
 
+def _camera_geometry_digest(cameras: Iterable[LazyCamera]) -> str:
+    """Hash only calibrated image geometry, excluding cache/runtime knobs."""
+    payload = [
+        {
+            "image_name": camera.image_name,
+            "colmap_id": int(camera.colmap_id),
+            "width": int(camera.image_width),
+            "height": int(camera.image_height),
+            "fx": float(camera.focal_x),
+            "fy": float(camera.focal_y),
+            "cx": float(camera.cx),
+            "cy": float(camera.cy),
+            "R_camera_to_world": np.asarray(
+                camera.R, dtype=np.float64
+            ).tolist(),
+            "T_world_to_camera": np.asarray(
+                camera.T, dtype=np.float64
+            ).tolist(),
+            "znear": float(camera.znear),
+            "zfar": float(camera.zfar),
+        }
+        for camera in cameras
+    ]
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class LazyScene:
     """Small ``Scene`` replacement used by the unified mainline."""
 
@@ -276,6 +395,7 @@ class LazyScene:
                 args.images,
                 args.eval,
                 load_images=False,
+                load_point_cloud=False,
             )
         elif (source_path / "transforms_train.json").exists():
             scene_info = sceneLoadTypeCallbacks["Blender"](
@@ -321,7 +441,11 @@ class LazyScene:
         output = Path(self.model_path)
         output.mkdir(parents=True, exist_ok=True)
         input_ply = output / "input.ply"
-        if not input_ply.exists():
+        if (
+            not input_ply.exists()
+            and scene_info.point_cloud is not None
+            and scene_info.ply_path is not None
+        ):
             shutil.copyfile(scene_info.ply_path, input_ply)
         primary = self.train_cameras.get(1.0, [])
         (output / "cameras.json").write_text(
@@ -343,9 +467,17 @@ class LazyScene:
             dtype=np.float64,
         )
         camera_contract = {
-            "schema_version": "calibrated-lazy-camera-contract-v1",
+            "schema_version": "calibrated-lazy-camera-contract-v3",
             "projection": "off_axis_colmap_pinhole",
+            "camera_container_only": True,
+            "colmap_points_or_tracks_opened": False,
+            "raster_coordinate_contract": (
+                "resolution_applies_to_rgb_raster_intrinsics_scale_from_"
+                "calibration_raster"
+            ),
+            "zfar_policy": "fixed_renderer_fallback_100m",
             "camera_count": len(primary),
+            "camera_geometry_sha256": _camera_geometry_digest(primary),
             "image_loading": {
                 "mode": "on_demand_lru",
                 "maximum_cached_views": image_cache_size,
@@ -366,6 +498,10 @@ class LazyScene:
             "cameras": [
                 {
                     "image_name": camera.image_name,
+                    "calibration_width": camera.calibration_width,
+                    "calibration_height": camera.calibration_height,
+                    "source_raster_width": camera.source_raster_width,
+                    "source_raster_height": camera.source_raster_height,
                     "width": camera.image_width,
                     "height": camera.image_height,
                     "fx": camera.focal_x,

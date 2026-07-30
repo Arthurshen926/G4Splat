@@ -1,161 +1,131 @@
-# Unified outdoor reconstruction
+# Cambridge native Hybrid Teacher mainline
 
-The unified mainline has one evidence contract, one from-scratch mixed teacher
-and one standard 3DGS export. Historical 40k/60k/68k PLY files are benchmarks,
-not valid parents of a unified run.
+The authoritative reconstruction path is a single fixed-camera,
+MASt3R/MAtCha/G4 evidence-to-native-Hybrid-Teacher pipeline. It does not train
+or report a student model, does not read COLMAP point/track geometry, and does
+not initialize from a historical trained Gaussian PLY.
+
+`scripts/run_cambridge_unified.py` is retained only as a compatibility name.
+It delegates to `scripts/run_cambridge_hybrid_teacher.py`; there is no second
+trainer, checkpoint format or evaluator behind it.
 
 ## End-to-end command
 
 ```bash
+export LD_LIBRARY_PATH=/root/miniconda3/envs/g4splat/lib:${LD_LIBRARY_PATH:-}
 /root/miniconda3/envs/g4splat/bin/python \
-  scripts/run_cambridge_unified.py \
+  scripts/run_cambridge_hybrid_teacher.py \
   --scene StMarysChurch \
+  --profile quality \
   --stage all \
-  --gpu 0
+  --gpu 2
 ```
 
-The output topology is:
-
-```text
-StMarysChurch_unified_v1/
-├── evidence/
-│   ├── evidence_manifest.json
-│   ├── colmap_tracks.npz
-│   └── mast3r_tracks.npz
-├── initialization/
-│   ├── surface_seed.npz
-│   └── foliage_seed_gaussians.pth
-├── teacher/
-│   ├── unified_teacher_checkpoint.pth
-│   └── unified_teacher_state.pth
-├── student_3dgs/
-│   ├── point_cloud/iteration_30000/point_cloud.ply
-│   ├── cameras.json
-│   └── distillation_manifest.json
-├── evaluation/
-└── pipeline_manifest.json
-```
-
-Stages are restartable:
-
-```bash
-python scripts/run_cambridge_unified.py --stage evidence
-python scripts/run_cambridge_unified.py --stage initialize
-python scripts/run_cambridge_unified.py --stage train_teacher
-python scripts/run_cambridge_unified.py --stage distill_student
-```
-
-Selecting a later stage validates and reuses completed prerequisites.
-
-## Contracts
-
-`evidence_manifest.json` keeps COLMAP, posed-MASt3R, Chart, plane and
-inverse-depth-cache artifacts separate and content-hashed. Sparse archives
-retain track ids, camera support, sequence support, role posteriors and
-position covariance. Inverse-depth fusion is a cache; training still constructs
-independent Chart, plane, inverse-depth and ordinal losses.
-
-Initialization assigns:
-
-- rigid tracks and gated Chart residuals to native 2D surfels;
-- linear tree tracks to static 3D trunk/branch Gaussians;
-- nonlinear tree tracks and the occlusion-aware ray/depth visual hull to the
-  canonical 3D crown;
-- cloned cross-sequence crown support to the training-only dynamic leaf branch.
-
-The teacher samples every real RGB camera from iteration one. Surface
-densification statistics are accepted only for rigid-dominant primitives, so
-canopy residuals cannot allocate 2D surfel topology. The teacher checkpoint
-contains both models, sky, spatial appearance/uncertainty, dynamic codes,
-optimizers, topology statistics, samplers, RNG states, curriculum phase,
-evidence hash and Python/CUDA implementation hashes.
-
-Full-resolution RGB is decoded on demand by a bounded view cache; constructing
-1,487 calibrated Cambridge cameras does not decode or retain the entire image
-set. This replaces the upstream eager loader, which can exceed 90 GB before the
-first optimization step, while preserving the exact off-axis intrinsics.
-
-During the dynamic phases, learned spatial uncertainty is detached and reused
-as a static-consistency weight for the canonical crown. Inconsistent leaf
-locations therefore stop pulling the canonical geometry toward a broad
-cross-frame average. Their complete RGB residual and a masked image-gradient
-loss are assigned to the sequence-conditioned dynamic leaf branch. Geometry
-sources retain their own finite-valid masks; invalid depth-cache values cannot
-propagate NaNs through a nominally zero loss weight.
-
-## Standard downstream interface
-
-The canonical export contains only the usual Graphdeco fields:
-
-```text
-x y z
-f_dc_*
-f_rest_*
-opacity
-scale_0 scale_1 scale_2
-rot_0 rot_1 rot_2 rot_3
-```
-
-There are no role, UV-gate, uncertainty, sequence or mixed-renderer fields.
-The PLY can therefore be loaded as an ordinary standard 3DGS model. Downstream
-projects should use their normal 3DGS loader and the exported `cameras.json`;
-they do not import G4Splat's mixed CUDA extension. `distillation_manifest.json`
-contains executable schema checks and states every removed teacher dependency.
-
-The canonical model intentionally represents rigid geometry, static
-trunk/branch structure, canonical crown and a Gaussian sky shell. A single
-static PLY cannot preserve every traversal-specific leaf deformation at once.
-
-## Fast mainline validation
-
-Use the fast profile while iterating on geometry/foliage design:
+The equivalent compatibility command is:
 
 ```bash
 /root/miniconda3/envs/g4splat/bin/python \
   scripts/run_cambridge_unified.py \
   --scene StMarysChurch \
-  --profile fast \
+  --profile quality \
   --stage all \
-  --gpu auto
+  --gpu 2
 ```
 
-It writes a separate `StMarysChurch_unified_fast_v1` run, so it cannot resume
-or overwrite the 80k quality run. The 30k teacher schedule is:
+The active stages are:
 
-| phase | iterations |
-| --- | ---: |
-| canonical bootstrap | 1–6,000 |
-| bounded surface/volume topology | 6,001–12,000 |
-| sequence-conditioned dynamic foliage | 12,001–21,900 |
-| per-candidate ownership cleanup | 21,901–27,000 |
-| canonical polish | 27,001–30,000 |
-
-The standard 3DGS student is shortened from 30k to 10k for this profile.
-Teacher surface topology has a 1.2M global budget and a 20k per-event growth
-budget; both can be overridden from the pipeline CLI. The quality profile
-keeps the 80k/30k schedules for the final benchmark after the fast profile
-has demonstrated a real canopy and rigid-region improvement.
-
-Before running a teacher, the pipeline requires 12,000 MiB of free physical
-GPU memory. `--gpu auto` selects the GPU with the most free memory; an explicit
-busy GPU fails immediately with a per-GPU memory report instead of spending
-minutes preparing the scene and later surfacing only a `CalledProcessError`.
-
-## Validation levels
-
-A short integration run is useful only for verifying that every phase executes:
-
-```bash
-python scripts/train_unified_outdoor_teacher.py \
-  -s DATASET -m OUTPUT \
-  --evidence-store EVIDENCE --initialization INITIALIZATION \
-  --iterations 100 --densify_from_iter 10 \
-  --densification_interval 10 --volume-densify-every 10 \
-  --replacement-every 5
+```text
+prepare_cameras
+build_mast3r_tracks
+build_charts
+build_evidence
+initialize_teacher
+train_teacher
+evaluate_teacher
+export_geometry
 ```
 
-It is not a reconstruction-quality result. The fast 30k/10k profile is the
-normal design-validation run; the default 80k teacher and 30k render-space
-student schedules remain the final quality run. Evaluation always reports
-canonical and conditioned teacher outputs separately and then evaluates the
-exported standard PLY through a fresh loader.
+`distill_student` is intentionally rejected. A standard 2DGS/3DGS conversion
+would be a separately labelled approximation and must not be silently reported
+as the native Teacher result.
+
+## Data and evidence contract
+
+- Cambridge intrinsics and poses are fixed and retain exact off-axis
+  principal points.
+- `cameras.bin` and `images.bin` are serialization containers only.
+  `points3D.bin` and COLMAP tracks are not geometry inputs.
+- MASt3R pointmaps/tracks, MAtCha Charts, planes, DAV2 ordinal depth and
+  foliage ray intervals remain content-addressed observations.
+- Renderer births are disposable optimization variables. Track ids,
+  observation pixels/depths, source roles, tree instances and lineages remain
+  persistent after split/prune.
+- RGB, geometry and topology use independent camera schedules.
+
+## Representation and training
+
+The mature rigid stage is a native perspective-correct 2D surfel model. The
+mixed stage consumes its validated PLY/handoff manifest, keeps rigid geometry
+and topology fixed, and permits only structural SH appearance polishing.
+There are no extra rigid completion births in this handoff experiment.
+
+Foliage is represented by static skeleton, canonical crown and
+sequence/time-conditioned dynamic-leaf 3D EWA Gaussians. Structural surfels
+and volume Gaussians are emitted into one tile list, share center-depth
+sorting, and are composited in the same CUDA front-to-back loop.
+
+The quality profile uses a 1.5M volume budget and at most 12k net growth slots
+per topology event. Growth is still constrained by measured screen-space
+deficit, role/instance/owner balance, posterior reliability and a smooth
+startup ramp. Volume opacity uses the same conservative `0.004` learning rate
+as colour/topology formation; sparse owner scheduling is not compensated by
+accelerating opacity alone.
+
+## Checkpoint and reuse contract
+
+`hybrid_teacher_checkpoint.pth` stores the two Gaussian families, role and
+observation metadata, sky, spatial appearance/uncertainty, temporal codes,
+optimizers, topology statistics, camera schedules, RNG states and immutable
+input/implementation hashes.
+
+A completed run is reusable only when all causal fields match, including:
+
+- evidence and initialization content hashes;
+- exact rigid PLY and handoff hashes;
+- training profile, horizon and all model capacities;
+- geometry-gradient ratio;
+- mature-surface policy and completion-seed count;
+- volume opacity schedule;
+- trainer, renderer, Gaussian model and CUDA implementation hashes;
+- final checkpoint content hash.
+
+Changing one of these fields makes the result stale instead of silently
+reusing it.
+
+## Evaluation scopes
+
+The evaluator reports three deliberately separate scopes:
+
+1. full 1,487-view database reconstruction under the exact historical uint8
+   static-mask protocol;
+2. canonical rendering on a disjoint 64-image official Cambridge query set at
+   ground-truth poses;
+3. conditioned database-view diagnostics, including tree/non-tree and
+   high-frequency regions.
+
+Only canonical database rendering is comparable to the historical
+`18.756 / 0.830 / 0.0821` result. Conditioned results have no ordinary static
+2DGS equivalent. Query64 evaluates reconstruction generalization at known
+poses; it is not yet a camera-pose localization benchmark.
+
+## Current downstream interface
+
+The native Teacher requires `outdoor.hybrid_teacher_api` and the mixed CUDA
+extension. It is not load-equivalent to an ordinary 2DGS or 3DGS PLY.
+`export_geometry` provides geometry inspection artifacts only.
+
+A universal standard PLY export/distillation path is currently absent by
+design after the decision to optimize and report the Teacher directly. If a
+downstream project requires a standard renderer, that conversion must be
+implemented and evaluated as an explicit second model rather than being
+claimed as lossless.

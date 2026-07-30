@@ -4,9 +4,12 @@ import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
+    LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     LAYER_STATIC_SKELETON,
     VolumetricFoliageModel,
+    conserve_local_temporal_fallback_mass,
+    local_optical_mass_replacement,
 )
 from scripts.train_layered_foliage_v6 import (
     _adaptive_topology,
@@ -76,6 +79,33 @@ def test_metadata_survives_dynamic_clone_split_prune_and_restore():
     assert torch.equal(restored.support_camera_ids, model.support_camera_ids)
 
 
+def test_adaptive_quaternary_split_spends_three_net_growth_slots():
+    model = VolumetricFoliageModel(0, device="cpu")
+    model.initialize_from_volume_state(_payload())
+    parent_scale = model.scales[0].clone()
+    parent_opacity = model.opacities[0].clone()
+
+    report = model.split_adaptive(
+        torch.tensor([0]),
+        torch.tensor([4]),
+    )
+
+    assert report["split_parents"] == 1
+    assert report["children"] == 4
+    assert report["net_growth"] == 3
+    assert report["quaternary_parents"] == 1
+    assert len(model) == 7
+    torch.testing.assert_close(
+        model.scales[-4:],
+        parent_scale[None].repeat(4, 1) / 2.0,
+    )
+    torch.testing.assert_close(
+        model.opacities[-4:],
+        parent_opacity.repeat(4),
+    )
+    assert len(torch.unique(model.xyz[-4:], dim=0)) == 4
+
+
 def test_candidate_state_remaps_by_stable_structural_index():
     remapped = _remap_candidate_values(
         torch.tensor([7, 2, 9, 4]),
@@ -91,6 +121,165 @@ def test_local_replacement_requires_depth_and_counterfactual_evidence():
     counterfactual = torch.tensor([0.0, 1.0, 0.5])
     match = _joint_replacement_match(depth, counterfactual)
     assert torch.equal(match, torch.tensor([0.0, 0.0, 0.4]))
+
+
+def test_local_optical_mass_replacement_is_split_invariant():
+    roles = torch.tensor(
+        [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF],
+        dtype=torch.int8,
+    )
+    groups = torch.tensor([0, 0], dtype=torch.int32)
+    opacities = torch.tensor([[0.04], [0.02]])
+    scales = torch.full((2, 3), 0.1)
+    parent = local_optical_mass_replacement(
+        roles, groups, opacities, scales
+    )
+
+    split_roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    split_groups = torch.tensor([0, 0, 0], dtype=torch.int32)
+    split_opacities = torch.tensor([[0.04], [0.02], [0.02]])
+    split_scales = torch.tensor(
+        [
+            [0.1, 0.1, 0.1],
+            [0.1, 0.1, 0.1],
+            [0.1, 0.1, 0.1],
+        ]
+    )
+    split_scales[1:] /= 2.0**0.5
+    children = local_optical_mass_replacement(
+        split_roles,
+        split_groups,
+        split_opacities,
+        split_scales,
+    )
+    assert torch.allclose(parent, children, atol=1.0e-6)
+
+
+def test_local_optical_mass_replacement_accumulates_local_descendants():
+    roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    groups = torch.tensor([0, 0, 0], dtype=torch.int32)
+    scales = torch.full((3, 3), 0.1)
+    one = local_optical_mass_replacement(
+        roles[:2],
+        groups[:2],
+        torch.tensor([[0.08], [0.01]]),
+        scales[:2],
+    )
+    two = local_optical_mass_replacement(
+        roles,
+        groups,
+        torch.tensor([[0.08], [0.01], [0.01]]),
+        scales,
+    )
+    assert 0.0 < one.item() < two.item() < 1.0
+
+
+def test_temporal_fallback_fills_but_cannot_exceed_local_canonical_mass():
+    roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    groups = torch.zeros(4, dtype=torch.int32)
+    scales = torch.full((4, 3), 0.1)
+    opacity = torch.tensor([[0.08], [0.02], [0.08], [0.08]])
+    gate = torch.tensor([1.0, 1.0, 0.5, 0.5])
+
+    adjusted = conserve_local_temporal_fallback_mass(
+        roles, groups, opacity * gate[:, None], scales, gate
+    )
+    area = scales[:, 0] * scales[:, 1]
+    mass = -torch.log1p(-adjusted[:, 0]) * area
+    canonical_mass = mass[0]
+    exact_mass = mass[1]
+    fallback_mass = mass[2:].sum()
+
+    torch.testing.assert_close(
+        exact_mass + fallback_mass, canonical_mass, atol=1.0e-7, rtol=1.0e-5
+    )
+    torch.testing.assert_close(adjusted[1], opacity[1])
+    assert bool((adjusted[2:] < opacity[2:] * 0.5).all())
+
+
+def test_temporal_fallback_mass_cap_is_split_invariant():
+    parent_roles = torch.tensor(
+        [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF], dtype=torch.int8
+    )
+    parent_groups = torch.zeros(2, dtype=torch.int32)
+    parent_scales = torch.full((2, 3), 0.1)
+    parent_opacity = torch.tensor([[0.04], [0.12]])
+    parent_gate = torch.tensor([1.0, 0.5])
+    parent = conserve_local_temporal_fallback_mass(
+        parent_roles,
+        parent_groups,
+        parent_opacity * parent_gate[:, None],
+        parent_scales,
+        parent_gate,
+    )
+
+    child_roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    child_groups = torch.zeros(3, dtype=torch.int32)
+    child_scales = torch.full((3, 3), 0.1)
+    child_scales[1:] /= 2.0**0.5
+    child_opacity = torch.tensor([[0.04], [0.12], [0.12]])
+    child_gate = torch.tensor([1.0, 0.5, 0.5])
+    children = conserve_local_temporal_fallback_mass(
+        child_roles,
+        child_groups,
+        child_opacity * child_gate[:, None],
+        child_scales,
+        child_gate,
+    )
+
+    def optical_mass(alpha, scale):
+        area = scale.prod(dim=1) / scale.min(dim=1).values
+        return (-torch.log1p(-alpha[:, 0]) * area).sum()
+
+    torch.testing.assert_close(
+        optical_mass(parent[1:], parent_scales[1:]),
+        optical_mass(children[1:], child_scales[1:]),
+        atol=1.0e-7,
+        rtol=1.0e-5,
+    )
+
+
+def test_temporal_fallback_without_live_canonical_reference_is_preserved():
+    roles = torch.tensor([LAYER_DYNAMIC_LEAF], dtype=torch.int8)
+    groups = torch.tensor([7], dtype=torch.int32)
+    opacity = torch.tensor([[0.03]])
+    adjusted = conserve_local_temporal_fallback_mass(
+        roles,
+        groups,
+        opacity,
+        torch.full((1, 3), 0.1),
+        torch.tensor([0.25]),
+    )
+    torch.testing.assert_close(adjusted, opacity)
 
 
 def test_adaptive_split_reserves_dynamic_and_canonical_roles():
