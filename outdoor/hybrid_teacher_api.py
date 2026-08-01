@@ -58,6 +58,14 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v30_exact_dynamic_ray_likelihood",
     "cambridge_native_hybrid_teacher_v31_lineage_complete_optical_schedule",
     "cambridge_native_hybrid_teacher_v32_preserved_handoff_topology_contract",
+    "cambridge_native_hybrid_teacher_v33_exact_ray_camera_plane_topology",
+    "cambridge_native_hybrid_teacher_v34_exact_owner_optical_mass_calibration",
+    "cambridge_native_hybrid_teacher_v35_atomic_volume_replace_split",
+    "cambridge_native_hybrid_teacher_v36_counterfactual_transparency_complete_ray_epoch",
+    "cambridge_native_hybrid_teacher_v37_exact_per_camera_ray_epoch_topology_settle",
+    "cambridge_native_hybrid_teacher_v38_resume_aware_ray_epoch_topology_settle",
+    "cambridge_native_hybrid_teacher_v39_conditioned_topology_settle",
+    "cambridge_native_hybrid_teacher_v40_projected_optical_footprint",
     "unified_outdoor_mixed_teacher_v1",
 }
 
@@ -134,6 +142,16 @@ RENDER_EQUIVALENT_IMPLEMENTATION_PAIRS = {
             "is normalized by the training camera reference-set size rather "
             "than a fixed observation count"
         ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "96391ac05a15bfc8fa62602da43c3ff67a793d5f30d23786850bbd68a06dc186",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "reserves source role 4 for future DAV2 births, preserves the "
+            "later training-only maturity metadata, and excludes UV-bound "
+            "Chart cells from future world-space clone/split/reallocation "
+            "so a separate atlas can refine them"
+        ),
     },
     "hybrid_renderer": {
         (
@@ -185,11 +203,40 @@ RENDER_EQUIVALENT_IMPLEMENTATION_PAIRS = {
             "gradient gates are now applied before their forward-identical "
             "sum and default to the prior parameter-family gate"
         ),
+        (
+            "ae7984e63425df4e512b49868c86b7a94a2a7303fc0592a71f818894495c3d13",
+            "f78bef52f44c962e723b5785b26b206569aa4459da21c40b0dd77d0df6ffe8bc",
+        ): (
+            "checkpoint inference is unchanged; the newer implementation "
+            "only adds an optional camera-plane direction to future "
+            "adaptive volume splits and leaves every existing forward "
+            "render tensor and mixed CUDA call unchanged"
+        ),
+        (
+            "f78bef52f44c962e723b5785b26b206569aa4459da21c40b0dd77d0df6ffe8bc",
+            "5b210eeb406502d30b0c0d83c2361221677a17e68417aee228386382303f6876",
+        ): (
+            "checkpoint inference is unchanged; the newer implementation "
+            "only fuses future volume retirement and adaptive splitting "
+            "into one parameter materialization before the same single "
+            "Adam-state migration"
+        ),
     },
 }
 
+PROJECTED_OPTICAL_FOOTPRINT_REPAIR_PREDECESSOR = {
+    "protocol": "cambridge_native_hybrid_teacher_v39_conditioned_topology_settle",
+    "hybrid_renderer": (
+        "5b210eeb406502d30b0c0d83c2361221677a17e68417aee228386382303f6876"
+    ),
+}
 
-def _validate_render_implementation(state: dict) -> dict:
+
+def _validate_render_implementation(
+    state: dict,
+    *,
+    allow_projected_optical_footprint_repair: bool = False,
+) -> dict:
     """Reject silently reinterpreting a state with different render code."""
     expected = state.get("implementation_hashes")
     if not expected:
@@ -231,6 +278,27 @@ def _validate_render_implementation(state: dict) -> dict:
                 "runtime_hash": actual,
                 "reason": migration,
             }
+    causal_repair = None
+    if (
+        allow_projected_optical_footprint_repair
+        and changed == ["hybrid_renderer"]
+        and state.get("protocol")
+        == PROJECTED_OPTICAL_FOOTPRINT_REPAIR_PREDECESSOR["protocol"]
+        and expected.get("hybrid_renderer")
+        == PROJECTED_OPTICAL_FOOTPRINT_REPAIR_PREDECESSOR[
+            "hybrid_renderer"
+        ]
+    ):
+        causal_repair = {
+            "state_hash": expected["hybrid_renderer"],
+            "runtime_hash": actual_hashes["hybrid_renderer"],
+            "reason": (
+                "explicit v39->v40 render repair: exact-ray metric depth "
+                "posterior is decoupled from non-owner EWA footprint and "
+                "local hand-off uses view-projected optical mass"
+            ),
+        }
+        changed.clear()
     if changed:
         raise RuntimeError(
             "Teacher state render implementation hash mismatch: "
@@ -238,12 +306,17 @@ def _validate_render_implementation(state: dict) -> dict:
         )
     return {
         "status": (
-            "render_equivalent_migration"
-            if equivalent
-            else "exact_implementation_match"
+            "projected_optical_footprint_causal_repair"
+            if causal_repair is not None
+            else (
+                "render_equivalent_migration"
+                if equivalent
+                else "exact_implementation_match"
+            )
         ),
-        "exact": not equivalent,
+        "exact": not equivalent and causal_repair is None,
         "render_equivalent_migrations": equivalent,
+        "causal_render_repair": causal_repair,
         "runtime_hashes": actual_hashes,
     }
 
@@ -387,6 +460,7 @@ class HybridTeacher:
         conditioned: bool = False,
         surface_only: bool = False,
         background: torch.Tensor | None = None,
+        exact_ray_render_aspect_limit: float = 4.0,
     ) -> dict[str, torch.Tensor]:
         """Render the mixed teacher or its native structural counterfactual.
 
@@ -448,6 +522,9 @@ class HybridTeacher:
                 )
             ),
             volume_gate=volume_gate,
+            exact_ray_render_aspect_limit=(
+                exact_ray_render_aspect_limit
+            ),
         )
         rgb = composite_white_background(
             package.render, package.alpha, self.sky(camera)
@@ -540,6 +617,7 @@ def load_hybrid_teacher(
     state_path: Path,
     *,
     sh_degree: int,
+    allow_projected_optical_footprint_repair: bool = False,
 ) -> HybridTeacher:
     """Load a Teacher state. No student conversion or COLMAP geometry is used."""
     try:
@@ -551,7 +629,12 @@ def load_hybrid_teacher(
     protocol = str(state.get("protocol", ""))
     if protocol not in SUPPORTED_TEACHER_PROTOCOLS:
         raise RuntimeError(f"Unsupported hybrid Teacher protocol {protocol!r}")
-    implementation_validation = _validate_render_implementation(state)
+    implementation_validation = _validate_render_implementation(
+        state,
+        allow_projected_optical_footprint_repair=(
+            allow_projected_optical_footprint_repair
+        ),
+    )
     state["_render_implementation_validation"] = implementation_validation
     surface = GaussianModel(sh_degree)
     _restore_surface(surface, state["surface"])

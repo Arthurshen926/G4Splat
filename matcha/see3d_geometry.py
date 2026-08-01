@@ -166,14 +166,24 @@ def robust_align_inverse_depth(
         )
 
     denominator = alpha + beta * disparity
-    positive = torch.isfinite(denominator) & (denominator > 1e-6)
+    positive = (
+        torch.isfinite(disparity)
+        & (disparity > 0)
+        & torch.isfinite(denominator)
+        & (denominator > 1e-6)
+    )
     aligned_depth = torch.zeros_like(disparity)
     if accepted:
         aligned_depth[positive] = denominator[positive].reciprocal()
         supported_depths = render_depth[valid]
         lower = torch.quantile(supported_depths, 0.01).clamp_min(1e-4) / 4.0
         upper = torch.quantile(supported_depths, 0.99).clamp_min(lower * 2.0) * 4.0
-        aligned_depth = aligned_depth.clamp(min=float(lower), max=float(upper))
+        # Preserve invalid/non-positive affine pixels as missing evidence.
+        # Clamping the complete zero-initialized image previously converted
+        # every invalid pixel into a fake hit at the lower scene bound.
+        aligned_depth[positive] = aligned_depth[positive].clamp(
+            min=float(lower), max=float(upper)
+        )
 
     diagnostics = DepthAlignmentDiagnostics(
         accepted=accepted,

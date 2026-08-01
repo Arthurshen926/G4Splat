@@ -5,12 +5,88 @@ import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
+    LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     VolumetricFoliageModel,
     _identity_with_gradient_gate,
     _restore_sparse_volume_rows,
     dynamic_visibility_gate,
 )
+
+
+def test_dynamic_leaf_inherits_shared_canonical_group_displacement():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor(
+            [[0.0, 0.0, 2.0], [0.2, 0.0, 2.0]]
+        ),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.4),
+        "opacities": torch.full((2, 1), 0.05),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 2
+        ),
+        "layer_role": torch.tensor(
+            [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF],
+            dtype=torch.int8,
+        ),
+        "tree_instance_id": torch.tensor([3, 3], dtype=torch.int32),
+        "replacement_group": torch.tensor([0, 0], dtype=torch.int64),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+    with torch.no_grad():
+        model.xyz[0, 0] += 0.3
+    conditioned, _, _ = model.conditioned_state(
+        torch.zeros(model.dynamic_rank), include_dynamic=True
+    )
+    assert torch.allclose(
+        conditioned[1],
+        torch.tensor([0.5, 0.0, 2.0]),
+        atol=1e-6,
+    )
+
+
+def test_visible_dynamic_temporal_state_deforms_shared_canonical_group():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor(
+            [[0.0, 0.0, 2.0], [0.2, 0.0, 2.0]]
+        ),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.4),
+        "opacities": torch.full((2, 1), 0.05),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 2
+        ),
+        "layer_role": torch.tensor(
+            [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF],
+            dtype=torch.int8,
+        ),
+        "tree_instance_id": torch.tensor([3, 3], dtype=torch.int32),
+        "replacement_group": torch.tensor([0, 0], dtype=torch.int64),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+    with torch.no_grad():
+        model.deformation_basis[1, 0, 0] = 0.25
+        model.dynamic_feature_basis[1, 0, 1] = 0.5
+        model.dynamic_opacity_basis[1, 0, 0] = 0.75
+    code = torch.zeros(model.dynamic_rank)
+    code[0] = 1.0
+
+    xyz, features, opacity = model.conditioned_state(
+        code,
+        include_dynamic=True,
+        conditioned_visibility_gate=torch.tensor([1.0, 1.0]),
+    )
+
+    assert xyz[0, 0].item() == pytest.approx(0.25)
+    assert xyz[1, 0].item() == pytest.approx(0.45)
+    assert features[0, 0, 1].item() == pytest.approx(
+        model.features[0, 0, 1].item() + 0.5
+    )
+    assert opacity[0] > model.opacities[0]
 
 
 def test_gradient_ownership_gate_is_forward_identity_and_backward_selective():
@@ -172,6 +248,56 @@ def test_exact_tree_support_continuously_suppresses_temporal_fallback():
     assert torch.equal(gate[:exact_count], torch.ones(exact_count))
     unsuppressed = 0.35 * torch.exp(torch.tensor(-1.0 / 12.0))
     assert 0 < gate[-1] < 0.5 * unsuppressed
+
+
+def test_ungrouped_dynamic_leaf_is_visible_only_in_exact_owner_camera():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = FoliageStub(
+        xyz=torch.zeros(2, 3),
+        dynamic_leaf_mask=torch.ones(2, dtype=torch.bool),
+        support_camera_ids=torch.tensor([[7], [8]], dtype=torch.int32),
+        tree_instance_id=torch.zeros(2, dtype=torch.int32),
+        split_generation=torch.zeros(2, dtype=torch.int16),
+        replacement_group=torch.tensor([-1, -1], dtype=torch.int64),
+    )
+    sequence = torch.full((10,), -1, dtype=torch.int16)
+    sequence[7:9] = 0
+    frame = torch.zeros(10, dtype=torch.int32)
+    frame[7] = 10
+    frame[8] = 11
+
+    gate = dynamic_visibility_gate(foliage, 7, sequence, frame)
+
+    assert gate.tolist() == [1.0, 0.0]
+
+
+def test_dynamic_leaf_with_retired_canonical_group_becomes_exact_only():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = FoliageStub(
+        xyz=torch.zeros(2, 3),
+        dynamic_leaf_mask=torch.tensor([False, True]),
+        canonical_crown_mask=torch.tensor([True, False]),
+        support_camera_ids=torch.tensor([[-1], [8]], dtype=torch.int32),
+        tree_instance_id=torch.zeros(2, dtype=torch.int32),
+        split_generation=torch.zeros(2, dtype=torch.int16),
+        # Group 0 still has a canonical row; group 1 was retired.
+        replacement_group=torch.tensor([0, 1], dtype=torch.int64),
+    )
+    sequence = torch.full((10,), -1, dtype=torch.int16)
+    sequence[7:9] = 0
+    frame = torch.zeros(10, dtype=torch.int32)
+    frame[7] = 10
+    frame[8] = 11
+
+    gate = dynamic_visibility_gate(foliage, 7, sequence, frame)
+
+    assert gate.tolist() == [1.0, 0.0]
 
 
 def test_dynamic_visibility_support_reduction_is_chunk_invariant():
@@ -401,6 +527,7 @@ def test_hybrid_contract_uses_one_rasterizer_and_no_fixed_branch_composite():
     assert "mixedRenderCUDA" in forward
     assert "id < surface_count" in forward
     assert "if (!(opacities[local_idx] > 0.0f))" in forward
+    assert "if (!isfinite(distance) || !(distance < 0.0f))" in forward
     assert "native_2d_surfel_and_3d_ewa_shared_tile_depth_sort" in trainer
     assert '"fixed_order_branch_compositing": False' in trainer
     assert '"true_volumetric_foliage_3dgs": True' in trainer

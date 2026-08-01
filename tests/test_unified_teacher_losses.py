@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from scripts.train_unified_outdoor_teacher import (
+    DYNAMIC_LIFECYCLE_REPAIR_TARGET,
     SURFACE_OWNERSHIP_REPAIR_TARGET,
     TRAINING_PROFILES,
     _adapt_volume,
@@ -16,6 +17,7 @@ from scripts.train_unified_outdoor_teacher import (
     _adaptive_geometry_scale,
     _backward_conditioned_foliage,
     _dynamic_enabled,
+    _dynamic_opacity_ceiling,
     _foliage_enabled,
     _full_epoch_schedule,
     _dynamic_opacity_floor,
@@ -29,30 +31,41 @@ from scripts.train_unified_outdoor_teacher import (
     _bounded_surface_retirement_fractions,
     _canopy_topology_signal,
     _confirmed_contradiction_fraction,
+    _complete_evidence_epoch_batch_size,
     _continued_surface_iteration,
+    _conditioned_branch_active,
     _conditioned_base_gradient_gate,
     _conditioned_photo_losses,
+    _counterfactual_volume_transparency_loss,
     _evidence_adaptive_role_quotas,
     _geometry_losses,
     _inherit_surface_optimizer_contract,
     _load_dav2_observation_patches,
     _masked_clamp_max_,
     _masked_ssim_loss,
+    _apply_volume_role_gradients,
     _apply_mature_surface_gradient_policy,
     _phase,
     _resolved_phase_schedule,
+    _resume_conditioned_visit_counts,
     _retain_checkpoint_snapshot,
     _rigid_completion_seed_indices,
+    _rigid_residual_patch_loss,
     _resume_training_contract_differences,
     _soft_surface_canopy_conflict,
     _surface_capture_to_device,
     _surface_topology_active,
+    _trainer_repair_hash_change_is_allowed,
+    _chart_topology_active,
     _volume_topology_ramp_scale,
     _validate_fixed_cameras,
     _validate_initialization_rgb_source,
     _validate_initialization_protocol,
     _validate_surface_warmstart,
     _volume_stats,
+    _volume_split_authority,
+    _volume_topology_active,
+    _volume_topology_authority,
     _write_rigid_stage_surface_handoff,
 )
 from outdoor.hybrid_gaussian_renderer import (
@@ -74,6 +87,71 @@ RIGID_SURFACE_OPTIMIZER = {
     "scaling_lr": 0.005,
     "rotation_lr": 0.001,
 }
+
+
+def test_ray_epoch_batch_capacity_uses_final_horizon_not_prefix():
+    batch, minimum, calls = _complete_evidence_epoch_batch_size(
+        512,
+        1_773_981,
+        12_000,
+        4,
+    )
+    assert calls == 3000
+    assert minimum == 621
+    assert batch == 621
+    assert batch * calls >= 1_773_981
+    # A 1k diagnostic prefix of the same 12k method must not silently choose
+    # a different batch; callers pass the final schedule horizon.
+    assert _complete_evidence_epoch_batch_size(
+        512, 1_773_981, 12_000, 4
+    ) == (batch, minimum, calls)
+
+
+def test_ray_epoch_batch_capacity_accounts_for_per_camera_tail_calls():
+    batch, exact_minimum, calls = _complete_evidence_epoch_batch_size(
+        512,
+        3_003,
+        4,
+        1,
+        per_camera_rows=[1_001, 1_001, 1_001],
+    )
+    # Aggregate capacity would choose 789, but that needs six independent
+    # camera-table calls. Four calls can complete all three tables only once
+    # each table fits in a single call.
+    assert calls == 4
+    assert exact_minimum == 1_001
+    assert batch == 1_001
+    assert sum((count + batch - 1) // batch for count in [1_001] * 3) <= calls
+
+
+def test_ray_epoch_batch_capacity_uses_resume_remaining_call_budget():
+    batch, exact_minimum, calls = _complete_evidence_epoch_batch_size(
+        512,
+        2_400,
+        4,
+        1,
+        margin=1.0,
+        per_camera_rows=[1_200, 1_200],
+        available_factor_calls=2,
+    )
+    assert calls == 2
+    assert exact_minimum == 1_200
+    assert batch == 1_200
+
+
+def test_trainer_repair_resume_accepts_chart_only_python_change():
+    assert _trainer_repair_hash_change_is_allowed(
+        {"chart_surface_model"}, enabled=True
+    )
+    assert _trainer_repair_hash_change_is_allowed(
+        {"trainer", "training_evidence"}, enabled=True
+    )
+    assert not _trainer_repair_hash_change_is_allowed(
+        {"hybrid_renderer"}, enabled=True
+    )
+    assert not _trainer_repair_hash_change_is_allowed(
+        {"chart_surface_model"}, enabled=False
+    )
 
 
 def test_dav2_observation_patch_contract_is_topology_independent(tmp_path):
@@ -122,8 +200,13 @@ def test_mature_handoff_appearance_policy_preserves_geometry_gradients():
     for parameter in vars(surface).values():
         parameter.grad = torch.ones_like(parameter)
 
+    chart_parameter = torch.nn.Parameter(torch.ones(2, 3))
+    chart_parameter.grad = torch.ones_like(chart_parameter)
+    chart_surface = torch.nn.ParameterList([chart_parameter])
     audit = _apply_mature_surface_gradient_policy(
-        surface, "appearance_only"
+        surface,
+        "appearance_only",
+        chart_surface=chart_surface,
     )
 
     for parameter in (
@@ -135,8 +218,22 @@ def test_mature_handoff_appearance_policy_preserves_geometry_gradients():
         assert not bool(parameter.grad.any())
     assert bool(surface._features_dc.grad.any())
     assert bool(surface._features_rest.grad.any())
+    assert chart_parameter.grad is None
     assert audit["geometry_trainable"] is False
+    assert audit["chart_geometry_trainable"] is False
     assert audit["appearance_trainable"] is True
+
+
+def test_mature_handoff_disables_chart_uv_topology():
+    args = SimpleNamespace(
+        mature_handoff_surface_policy="appearance_only",
+        densify_from_iter=1,
+        densify_until_iter=100,
+        chart_quadtree_growth_fraction=0.3,
+    )
+    assert not _chart_topology_active(10, args)
+    args.mature_handoff_surface_policy = "joint"
+    assert _chart_topology_active(10, args)
 
 
 def test_surface_retirement_is_continuous_and_optical_mass_bounded():
@@ -319,6 +416,152 @@ def test_capacity_repair_resume_allows_only_exact_audited_contract():
         )
 
 
+def test_trainer_repair_migrates_observation_immunity_contract():
+    saved = {
+        "dynamic_lifecycle_contract": (
+            "persistent_observation_identity_survives_sampling_windows"
+        ),
+        "geometry_weight": 0.12,
+    }
+    current = {
+        **saved,
+        "dynamic_lifecycle_contract": DYNAMIC_LIFECYCLE_REPAIR_TARGET,
+    }
+
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        saved,
+        {**current, "geometry_weight": 0.13},
+        allow_trainer_repair_migration=True,
+    ) == {"geometry_weight"}
+
+
+def test_trainer_repair_migrates_only_rigid_patch_nms_selection():
+    old_selection = (
+        "detached_rigid_residual_times_target_edge_local_pool"
+    )
+    new_selection = (
+        "detached_rigid_residual_times_target_edge_spatial_nms_pool"
+    )
+    saved = {
+        "rigid_residual_patch": {
+            "weight": 0.2,
+            "maximum_patches_per_view": 64,
+            "patch_size": 11,
+            "selection": old_selection,
+        }
+    }
+    current = {
+        "rigid_residual_patch": {
+            **saved["rigid_residual_patch"],
+            "selection": new_selection,
+        }
+    }
+
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=False,
+    ) == {"rigid_residual_patch"}
+    changed_weight = {
+        "rigid_residual_patch": {
+            **current["rigid_residual_patch"],
+            "weight": 0.3,
+        }
+    }
+    assert _resume_training_contract_differences(
+        saved,
+        changed_weight,
+        allow_trainer_repair_migration=True,
+    ) == {"rigid_residual_patch"}
+
+
+def test_trainer_repair_extends_chart_topology_with_volume_horizon():
+    saved = {
+        "densify_until_iter": 3000,
+        "volume_densify_until_iteration": 10000,
+        "other": "fixed",
+    }
+    current = {
+        "densify_until_iter": 10000,
+        "volume_densify_until_iteration": 10000,
+        "other": "fixed",
+    }
+
+    assert _resume_training_contract_differences(saved, current) == {
+        "densify_until_iter"
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        saved,
+        {**current, "other": "changed"},
+        allow_trainer_repair_migration=True,
+    ) == {"other"}
+
+
+def test_conditioned_schedule_resume_migrates_only_sampling_identity():
+    saved = {
+        "sampling_schedule_sha256": "legacy",
+        "conditioned_sampling": {
+            "coverage_preserving": False,
+            "evidence_steps": 7020,
+        },
+        "geometry_weight": 0.12,
+    }
+    current = {
+        "sampling_schedule_sha256": "repaired",
+        "conditioned_sampling": {
+            "coverage_preserving": True,
+            "evidence_steps": 6339,
+            "minimum_full_scene_visits": 3,
+        },
+        "geometry_weight": 0.12,
+    }
+
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_conditioned_schedule_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        saved,
+        current,
+        allow_conditioned_schedule_repair_migration=False,
+    ) == {
+        "sampling_schedule_sha256",
+        "conditioned_sampling",
+    }
+    assert _resume_training_contract_differences(
+        saved,
+        {**current, "geometry_weight": 0.13},
+        allow_conditioned_schedule_repair_migration=True,
+    ) == {"geometry_weight"}
+
+    already_repaired = {
+        **saved,
+        "conditioned_sampling": {"coverage_preserving": True},
+    }
+    with pytest.raises(RuntimeError, match="legacy replacing schedule"):
+        _resume_training_contract_differences(
+            already_repaired,
+            current,
+            allow_conditioned_schedule_repair_migration=True,
+        )
+
+
 def test_surface_ownership_resume_changes_only_the_audited_contract():
     saved = {
         "mature_handoff_surface_policy": "appearance_only",
@@ -343,6 +586,82 @@ def test_surface_ownership_resume_changes_only_the_audited_contract():
         bad,
         allow_surface_ownership_repair_migration=True,
     ) == {"geometry_weight"}
+
+
+def test_v38_resume_migrates_runtime_ray_capacity_and_topology_settle():
+    saved = {
+        "schedule_horizon": 12_000,
+        "volume_densify_until_iteration": 10_000,
+        "ray_posterior_maximum_rays": 1_000,
+        "ray_posterior_configured_maximum_rays": 512,
+        "ray_evidence_epoch_capacity": {
+            "scheduled_factor_calls": 3_000,
+            "effective_row_count": 2_854_438,
+            "minimum_batch_with_five_percent_margin": 1_000,
+            "complete_epoch_capacity": True,
+        },
+    }
+    current = {
+        "schedule_horizon": 12_000,
+        "volume_densify_until_iteration": 12_000,
+        "volume_topology_phase_contract": (
+            "screen_adaptive_until_configured_end__disabled_during_"
+            "canonical_polish_settle"
+        ),
+        "conditioned_settle_contract": (
+            "canonical_polish_disables_topology_not_conditioned_optimization"
+        ),
+        "counterfactual_transparency": {
+            "contract": (
+                "detached_surface_only_relative_rgb_advantage_routes_only_"
+                "volume_optical_depth"
+            ),
+            "weight": 0.06,
+            "margin": 0.02,
+            "temperature": 0.015,
+            "conditioned_every": 4,
+            "gradient_owner": "volume_opacity_only",
+            "responsibility_gradient": "detached",
+        },
+        "ray_posterior_maximum_rays": 1_532,
+        "ray_posterior_configured_maximum_rays": 512,
+        "ray_evidence_epoch_capacity": {
+            "scheduled_factor_calls": 3_000,
+            "batch_boundary_contract": (
+                "short_tail_never_wraps_into_next_camera_epoch"
+            ),
+            "capacity_contract": (
+                "sum_per_camera_ceil_rows_over_batch_lte_scheduled_calls"
+            ),
+            "capacity_scope": "resume_remaining_unvisited_rows",
+            "prior_factor_calls": 2_250,
+            "available_factor_calls": 750,
+            "camera_table_count": 751,
+            "full_effective_row_count": 2_854_438,
+            "remaining_unvisited_row_count": 633_251,
+            "clean_epoch_aggregate_minimum_batch_with_five_percent_margin": 1_000,
+            "clean_epoch_minimum_batch_for_complete_per_camera_epoch": 1_090,
+            "clean_epoch_effective_batch": 1_090,
+            "runtime_aggregate_minimum_batch_with_five_percent_margin": 887,
+            "minimum_batch_for_runtime_completion": 1_532,
+            "required_factor_calls": 750,
+            "unused_factor_calls": 0,
+            "complete_epoch_capacity": True,
+        },
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_v38_causal_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(saved, current) == {
+        "counterfactual_transparency",
+        "ray_evidence_epoch_capacity",
+        "ray_posterior_maximum_rays",
+        "volume_densify_until_iteration",
+        "volume_topology_phase_contract",
+        "conditioned_settle_contract",
+    }
 
 
 def test_rigid_completion_births_only_independently_supported_deficits():
@@ -472,6 +791,71 @@ def test_evidence_adaptive_role_quotas_use_observed_dynamic_population():
     # exact dynamic contexts in this topology epoch.
     assert quotas["dynamic_leaf"] > quotas["canonical_crown"]
     assert sum(quotas.values()) == 6_000
+
+
+def test_evidence_adaptive_role_quotas_use_continuous_geometry_authority():
+    quotas = _evidence_adaptive_role_quotas(
+        {
+            "static_skeleton": 0,
+            "canonical_crown": 4_000,
+            "dynamic_leaf": 8_000,
+        },
+        {
+            "static_skeleton": 1,
+            "canonical_crown": 40_000,
+            "dynamic_leaf": 800_000,
+        },
+        6_000,
+        observable_counts={
+            "static_skeleton": 0,
+            "canonical_crown": 20_000,
+            "dynamic_leaf": 10_000,
+        },
+        effective_eligible_mass={
+            "static_skeleton": 0.0,
+            "canonical_crown": 4_000.0,
+            # Every visible dynamic row has a gradient, but its weak depth
+            # posterior supplies only five percent effective authority.
+            "dynamic_leaf": 400.0,
+        },
+    )
+    assert quotas["canonical_crown"] > quotas["dynamic_leaf"]
+    assert sum(quotas.values()) == 6_000
+
+
+def test_volume_topology_authority_is_continuous_and_owner_aware():
+    foliage = SimpleNamespace(
+        ray_depth_nll=torch.tensor([0.0, 15.0, 15.0, 399.0]),
+        occupancy_probability=torch.tensor([0.0, 0.0, 0.10, 0.0]),
+        dynamic_leaf_mask=torch.tensor([False, True, True, True]),
+        replacement_group=torch.tensor([-1, 7, -1, -1]),
+    )
+    authority = _volume_topology_authority(foliage)
+    torch.testing.assert_close(
+        authority,
+        torch.tensor([1.0, 0.25, 0.03625, 0.0025]),
+    )
+    assert bool((authority > 0).all())
+
+
+def test_exact_ray_optical_split_authority_does_not_claim_better_depth():
+    foliage = SimpleNamespace(
+        ray_depth_nll=torch.tensor([399.0, 399.0]),
+        occupancy_probability=torch.tensor([0.01, 0.01]),
+        dynamic_leaf_mask=torch.tensor([True, True]),
+        replacement_group=torch.tensor([-1, -1]),
+        initialization_source=torch.tensor([4, 3], dtype=torch.int8),
+        observation_camera_ids=torch.tensor(
+            [[7], [7]], dtype=torch.int32
+        ),
+    )
+
+    geometry = _volume_topology_authority(foliage)
+    split = _volume_split_authority(foliage)
+
+    assert geometry.tolist() == pytest.approx([0.002975, 0.002975])
+    assert split[0].item() == 1.0
+    assert split[1].item() == pytest.approx(0.002975)
 
 
 def test_evidence_adaptive_role_quotas_never_invent_or_drop_capacity():
@@ -652,6 +1036,56 @@ def test_surface_topology_schedule_can_extend_past_named_topology_phase():
     assert _surface_topology_active(8_999, args)
     assert _surface_topology_active(10_499, args)
     assert not _surface_topology_active(10_500, args)
+
+
+def test_volume_topology_stops_before_canonical_polish_settle():
+    args = SimpleNamespace(volume_densify_until_iteration=12_000)
+    assert _volume_topology_active(10_999, args, "ownership_cleanup")
+    assert not _volume_topology_active(11_040, args, "canonical_polish")
+    assert not _volume_topology_active(12_000, args, "ownership_cleanup")
+
+
+def test_conditioned_branch_keeps_training_during_topology_settle():
+    horizon = 12_000
+    profile = "hybrid_handoff_quality"
+    assert _phase(11_040, horizon, profile) == "canonical_polish"
+    assert _conditioned_branch_active(11_040, horizon, profile)
+    assert _conditioned_branch_active(11_999, horizon, profile)
+
+
+def test_conditioned_bases_keep_gradients_during_topology_settle():
+    foliage = SimpleNamespace(
+        static_skeleton_mask=torch.tensor([True, False, False]),
+        dynamic_leaf_mask=torch.tensor([False, True, False]),
+        static_skeleton_confidence=torch.tensor([1.0, 1.0, 1.0]),
+        xyz=torch.zeros(3, 3, requires_grad=True),
+        log_scales=torch.zeros(3, 3, requires_grad=True),
+        opacity_logits=torch.zeros(3, 1, requires_grad=True),
+        deformation_basis=torch.zeros(3, 2, requires_grad=True),
+        dynamic_feature_basis=torch.zeros(3, 2, requires_grad=True),
+        dynamic_opacity_basis=torch.zeros(3, 2, requires_grad=True),
+    )
+    for parameter in (
+        foliage.xyz,
+        foliage.log_scales,
+        foliage.opacity_logits,
+        foliage.deformation_basis,
+        foliage.dynamic_feature_basis,
+        foliage.dynamic_opacity_basis,
+    ):
+        parameter.grad = torch.ones_like(parameter)
+
+    _apply_volume_role_gradients(
+        foliage, "canonical_polish", dynamic_active=True
+    )
+
+    for parameter in (
+        foliage.deformation_basis,
+        foliage.dynamic_feature_basis,
+        foliage.dynamic_opacity_basis,
+    ):
+        assert torch.all(parameter.grad[foliage.dynamic_leaf_mask] == 1)
+        assert torch.all(parameter.grad[~foliage.dynamic_leaf_mask] == 0)
 
 
 def test_known_invalid_free_space_initialization_cannot_train():
@@ -1030,28 +1464,39 @@ def test_contradiction_fraction_uses_all_confirmed_binary_evidence():
     assert ratio[0] < 0.55
 
 
-def test_exact_dynamic_observation_survives_unsampled_topology_window():
+def test_strong_contradiction_retires_observed_dynamic_identity():
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
-        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
-        "scales": torch.full((1, 3), 0.05),
-        "colors": torch.full((1, 3), 0.4),
-        "opacities": torch.full((1, 1), 0.001),
-        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "centers": torch.tensor(
+            [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0]]
+        ),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.4),
+        "opacities": torch.full((2, 1), 0.001),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 2
+        ),
         "layer_role": torch.tensor(
-            [LAYER_DYNAMIC_LEAF], dtype=torch.int8
+            [LAYER_DYNAMIC_LEAF, 0], dtype=torch.int8
         ),
-        "support_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "support_camera_ids": torch.tensor(
+            [[7], [8]], dtype=torch.int32
+        ),
         "observation_camera_ids": torch.tensor(
-            [[7]], dtype=torch.int32
+            [[7], [-1]], dtype=torch.int32
         ),
-        "observation_uv": torch.tensor([[[0.5, 0.5]]]),
-        "observation_depth": torch.tensor([[2.0]]),
-        "support_view_count": torch.tensor([1], dtype=torch.int16),
+        "observation_uv": torch.tensor(
+            [[[0.5, 0.5]], [[0.0, 0.0]]]
+        ),
+        "observation_depth": torch.tensor([[2.0], [0.0]]),
+        "support_view_count": torch.tensor([1, 2], dtype=torch.int16),
+        "support_sequence_count": torch.tensor(
+            [1, 2], dtype=torch.int16
+        ),
         "free_space_violation_count": torch.tensor(
-            [10], dtype=torch.int16
+            [10, 0], dtype=torch.int16
         ),
-        "occupancy_probability": torch.tensor([0.01]),
+        "occupancy_probability": torch.tensor([0.01, 0.9]),
     }
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(payload)
@@ -1060,16 +1505,78 @@ def test_exact_dynamic_observation_survives_unsampled_topology_window():
     event = _adapt_volume(
         SimpleNamespace(
             volume_split_radius=3.0,
-            maximum_volume_gaussians=1,
+            maximum_volume_gaussians=2,
             maximum_volume_splits=0,
         ),
         foliage,
         stats,
-        volume_budget=1,
+        volume_budget=2,
     )
 
     assert len(foliage) == 1
+    assert event["pruned"] == 1
+    prune = event["contradiction_prune_evidence"]
+    assert prune["strong_contradiction_candidates"] == 1
+    assert prune["observed_unverified_rows_prunable"] == 1
+
+
+def test_weak_conflict_keeps_independent_cross_sequence_positive_support():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor(
+            [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0]]
+        ),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.4),
+        "opacities": torch.full((2, 1), 0.001),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 2
+        ),
+        "layer_role": torch.tensor(
+            [LAYER_DYNAMIC_LEAF, 0], dtype=torch.int8
+        ),
+        "support_camera_ids": torch.tensor(
+            [[7, 9, 10, 11], [8, 12, -1, -1]], dtype=torch.int32
+        ),
+        "observation_camera_ids": torch.tensor(
+            [[7, 9], [-1, -1]], dtype=torch.int32
+        ),
+        "observation_uv": torch.tensor(
+            [
+                [[0.5, 0.5], [0.6, 0.5]],
+                [[0.0, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "observation_depth": torch.tensor(
+            [[2.0, 2.1], [0.0, 0.0]]
+        ),
+        "support_view_count": torch.tensor([4, 2], dtype=torch.int16),
+        "support_sequence_count": torch.tensor(
+            [2, 2], dtype=torch.int16
+        ),
+        "free_space_violation_count": torch.tensor(
+            [2, 0], dtype=torch.int16
+        ),
+        "occupancy_probability": torch.tensor([0.10, 0.9]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+
+    event = _adapt_volume(
+        SimpleNamespace(
+            volume_split_radius=3.0,
+            maximum_volume_gaussians=2,
+            maximum_volume_splits=0,
+        ),
+        foliage,
+        _volume_stats(foliage),
+        volume_budget=2,
+    )
+
+    assert len(foliage) == 2
     assert event["pruned"] == 0
+    prune = event["contradiction_prune_evidence"]
+    assert prune["weak_positive_rows_protected"] == 1
 
 
 def test_read_only_temporal_fallback_cannot_drive_volume_topology():
@@ -1218,6 +1725,57 @@ def test_dynamic_opacity_floor_uses_local_dense_ray_evidence():
 
     assert 0.04 < floor[0] <= 0.06
     assert floor[1] == 0.015
+
+
+def test_uncertain_ownerless_dense_birth_has_spatial_opacity_ceiling():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor(
+            [
+                [0.0, 0.0, 2.0],
+                [0.1, 0.0, 2.0],
+                [0.2, 0.0, 2.0],
+                [0.1, 0.0, 2.0],
+            ]
+        ),
+        "scales": torch.full((4, 3), 0.05),
+        "colors": torch.full((4, 3), 0.4),
+        "opacities": torch.full((4, 1), 0.03),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 4
+        ),
+        "layer_role": torch.tensor(
+            [
+                LAYER_DYNAMIC_LEAF,
+                LAYER_DYNAMIC_LEAF,
+                LAYER_DYNAMIC_LEAF,
+                0,
+            ],
+            dtype=torch.int8,
+        ),
+        "initialization_source": torch.tensor(
+            [4, 4, 1, 0], dtype=torch.int8
+        ),
+        "occupancy_probability": torch.tensor([0.1, 0.1, 0.1, 0.9]),
+        "support_view_count": torch.ones(4, dtype=torch.int16),
+        "unknown_view_count": torch.zeros(4, dtype=torch.int16),
+        "ray_depth_nll": torch.tensor([99.0, 99.0, 99.0, 0.0]),
+        "free_space_violation_count": torch.zeros(
+            4, dtype=torch.int16
+        ),
+        "replacement_group": torch.tensor([-1, 0, -1, 0]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+
+    ceiling = _dynamic_opacity_ceiling(foliage, 0.40)
+
+    floor = _dynamic_opacity_floor(foliage)
+    # Same depth posterior, but a physically local canonical owner grants
+    # more replacement authority than an unconserved ownerless birth.
+    assert floor[0] <= ceiling[0] < ceiling[1] < 0.10
+    # Non-DAV2/non-dense legacy dynamics retain the normal global ceiling.
+    assert ceiling[2].item() == pytest.approx(0.40)
 
 
 def test_masked_ssim_does_not_create_zero_boundary_error():
@@ -1848,7 +2406,7 @@ def test_foliage_ray_table_without_source_resolution_fails_closed():
         )
 
 
-def _interval_evidence(kind):
+def _interval_evidence(kind, *, confidence=1.0):
     return FoliageRayEvidence(
         {
             "offsets": torch.tensor([0, 1], dtype=torch.int64),
@@ -1863,7 +2421,7 @@ def _interval_evidence(kind):
             "observation_type": torch.tensor(
                 [kind], dtype=torch.int8
             ),
-            "confidence": torch.ones(1),
+            "confidence": torch.full((1,), float(confidence)),
         }
     )
 
@@ -1879,6 +2437,26 @@ def _interval_foliage(z):
         "ray_evidence": {
             "offsets": torch.tensor([0, 1], dtype=torch.int64)
         },
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+    return model
+
+
+def _interval_dynamic_foliage(z, *, support_camera_id=7):
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, float(z)]]),
+        "scales": torch.tensor([[0.2, 0.2, 0.2]]),
+        "colors": torch.tensor([[0.2, 0.4, 0.6]]),
+        "opacities": torch.tensor([[0.5]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([2], dtype=torch.int8),
+        "support_camera_ids": torch.tensor(
+            [[support_camera_id]], dtype=torch.int32
+        ),
+        # Observation-space births deliberately have no canonical ray id.
+        "ray_evidence": {"offsets": torch.tensor([0], dtype=torch.int64)},
     }
     model = VolumetricFoliageModel(1, device="cpu")
     model.initialize_from_volume_state(payload)
@@ -1917,6 +2495,63 @@ def test_candidate_interval_factor_rewards_mass_inside_measured_hit():
     correct_loss.backward()
     assert correct.opacity_logits.grad is not None
     assert correct.opacity_logits.grad.abs().sum() > 0
+
+
+def test_candidate_interval_confidence_separates_geometry_and_existence():
+    strong_evidence = _interval_evidence(1, confidence=1.0)
+    weak_evidence = _interval_evidence(1, confidence=0.1)
+    strong_foliage = _interval_foliage(3.05)
+    weak_foliage = _interval_foliage(3.05)
+
+    strong_loss, strong_audit = strong_evidence.interval_factor(
+        _interval_camera(), strong_foliage
+    )
+    weak_loss, weak_audit = weak_evidence.interval_factor(
+        _interval_camera(), weak_foliage
+    )
+
+    strong_loss.backward()
+    weak_loss.backward()
+    # The hit pixel remains one unit of optical-existence evidence.  Only
+    # metric placement/free-space gradients pay the weak depth confidence.
+    assert weak_loss > 0.9 * strong_loss
+    torch.testing.assert_close(
+        weak_foliage.opacity_logits.grad,
+        strong_foliage.opacity_logits.grad,
+        rtol=0.03,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        weak_foliage.xyz.grad,
+        0.1 * strong_foliage.xyz.grad,
+        rtol=0.03,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        weak_foliage.log_scales.grad,
+        0.1 * strong_foliage.log_scales.grad,
+        rtol=0.03,
+        atol=1e-5,
+    )
+    assert weak_audit["hit_geometry"] < strong_audit["hit_geometry"]
+    assert weak_audit["hit_optical_existence"] > 0
+    assert strong_audit["hit_optical_existence"] == 0
+    assert strong_audit["mean_confidence"] == pytest.approx(1.0)
+    assert weak_audit["mean_confidence"] == pytest.approx(0.1)
+    assert weak_audit["confidence_normalization"] == (
+        "depth_geometry_weighted_sum_over_ray_count__missing_confidence_"
+        "mass_routes_to_opacity_only_existence"
+    )
+
+
+def test_candidate_interval_factor_audits_allowed_behind_mass():
+    evidence = _interval_evidence(1)
+    foliage = _interval_foliage(4.0)
+
+    _, audit = evidence.interval_factor(_interval_camera(), foliage)
+
+    assert audit["behind_mass"] > 0.1
+    assert audit["hit"] > 1.0
 
 
 def test_candidate_interval_factor_converts_camera_z_on_off_axis_ray():
@@ -1973,7 +2608,7 @@ def test_candidate_interval_tiny_hit_mass_retains_opacity_gradient():
     assert foliage.opacity_logits.grad.abs().sum() > 0
 
 
-def test_ownerless_observation_space_ray_is_retained_but_dynamic_only():
+def test_ownerless_ray_uses_preverified_canonical_or_exact_dynamic():
     evidence = FoliageRayEvidence(
         {
             # Primitive zero owns the first row.  The second row is a dense
@@ -1996,17 +2631,81 @@ def test_ownerless_observation_space_ray_is_retained_but_dynamic_only():
     assert audit["observation_space_ray_count"] == 1
     assert audit["factor_camera_count"] == 1
 
-    foliage = _interval_foliage(3.0)
-    loss, interval = evidence.interval_factor(
-        _interval_camera(), foliage, maximum_rays=2
+    canonical = _interval_foliage(3.0)
+    # This lineage was established independently before the dense
+    # observation-space ray. The ray may refine it but cannot create/promote
+    # such support itself.
+    canonical.support_sequence_count.fill_(2)
+    dynamic = _interval_dynamic_foliage(3.0)
+    # Check the two physical consumers independently: the seed-bound row uses
+    # canonical mass; the ownerless row can use an already verified canonical
+    # lineage or its exact-camera dynamic residual.
+    canonical_loss, canonical_interval = evidence.interval_factor(
+        _interval_camera(), canonical, maximum_rays=2
     )
-    assert interval["rays"] == 2
-    assert interval["hit_rays"] == 1
-    assert interval["ownerless_hit_rays"] == 1
-    assert interval["verified_ownerless_hit_rays"] == 0
-    assert interval["excluded_ownerless_hit_rays"] == 1
-    loss.backward()
-    assert foliage.opacity_logits.grad.abs().sum() > 0
+    evidence = FoliageRayEvidence(
+        {
+            "offsets": torch.tensor([0, 1], dtype=torch.int64),
+            "camera_ids": torch.tensor([7, 7], dtype=torch.int32),
+            "pixels": torch.full((2, 2), 50.0),
+            "source_image_sizes": torch.full(
+                (2, 2), 100, dtype=torch.int32
+            ),
+            "free_end_depth": torch.full((2,), 2.5),
+            "hit_start_depth": torch.full((2,), 2.8),
+            "hit_end_depth": torch.full((2,), 3.2),
+            "observation_type": torch.ones(2, dtype=torch.int8),
+            "confidence": torch.ones(2),
+        }
+    )
+    dynamic_loss, dynamic_interval = evidence.interval_factor(
+        _interval_camera(), dynamic, maximum_rays=2
+    )
+    assert canonical_interval["rays"] == 2
+    assert canonical_interval["hit_rays"] == 2
+    assert canonical_interval["ownerless_hit_rays"] == 1
+    assert canonical_interval["ownerless_canonical_hit_rays"] == 1
+    assert canonical_interval["verified_ownerless_hit_rays"] == 1
+    assert canonical_interval["ownerless_supported_hit_rays"] == 1
+    assert canonical_interval["ownerless_missing_supported_hit_rays"] == 0
+    assert canonical_interval["excluded_ownerless_hit_rays"] == 0
+    assert canonical_interval["exact_dynamic_candidate_evaluations"] == 0
+    assert dynamic_interval["exact_dynamic_candidate_evaluations"] == 2
+    assert dynamic_interval["ownerless_dynamic_hit_rays"] == 1
+    assert dynamic_interval["ownerless_missing_dynamic_hit_rays"] == 0
+    assert dynamic_interval["ownerless_supported_hit_rays"] == 1
+    canonical_loss.backward()
+    dynamic_loss.backward()
+    assert canonical.opacity_logits.grad.abs().sum() > 0
+    assert dynamic.opacity_logits.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_ownerless_verified_row_audit_crosses_cuda_to_cpu_safely():
+    evidence = FoliageRayEvidence(
+        {
+            "offsets": torch.tensor([0, 0], dtype=torch.int64),
+            "camera_ids": torch.tensor([7], dtype=torch.int32),
+            "pixels": torch.full((1, 2), 50.0),
+            "source_image_sizes": torch.full(
+                (1, 2), 100, dtype=torch.int32
+            ),
+            "free_end_depth": torch.tensor([2.5]),
+            "hit_start_depth": torch.tensor([2.8]),
+            "hit_end_depth": torch.tensor([3.2]),
+            "observation_type": torch.ones(1, dtype=torch.int8),
+            "confidence": torch.ones(1),
+        }
+    )
+    foliage = _interval_foliage(3.0).cuda()
+    foliage.support_sequence_count.fill_(2)
+
+    loss, audit = evidence.interval_factor(_interval_camera(), foliage)
+
+    assert loss.is_cuda
+    assert audit["ownerless_canonical_hit_rays"] == 1
+    assert audit["ownerless_missing_supported_hit_rays"] == 0
+    assert evidence.ownerless_canonical_verified.tolist() == [True]
 
 
 def test_ownerless_hit_without_canonical_interval_support_is_dynamic_only():
@@ -2038,8 +2737,42 @@ def test_ownerless_hit_without_canonical_interval_support_is_dynamic_only():
     assert audit["ownerless_hit_rays"] == 1
     assert audit["verified_ownerless_hit_rays"] == 0
     assert audit["excluded_ownerless_hit_rays"] == 1
-    assert float(loss) == 0.0
+    assert audit["ownerless_dynamic_hit_rays"] == 0
+    assert audit["ownerless_missing_dynamic_hit_rays"] == 1
+    assert audit["ownerless_missing_supported_hit_rays"] == 1
+    # Missing exact-owner mass remains a measurable posterior deficit, but
+    # the unrelated canonical Gaussian receives no gradient from it.
+    assert float(loss) > 5.0
+    assert not loss.requires_grad
     assert evidence.audit()["unique_verified_ownerless_rows"] == 0
+
+
+def test_ownerless_hit_rejects_dynamic_birth_owned_by_another_camera():
+    evidence = FoliageRayEvidence(
+        {
+            "offsets": torch.tensor([0, 0], dtype=torch.int64),
+            "camera_ids": torch.tensor([7], dtype=torch.int32),
+            "pixels": torch.tensor([[50.0, 50.0]]),
+            "source_image_sizes": torch.tensor(
+                [[100, 100]], dtype=torch.int32
+            ),
+            "free_end_depth": torch.tensor([2.5]),
+            "hit_start_depth": torch.tensor([2.8]),
+            "hit_end_depth": torch.tensor([3.2]),
+            "observation_type": torch.ones(1, dtype=torch.int8),
+            "confidence": torch.ones(1),
+        }
+    )
+    foliage = _interval_dynamic_foliage(3.0, support_camera_id=8)
+
+    loss, audit = evidence.interval_factor(_interval_camera(), foliage)
+
+    assert audit["exact_dynamic_candidate_evaluations"] == 0
+    assert audit["ownerless_dynamic_hit_rays"] == 0
+    assert audit["ownerless_missing_dynamic_hit_rays"] == 1
+    assert audit["ownerless_missing_supported_hit_rays"] == 1
+    assert float(loss) > 5.0
+    assert not loss.requires_grad
 
 
 def test_candidate_interval_descendant_index_rebuilds_after_split():
@@ -2143,6 +2876,47 @@ def test_candidate_interval_sampling_eventually_covers_every_row():
     assert evidence.audit()["interval_row_coverage"] == 1.0
 
 
+def test_ray_camera_schedule_balances_row_coverage_not_camera_calls():
+    camera_ids = torch.tensor([7, 7] + [8] * 6, dtype=torch.int32)
+    count = len(camera_ids)
+    evidence = FoliageRayEvidence(
+        {
+            "offsets": torch.arange(count + 1, dtype=torch.int64),
+            "camera_ids": camera_ids,
+            "pixels": torch.full((count, 2), 50.0),
+            "source_image_sizes": torch.full(
+                (count, 2), 100, dtype=torch.int32
+            ),
+            "free_end_depth": torch.full((count,), 2.5),
+            "hit_start_depth": torch.full((count,), 2.8),
+            "hit_end_depth": torch.full((count,), 3.2),
+            "observation_type": torch.ones(count, dtype=torch.int8),
+            "confidence": torch.ones(count),
+        }
+    )
+    foliage = _interval_foliage(3.0)
+    views = {
+        camera_id: SimpleNamespace(
+            **{**vars(_interval_camera()), "colmap_id": camera_id}
+        )
+        for camera_id in (7, 8)
+    }
+    scheduled = []
+    for update in range(4):
+        camera_id = evidence.scheduled_camera_id(update)
+        scheduled.append(camera_id)
+        evidence.interval_factor(
+            views[camera_id], foliage, maximum_rays=2
+        )
+
+    # Camera 8 has three times as many rows, so equal row coverage requires
+    # one call for camera 7 and three calls for camera 8.
+    assert scheduled == [7, 8, 8, 8]
+    audits = evidence.audit()["camera_epoch_audits"]
+    assert audits["7"]["coverage"] == 1.0
+    assert audits["8"]["coverage"] == 1.0
+
+
 def test_candidate_interval_factor_penalizes_only_mass_before_free_boundary():
     evidence = _interval_evidence(-1)
     before = _interval_foliage(1.0)
@@ -2175,6 +2949,75 @@ def test_foliage_ray_runtime_state_survives_exact_resume():
     )
 
 
+def test_foliage_ray_resume_continues_exact_per_camera_epoch():
+    count = 7
+    evidence = FoliageRayEvidence(
+        {
+            "offsets": torch.arange(count + 1, dtype=torch.int64),
+            "camera_ids": torch.full(
+                (count,), 7, dtype=torch.int32
+            ),
+            "pixels": torch.full((count, 2), 50.0),
+            "source_image_sizes": torch.full(
+                (count, 2), 100, dtype=torch.int32
+            ),
+            "free_end_depth": torch.full((count,), 2.5),
+            "hit_start_depth": torch.full((count,), 2.8),
+            "hit_end_depth": torch.full((count,), 3.2),
+            # The last row is explicitly unknown and is not part of a
+            # free/hit evidence epoch.
+            "observation_type": torch.tensor(
+                [1, 1, -1, 1, -1, 1, 0], dtype=torch.int8
+            ),
+            "confidence": torch.ones(count),
+        }
+    )
+    foliage = _interval_foliage(3.0)
+    evidence.interval_factor(
+        _interval_camera(), foliage, maximum_rays=2
+    )
+    restored = FoliageRayEvidence(
+        {
+            "offsets": torch.arange(count + 1, dtype=torch.int64),
+            "camera_ids": torch.full(
+                (count,), 7, dtype=torch.int32
+            ),
+            "pixels": torch.full((count, 2), 50.0),
+            "source_image_sizes": torch.full(
+                (count, 2), 100, dtype=torch.int32
+            ),
+            "free_end_depth": torch.full((count,), 2.5),
+            "hit_start_depth": torch.full((count,), 2.8),
+            "hit_end_depth": torch.full((count,), 3.2),
+            "observation_type": torch.tensor(
+                [1, 1, -1, 1, -1, 1, 0], dtype=torch.int8
+            ),
+            "confidence": torch.ones(count),
+        }
+    )
+    restored.restore_runtime_state(evidence.capture_runtime_state())
+
+    evidence.interval_factor(
+        _interval_camera(), foliage, maximum_rays=2
+    )
+    restored.interval_factor(
+        _interval_camera(), foliage, maximum_rays=2
+    )
+
+    assert torch.equal(
+        restored.interval_row_visits, evidence.interval_row_visits
+    )
+    assert restored.capture_runtime_state()[
+        "camera_sampler_states"
+    ]["7"]["cursor"] == evidence.capture_runtime_state()[
+        "camera_sampler_states"
+    ]["7"]["cursor"]
+    audit = restored.audit()
+    assert audit["interval_effective_rows"] == 6
+    assert audit["interval_unique_rows"] == 4
+    assert audit["camera_epoch_audits"]["7"]["never_visited"] == 2
+
+
 def test_hybrid_volume_owner_activates_immediately_after_bootstrap():
     assert TRAINING_PROFILES["hybrid_fast"]["foliage_start"] == 0.08
     assert TRAINING_PROFILES["hybrid_quality"]["foliage_start"] == 0.12
@@ -2201,26 +3044,96 @@ def test_hybrid_volume_owner_activates_immediately_after_bootstrap():
 
 
 def test_conditioned_schedule_balances_exact_evidence_in_every_prefix():
-    rgb = np.arange(8, dtype=np.int64)
+    rgb = np.tile(np.arange(4, dtype=np.int64), 4)
     schedule, audit = _evidence_biased_schedule(
-        rgb, [10, 11], fraction=0.75, seed=7
+        rgb,
+        [10, 11],
+        fraction=0.75,
+        seed=7,
+        active_mask=np.ones(len(rgb), dtype=bool),
+        minimum_full_scene_visits=3,
     )
 
     evidence = np.isin(schedule, [10, 11])
-    assert evidence.tolist() == [
-        False,
-        True,
-        True,
-        True,
-        False,
-        True,
-        True,
-        True,
-    ]
-    assert int(evidence.sum()) == 6
+    # Three visits per full-scene camera are protected. Only four slots are
+    # replaceable, but they are interleaved across the entire interval rather
+    # than delayed until all three protected epochs have run.
+    assert int(evidence.sum()) == 4
+    assert np.array_equal(np.flatnonzero(evidence), [0, 4, 8, 12])
+    for view_id in range(4):
+        assert int((schedule == view_id).sum()) == 3
     assert abs(int((schedule == 10).sum()) - int((schedule == 11).sum())) <= 1
-    assert audit["evidence_steps"] == 6
-    assert audit["realized_fraction"] == 0.75
+    assert audit["evidence_steps"] == 4
+    assert audit["requested_evidence_steps"] == 12
+    assert audit["protected_full_scene_steps"] == 12
+    assert (
+        audit["protected_placement"]
+        == "uniform_interleaved_complete_epochs"
+    )
+    assert audit["minimum_full_scene_visits"] == 3
+    assert audit["coverage_preserving"]
+    assert audit["realized_fraction"] == 0.25
+
+
+def test_conditioned_schedule_protects_only_active_rgb_visits():
+    rgb = np.tile(np.arange(3, dtype=np.int64), 4)
+    active = np.zeros(len(rgb), dtype=bool)
+    active[3:9] = True
+    schedule, audit = _evidence_biased_schedule(
+        rgb,
+        [10],
+        fraction=0.75,
+        seed=5,
+        active_mask=active,
+        minimum_full_scene_visits=3,
+    )
+
+    # There are only two complete active epochs, so both are protected. The
+    # inactive prefix/suffix remain bit-identical to RGB while the active
+    # interval is a fresh balanced conditioned epoch.
+    assert np.array_equal(schedule[:3], rgb[:3])
+    assert np.array_equal(schedule[9:], rgb[9:])
+    assert sorted(schedule[3:9].tolist()) == [0, 0, 1, 1, 2, 2]
+    assert audit["minimum_full_scene_visits"] == 2
+    assert audit["protected_full_scene_steps"] == 6
+    assert audit["evidence_steps"] == 0
+
+
+def test_resume_conditioned_visits_migrate_the_saved_schedule_prefix():
+    counts, audit = _resume_conditioned_visit_counts(
+        {
+            "iteration": 10,
+            "schedule_horizon": 10,
+            "training_profile": "hybrid_handoff_quality",
+            "schedules": {
+                "conditioned": np.asarray(
+                    [0, 1, 2, 0, 1, 2, 0, 1, 2, 2],
+                    dtype=np.int64,
+                )
+            },
+        },
+        view_count=3,
+    )
+    # Iteration 10 is canonical polish for this compressed profile, so its
+    # final camera row was stored in the schedule but never optimized.
+    assert counts.tolist() == [3, 3, 3]
+    assert audit["source"] == "legacy_saved_schedule_exact_migration"
+    assert audit["carried_conditioned_steps"] == 9
+
+
+def test_resume_conditioned_visits_prefers_explicit_runtime_ledger():
+    counts, audit = _resume_conditioned_visit_counts(
+        {
+            "iteration": 6,
+            "conditioned_visit_counts": torch.tensor([0, 4, 1]),
+            # A repaired future schedule must not rewrite the old prefix.
+            "schedules": {"conditioned": np.asarray([2] * 10)},
+        },
+        view_count=3,
+    )
+    assert counts.tolist() == [0, 4, 1]
+    assert audit["source"] == "explicit_runtime_ledger"
+    assert audit["carried_conditioned_steps"] == 5
 
 
 def test_volume_split_selection_reserves_each_tree_before_refill():
@@ -2285,6 +3198,27 @@ def test_volume_split_selection_reserves_exact_owner_contexts():
     assert set(contexts[selected].tolist()) == {10, 20, 30}
 
 
+def test_volume_split_selection_reserves_lineage_families_inside_owner():
+    indices = torch.arange(8)
+    score = torch.tensor([100.0, 90.0, 80.0, 70.0, 1.0, 0.9, 0.8, 0.7])
+    instances = torch.zeros(8, dtype=torch.int64)
+    contexts = torch.full((8,), 10, dtype=torch.int64)
+    families = torch.tensor([3, 3, 3, 3, 4, 4, 4, 4])
+
+    selected = _balanced_instance_topk(
+        indices,
+        score,
+        instances,
+        quota=4,
+        context_id=contexts,
+        lineage_family_id=families,
+    )
+
+    assert len(selected) == 4
+    assert (families[selected] == 3).sum().item() == 2
+    assert (families[selected] == 4).sum().item() == 2
+
+
 def test_extra_surface_topology_uses_nonzero_rigid_weight():
     source = (
         Path(__file__).resolve().parents[1]
@@ -2310,6 +3244,39 @@ def test_canopy_topology_signal_tracks_target_high_frequency():
         _canopy_topology_signal(checker, task).mean()
         > _canopy_topology_signal(flat, task).mean()
     )
+
+
+def test_rigid_residual_patch_pool_routes_gradient_to_small_edge():
+    target = torch.zeros(3, 48, 48)
+    for y, x in ((8, 8), (8, 34), (34, 8), (34, 34)):
+        target[:, y : y + 3, x : x + 3] = 1
+    prediction = torch.zeros_like(target, requires_grad=True)
+    rigid = torch.ones(48, 48)
+    loss, audit = _rigid_residual_patch_loss(
+        prediction, target, rigid, maximum_patches=4, radius=2
+    )
+    loss.backward()
+    assert audit["patches"] == 4
+    # Four radius-two patches can cover at most 100 pixels. Spatial NMS keeps
+    # them on independent residual components instead of spending all four
+    # slots on adjacent centres around one component.
+    assert audit["pixels"] >= 80
+    assert audit["independent_peak_candidates"] >= 4
+    for y, x in ((8, 8), (8, 34), (34, 8), (34, 34)):
+        assert prediction.grad[:, y : y + 3, x : x + 3].abs().sum() > 0
+
+
+def test_chart_uv_topology_obeys_mature_world_geometry_freeze():
+    args = SimpleNamespace(
+        mature_handoff_surface_policy="appearance_only",
+        densify_from_iter=10,
+        densify_until_iter=20,
+        chart_quadtree_growth_fraction=0.3,
+    )
+    assert not _surface_topology_active(9, args)
+    assert not _chart_topology_active(9, args)
+    args.mature_handoff_surface_policy = "joint"
+    assert _chart_topology_active(9, args)
 
 
 def test_surface_canopy_ownership_only_penalizes_front_layer():
@@ -2339,3 +3306,58 @@ def test_surface_canopy_ownership_only_penalizes_front_layer():
     assert in_front > 20 * behind
     assert behind < gap_ray
     assert gap_ray < 0.03
+
+
+def test_counterfactual_transparency_routes_only_volume_alpha_gradient():
+    target = torch.zeros(3, 2, 2)
+    mixed = torch.full((3, 2, 2), 0.8, requires_grad=True)
+    surface = torch.zeros(3, 2, 2, requires_grad=True)
+    volume_alpha = torch.full((1, 2, 2), 0.5, requires_grad=True)
+    surface_alpha = torch.ones(1, 2, 2, requires_grad=True)
+    task = {
+        "p_rigid": torch.ones(2, 2),
+        "p_canopy": torch.zeros(2, 2),
+        "p_canopy_core": torch.zeros(2, 2),
+        "p_transient": torch.zeros(2, 2),
+        "p_boundary_uncertain": torch.zeros(2, 2),
+        "w_rgb": torch.ones(2, 2),
+    }
+    loss, audit = _counterfactual_volume_transparency_loss(
+        mixed,
+        surface,
+        target,
+        volume_alpha,
+        surface_alpha,
+        task,
+    )
+    loss.backward()
+    assert audit["supported_pixels"] == 4
+    assert audit["mean_responsibility"] > 0.99
+    assert volume_alpha.grad is not None
+    assert float(volume_alpha.grad.sum()) > 0
+    # RGB comparison and surface support are detached evidence, never a
+    # second trainable image owner.
+    assert mixed.grad is None
+    assert surface.grad is None
+    assert surface_alpha.grad is None
+
+
+def test_counterfactual_transparency_softly_retains_real_leaf_owner():
+    target = torch.zeros(3, 1, 2)
+    mixed = torch.tensor([[[0.0, 0.4]], [[0.0, 0.4]], [[0.0, 0.4]]])
+    surface = torch.tensor([[[0.8, 0.0]], [[0.8, 0.0]], [[0.8, 0.0]]])
+    alpha = torch.full((1, 1, 2), 0.5, requires_grad=True)
+    task = {
+        "p_rigid": torch.zeros(1, 2),
+        "p_canopy": torch.ones(1, 2),
+        "p_canopy_core": torch.ones(1, 2),
+        "p_transient": torch.zeros(1, 2),
+        "p_boundary_uncertain": torch.zeros(1, 2),
+        "w_rgb": torch.ones(1, 2),
+    }
+    _, audit = _counterfactual_volume_transparency_loss(
+        mixed, surface, target, alpha, torch.ones(1, 1, 2), task
+    )
+    # The first ray is correctly explained by the mixed leaf, while the
+    # second is better explained by the surface gap. Both remain continuous.
+    assert 0 < audit["mean_responsibility"] < 1

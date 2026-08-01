@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -314,6 +315,49 @@ def test_conditioned_visit_counts_use_absolute_schedule_horizon():
     assert audit["schedule_horizon"] == 12
     assert audit["active_schedule_begin"] == 2
     assert audit["active_schedule_end"] == 6
+
+
+def test_conditioned_visit_counts_prefers_explicit_resume_ledger():
+    state = {
+        "iteration": 8,
+        "training_contract": {
+            "schedule_horizon": 10,
+            "branch_activation": {"dynamic_iteration": 1},
+        },
+        # This repaired schedule was never consumed before a step-6 resume
+        # and must not be treated as historical visitation.
+        "schedules": {"conditioned": [2] * 10},
+        "conditioned_visit_counts": np.asarray([1, 3, 0]),
+        "conditioned_visit_provenance": {
+            "source": "legacy_saved_schedule_exact_migration"
+        },
+    }
+    counts, audit = _conditioned_visit_counts(state, 3)
+    assert counts.tolist() == [1, 3, 0]
+    assert audit["source"] == "explicit_runtime_ledger"
+    assert audit["active_conditioned_steps"] == 4
+    assert audit["trained_view_count"] == 2
+
+
+def test_conditioned_visit_counts_excludes_canonical_polish_suffix():
+    state = {
+        "iteration": 10,
+        "training_contract": {
+            "schedule_horizon": 10,
+            "branch_activation": {"dynamic_iteration": 1},
+            "resolved_phase_schedule": (
+                ("dynamic_appearance", 7),
+                ("canonical_polish", 10),
+            ),
+        },
+        "schedules": {
+            "conditioned": [0, 1, 0, 1, 0, 1, 0, 2, 2, 2],
+        },
+    }
+    counts, audit = _conditioned_visit_counts(state, 3)
+    assert counts.tolist() == [4, 3, 0]
+    assert audit["active_schedule_end"] == 7
+    assert audit["active_conditioned_steps"] == 7
 
 
 def test_localization_query_defaults_to_complete_split():

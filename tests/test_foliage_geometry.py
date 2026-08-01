@@ -4,9 +4,14 @@ import torch
 from outdoor.foliage_geometry import (
     _accumulate_supported_depth_nll,
     _allocate_dense_ray_budgets,
+    _bounded_candidate_ray_rows,
     _confirmed_free_space_mask,
     _dense_component_ray_posterior,
+    _dynamic_birth_limit_for_view,
+    _incidence_mask,
+    _invert_track_image_incidence,
     _priority_candidate_voxels,
+    _spatially_stratified_coverage_rows,
     _supported_view_geometry_statistics,
     semantic_tree_tracks,
 )
@@ -21,6 +26,103 @@ from outdoor.training_evidence import EvidenceEpochSampler
 
 def _budget_view(image_id):
     return {"image_id": image_id}
+
+
+def test_track_image_incidence_is_inverted_once_for_selected_cameras():
+    rows = _invert_track_image_incidence(
+        [{3, 5}, {5}, set(), {7, 3}, {11}],
+        [3, 5, 7],
+    )
+
+    np.testing.assert_array_equal(rows[3], np.asarray([0, 3]))
+    np.testing.assert_array_equal(rows[5], np.asarray([0, 1]))
+    np.testing.assert_array_equal(rows[7], np.asarray([3]))
+    assert 11 not in rows
+    np.testing.assert_array_equal(
+        _incidence_mask(rows[3], 5),
+        np.asarray([True, False, False, True, False]),
+    )
+
+
+def test_weak_continuous_view_gets_more_births_not_larger_splats():
+    tracks = [
+        {"dav2_alignment_status": "accepted"},
+        {"dav2_alignment_status": "weak_continuous"},
+        {},
+    ]
+    normal, normal_weak, normal_area = _dynamic_birth_limit_for_view(
+        tracks,
+        np.asarray([True, False, True]),
+        ordinary_limit=384,
+        weak_continuous_limit=2048,
+    )
+    expanded, expanded_weak, expanded_area = _dynamic_birth_limit_for_view(
+        tracks,
+        np.asarray([False, True, False]),
+        ordinary_limit=384,
+        weak_continuous_limit=2048,
+    )
+
+    assert normal == 384
+    assert normal_area == 384
+    assert not normal_weak
+    assert expanded == 2048
+    assert expanded_area == 384
+    assert expanded_weak
+
+
+def test_large_accepted_view_gets_continuous_pixel_bandwidth():
+    tracks = [{"dav2_alignment_status": "accepted"}]
+
+    limit, weak, area_limit = _dynamic_birth_limit_for_view(
+        tracks,
+        np.asarray([True]),
+        ordinary_limit=384,
+        weak_continuous_limit=2048,
+        eligible_pixel_count=199_229,
+        target_pixels_per_birth=192.0,
+    )
+
+    assert not weak
+    assert area_limit == 1_038
+    assert limit == 1_038
+
+
+def test_pixel_bandwidth_is_bounded_by_adaptive_cap():
+    limit, weak, area_limit = _dynamic_birth_limit_for_view(
+        [{}],
+        np.asarray([True]),
+        ordinary_limit=384,
+        weak_continuous_limit=2048,
+        eligible_pixel_count=10_000_000,
+        target_pixels_per_birth=192.0,
+    )
+
+    assert not weak
+    assert area_limit == 2_048
+    assert limit == 2_048
+
+
+def test_dynamic_coverage_scaffold_is_two_dimensional_and_order_invariant():
+    width = height = 6
+    u, v = np.meshgrid(np.arange(width), np.arange(height))
+    sample_u = u.reshape(-1).astype(np.float64)
+    sample_v = v.reshape(-1).astype(np.float64)
+    rows = np.arange(width * height, dtype=np.int64)
+
+    selected = _spatially_stratified_coverage_rows(
+        rows, sample_u, sample_v, 4
+    )
+    shuffled = _spatially_stratified_coverage_rows(
+        rows[::-1], sample_u, sample_v, 4
+    )
+
+    np.testing.assert_array_equal(selected, shuffled)
+    quadrant = (
+        (sample_v[selected] >= height / 2).astype(np.int64) * 2
+        + (sample_u[selected] >= width / 2).astype(np.int64)
+    )
+    np.testing.assert_array_equal(np.sort(quadrant), np.arange(4))
 
 
 def test_global_dense_ray_budget_preserves_coverage_and_exact_total():
@@ -94,6 +196,45 @@ def test_global_dense_ray_budget_rejects_impossible_floor():
             total_budget=10,
             minimum_per_view=8,
         )
+
+
+def test_candidate_bound_ray_basis_is_bounded_spatial_and_type_complete():
+    rows = np.arange(36, dtype=np.int64)
+    pixel_u = np.tile(np.arange(6, dtype=np.float64), 6)
+    pixel_v = np.repeat(np.arange(6, dtype=np.float64), 6)
+    observation_type = np.zeros(36, dtype=np.int8)
+    observation_type[:20] = 1
+    observation_type[20:30] = -1
+
+    first = _bounded_candidate_ray_rows(
+        rows,
+        pixel_u,
+        pixel_v,
+        observation_type,
+        maximum_rows=12,
+    )
+    second = _bounded_candidate_ray_rows(
+        rows,
+        pixel_u,
+        pixel_v,
+        observation_type,
+        maximum_rows=12,
+    )
+
+    assert len(first) == 12
+    np.testing.assert_array_equal(first, second)
+    assert set(observation_type[first].tolist()) == {-1, 0, 1}
+    assert np.ptp(pixel_u[first]) >= 4
+    assert np.ptp(pixel_v[first]) >= 4
+    assert not len(
+        _bounded_candidate_ray_rows(
+            rows,
+            pixel_u,
+            pixel_v,
+            observation_type,
+            maximum_rows=0,
+        )
+    )
 
 
 def test_sequence_id_is_not_frame_identity():
@@ -177,6 +318,17 @@ def test_evidence_epoch_sampler_visits_every_factor_without_fixed_stride():
     audit = sampler.audit()
     assert audit["never_visited"] == 0
     assert audit["completed_epochs"] == 1
+
+
+def test_evidence_epoch_sampler_tail_does_not_wrap_and_repeat():
+    sampler = EvidenceEpochSampler(11, seed=3)
+    first = sampler.next(8)
+    tail = sampler.next(8)
+    assert len(first) == 8
+    assert len(tail) == 3
+    assert len(np.unique(np.concatenate([first, tail]))) == 11
+    assert sampler.audit()["completed_epochs"] == 1
+    assert sampler.audit()["maximum_visits"] == 1
 
 
 def test_empty_cambridge_point2d_rows_use_tracked_calibrated_reprojection():
@@ -370,9 +522,9 @@ def test_dense_component_rays_create_ownerless_hole_proposals():
     np.testing.assert_allclose(
         [row["xyz"][2] for row in proposals], 5.0
     )
-    # Canonical hole proposals remain bounded, but every calibrated hit gets
-    # a sequence-local renderer primitive. Otherwise a dense posterior row
-    # can supervise no parameter when the canonical hull rejects its cell.
+    # The default basis is larger than this tiny raster, so every row is
+    # represented here. Production views explicitly decouple the much denser
+    # posterior table from a bounded finite-footprint renderer basis.
     assert len(dynamic_births) == 16
     assert all(
         row["_dense_ray_dynamic_birth"] for row in dynamic_births
@@ -387,6 +539,44 @@ def test_dense_component_rays_create_ownerless_hole_proposals():
         [row["observation_depth"][0] for row in dynamic_births],
         5.0,
     )
+
+
+def test_dense_component_propagates_measured_depth_uncertainty():
+    view = {
+        "image_id": 7,
+        "width": 4,
+        "height": 4,
+        "fx": 4.0,
+        "fy": 4.0,
+        "cx": 2.0,
+        "cy": 2.0,
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "tree_keep_mask": np.zeros((4, 4), dtype=bool),
+    }
+    record, _, dynamic_births = _dense_component_ray_posterior(
+        view,
+        np.asarray([[0.0, 0.0, 5.0]]),
+        np.asarray([3], dtype=np.int32),
+        np.asarray([0.1]),
+        np.asarray([[20, 80, 30]], dtype=np.uint8),
+        np.asarray([True]),
+        observation_depth_sigmas=np.asarray([1.2]),
+        depth_neighbor_pixels=10.0,
+        maximum_rays=16,
+        maximum_proposals=0,
+    )
+
+    assert record is not None
+    assert np.median(record["hit_end"] - record["hit_start"]) > 2.0
+    assert min(row["position_sigma"] for row in dynamic_births) >= 1.2
+    # Weak geometry remains in both the immutable ray table and the renderer
+    # basis, but it no longer receives the same existence/topology authority
+    # as a precise metric hit.
+    assert len(record["camera_id"]) == 16
+    assert len(dynamic_births) == 16
+    assert max(row["tree_fraction"] for row in dynamic_births) < 0.2
+    assert min(row["ray_depth_nll"] for row in dynamic_births) > 20.0
 
 
 def test_dense_dynamic_births_use_exact_contracted_target_rgb():
@@ -461,3 +651,191 @@ def test_dense_component_supports_multiple_instances_in_one_tree_mask():
     assert len(record["camera_id"]) == 16
     assert len(dynamic_births) == 16
     assert {row["_tree_instance_id"] for row in dynamic_births} == {3, 4}
+
+
+def test_dense_ray_table_is_decoupled_from_instance_balanced_birth_basis():
+    width, height = 8, 4
+    instance_raster = np.full((height, width), 3, dtype=np.int32)
+    instance_raster[:, width // 2 :] = 4
+    view = {
+        "image_id": 11,
+        "width": width,
+        "height": height,
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": width / 2,
+        "cy": height / 2,
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "tree_keep_mask": np.ones((height, width), dtype=bool),
+    }
+    depth = 5.0
+    track_u = np.asarray([1.5, 5.5])
+    track_v = np.asarray([1.5, 1.5])
+    track_xyz = np.column_stack(
+        [
+            (track_u - view["cx"]) * depth / view["fx"],
+            (track_v - view["cy"]) * depth / view["fy"],
+            np.full(2, depth),
+        ]
+    )
+    record, _, compact = _dense_component_ray_posterior(
+        view,
+        track_xyz,
+        np.asarray([3, 4], dtype=np.int32),
+        np.asarray([0.1, 0.1]),
+        np.asarray([[20, 80, 30], [40, 100, 50]], dtype=np.uint8),
+        np.asarray([True, True]),
+        depth_neighbor_pixels=100.0,
+        maximum_rays=32,
+        maximum_proposals=0,
+        maximum_dynamic_births=4,
+        instance_raster=instance_raster,
+    )
+    _, _, dense = _dense_component_ray_posterior(
+        view,
+        track_xyz,
+        np.asarray([3, 4], dtype=np.int32),
+        np.asarray([0.1, 0.1]),
+        np.asarray([[20, 80, 30], [40, 100, 50]], dtype=np.uint8),
+        np.asarray([True, True]),
+        depth_neighbor_pixels=100.0,
+        maximum_rays=32,
+        maximum_proposals=0,
+        maximum_dynamic_births=32,
+        instance_raster=instance_raster,
+    )
+
+    assert record is not None
+    assert len(record["camera_id"]) == 32
+    assert len(compact) == 4
+    assert {row["_tree_instance_id"] for row in compact} == {3, 4}
+    assert {
+        row["_dense_ray_basis_role"] for row in compact
+    } == {"coverage", "frequency_residual"}
+    coverage_scale = [
+        row["ray_footprint_scale"]
+        for row in compact
+        if row["_dense_ray_basis_role"] == "coverage"
+    ]
+    residual_scale = [
+        row["ray_footprint_scale"]
+        for row in compact
+        if row["_dense_ray_basis_role"] == "frequency_residual"
+    ]
+    assert min(coverage_scale) > max(residual_scale)
+    confidence_by_uv = {
+        tuple(pixel / np.asarray([width, height])): confidence
+        for pixel, confidence in zip(
+            record["pixel"], record["confidence"]
+        )
+    }
+    for birth in compact:
+        uv = tuple(birth["observation_uv"][0])
+        np.testing.assert_allclose(
+            birth["tree_fraction"],
+            confidence_by_uv[uv],
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(
+            1.0 / np.sqrt(1.0 + birth["ray_depth_nll"]),
+            confidence_by_uv[uv],
+            rtol=1e-6,
+        )
+    assert min(row["ray_footprint_scale"] for row in compact) > max(
+        row["ray_footprint_scale"] for row in dense
+    )
+    assert {
+        row["_dense_ray_basis_role"] for row in dense
+    } == {"coverage", "frequency_residual"}
+
+
+def test_dense_evidence_budget_covers_image_plane_not_raster_diagonal():
+    width = height = 16
+    view = {
+        "image_id": 12,
+        "width": width,
+        "height": height,
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": width / 2,
+        "cy": height / 2,
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "tree_keep_mask": np.ones((height, width), dtype=bool),
+    }
+    depth = 5.0
+    track_u = track_v = np.asarray([width / 2])
+    track_xyz = np.column_stack(
+        [
+            (track_u - view["cx"]) * depth / view["fx"],
+            (track_v - view["cy"]) * depth / view["fy"],
+            np.full(1, depth),
+        ]
+    )
+    record, _, births = _dense_component_ray_posterior(
+        view,
+        track_xyz,
+        np.asarray([3], dtype=np.int32),
+        np.asarray([0.1]),
+        np.asarray([[20, 80, 30]], dtype=np.uint8),
+        np.asarray([True]),
+        depth_neighbor_pixels=100.0,
+        maximum_rays=16,
+        maximum_proposals=0,
+        maximum_dynamic_births=16,
+        instance_raster=np.full((height, width), 3, dtype=np.int32),
+    )
+
+    assert record is not None
+    assert len(record["pixel"]) == len(births) == 16
+    pixel = np.asarray(record["pixel"])
+    quadrants = (
+        (pixel[:, 0] >= width / 2).astype(np.int32)
+        + 2 * (pixel[:, 1] >= height / 2).astype(np.int32)
+    )
+    assert set(quadrants.tolist()) == {0, 1, 2, 3}
+    assert len(np.unique(pixel[:, 0])) >= 4
+    assert len(np.unique(pixel[:, 1])) >= 4
+    assert {
+        row["_dense_ray_basis_role"] for row in births
+    } == {"coverage", "frequency_residual"}
+
+
+def test_dense_component_ray_budget_is_filled_after_posterior_filtering():
+    # Only the centre of this silhouette is close enough to a measured depth
+    # anchor.  Sampling the budget before validity would choose the two
+    # endpoints and return no owners at all.
+    width = 8
+    view = {
+        "image_id": 10,
+        "width": width,
+        "height": 1,
+        "fx": 8.0,
+        "fy": 8.0,
+        "cx": 4.0,
+        "cy": 0.5,
+        "rotation": np.eye(3),
+        "translation": np.zeros(3),
+        "tree_keep_mask": np.ones((1, width), dtype=bool),
+    }
+    anchor_u = 3.5
+    depth = 5.0
+    anchor_x = (anchor_u - view["cx"]) * depth / view["fx"]
+    record, _, dynamic_births = _dense_component_ray_posterior(
+        view,
+        np.asarray([[anchor_x, 0.0, depth]]),
+        np.asarray([3], dtype=np.int32),
+        np.asarray([0.1]),
+        np.asarray([[20, 80, 30]], dtype=np.uint8),
+        np.asarray([True]),
+        depth_neighbor_pixels=1.1,
+        maximum_rays=2,
+        maximum_proposals=0,
+        instance_raster=np.full((1, width), 3, dtype=np.int32),
+    )
+
+    assert record is not None
+    assert len(record["camera_id"]) == 2
+    assert len(dynamic_births) == 2
+    assert all(row["ray_footprint_scale"] > 0 for row in dynamic_births)

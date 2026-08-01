@@ -9,7 +9,7 @@
   "camera_geometry_sha256": "01acbde64e1e7fd6ec9fd34caa90576c067ee95cc446e1cfabfebb01a23a7527",
   "image_loading": {
     "mode": "on_demand_lru",
-    "maximum_cached_views": 4,
+    "maximum_cached_views": 1,
     "eager_rgb_tensor_count": 0
   },
   "principal_point_offset_pixels": {

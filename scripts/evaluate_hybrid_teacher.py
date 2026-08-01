@@ -392,7 +392,8 @@ def _conditioned_visit_counts(
     both pessimistic and methodologically ambiguous.  The immutable schedule
     stored in the checkpoint is the authoritative visitation record.
     """
-    counts = np.zeros(max(int(view_count), 0), dtype=np.int64)
+    view_count = max(int(view_count), 0)
+    counts = np.zeros(view_count, dtype=np.int64)
     schedule = state.get("schedules", {}).get("conditioned")
     contract = state.get("training_contract", {})
     total = int(
@@ -405,6 +406,44 @@ def _conditioned_visit_counts(
     activation = contract.get("branch_activation", {})
     dynamic_iteration = activation.get("dynamic_iteration")
     dynamic_start = activation.get("dynamic")
+    explicit = state.get("conditioned_visit_counts")
+    if explicit is not None:
+        if torch.is_tensor(explicit):
+            explicit = explicit.detach().cpu().numpy()
+        explicit = np.asarray(explicit)
+        if (
+            explicit.ndim != 1
+            or len(explicit) != view_count
+            or not np.issubdtype(explicit.dtype, np.integer)
+            or bool((explicit < 0).any())
+        ):
+            raise RuntimeError(
+                "Checkpoint conditioned visit ledger is invalid"
+            )
+        counts = explicit.astype(np.int64, copy=True)
+        trained = int((counts > 0).sum())
+        provenance = state.get(
+            "conditioned_visit_provenance", {}
+        )
+        return counts, {
+            "available": True,
+            "source": "explicit_runtime_ledger",
+            "provenance": provenance,
+            "schedule_horizon": total,
+            "active_conditioned_steps": int(counts.sum()),
+            "trained_view_count": trained,
+            "untrained_view_count": view_count - trained,
+            "trained_view_fraction": trained / max(view_count, 1),
+            "minimum_visits": int(counts.min()) if len(counts) else 0,
+            "median_visits": (
+                float(np.median(counts[counts > 0]))
+                if bool((counts > 0).any())
+                else 0.0
+            ),
+            "maximum_visits": (
+                int(counts.max()) if len(counts) else 0
+            ),
+        }
     if (
         schedule is None
         or total <= 0
@@ -432,7 +471,25 @@ def _conditioned_visit_counts(
             stop,
         )
         activation_source = "legacy_fraction"
-    active = schedule[start:stop]
+    # The conditioned branch is deliberately disabled during the terminal
+    # canonical-polish phase.  Legacy schedule-only checkpoints did not store
+    # an explicit ledger, so exclude that suffix rather than claiming those
+    # camera codes received optimizer updates.
+    resolved_phases = state.get(
+        "resolved_phase_schedule",
+        contract.get("resolved_phase_schedule", ()),
+    )
+    previous_endpoint = 0
+    canonical_polish_begin = stop
+    for name, endpoint in resolved_phases:
+        if str(name) == "canonical_polish":
+            canonical_polish_begin = min(
+                max(int(previous_endpoint), 0), stop
+            )
+            break
+        previous_endpoint = int(endpoint)
+    effective_stop = min(stop, canonical_polish_begin)
+    active = schedule[start:effective_stop]
     if active.size and (
         int(active.min()) < 0 or int(active.max()) >= int(view_count)
     ):
@@ -444,6 +501,7 @@ def _conditioned_visit_counts(
     trained = int((counts > 0).sum())
     return counts, {
         "available": True,
+        "source": "legacy_schedule_reconstruction",
         "schedule_horizon": total,
         "activation_source": activation_source,
         "dynamic_iteration": (
@@ -455,7 +513,7 @@ def _conditioned_visit_counts(
             float(dynamic_start) if dynamic_start is not None else None
         ),
         "active_schedule_begin": start,
-        "active_schedule_end": stop,
+        "active_schedule_end": effective_stop,
         "active_conditioned_steps": int(active.size),
         "trained_view_count": trained,
         "untrained_view_count": int(view_count) - trained,
@@ -875,6 +933,26 @@ def main() -> None:
     )
     parser.add_argument("--view-cache-size", type=int, default=2)
     parser.add_argument(
+        "--allow-projected-optical-footprint-repair",
+        action="store_true",
+        help=(
+            "Explicitly evaluate the exact retained v39 state with the v40 "
+            "view-projected optical-mass and non-owner exact-ray render-"
+            "footprint repair. This is a labelled causal reinterpretation, "
+            "not a render-equivalent migration."
+        ),
+    )
+    parser.add_argument(
+        "--exact-ray-render-aspect-limit",
+        type=float,
+        default=4.0,
+        help=(
+            "Render-only maximum depth/tangent scale ratio for a visible "
+            "single-observation exact-ray leaf. Metric position covariance, "
+            "tangent footprint, colour and opacity are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--allow-resolution-override",
         action="store_true",
         help=(
@@ -913,7 +991,11 @@ def main() -> None:
     # to fail when the first raster is opened.
     evaluation_rgb_source = rgb_source_contract(dataset)
     teacher = load_hybrid_teacher(
-        args.teacher_state, sh_degree=dataset.sh_degree
+        args.teacher_state,
+        sh_degree=dataset.sh_degree,
+        allow_projected_optical_footprint_repair=(
+            args.allow_projected_optical_footprint_repair
+        ),
     )
     evaluation_rgb_source, rgb_source_contract_match = (
         _assert_rgb_source_contract(
@@ -1067,6 +1149,9 @@ def main() -> None:
                 task=None,
                 conditioned=False,
                 surface_only=(evaluation_mode == "rigid"),
+                exact_ray_render_aspect_limit=(
+                    args.exact_ray_render_aspect_limit
+                ),
             )
             conditioned = (
                 teacher.render(
@@ -1077,6 +1162,9 @@ def main() -> None:
                         else None
                     ),
                     conditioned=True,
+                    exact_ray_render_aspect_limit=(
+                        args.exact_ray_render_aspect_limit
+                    ),
                 )
                 if evaluation_mode == "hybrid"
                 else None

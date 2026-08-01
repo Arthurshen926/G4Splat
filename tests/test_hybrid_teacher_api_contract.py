@@ -117,6 +117,38 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "cambridge_native_hybrid_teacher_v32_preserved_handoff_topology_contract"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v33_exact_ray_camera_plane_topology"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v34_exact_owner_optical_mass_calibration"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v35_atomic_volume_replace_split"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v36_counterfactual_transparency_complete_ray_epoch"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v37_exact_per_camera_ray_epoch_topology_settle"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v38_resume_aware_ray_epoch_topology_settle"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v39_conditioned_topology_settle"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v40_projected_optical_footprint"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():
@@ -196,6 +228,46 @@ def test_audited_render_equivalent_renderer_migration_is_narrow(monkeypatch):
         audit["render_equivalent_migrations"]["hybrid_renderer"]["reason"]
         == "forward-equivalent test pair"
     )
+
+
+def test_projected_optical_footprint_repair_requires_explicit_exact_predecessor(
+    monkeypatch,
+):
+    predecessor = api.PROJECTED_OPTICAL_FOOTPRINT_REPAIR_PREDECESSOR
+    hashes = {
+        "appearance_uncertainty": api.sha256_file(
+            api.REPO_ROOT / "outdoor/appearance_uncertainty.py"
+        ),
+        "dataset_reader": api.sha256_file(
+            api.SURFEL_ROOT / "scene/dataset_readers.py"
+        ),
+        "gaussian_model": api.sha256_file(
+            api.SURFEL_ROOT / "scene/gaussian_model.py"
+        ),
+        "hybrid_renderer": predecessor["hybrid_renderer"],
+        "mixed_forward_cuda": api.sha256_file(
+            api.SURFEL_ROOT
+            / "submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu"
+        ),
+    }
+    state = {
+        "protocol": predecessor["protocol"],
+        "implementation_hashes": hashes,
+    }
+    with pytest.raises(RuntimeError, match="hybrid_renderer"):
+        api._validate_render_implementation(state)
+    audit = api._validate_render_implementation(
+        state, allow_projected_optical_footprint_repair=True
+    )
+    assert audit["status"] == "projected_optical_footprint_causal_repair"
+    assert not audit["exact"]
+    assert audit["causal_render_repair"] is not None
+
+    wrong = {**state, "protocol": "unrelated"}
+    with pytest.raises(RuntimeError, match="hybrid_renderer"):
+        api._validate_render_implementation(
+            wrong, allow_projected_optical_footprint_repair=True
+        )
 
 
 def test_audited_dav2_source_role_migration_is_render_equivalent():

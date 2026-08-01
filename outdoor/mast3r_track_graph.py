@@ -35,6 +35,87 @@ ROLE_NAMES = ("rigid", "canopy", "sky", "transient", "unknown")
 ROLE_RIGID, ROLE_CANOPY, ROLE_SKY, ROLE_TRANSIENT, ROLE_UNKNOWN = range(5)
 
 
+class CameraUniqueUnionFind:
+    """Union observation nodes without allowing two pixels from one camera.
+
+    Pairwise reciprocal matches can still form an invalid transitive chain:
+    A(u)-B(v) and B(v)-C(w) are a valid track, while a later edge to a
+    different A pixel would merge two physical points.  Dropping one of the A
+    observations only after union-find does not undo that merge.  Maintain the
+    one-observation-per-camera invariant during every union instead.
+    """
+
+    def __init__(self):
+        self.parent: list[int] = []
+        self.rank: list[int] = []
+        self.cameras: list[set[int]] = []
+
+    def add(self, camera_id: int) -> int:
+        index = len(self.parent)
+        self.parent.append(index)
+        self.rank.append(0)
+        self.cameras.append({int(camera_id)})
+        return index
+
+    def find(self, value: int) -> int:
+        parent = self.parent[value]
+        if parent != value:
+            self.parent[value] = self.find(parent)
+        return self.parent[value]
+
+    def union(self, first: int, second: int) -> bool:
+        first = self.find(first)
+        second = self.find(second)
+        if first == second:
+            return True
+        if self.cameras[first] & self.cameras[second]:
+            return False
+        if self.rank[first] < self.rank[second]:
+            first, second = second, first
+        self.parent[second] = first
+        self.cameras[first].update(self.cameras[second])
+        self.cameras[second].clear()
+        if self.rank[first] == self.rank[second]:
+            self.rank[first] += 1
+        return True
+
+
+def descriptor_view_direction_cost(
+    source_forward: np.ndarray, target_forward: np.ndarray
+) -> np.ndarray:
+    """Return an optical-axis mismatch that distinguishes opposite views."""
+    source = np.asarray(source_forward, dtype=np.float64)
+    target = np.asarray(target_forward, dtype=np.float64)
+    return 1.0 - np.clip(target @ source, -1.0, 1.0)
+
+
+def descriptor_cycle_consistency(
+    median_reprojection_error: float,
+    maximum_reprojection_error: float,
+    descriptor_edge_count: int,
+    observation_node_count: int,
+) -> tuple[int, float]:
+    """Combine reciprocal graph closure with exact-K reprojection quality."""
+    if descriptor_edge_count < 0 or observation_node_count < 1:
+        raise ValueError("Descriptor graph counts must be non-negative")
+    cycle_rank = max(
+        int(descriptor_edge_count) - int(observation_node_count) + 1,
+        0,
+    )
+    scale = max(float(maximum_reprojection_error), 1e-6)
+    reprojection = float(
+        np.exp(
+            -0.5
+            * (float(median_reprojection_error) / scale) ** 2
+        )
+    )
+    # A reciprocal pair is already a checked A-B-A descriptor cycle.  An
+    # independent graph loop (for example A-B-C-A) raises the closure weight
+    # to one, but cannot hide poor fixed-camera reprojection.
+    graph_closure = 0.85 + 0.15 * min(cycle_rank, 1)
+    return cycle_rank, reprojection * graph_closure
+
+
 def _sequence(name: str) -> str:
     stem = Path(name).stem
     return stem.split("__", 1)[0] if "__" in stem else "default"
@@ -1106,14 +1187,70 @@ def validate_track_gate(
         rigid = archive["dominant_role"] == ROLE_RIGID
         reprojection = archive["reprojection_error"]
         angle = archive["triangulation_angle_median"]
+        camera_count = len(archive["camera_names"])
+        observed_cameras = np.unique(
+            archive["observation_camera_indices"]
+        )
+        if (
+            len(observed_cameras)
+            and (
+                int(observed_cameras.min()) < 0
+                or int(observed_cameras.max()) >= camera_count
+            )
+        ):
+            raise RuntimeError(
+                "MASt3R track observations reference a camera outside the "
+                "archive camera table"
+            )
+        cycle = (
+            np.asarray(archive["cycle_consistency"])
+            if "cycle_consistency" in archive
+            else np.empty(0, dtype=np.float32)
+        )
+        cycle_rank = (
+            np.asarray(archive["descriptor_cycle_rank"])
+            if "descriptor_cycle_rank" in archive
+            else np.empty(0, dtype=np.int16)
+        )
+        builder = (
+            str(archive["correspondence_builder"].item())
+            if "correspondence_builder" in archive
+            else "unspecified"
+        )
+        camera_scope = (
+            str(archive["camera_scope"].item())
+            if "camera_scope" in archive
+            else "unspecified"
+        )
     values = {
         "schema_version": schema,
+        "correspondence_builder": builder,
+        "camera_scope": camera_scope,
         "track_count": int(count),
         "global_rigid_track_count": int((rigid & (sequences >= 2)).sum()),
         "median_observations": float(np.median(observations)),
         "cross_sequence_fraction": float((sequences >= 2).mean()),
         "median_reprojection_error": float(np.median(reprojection)),
+        "reprojection_error_p90": float(
+            np.percentile(reprojection, 90)
+        ),
+        "reprojection_error_p99": float(
+            np.percentile(reprojection, 99)
+        ),
         "median_triangulation_angle": float(np.median(angle)),
+        "observation_camera_count": int(len(observed_cameras)),
+        "observation_camera_coverage": float(
+            len(observed_cameras) / max(camera_count, 1)
+        ),
+        "never_observed_keyframe_count": int(
+            camera_count - len(observed_cameras)
+        ),
+        "median_cycle_consistency": (
+            float(np.median(cycle)) if len(cycle) else None
+        ),
+        "graph_cycle_track_fraction": (
+            float((cycle_rank > 0).mean()) if len(cycle_rank) else None
+        ),
     }
     failures = []
     checks = {

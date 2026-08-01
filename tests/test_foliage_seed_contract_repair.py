@@ -9,6 +9,7 @@ from scripts.repair_foliage_seed_contract import (
     _merge_sequence_groups,
     sequence_local_correspondence_groups,
 )
+from scripts.repair_foliage_optical_prior import _repair_opacity_payload
 
 
 def test_measured_skeleton_uses_continuous_multiview_line_evidence():
@@ -62,13 +63,46 @@ def test_leaf_optical_mass_is_spatial_bounded_and_contradiction_aware():
         )
     )
 
-    assert torch.all((initial >= 0.035) & (initial <= 0.10))
+    assert torch.all((initial >= 0.08) & (initial <= 0.40))
     assert torch.all((floor >= 0.020) & (floor <= 0.060))
-    assert initial[1] > initial[0]
+    # Equal owner/free-space evidence gives equal optical initialization even
+    # when geometry occupancy differs; the geometry-aware floor still tracks
+    # that distinction.
+    torch.testing.assert_close(initial[1], initial[0])
+    assert floor[1] > floor[0]
     assert initial[2] > initial[1]
     assert floor[2] > floor[1]
     assert contradicted[0] < initial[1]
     assert contradicted_floor[0] < floor[1]
+
+
+def test_optical_prior_repair_changes_only_observed_dynamic_alpha():
+    payload = {
+        "opacities": torch.full((4, 1), 0.02),
+        "layer_role": torch.tensor([2, 2, 2, 1]),
+        "initialization_source": torch.tensor([4, 3, 1, 4]),
+        "occupancy_probability": torch.tensor([0.1, 0.2, 0.9, 0.9]),
+        "support_view_count": torch.tensor([1, 1, 3, 3]),
+        "unknown_view_count": torch.zeros(4),
+        "ray_depth_nll": torch.tensor([99.0, 24.0, 0.0, 0.0]),
+        "free_space_violation_count": torch.zeros(4),
+        "centers": torch.arange(12).reshape(4, 3),
+        "audit": {},
+    }
+    result = _repair_opacity_payload(payload)
+
+    assert result["opacities"][0, 0] > 0.30
+    # DAV2-only geometry has no exact calibrated owner-pixel optical
+    # authority and therefore keeps its original alpha.
+    assert result["opacities"][1, 0] == payload["opacities"][1, 0]
+    torch.testing.assert_close(
+        result["opacities"][2:], payload["opacities"][2:]
+    )
+    torch.testing.assert_close(result["centers"], payload["centers"])
+    audit = result["audit"]["optical_existence_prior_repair"]
+    assert audit["candidate_count"] == 1
+    assert audit["lifted_count"] == 1
+    assert not audit["historical_rgb_fit_used"]
 
 
 def test_sequence_graph_never_merges_same_camera_samples():

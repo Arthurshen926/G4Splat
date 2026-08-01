@@ -67,3 +67,26 @@ def test_robust_inverse_depth_alignment_rejects_sparse_support():
     assert not diagnostics.accepted
     assert "insufficient support" in diagnostics.reason
     assert torch.count_nonzero(aligned) == 0
+
+
+def test_inverse_depth_alignment_does_not_turn_invalid_pixels_into_hits():
+    disparity = torch.linspace(0.2, 1.0, 32 * 32).reshape(32, 32)
+    inverse_depth = 0.1 + 0.8 * disparity
+    depth = inverse_depth.reciprocal()
+    support = torch.ones_like(disparity, dtype=torch.bool)
+    disparity[0, 0] = float("nan")
+    disparity[0, 1] = 0.0
+    support[0, :2] = False
+
+    aligned, diagnostics = robust_align_inverse_depth(
+        disparity,
+        depth,
+        support,
+        min_samples=64,
+        max_relative_rmse=0.01,
+    )
+
+    assert diagnostics.accepted
+    assert aligned[0, 0] == 0
+    assert aligned[0, 1] == 0
+    assert torch.all(aligned[1:] > 0)

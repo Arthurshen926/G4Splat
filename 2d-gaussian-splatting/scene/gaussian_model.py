@@ -1858,6 +1858,22 @@ class GaussianModel:
         candidate_before = (
             clone_candidate_before | split_candidate_before
         )
+        # Exact negative ids bind a Chart renderer cell to the learnable UV
+        # atlas. Random world-space clone/split would either duplicate that
+        # cell or clear its identity. Chart cells are refined separately by a
+        # four-child UV quadtree replace-and-retire event.
+        chart_bound_before = (
+            (self._source_type == self.SOURCE_CHART_RESIDUAL)
+            & (self._track_id < -1)
+            if (
+                len(self._source_type) == before
+                and len(getattr(self, "_track_id", ())) == before
+            )
+            else torch.zeros(
+                before, dtype=torch.bool, device=prune_mask.device
+            )
+        )
+        candidate_before &= ~chart_bound_before
         if len(self._protected_flag) == before:
             candidate_before &= ~self._protected_flag
         candidate_before &= ~prune_mask
@@ -1879,6 +1895,7 @@ class GaussianModel:
         if reallocation_target > 0:
             alpha = self.get_opacity.reshape(-1)
             eligible = ~prune_mask & ~candidate_before
+            eligible &= ~chart_bound_before
             if len(self._protected_flag) == before:
                 eligible &= ~self._protected_flag
             # Only weak optical contributors may be displaced.  High-opacity
@@ -1938,6 +1955,21 @@ class GaussianModel:
                     projected_large,
                 ),
             )
+            chart_bound = (
+                (self._source_type == self.SOURCE_CHART_RESIDUAL)
+                & (self._track_id < -1)
+                if (
+                    len(self._source_type) == point_count
+                    and len(getattr(self, "_track_id", ())) == point_count
+                )
+                else torch.zeros(
+                    point_count,
+                    dtype=torch.bool,
+                    device=split_candidates.device,
+                )
+            )
+            split_candidates &= ~chart_bound
+            clone_candidates &= ~chart_bound
             # A still-protected Chart seed belongs to the bootstrap atlas and
             # cannot be randomly replaced.  Once released, it is merely a
             # renderer seed; tangent-plane splitting is allowed while the

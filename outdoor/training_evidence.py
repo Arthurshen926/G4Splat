@@ -34,22 +34,25 @@ class EvidenceEpochSampler:
     def next(self, maximum: int) -> np.ndarray:
         if self.count == 0 or int(maximum) <= 0:
             return np.empty(0, dtype=np.int64)
-        take = min(int(maximum), self.count)
-        chunks = []
-        remaining = take
-        while remaining:
-            available = self.count - self.cursor
-            amount = min(remaining, available)
-            chunk = self.order[self.cursor : self.cursor + amount]
-            chunks.append(chunk)
-            self.visits[chunk] += 1
-            self.cursor += amount
-            remaining -= amount
-            if self.cursor == self.count:
-                self.epoch += 1
-                self.order = self.rng.permutation(self.count)
-                self.cursor = 0
-        return np.concatenate(chunks)
+        # Do not wrap into the next epoch inside one factor call.  Camera
+        # tables have very different sizes; filling every tail batch back to
+        # ``maximum`` used the remainder on duplicate rows from small tables.
+        # The global capacity calculation then claimed a complete first pass
+        # even though those duplicate slots left large-camera rows untouched.
+        # A short tail batch is loss-normalized by its real row count, while
+        # the outer least-progress scheduler can immediately advance the next
+        # incomplete camera.  This makes ``completed_epochs`` an actual
+        # evidence boundary rather than a boundary crossed mid-batch.
+        available = self.count - self.cursor
+        take = min(int(maximum), available)
+        chunk = self.order[self.cursor : self.cursor + take]
+        self.visits[chunk] += 1
+        self.cursor += take
+        if self.cursor == self.count:
+            self.epoch += 1
+            self.order = self.rng.permutation(self.count)
+            self.cursor = 0
+        return chunk.copy()
 
     def audit(self) -> dict:
         visited = int((self.visits > 0).sum())
@@ -62,6 +65,61 @@ class EvidenceEpochSampler:
             "minimum_visits": int(self.visits.min()) if self.count else 0,
             "maximum_visits": int(self.visits.max()) if self.count else 0,
         }
+
+    def capture_state(self) -> dict:
+        """Return the exact shuffled-epoch continuation state."""
+        return {
+            "version": "evidence-epoch-sampler-v1",
+            "count": self.count,
+            "order": torch.from_numpy(self.order.copy()),
+            "cursor": int(self.cursor),
+            "epoch": int(self.epoch),
+            "visits": torch.from_numpy(self.visits.copy()),
+            "rng_state": self.rng.bit_generator.state,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        if state.get("version") != "evidence-epoch-sampler-v1":
+            raise RuntimeError(
+                "Unsupported evidence epoch sampler state: "
+                f"{state.get('version')!r}"
+            )
+        if int(state.get("count", -1)) != self.count:
+            raise RuntimeError(
+                "Evidence epoch sampler count changed across resume"
+            )
+        order = torch.as_tensor(
+            state["order"], dtype=torch.int64
+        ).cpu().numpy()
+        visits = torch.as_tensor(
+            state["visits"], dtype=torch.int64
+        ).cpu().numpy()
+        if order.shape != (self.count,) or visits.shape != (self.count,):
+            raise RuntimeError(
+                "Evidence epoch sampler arrays have an invalid shape"
+            )
+        if self.count and not np.array_equal(
+            np.sort(order), np.arange(self.count)
+        ):
+            raise RuntimeError(
+                "Evidence epoch sampler order is not a permutation"
+            )
+        cursor = int(state.get("cursor", -1))
+        epoch = int(state.get("epoch", -1))
+        if (
+            cursor < 0
+            or cursor >= max(self.count, 1)
+            or epoch < 0
+            or bool((visits < 0).any())
+        ):
+            raise RuntimeError(
+                "Evidence epoch sampler counters are invalid"
+            )
+        self.order = order.copy()
+        self.cursor = cursor
+        self.epoch = epoch
+        self.visits = visits.copy()
+        self.rng.bit_generator.state = state["rng_state"]
 
 
 class FoliageRayEvidence:
@@ -138,6 +196,29 @@ class FoliageRayEvidence:
                     "Foliage ray source image sizes must be positive"
                 )
             upper = self.source_image_sizes.to(self.pixels.dtype)
+            # Initialization archives produced before the half-open endpoint
+            # repair can contain a float64 projection that was valid before
+            # serialization but rounded to exactly width/height in float32.
+            # Migrate only that exact representation edge case.  Values
+            # materially beyond the endpoint still fail the strict check
+            # below, so this cannot hide a bad camera/raster contract.
+            rounded_endpoint = (
+                torch.isfinite(self.pixels).all(dim=1)
+                & (self.pixels >= 0).all(dim=1)
+                & (self.pixels <= upper).all(dim=1)
+                & (self.pixels == upper).any(dim=1)
+            )
+            self.endpoint_rounding_repairs = int(
+                rounded_endpoint.sum()
+            )
+            if self.endpoint_rounding_repairs:
+                strict_upper = torch.nextafter(
+                    upper,
+                    torch.full_like(upper, -torch.inf),
+                )
+                self.pixels = torch.minimum(
+                    self.pixels, strict_upper
+                )
             valid_pixels = (
                 torch.isfinite(self.pixels).all(dim=1)
                 & (self.pixels >= 0).all(dim=1)
@@ -148,6 +229,37 @@ class FoliageRayEvidence:
                     "Foliage ray pixels fall outside their declared source "
                     "raster"
                 )
+            hit_rows = self.observation_type > 0
+            finite_hit_intervals = (
+                torch.isfinite(self.free_end)
+                & torch.isfinite(self.hit_start)
+                & torch.isfinite(self.hit_end)
+            )
+            valid_hit_intervals = (
+                finite_hit_intervals
+                & (self.free_end >= 0)
+                & (self.free_end <= self.hit_start)
+                & (self.hit_start < self.hit_end)
+            )
+            invalid_hit_rows = hit_rows & ~valid_hit_intervals
+            if bool(invalid_hit_rows.any()):
+                invalid_count = int(invalid_hit_rows.sum())
+                overlap_count = int(
+                    (
+                        hit_rows
+                        & torch.isfinite(self.free_end)
+                        & torch.isfinite(self.hit_start)
+                        & (self.free_end > self.hit_start)
+                    ).sum()
+                )
+                raise RuntimeError(
+                    "Foliage hit ray intervals violate the strict "
+                    "free_end <= hit_start < hit_end contract: "
+                    f"invalid_rows={invalid_count}, "
+                    f"overlap_rows={overlap_count}"
+                )
+        else:
+            self.endpoint_rounding_repairs = 0
         if self.offsets.numel():
             if self.offsets.ndim != 1 or int(self.offsets[0]) != 0:
                 raise RuntimeError(
@@ -184,21 +296,49 @@ class FoliageRayEvidence:
                 (count,), -1, dtype=torch.int64
             )
         effective_rows = self.observation_type != 0
+        self.effective_rows = effective_rows
         self.camera_id_values = torch.unique(
             self.camera_ids[effective_rows].to(dtype=torch.int64),
             sorted=True,
         )
         self.camera_rows = {}
-        for camera_id in self.camera_id_values.tolist():
-            rows = torch.nonzero(
-                (self.camera_ids == int(camera_id)) & effective_rows,
-                as_tuple=False,
-            ).flatten()
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(7_919 + int(camera_id) * 104_729)
-            self.camera_rows[int(camera_id)] = rows[
-                torch.randperm(len(rows), generator=generator)
-            ]
+        self.camera_samplers = {}
+        # Group the table once. Scanning all N rows separately for every
+        # camera is O(N*C) (about 1.6 billion comparisons for Cambridge v64)
+        # and dominated every restart. The composite key preserves the
+        # original row order within each camera, so sampler determinism and
+        # checkpoint continuation remain unchanged.
+        effective_indices = torch.nonzero(
+            effective_rows, as_tuple=False
+        ).flatten()
+        effective_camera_ids = self.camera_ids[
+            effective_indices
+        ].to(dtype=torch.int64)
+        if len(effective_indices):
+            grouping_key = (
+                effective_camera_ids * (count + 1)
+                + effective_indices
+            )
+            grouping_order = torch.argsort(grouping_key)
+            grouped_rows = effective_indices[grouping_order]
+            grouped_camera_ids = effective_camera_ids[grouping_order]
+            grouped_values, grouped_counts = torch.unique_consecutive(
+                grouped_camera_ids, return_counts=True
+            )
+        else:
+            grouped_rows = effective_indices
+            grouped_values = effective_camera_ids
+            grouped_counts = torch.empty(0, dtype=torch.int64)
+        offset = 0
+        for camera_id, camera_count in zip(
+            grouped_values.tolist(), grouped_counts.tolist()
+        ):
+            rows = grouped_rows[offset : offset + int(camera_count)]
+            offset += int(camera_count)
+            self.camera_rows[int(camera_id)] = rows
+            self.camera_samplers[int(camera_id)] = EvidenceEpochSampler(
+                len(rows), seed=7_919 + int(camera_id) * 104_729
+            )
         # A topology mutation replaces the metadata buffer and therefore
         # changes its data pointer.  Cache the evidence-id ordering between
         # those sparse events instead of scanning every live volume on every
@@ -219,25 +359,38 @@ class FoliageRayEvidence:
         self.interval_factor_calls = 0
         self.interval_factor_calls_with_candidates = 0
         self.interval_candidate_evaluations = 0
-        self.interval_row_visits = torch.zeros(count, dtype=torch.bool)
-        # A seed-bound interval survived the producer's independent
-        # cross-sequence canonical hull gate. Ownerless rows are the dense
-        # single-traversal observations that explicitly produced dynamic
-        # births. They must never be promoted by overlap with the *current*
-        # canonical prediction: doing so lets the model manufacture its own
-        # supervision and turns transient leaves into a persistent fog layer.
-        # Keep the all-false buffer only as an explicit runtime invariant and
-        # a fail-closed checkpoint field.
+        self.interval_canonical_candidate_evaluations = 0
+        self.interval_exact_dynamic_candidate_evaluations = 0
+        self.interval_row_visits = torch.zeros(count, dtype=torch.int64)
+        # This records ownerless rays that were consumed by an *already
+        # independently verified* canonical lineage. It is an audit of
+        # factor routing, never a promotion mask: no ownerless observation
+        # can change a primitive's role, support count or persistence.
         self.ownerless_canonical_verified = torch.zeros(
             count, dtype=torch.bool
         )
         self.sampled_ownerless_hit_rows = 0
+        self.ownerless_canonical_hit_rows = 0
+        self.ownerless_dynamic_hit_rows = 0
+        self.ownerless_missing_dynamic_hit_rows = 0
+        self.ownerless_supported_hit_rows = 0
+        self.ownerless_missing_supported_hit_rows = 0
         self.verified_ownerless_hit_rows = 0
         self.excluded_ownerless_hit_rows = 0
 
     def audit(self) -> dict:
         kind = self.observation_type
         source_camera_count = int(torch.unique(self.camera_ids).numel())
+        effective_visits = self.interval_row_visits[self.effective_rows]
+        visited_effective = int((effective_visits > 0).sum())
+        camera_epoch_audits = {
+            str(camera_id): sampler.audit()
+            for camera_id, sampler in self.camera_samplers.items()
+        }
+        completed_epochs = [
+            audit["completed_epochs"]
+            for audit in camera_epoch_audits.values()
+        ]
         return {
             "ray_count": int(len(kind)),
             "hit_count": int((kind > 0).sum()),
@@ -246,6 +399,9 @@ class FoliageRayEvidence:
             "camera_count": source_camera_count,
             "factor_camera_count": int(len(self.camera_id_values)),
             "explicit_source_resolution": True,
+            "endpoint_rounding_repairs": int(
+                self.endpoint_rounding_repairs
+            ),
             "primitive_association_retained": bool(
                 (self.primitive_ids >= 0).any()
             ),
@@ -262,7 +418,12 @@ class FoliageRayEvidence:
                 "t=z/direction_camera_z"
             ),
             "depth_coordinate_explicit": self.depth_coordinate_explicit,
+            "strict_hit_interval_validation": True,
             "unknown_is_excluded_from_free_loss": True,
+            "confidence_normalization": (
+                "depth_geometry_weighted_sum_over_ray_count__missing_"
+                "confidence_mass_routes_to_opacity_only_existence"
+            ),
             "factor_calls": int(self.factor_calls),
             "factor_calls_with_rays": int(self.factor_calls_with_rays),
             "sampled_rays": int(self.sampled_rays),
@@ -283,24 +444,68 @@ class FoliageRayEvidence:
             "interval_candidate_evaluations": int(
                 self.interval_candidate_evaluations
             ),
-            "interval_unique_rows": int(
-                self.interval_row_visits.sum()
+            "interval_canonical_candidate_evaluations": int(
+                self.interval_canonical_candidate_evaluations
             ),
+            "interval_exact_dynamic_candidate_evaluations": int(
+                self.interval_exact_dynamic_candidate_evaluations
+            ),
+            "interval_effective_rows": int(self.effective_rows.sum()),
+            "interval_unique_rows": visited_effective,
             "interval_row_coverage": float(
-                self.interval_row_visits.float().mean()
+                visited_effective / max(len(effective_visits), 1)
             )
-            if len(self.interval_row_visits)
+            if len(effective_visits)
             else 0.0,
+            "interval_minimum_visits": (
+                int(effective_visits.min())
+                if len(effective_visits)
+                else 0
+            ),
+            "interval_maximum_visits": (
+                int(effective_visits.max())
+                if len(effective_visits)
+                else 0
+            ),
+            "camera_epoch_minimum": (
+                int(min(completed_epochs)) if completed_epochs else 0
+            ),
+            "camera_epoch_maximum": (
+                int(max(completed_epochs)) if completed_epochs else 0
+            ),
+            "camera_epoch_audits": camera_epoch_audits,
+            "camera_schedule_contract": (
+                "minimum_normalized_row_visits_first__stable_camera_id_tie"
+            ),
             "ownerless_canonical_contract": (
-                "producer_cross_sequence_seed_bound_only__ownerless_dynamic"
+                "ownerless_never_promotes__existing_cross_sequence_"
+                "canonical_lineage_plus_exact_camera_dynamic_residual"
             ),
             "sampled_ownerless_hit_rows": int(
                 self.sampled_ownerless_hit_rows
+            ),
+            "ownerless_canonical_factor_rows": int(
+                self.ownerless_canonical_hit_rows
+            ),
+            "ownerless_dynamic_factor_rows": int(
+                self.ownerless_dynamic_hit_rows
+            ),
+            "ownerless_missing_dynamic_hit_rows": int(
+                self.ownerless_missing_dynamic_hit_rows
+            ),
+            "ownerless_supported_hit_rows": int(
+                self.ownerless_supported_hit_rows
+            ),
+            "ownerless_missing_supported_hit_rows": int(
+                self.ownerless_missing_supported_hit_rows
             ),
             "verified_ownerless_hit_rows": int(
                 self.verified_ownerless_hit_rows
             ),
             "excluded_ownerless_hit_rows": int(
+                self.excluded_ownerless_hit_rows
+            ),
+            "ownerless_excluded_from_canonical_promotion_rows": int(
                 self.excluded_ownerless_hit_rows
             ),
             "unique_verified_ownerless_rows": int(
@@ -309,9 +514,9 @@ class FoliageRayEvidence:
         }
 
     def capture_runtime_state(self) -> dict:
-        """Persist posterior coverage and the ownerless-dynamic invariant."""
+        """Persist posterior coverage and ownerless factor routing."""
         return {
-            "version": "foliage-ray-runtime-v2-independent-canonical",
+            "version": "foliage-ray-runtime-v5-shared-canonical-residual",
             "row_count": int(len(self.camera_ids)),
             "factor_calls": int(self.factor_calls),
             "factor_calls_with_rays": int(
@@ -331,12 +536,37 @@ class FoliageRayEvidence:
             "interval_candidate_evaluations": int(
                 self.interval_candidate_evaluations
             ),
+            "interval_canonical_candidate_evaluations": int(
+                self.interval_canonical_candidate_evaluations
+            ),
+            "interval_exact_dynamic_candidate_evaluations": int(
+                self.interval_exact_dynamic_candidate_evaluations
+            ),
             "interval_row_visits": self.interval_row_visits.clone(),
+            "camera_sampler_states": {
+                str(camera_id): sampler.capture_state()
+                for camera_id, sampler in self.camera_samplers.items()
+            },
             "ownerless_canonical_verified": (
                 self.ownerless_canonical_verified.clone()
             ),
             "sampled_ownerless_hit_rows": int(
                 self.sampled_ownerless_hit_rows
+            ),
+            "ownerless_canonical_hit_rows": int(
+                self.ownerless_canonical_hit_rows
+            ),
+            "ownerless_dynamic_hit_rows": int(
+                self.ownerless_dynamic_hit_rows
+            ),
+            "ownerless_missing_dynamic_hit_rows": int(
+                self.ownerless_missing_dynamic_hit_rows
+            ),
+            "ownerless_supported_hit_rows": int(
+                self.ownerless_supported_hit_rows
+            ),
+            "ownerless_missing_supported_hit_rows": int(
+                self.ownerless_missing_supported_hit_rows
             ),
             "verified_ownerless_hit_rows": int(
                 self.verified_ownerless_hit_rows
@@ -350,13 +580,16 @@ class FoliageRayEvidence:
         """Restore an exact posterior-factor continuation contract."""
         if not state:
             return
-        if (
-            state.get("version")
-            != "foliage-ray-runtime-v2-independent-canonical"
-        ):
+        version = state.get("version")
+        if version not in {
+            "foliage-ray-runtime-v2-independent-canonical",
+            "foliage-ray-runtime-v3-camera-epochs",
+            "foliage-ray-runtime-v4-owner-audit",
+            "foliage-ray-runtime-v5-shared-canonical-residual",
+        }:
             raise RuntimeError(
                 "Unsupported foliage ray runtime state version: "
-                f"{state.get('version')!r}"
+                f"{version!r}"
             )
         row_count = int(state.get("row_count", -1))
         if row_count != len(self.camera_ids):
@@ -365,7 +598,7 @@ class FoliageRayEvidence:
                 f"{row_count} != {len(self.camera_ids)}"
             )
         row_visits = torch.as_tensor(
-            state["interval_row_visits"], dtype=torch.bool
+            state["interval_row_visits"], dtype=torch.int64
         ).cpu()
         verified = torch.as_tensor(
             state["ownerless_canonical_verified"],
@@ -379,10 +612,13 @@ class FoliageRayEvidence:
             raise RuntimeError(
                 "Foliage ray runtime masks do not match the evidence table"
             )
-        if bool(verified.any()):
+        if (
+            version != "foliage-ray-runtime-v5-shared-canonical-residual"
+            and bool(verified.any())
+        ):
             raise RuntimeError(
-                "Ownerless dynamic rays cannot be restored as canonical "
-                "evidence; restart from the immutable initialization"
+                "A legacy ownerless-ray runtime state unexpectedly contains "
+                "canonical-consumption rows"
             )
         integer_fields = (
             "factor_calls",
@@ -394,7 +630,14 @@ class FoliageRayEvidence:
             "interval_factor_calls",
             "interval_factor_calls_with_candidates",
             "interval_candidate_evaluations",
+            "interval_canonical_candidate_evaluations",
+            "interval_exact_dynamic_candidate_evaluations",
             "sampled_ownerless_hit_rows",
+            "ownerless_canonical_hit_rows",
+            "ownerless_dynamic_hit_rows",
+            "ownerless_missing_dynamic_hit_rows",
+            "ownerless_supported_hit_rows",
+            "ownerless_missing_supported_hit_rows",
             "verified_ownerless_hit_rows",
             "excluded_ownerless_hit_rows",
         )
@@ -416,15 +659,100 @@ class FoliageRayEvidence:
         self.consumed_camera_ids = consumed
         self.interval_row_visits.copy_(row_visits)
         self.ownerless_canonical_verified.copy_(verified)
+        if version in {
+            "foliage-ray-runtime-v3-camera-epochs",
+            "foliage-ray-runtime-v4-owner-audit",
+            "foliage-ray-runtime-v5-shared-canonical-residual",
+        }:
+            sampler_states = state.get("camera_sampler_states", {})
+            expected = {
+                str(camera_id) for camera_id in self.camera_samplers
+            }
+            if set(sampler_states) != expected:
+                raise RuntimeError(
+                    "Foliage ray camera sampler identities changed across "
+                    "resume"
+                )
+            for camera_id, sampler in self.camera_samplers.items():
+                sampler.restore_state(sampler_states[str(camera_id)])
+        else:
+            # v2 selected contiguous blocks from one deterministic shuffled
+            # order but persisted only a boolean coverage mask.  Recover the
+            # longest visited prefix when possible and otherwise put all
+            # never-visited rows first.  This migration cannot reconstruct
+            # repeated visits, but it never throws away known coverage or
+            # restarts at the same already-visited prefix.
+            for camera_id, sampler in self.camera_samplers.items():
+                rows = self.camera_rows[camera_id]
+                local_visited = (
+                    self.interval_row_visits[rows].numpy() > 0
+                )
+                ordered_visited = local_visited[sampler.order]
+                prefix = 0
+                while (
+                    prefix < sampler.count
+                    and bool(ordered_visited[prefix])
+                ):
+                    prefix += 1
+                sampler.visits = local_visited.astype(
+                    np.int64, copy=True
+                )
+                if prefix == sampler.count and sampler.count:
+                    sampler.epoch = 1
+                    sampler.order = sampler.rng.permutation(
+                        sampler.count
+                    )
+                    sampler.cursor = 0
+                elif not bool(ordered_visited[prefix:].any()):
+                    sampler.cursor = prefix
+                else:
+                    sampler.order = np.concatenate(
+                        [
+                            sampler.order[ordered_visited],
+                            sampler.order[~ordered_visited],
+                        ]
+                    )
+                    sampler.cursor = int(ordered_visited.sum())
 
     def scheduled_camera_id(self, update: int) -> int | None:
         if not len(self.camera_id_values):
             return None
-        return int(
-            self.camera_id_values[
-                int(update) % len(self.camera_id_values)
-            ]
-        )
+        # Camera tables differ by almost two orders of magnitude in Cambridge.
+        # A uniform camera round-robin therefore repeated small tables while
+        # large tree views remained mostly untouched.  Schedule the camera
+        # with the least normalized row visitation instead.  The per-camera
+        # sampler still owns permutation/cursor/epoch state; this outer policy
+        # only decides which independent epoch advances next.
+        del update
+        best_camera = None
+        best_progress = None
+        for camera_id in self.camera_id_values.tolist():
+            sampler = self.camera_samplers[int(camera_id)]
+            progress = (
+                float(sampler.epoch)
+                + float(sampler.cursor) / max(sampler.count, 1)
+            )
+            if (
+                best_progress is None
+                or progress < best_progress - 1e-12
+            ):
+                best_camera = int(camera_id)
+                best_progress = progress
+        return best_camera
+
+    def _next_camera_rows(
+        self, camera_id: int, maximum_rays: int
+    ) -> torch.Tensor:
+        rows = self.camera_rows.get(int(camera_id))
+        sampler = self.camera_samplers.get(int(camera_id))
+        if rows is None or sampler is None:
+            return torch.empty(0, dtype=torch.int64)
+        local_rows = sampler.next(int(maximum_rays))
+        if not len(local_rows):
+            return rows[:0]
+        selected = rows[torch.from_numpy(local_rows)]
+        self.interval_row_visits[selected] += 1
+        return selected
 
     def _descendants_for_sources(self, foliage, source_ids):
         current_ids = foliage.evidence_primitive_id
@@ -503,14 +831,19 @@ class FoliageRayEvidence:
             tau_before - log(1 - exp(-tau_inside)),
 
         while a confirmed-free observation penalizes only ``tau_before``.
-        Dynamic sequence-local leaves are deliberately excluded from this
-        cross-sequence canonical posterior.
+        Cross-sequence seed-bound hits use canonical mass. Dense
+        observation-space hits use the sum of (a) canonical lineages that
+        were independently established before this observation and (b)
+        sequence-local residual leaves whose immutable support table names
+        the exact scheduled camera. The dense ray can optimize an existing
+        canonical lineage, but can never promote a new one or alter its
+        support metadata. Confirmed-free rays constrain both branches visible
+        in that camera.
         """
         self.interval_factor_calls += 1
         zero = foliage.xyz.new_zeros(())
-        selected = self.camera_rows.get(
-            int(view.colmap_id),
-            torch.empty(0, dtype=torch.int64),
+        selected = self._next_camera_rows(
+            int(view.colmap_id), int(maximum_rays)
         )
         if not len(selected):
             return zero, {
@@ -521,23 +854,8 @@ class FoliageRayEvidence:
                 "unknown_rays": 0,
                 "free": 0.0,
                 "hit": 0.0,
+                "behind_mass": 0.0,
             }
-        if len(selected) > int(maximum_rays):
-            # Deterministic shuffled blocks eventually visit every measured
-            # ray.  A fixed linspace sampled the same 4,096 rows forever and
-            # could report thousands of factor calls while most posterior
-            # observations remained untouched.
-            camera_visits = int(sample_update) // max(
-                len(self.camera_id_values), 1
-            )
-            start = (
-                camera_visits * int(maximum_rays)
-            ) % len(selected)
-            positions = (
-                torch.arange(int(maximum_rays)) + start
-            ) % len(selected)
-            selected = selected[positions]
-        self.interval_row_visits[selected] = True
         device, dtype = foliage.xyz.device, foliage.xyz.dtype
         pixels = self.pixels[selected].to(device=device, dtype=dtype)
         source_size = self.source_image_sizes[selected].to(
@@ -593,25 +911,61 @@ class FoliageRayEvidence:
                 1.0 + torch.erf(value / sqrt_two)
             )
 
-        canonical_rows = torch.nonzero(
-            ~foliage.dynamic_leaf_mask, as_tuple=False
+        dynamic_mask = foliage.dynamic_leaf_mask
+        support_camera_ids = foliage.support_camera_ids
+        if support_camera_ids.ndim != 2 or len(support_camera_ids) != len(
+            foliage
+        ):
+            raise RuntimeError(
+                "Foliage support-camera metadata no longer aligns with the "
+                "volume model"
+            )
+        # Cross-sequence seed-bound rays supervise the canonical crown.  A
+        # dense observation-space ray instead owns the exact sequence-local
+        # birth created from this calibrated camera.  Include only those
+        # dynamic rows whose immutable support table names the scheduled
+        # camera; neighbouring-frame fallback is rendering interpolation,
+        # not ray-posterior evidence.
+        exact_dynamic = dynamic_mask & (
+            support_camera_ids == int(view.colmap_id)
+        ).any(dim=1)
+        verified_canonical = (
+            ~dynamic_mask
+            & (
+                (foliage.support_sequence_count >= 2)
+                | (foliage.split_generation > 0)
+            )
+        )
+        candidate_pool = torch.nonzero(
+            (~dynamic_mask) | exact_dynamic, as_tuple=False
         ).flatten()
         candidate_evaluations = 0
+        canonical_candidate_evaluations = 0
+        exact_dynamic_candidate_evaluations = 0
         rays_with_candidates = 0
-        free_tau_chunks = []
-        hit_tau_chunks = []
+        canonical_free_tau_chunks = []
+        canonical_hit_tau_chunks = []
+        canonical_hit_optical_tau_chunks = []
+        canonical_behind_tau_chunks = []
+        verified_canonical_free_tau_chunks = []
+        verified_canonical_hit_tau_chunks = []
+        verified_canonical_behind_tau_chunks = []
+        dynamic_free_tau_chunks = []
+        dynamic_hit_tau_chunks = []
+        dynamic_hit_optical_tau_chunks = []
+        dynamic_behind_tau_chunks = []
         # Candidate lookup is intentionally detached.  It is a sparse
         # acceleration structure, not part of the objective; the selected
         # Gaussian parameters below remain fully differentiable.
         lookup_chunk = 64
-        if len(canonical_rows):
+        if len(candidate_pool):
             with torch.no_grad():
                 lookup_displacement = (
-                    foliage.xyz[canonical_rows] - origin
+                    foliage.xyz[candidate_pool] - origin
                 )
                 lookup_norm2 = lookup_displacement.square().sum(-1)
                 lookup_scale2 = (
-                    foliage.scales[canonical_rows]
+                    foliage.scales[candidate_pool]
                     .amax(dim=-1)
                     .clamp_min(1e-4)
                     .square()
@@ -619,13 +973,21 @@ class FoliageRayEvidence:
         for begin in range(0, len(selected), lookup_chunk):
             end = min(begin + lookup_chunk, len(selected))
             ray_count = end - begin
-            if not len(canonical_rows):
-                free_tau_chunks.append(
-                    torch.zeros(ray_count, device=device, dtype=dtype)
+            if not len(candidate_pool):
+                empty = torch.zeros(
+                    ray_count, device=device, dtype=dtype
                 )
-                hit_tau_chunks.append(
-                    torch.zeros(ray_count, device=device, dtype=dtype)
-                )
+                canonical_free_tau_chunks.append(empty)
+                canonical_hit_tau_chunks.append(empty)
+                canonical_hit_optical_tau_chunks.append(empty)
+                canonical_behind_tau_chunks.append(empty)
+                verified_canonical_free_tau_chunks.append(empty)
+                verified_canonical_hit_tau_chunks.append(empty)
+                verified_canonical_behind_tau_chunks.append(empty)
+                dynamic_free_tau_chunks.append(empty)
+                dynamic_hit_tau_chunks.append(empty)
+                dynamic_hit_optical_tau_chunks.append(empty)
+                dynamic_behind_tau_chunks.append(empty)
                 continue
             with torch.no_grad():
                 ray_direction = direction_world[begin:end]
@@ -641,7 +1003,7 @@ class FoliageRayEvidence:
                 )
                 candidate_limit = min(
                     max(int(maximum_candidates_per_ray), 1),
-                    len(canonical_rows),
+                    len(candidate_pool),
                 )
                 score, local_rows = torch.topk(
                     lookup_score,
@@ -657,18 +1019,33 @@ class FoliageRayEvidence:
                 local_ray, slot = torch.nonzero(
                     supported, as_tuple=True
                 )
-                candidate_rows = canonical_rows[
+                candidate_rows = candidate_pool[
                     local_rows[local_ray, slot]
                 ]
             if not len(candidate_rows):
-                free_tau_chunks.append(
-                    torch.zeros(ray_count, device=device, dtype=dtype)
+                empty = torch.zeros(
+                    ray_count, device=device, dtype=dtype
                 )
-                hit_tau_chunks.append(
-                    torch.zeros(ray_count, device=device, dtype=dtype)
-                )
+                canonical_free_tau_chunks.append(empty)
+                canonical_hit_tau_chunks.append(empty)
+                canonical_hit_optical_tau_chunks.append(empty)
+                canonical_behind_tau_chunks.append(empty)
+                verified_canonical_free_tau_chunks.append(empty)
+                verified_canonical_hit_tau_chunks.append(empty)
+                verified_canonical_behind_tau_chunks.append(empty)
+                dynamic_free_tau_chunks.append(empty)
+                dynamic_hit_tau_chunks.append(empty)
+                dynamic_hit_optical_tau_chunks.append(empty)
+                dynamic_behind_tau_chunks.append(empty)
                 continue
             candidate_evaluations += int(len(candidate_rows))
+            candidate_dynamic = dynamic_mask[candidate_rows]
+            exact_dynamic_candidate_evaluations += int(
+                candidate_dynamic.sum()
+            )
+            canonical_candidate_evaluations += int(
+                (~candidate_dynamic).sum()
+            )
             rays_with_candidates += int(torch.unique(local_ray).numel())
             direction = direction_world[begin:end][local_ray]
             displacement = foliage.xyz[candidate_rows] - origin
@@ -720,6 +1097,19 @@ class FoliageRayEvidence:
                 )
             ).clamp(0, 1 - 1e-6)
             local_tau = -torch.log1p(-local_alpha)
+            # A tree-labelled owner pixel is strong optical-existence
+            # evidence even when its monocular metric depth is uncertain.
+            # Build a second tau whose footprint/depth terms are constants:
+            # it can update opacity, but cannot drag centres/scales toward a
+            # broad interval.  The confidence-weighted analytic tau below
+            # remains the geometry posterior.
+            local_alpha_optical = (
+                foliage.opacities[candidate_rows]
+                * torch.exp(
+                    -0.5 * radial_mahalanobis.detach().clamp_max(80)
+                )
+            ).clamp(0, 1 - 1e-6)
+            local_tau_optical = -torch.log1p(-local_alpha_optical)
             longitudinal_sigma = ray_precision.rsqrt().clamp_min(1e-4)
             free_fraction = normal_cdf(
                 (
@@ -743,44 +1133,177 @@ class FoliageRayEvidence:
                     / longitudinal_sigma
                 )
             ).clamp(0, 1)
-            free_chunk = torch.zeros(
-                ray_count, device=device, dtype=dtype
-            ).scatter_add(
-                0, local_ray, local_tau * free_fraction
+            behind_fraction = torch.nan_to_num(
+                1.0
+                - normal_cdf(
+                    (
+                        hit_end[begin:end][local_ray]
+                        - closest_depth
+                    )
+                    / longitudinal_sigma
+                ),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(0, 1)
+            canonical_weight = (~candidate_dynamic).to(local_tau)
+            verified_canonical_weight = verified_canonical[
+                candidate_rows
+            ].to(local_tau)
+            dynamic_weight = candidate_dynamic.to(local_tau)
+
+            def accumulate(value, branch_weight):
+                return torch.zeros(
+                    ray_count, device=device, dtype=dtype
+                ).scatter_add(
+                    0, local_ray, value * branch_weight
+                )
+
+            canonical_free_tau_chunks.append(
+                accumulate(local_tau * free_fraction, canonical_weight)
             )
-            hit_chunk = torch.zeros_like(free_chunk).scatter_add(
-                0, local_ray, local_tau * hit_fraction
+            canonical_hit_tau_chunks.append(
+                accumulate(local_tau * hit_fraction, canonical_weight)
             )
-            free_tau_chunks.append(free_chunk)
-            hit_tau_chunks.append(hit_chunk)
-        free_tau = torch.cat(free_tau_chunks)
-        hit_tau = torch.cat(hit_tau_chunks)
-        hit_alpha = -torch.expm1(-hit_tau)
+            canonical_hit_optical_tau_chunks.append(
+                accumulate(
+                    local_tau_optical * hit_fraction.detach(),
+                    canonical_weight,
+                )
+            )
+            canonical_behind_tau_chunks.append(
+                accumulate(local_tau * behind_fraction, canonical_weight)
+            )
+            verified_canonical_free_tau_chunks.append(
+                accumulate(
+                    local_tau * free_fraction,
+                    verified_canonical_weight,
+                )
+            )
+            verified_canonical_hit_tau_chunks.append(
+                accumulate(
+                    local_tau * hit_fraction,
+                    verified_canonical_weight,
+                )
+            )
+            verified_canonical_behind_tau_chunks.append(
+                accumulate(
+                    local_tau * behind_fraction,
+                    verified_canonical_weight,
+                )
+            )
+            dynamic_free_tau_chunks.append(
+                accumulate(local_tau * free_fraction, dynamic_weight)
+            )
+            dynamic_hit_tau_chunks.append(
+                accumulate(local_tau * hit_fraction, dynamic_weight)
+            )
+            dynamic_hit_optical_tau_chunks.append(
+                accumulate(
+                    local_tau_optical * hit_fraction.detach(),
+                    dynamic_weight,
+                )
+            )
+            dynamic_behind_tau_chunks.append(
+                accumulate(local_tau * behind_fraction, dynamic_weight)
+            )
+        canonical_free_tau = torch.cat(canonical_free_tau_chunks)
+        canonical_hit_tau = torch.cat(canonical_hit_tau_chunks)
+        canonical_hit_optical_tau = torch.cat(
+            canonical_hit_optical_tau_chunks
+        )
+        canonical_behind_tau = torch.cat(canonical_behind_tau_chunks)
+        verified_canonical_free_tau = torch.cat(
+            verified_canonical_free_tau_chunks
+        )
+        verified_canonical_hit_tau = torch.cat(
+            verified_canonical_hit_tau_chunks
+        )
+        verified_canonical_behind_tau = torch.cat(
+            verified_canonical_behind_tau_chunks
+        )
+        dynamic_free_tau = torch.cat(dynamic_free_tau_chunks)
+        dynamic_hit_tau = torch.cat(dynamic_hit_tau_chunks)
+        dynamic_hit_optical_tau = torch.cat(
+            dynamic_hit_optical_tau_chunks
+        )
+        dynamic_behind_tau = torch.cat(dynamic_behind_tau_chunks)
         kind = self.observation_type[selected].to(device=device)
         weight = self.confidence[selected].to(
             device=device, dtype=dtype
         ).clamp(0.05, 1.0)
         seed_bound = self.primitive_ids[selected].to(device=device) >= 0
         ownerless_hit = (~seed_bound) & (kind > 0)
-        # Seed-bound rows have already passed independent canonical
-        # multi-view support. A same-ray overlap with the prediction being
-        # optimized is not new evidence, so every ownerless hit stays in the
-        # sequence-conditioned dynamic factor.
-        verified_ownerless = torch.zeros_like(ownerless_hit)
-        posterior_applicable = seed_bound
+        # Runtime consumption by an existing verified canonical lineage is
+        # not canonical promotion. The producer established that lineage
+        # from independent cameras; this row supplies an additional
+        # same-ray interval factor without changing role/support metadata.
+        ownerless_canonical_hit = ownerless_hit & (
+            verified_canonical_hit_tau.detach() > 0
+        )
+        verified_ownerless = ownerless_canonical_hit
+        ownerless_dynamic_hit = ownerless_hit & (
+            dynamic_hit_tau.detach() > 0
+        )
+        ownerless_missing_dynamic_hit = (
+            ownerless_hit & ~ownerless_dynamic_hit
+        )
+        ownerless_supported_hit = (
+            ownerless_canonical_hit | ownerless_dynamic_hit
+        )
+        ownerless_missing_supported_hit = (
+            ownerless_hit & ~ownerless_supported_hit
+        )
+        ownerless_free_tau = (
+            verified_canonical_free_tau + dynamic_free_tau
+        )
+        ownerless_hit_tau = (
+            verified_canonical_hit_tau + dynamic_hit_tau
+        )
+        ownerless_behind_tau = (
+            verified_canonical_behind_tau + dynamic_behind_tau
+        )
+        selected_free_tau = torch.where(
+            seed_bound, canonical_free_tau, ownerless_free_tau
+        )
+        selected_hit_tau = torch.where(
+            seed_bound, canonical_hit_tau, ownerless_hit_tau
+        )
+        # Seed-bound multi-view rows retain their canonical optical owner.
+        # Ownerless single-view observations route optical existence only to
+        # the exact dynamic residual; a weak depth posterior must never make
+        # an unrelated canonical lineage opaque.
+        selected_hit_optical_tau = torch.where(
+            seed_bound,
+            canonical_hit_optical_tau,
+            dynamic_hit_optical_tau,
+        )
+        selected_behind_tau = torch.where(
+            seed_bound, canonical_behind_tau, ownerless_behind_tau
+        )
+        hit_alpha = -torch.expm1(-selected_hit_tau)
+        hit_alpha_optical = -torch.expm1(-selected_hit_optical_tau)
         # A hit interval also confirms that the space before it should be
         # transparent.  Penalizing pre-hit mass is what distinguishes a
         # layered crown from a broad foreground fog slab.
-        prehit_free_mask = (kind != 0) & posterior_applicable
-        confirmed_free_mask = (kind < 0) & seed_bound
-        hit_mask = (kind > 0) & posterior_applicable
+        free_evidence_mask = kind != 0
+        confirmed_free_mask = kind < 0
+        hit_mask = kind > 0
+        # A confirmed-free observation has no positive owner. It is valid
+        # negative evidence for both persistent canonical mass and the exact
+        # sequence-local births visible from this camera.
+        free_tau = torch.where(
+            confirmed_free_mask,
+            canonical_free_tau + dynamic_free_tau,
+            selected_free_tau,
+        )
         free_loss = (
-            (free_tau * weight)[prehit_free_mask].sum()
-            / weight[prehit_free_mask].sum().clamp_min(1)
-            if bool(prehit_free_mask.any())
+            (free_tau * weight)[free_evidence_mask].sum()
+            / free_evidence_mask.sum().clamp_min(1).to(dtype)
+            if bool(free_evidence_mask.any())
             else zero
         )
-        hit_loss = (
+        hit_geometry_loss = (
             (
                 # Add a small observation-noise floor rather than clamping
                 # the predicted mass.  clamp_min made every hit with
@@ -789,6 +1312,30 @@ class FoliageRayEvidence:
                 # existed.  The additive floor keeps the likelihood finite
                 # while preserving its derivative all the way to zero mass.
                 -torch.log(hit_alpha + 1e-4) * weight
+            )[hit_mask].sum()
+            / hit_mask.sum().clamp_min(1).to(dtype)
+            if bool(hit_mask.any())
+            else zero
+        )
+        # Complete the missing confidence mass with an opacity-only
+        # likelihood.  Thus depth confidence scales placement/free-space
+        # gradients absolutely, while the observed tree pixel keeps one unit
+        # of optical-existence evidence.  At confidence one this term is
+        # exactly zero.
+        optical_residual_weight = (1.0 - weight).clamp(0.0, 1.0)
+        hit_optical_loss = (
+            (
+                -torch.log(hit_alpha_optical + 1e-4)
+                * optical_residual_weight
+            )[hit_mask].sum()
+            / hit_mask.sum().clamp_min(1).to(dtype)
+            if bool(hit_mask.any())
+            else zero
+        )
+        hit_loss = hit_geometry_loss + hit_optical_loss
+        behind_mass = (
+            (
+                -torch.expm1(-selected_behind_tau) * weight
             )[hit_mask].sum()
             / weight[hit_mask].sum().clamp_min(1)
             if bool(hit_mask.any())
@@ -800,6 +1347,12 @@ class FoliageRayEvidence:
         if candidate_evaluations:
             self.interval_factor_calls_with_candidates += 1
         self.interval_candidate_evaluations += candidate_evaluations
+        self.interval_canonical_candidate_evaluations += (
+            canonical_candidate_evaluations
+        )
+        self.interval_exact_dynamic_candidate_evaluations += (
+            exact_dynamic_candidate_evaluations
+        )
         self.sampled_rays += int(len(selected))
         self.sampled_confirmed_free += int(
             confirmed_free_mask.sum()
@@ -807,16 +1360,40 @@ class FoliageRayEvidence:
         self.sampled_hits += int(hit_mask.sum())
         self.sampled_unknown += int(unknown_mask.sum())
         self.sampled_ownerless_hit_rows += int(ownerless_hit.sum())
+        self.ownerless_canonical_hit_rows += int(
+            ownerless_canonical_hit.sum()
+        )
+        self.ownerless_dynamic_hit_rows += int(
+            ownerless_dynamic_hit.sum()
+        )
+        self.ownerless_missing_dynamic_hit_rows += int(
+            ownerless_missing_dynamic_hit.sum()
+        )
+        self.ownerless_supported_hit_rows += int(
+            ownerless_supported_hit.sum()
+        )
+        self.ownerless_missing_supported_hit_rows += int(
+            ownerless_missing_supported_hit.sum()
+        )
         self.verified_ownerless_hit_rows += int(
             verified_ownerless.sum()
         )
         self.excluded_ownerless_hit_rows += int(
-            (ownerless_hit & ~verified_ownerless).sum()
+            ownerless_missing_supported_hit.sum()
         )
+        if bool(verified_ownerless.any()):
+            verified_rows = selected[verified_ownerless.detach().cpu()]
+            self.ownerless_canonical_verified[verified_rows] = True
         self.consumed_camera_ids.add(int(view.colmap_id))
         return free_loss + hit_loss, {
             "rays": int(len(selected)),
             "candidate_evaluations": candidate_evaluations,
+            "canonical_candidate_evaluations": (
+                canonical_candidate_evaluations
+            ),
+            "exact_dynamic_candidate_evaluations": (
+                exact_dynamic_candidate_evaluations
+            ),
             "rays_with_candidates": rays_with_candidates,
             "confirmed_free_rays": int(
                 confirmed_free_mask.sum()
@@ -824,14 +1401,56 @@ class FoliageRayEvidence:
             "hit_rays": int(hit_mask.sum()),
             "unknown_rays": int(unknown_mask.sum()),
             "ownerless_hit_rays": int(ownerless_hit.sum()),
+            "ownerless_canonical_hit_rays": int(
+                ownerless_canonical_hit.sum()
+            ),
+            "ownerless_dynamic_hit_rays": int(
+                ownerless_dynamic_hit.sum()
+            ),
+            "ownerless_missing_dynamic_hit_rays": int(
+                ownerless_missing_dynamic_hit.sum()
+            ),
+            "ownerless_supported_hit_rays": int(
+                ownerless_supported_hit.sum()
+            ),
+            "ownerless_missing_supported_hit_rays": int(
+                ownerless_missing_supported_hit.sum()
+            ),
             "verified_ownerless_hit_rays": int(
                 verified_ownerless.sum()
             ),
             "excluded_ownerless_hit_rays": int(
-                (ownerless_hit & ~verified_ownerless).sum()
+                ownerless_missing_supported_hit.sum()
             ),
             "free": float(free_loss.detach()),
             "hit": float(hit_loss.detach()),
+            "hit_geometry": float(hit_geometry_loss.detach()),
+            "hit_optical_existence": float(hit_optical_loss.detach()),
+            "mean_confidence": float(weight.mean()),
+            "hit_mean_confidence": (
+                float(weight[hit_mask].mean())
+                if bool(hit_mask.any())
+                else 0.0
+            ),
+            "free_mean_confidence": (
+                float(weight[free_evidence_mask].mean())
+                if bool(free_evidence_mask.any())
+                else 0.0
+            ),
+            "confidence_normalization": (
+                "depth_geometry_weighted_sum_over_ray_count__missing_"
+                "confidence_mass_routes_to_opacity_only_existence"
+            ),
+            # Multi-layer foliage behind the first measured interval is
+            # physically allowed, so this is an audit rather than a penalty.
+            "behind_mass": float(behind_mass.detach()),
+            "ownerless_hit_contract": (
+                "existing_cross_sequence_canonical_lineage_plus_exact_"
+                "camera_dynamic_residual__never_canonical_promotion"
+            ),
+            "confirmed_free_contract": (
+                "canonical_plus_exact_camera_dynamic"
+            ),
             "depth_coordinate": "camera_z_converted_to_unit_ray_distance",
         }
 
@@ -840,6 +1459,10 @@ class FoliageRayEvidence:
         depth_map = package.volume_depth[0]
         alpha_map = package.volume_alpha[0]
         zero = depth_map.new_zeros(())
+        # Legacy rendered-depth diagnostic: retain unknown rows so this path
+        # can explicitly audit that they contribute to neither free nor hit
+        # loss.  The optimization path above uses only the effective free/hit
+        # per-camera epoch and owns ``interval_row_visits``.
         selected = torch.nonzero(
             self.camera_ids == int(view.colmap_id), as_tuple=False
         ).flatten()
@@ -855,9 +1478,12 @@ class FoliageRayEvidence:
                 "hit": 0.0,
             }
         if len(selected) > int(maximum_rays):
-            positions = torch.linspace(
-                0, len(selected) - 1, int(maximum_rays)
-            ).long()
+            start = (
+                (self.factor_calls - 1) * int(maximum_rays)
+            ) % len(selected)
+            positions = (
+                torch.arange(int(maximum_rays)) + start
+            ) % len(selected)
             selected = selected[positions]
         device, dtype = depth_map.device, depth_map.dtype
         pixels = self.pixels[selected].to(device=device, dtype=dtype)
@@ -1196,6 +1822,11 @@ class OutdoorGeometryEvidence:
             }
         self.track_archives = {}
         self.track_observations: dict[str, dict[str, np.ndarray]] = {}
+        self.track_graph_contract = {
+            "representation": "source_pointmap_projection_star_tracks",
+            "descriptor_reciprocal_union_find_tracks": False,
+            "camera_scope": "selected_matcha_chart_views",
+        }
         for source_code, artifact_name in (
             (0, "colmap_tracks"),
             (1, "mast3r_tracks"),
@@ -1219,6 +1850,25 @@ class OutdoorGeometryEvidence:
                             f"{TRACK_GRAPH_VERSION!r}. Rebuild evidence and "
                             "role-aware initialization."
                         )
+                    if "correspondence_builder" in archive:
+                        builder = str(
+                            archive["correspondence_builder"].item()
+                        )
+                        descriptor = (
+                            builder
+                            == "mast3r_reciprocal_descriptor_union_find"
+                        )
+                        self.track_graph_contract = {
+                            "representation": builder,
+                            "descriptor_reciprocal_union_find_tracks": (
+                                descriptor
+                            ),
+                            "camera_scope": (
+                                str(archive["camera_scope"].item())
+                                if "camera_scope" in archive
+                                else "unspecified"
+                            ),
+                        }
                 order = np.argsort(archive["track_id"])
                 self.track_archives[source_code] = {
                     "track_id": archive["track_id"][order].astype(np.int64),
@@ -2332,13 +2982,17 @@ class OutdoorGeometryEvidence:
             "nonempty_track_observation_camera_count": int(
                 nonempty_track_observation_cameras
             ),
-            "track_graph_representation": (
-                "source_pointmap_projection_star_tracks"
+            "track_graph_representation": self.track_graph_contract[
+                "representation"
+            ],
+            "descriptor_reciprocal_union_find_tracks": (
+                self.track_graph_contract[
+                    "descriptor_reciprocal_union_find_tracks"
+                ]
             ),
-            "descriptor_reciprocal_union_find_tracks": False,
-            "track_graph_database_scope": (
-                "selected_matcha_chart_views"
-            ),
+            "track_graph_database_scope": self.track_graph_contract[
+                "camera_scope"
+            ],
             "source_consumption_count": dict(self.consumed),
             "source_losses_are_mutually_exclusive": True,
             "pointmap_cross_sequence_posterior": {

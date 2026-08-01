@@ -129,8 +129,22 @@ __device__ bool compute_aabb(
 	// Compute AABB
 	float3 temp_point = {cutoff * cutoff, cutoff * cutoff, -1.0f};
 	float distance = sumf3(T3 * T3 * temp_point);
+	// The projected ellipse has a finite image-space AABB only when its
+	// cutoff support does not intersect the projective horizon w(u,v)=0.
+	// In this parameterization that condition is
+	//
+	//   cutoff^2 * (T3.x^2 + T3.y^2) - T3.z^2 < 0.
+	//
+	// The former equality-only check admitted the entire positive branch.
+	// Those ellipses are mathematically unbounded, yet the algebra below
+	// returned enormous finite extents (10^5--10^7 pixels in Cambridge).
+	// Binning them across every tile creates exactly the view-wide paint
+	// splats that UV refinement is intended to remove.  This is a domain
+	// check, not a scene-dependent radius threshold: every finite projected
+	// ellipse, however oblique, still follows the unchanged path.
+	if (!isfinite(distance) || !(distance < 0.0f))
+		return false;
 	float3 f = (1 / distance) * temp_point;
-	if (distance == 0.0) return false;
 
 	point_image = {
 		sumf3(f * T0 * T3),

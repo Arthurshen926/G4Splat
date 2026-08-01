@@ -31,6 +31,8 @@ from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
 from outdoor.lazy_scene import rgb_source_contract  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
     INITIALIZATION_VERSION,
+    RIGID_CALIBRATED_INITIALIZATION_VERSION,
+    TEMPORAL_DAV2_AUGMENTATION_VERSION,
 )
 from scripts.build_crossview_chart_consensus import (  # noqa: E402
     CONSENSUS_VERSION,
@@ -38,8 +40,9 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v20-"
-    "rigid-first-dav2-cross-ray-posterior-exact-rgb-contract"
+    "cambridge-native-hybrid-teacher-mainline-v37-native-rigid-depth-"
+    "calibrated-continuous-all-camera-posterior-adaptive-optical-bandwidth-"
+    "atomic-volume-replace-split"
 )
 STAGES = (
     "prepare_cameras",
@@ -71,7 +74,12 @@ PROFILES = {
         "rigid_pretrain_densify_until_iteration": 16_000,
         "rigid_geometry_gradient_ratio": 0.15,
         "geometry_gradient_ratio": 0.15,
-        "checkpoint_every": 1000,
+        # A mixed checkpoint is roughly 1.5 GB at the current evidence/model
+        # scale. The runner keeps only the rolling file, so 1k saves spent
+        # minutes rewriting checkpoints that were never retained. Three
+        # thousand steps keeps useful 3k/6k/9k milestones and materially
+        # shortens the end-to-end quality run.
+        "checkpoint_every": 3000,
         "track_stride": 5,
         # Keep the complete source-resolution Chart/pointmap rasters as
         # external factors, but do not turn every sample into a renderer
@@ -94,13 +102,41 @@ PROFILES = {
         "dav2_rigid_selected_views": 512,
         "dav2_rigid_seeds_per_view": 384,
         "dav2_rigid_cross_sequence_radius": 0.25,
-        # Keep camera-manifold coverage independent from observation-space
-        # bandwidth.  A fixed 96 x 16k allocation made a few exact keyframes
-        # look strong while leaving most interpolation views unsupported.
-        "selected_foliage_views": 256,
-        "maximum_dense_rays_per_foliage_view": 8_192,
+        # Cover every fixed database camera that has measured tree support.
+        # The global row budget remains fixed; per-view caps trade redundant
+        # keyframe density for exact owner/depth coverage on interpolation
+        # views instead of forcing them through a temporal fallback.
+        "selected_foliage_views": 0,
+        "maximum_dense_rays_per_foliage_view": 2_048,
         "maximum_dense_rays_total": 1_572_864,
-        "minimum_dense_rays_per_foliage_view": 4_096,
+        "minimum_dense_rays_per_foliage_view": 512,
+        # All-camera coverage must augment rather than thin the previously
+        # validated free/hit basis.  The 2,048 cap reduced candidate-bound
+        # rows from 2.30M to 0.70M and allowed an opaque low-frequency canopy.
+        # Restore the finite 8,192-row cap; the trainer derives a complete
+        # epoch batch from the persisted effective-row count.
+        "maximum_bound_rays_per_foliage_view": 8_192,
+        # Preserve roughly the validated 260k local renderer basis while
+        # spreading it over more exact cameras.
+        "maximum_dynamic_births_per_foliage_view": 384,
+        # Weak-continuous DAV2 fits are still valid visibility/colour
+        # observations even when they are weak metric witnesses.  Give those
+        # exact cameras enough local optical basis without increasing the
+        # ordinary all-camera birth cap or promoting weak depth to geometry.
+        "maximum_weak_continuous_dynamic_births_per_foliage_view": 2_048,
+        # Source masks are 1920x1080 while optimization uses 640x360.  One
+        # birth per 192 measured source pixels is roughly one finite local
+        # basis row per 21 training pixels.  This closes large accepted-view
+        # silhouette holes continuously without increasing small-view caps.
+        "dynamic_birth_target_source_pixels_per_basis": 192.0,
+        # A rejected per-view DAV2 affine fit is missing metric evidence, not
+        # permission to manufacture it by interpolating frame numbers.
+        # Sequence/time conditioning still handles those database views, but
+        # no interpolated depth is promoted to a 3D witness.
+        "use_temporal_dav2_witnesses": False,
+        "use_rigid_depth_calibrated_foliage": True,
+        "rigid_calibration_resolution_scale": 0.125,
+        "foliage_voxel_size": 0.12,
         # The historical 18.756 dB 2DGS contains 350,998 surfels.  Capping a
         # from-scratch rigid branch below that known-good capacity made the
         # unified method an implicit low-capacity ablation.
@@ -114,6 +150,7 @@ PROFILES = {
         "maximum_volume_gaussians": 2_000_000,
         "maximum_volume_splits": 20_000,
         "volume_densify_until_fraction": 0.85,
+        "surface_densify_until_fraction": 0.85,
         "mature_handoff_surface_policy": "appearance_only",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
         "maximum_rigid_completion_seeds": 0,
@@ -131,7 +168,7 @@ PROFILES = {
         "rigid_pretrain_densify_until_iteration": 8_000,
         "rigid_geometry_gradient_ratio": 0.15,
         "geometry_gradient_ratio": 0.15,
-        "checkpoint_every": 500,
+        "checkpoint_every": 3000,
         "track_stride": 7,
         "maximum_chart_seeds": 80_000,
         "chart_seeds_per_view": 3000,
@@ -142,15 +179,27 @@ PROFILES = {
         "dav2_rigid_selected_views": 128,
         "dav2_rigid_seeds_per_view": 160,
         "dav2_rigid_cross_sequence_radius": 0.25,
-        "selected_foliage_views": 128,
-        "maximum_dense_rays_per_foliage_view": 8_192,
-        "maximum_dense_rays_total": 786_432,
-        "minimum_dense_rays_per_foliage_view": 4_096,
+        # ``fast`` shortens optimization, not the fixed-camera evidence
+        # manifold. Zero selects all database cameras while preserving the
+        # same global posterior-row budget as quality.
+        "selected_foliage_views": 0,
+        "maximum_dense_rays_per_foliage_view": 2_048,
+        "maximum_dense_rays_total": 1_572_864,
+        "minimum_dense_rays_per_foliage_view": 512,
+        "maximum_bound_rays_per_foliage_view": 8_192,
+        "maximum_dynamic_births_per_foliage_view": 384,
+        "maximum_weak_continuous_dynamic_births_per_foliage_view": 2_048,
+        "dynamic_birth_target_source_pixels_per_basis": 192.0,
+        "use_temporal_dav2_witnesses": False,
+        "use_rigid_depth_calibrated_foliage": True,
+        "rigid_calibration_resolution_scale": 0.125,
+        "foliage_voxel_size": 0.12,
         "maximum_surface_gaussians": 600_000,
         "maximum_surface_growth_per_event": 5000,
         "maximum_volume_gaussians": 2_000_000,
         "maximum_volume_splits": 20_000,
         "volume_densify_until_fraction": 5.0 / 6.0,
+        "surface_densify_until_fraction": 5.0 / 6.0,
         "mature_handoff_surface_policy": "appearance_only",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
         "maximum_rigid_completion_seeds": 0,
@@ -174,6 +223,15 @@ PROFILES = {
         "maximum_dense_rays_per_foliage_view": 8_192,
         "maximum_dense_rays_total": 294_912,
         "minimum_dense_rays_per_foliage_view": 2_048,
+        "maximum_bound_rays_per_foliage_view": 8_192,
+        "maximum_dynamic_births_per_foliage_view": 1024,
+        "maximum_weak_continuous_dynamic_births_per_foliage_view": 1024,
+        # Ordinary and adaptive caps are both 1,024 in this diagnostic
+        # profile, so persisting the same target is contract-complete but does
+        # not alter its renderer basis.
+        "dynamic_birth_target_source_pixels_per_basis": 192.0,
+        "use_rigid_depth_calibrated_foliage": False,
+        "foliage_voxel_size": 0.12,
         "maximum_surface_gaussians": 400_000,
         "maximum_surface_growth_per_event": 2500,
         "maximum_volume_gaussians": 800_000,
@@ -776,7 +834,7 @@ def main() -> None:
     profile = PROFILES[args.profile]
     run = (
         args.run_root.expanduser().resolve()
-        / f"{args.scene}_hybrid_teacher_{args.profile}_v20"
+        / f"{args.scene}_hybrid_teacher_{args.profile}_v24"
     )
     run.mkdir(parents=True, exist_ok=True)
     manifest_path = run / "pipeline_manifest.json"
@@ -793,6 +851,11 @@ def main() -> None:
             "stages": {},
         }
     )
+    # A resumable run may predate a repaired producer/training contract.
+    # Always record the implementation contract that is actually executing;
+    # individual stages below still validate their content hashes before
+    # reusing artifacts.
+    manifest["version"] = PIPELINE_VERSION
     selected = STAGES if args.stage == "all" else (args.stage,)
     python = sys.executable
     env = dict(os.environ)
@@ -951,6 +1014,33 @@ def main() -> None:
 
     tracks = run / "tracks/mast3r_multiview_tracks.npz"
     if "build_mast3r_tracks" in selected:
+        track_scene_contract = (
+            run / "tracks/database_scene_contract.json"
+        )
+        track_scene_contract.parent.mkdir(parents=True, exist_ok=True)
+        if not track_scene_contract.is_file():
+            _run(
+                [
+                    python,
+                    str(
+                        REPO_ROOT
+                        / "scripts/build_cambridge_scene_manifest.py"
+                    ),
+                    "--dataset",
+                    str(dataset),
+                    "--output",
+                    str(track_scene_contract),
+                    "--mask-pickle",
+                    str(base_mask),
+                    "--split",
+                    "database_train",
+                ],
+                env=env,
+                log=run / "logs/build_track_scene_contract.log",
+                dry_run=args.dry_run,
+            )
+        if args.dry_run:
+            return
         rebuild_tracks = not tracks.is_file()
         if not rebuild_tracks:
             try:
@@ -958,9 +1048,30 @@ def main() -> None:
                 track_summary = json.loads(
                     tracks.with_suffix(".json").read_text()
                 )
-                if track_summary.get(
-                    "chart_consensus_sha256"
-                ) != sha256_file(chart_consensus):
+                if (
+                    track_summary.get("correspondence_builder")
+                    != "mast3r_reciprocal_descriptor_union_find"
+                    or track_summary.get("camera_scope")
+                    != "database_keyframes_full_sequence_coverage"
+                    or track_summary.get("scene_contract_sha256")
+                    != sha256_file(track_scene_contract)
+                    or track_summary.get("tree_mask_pickle_sha256")
+                    != sha256_file(tree_mask)
+                    or track_summary.get(
+                        "producer_implementation_sha256"
+                    )
+                    != sha256_file(
+                        REPO_ROOT
+                        / "scripts/build_mast3r_descriptor_track_graph.py"
+                    )
+                    or track_summary.get("checkpoint_sha256")
+                    != sha256_file(
+                        REPO_ROOT
+                        / "mast3r/checkpoints/"
+                        "MASt3R_ViTLarge_BaseDecoder_512_"
+                        "catmlpdpt_metric.pth"
+                    )
+                ):
                     rebuild_tracks = True
             except (RuntimeError, OSError, KeyError, ValueError) as error:
                 rebuild_tracks = True
@@ -968,22 +1079,29 @@ def main() -> None:
         if rebuild_tracks:
             command = [
                 python,
-                str(REPO_ROOT / "scripts/build_mast3r_multiview_tracks.py"),
-                "--mast3r-scene",
-                str(mast3r),
+                str(
+                    REPO_ROOT
+                    / "scripts/build_mast3r_descriptor_track_graph.py"
+                ),
                 "--dataset",
                 str(dataset),
+                "--scene-contract",
+                str(track_scene_contract),
                 "--tree-mask-pickle",
                 str(tree_mask),
-                "--chart-consensus",
-                str(chart_consensus),
                 "--output",
                 str(tracks),
-                "--stride",
-                str(profile["track_stride"]),
+                "--maximum-keyframes",
+                # Track coverage is geometry evidence and must not shrink
+                # with the optimization iteration budget.
+                str(256 if args.profile in {"quality", "fast"} else 128),
+                "--temporal-neighbours",
+                "2",
+                "--cross-sequence-neighbours",
+                "4",
+                "--subsample",
+                "8",
             ]
-            if tracks.exists():
-                command.append("--replace")
             _run(
                 command,
                 env=env,
@@ -1017,7 +1135,10 @@ def main() -> None:
             "atlas": str(required[0]),
             "crossview_consensus": str(chart_consensus),
             "native_resolution_observation_factor": True,
-            "learnable_continuous_chart_atlas": False,
+            "learnable_continuous_chart_atlas": True,
+            "inverse_depth_residual_pyramid": True,
+            "uv_parent_replace_and_retire": True,
+            "exact_k_runtime_unprojection": True,
         }
         _write_manifest(manifest_path, manifest)
 
@@ -1144,7 +1265,15 @@ def main() -> None:
         }
         _write_manifest(manifest_path, manifest)
 
-    initialization = run / "initialization"
+    base_initialization = run / "initialization"
+    use_temporal_dav2_witnesses = bool(
+        profile.get("use_temporal_dav2_witnesses", False)
+    )
+    initialization = (
+        run / "initialization_temporal_dav2"
+        if use_temporal_dav2_witnesses
+        else base_initialization
+    )
     if "initialize_teacher" in selected:
         store_hash = load_evidence_store(evidence)["evidence_hash"]
         initialization_contract = {
@@ -1200,16 +1329,39 @@ def main() -> None:
             "minimum_dense_rays_per_foliage_view": int(
                 profile["minimum_dense_rays_per_foliage_view"]
             ),
-            "voxel_size": 0.12,
+            "maximum_bound_rays_per_foliage_view": int(
+                profile["maximum_bound_rays_per_foliage_view"]
+            ),
+            "maximum_dynamic_births_per_foliage_view": int(
+                profile["maximum_dynamic_births_per_foliage_view"]
+            ),
+            "maximum_weak_continuous_dynamic_births_per_foliage_view": int(
+                profile[
+                    "maximum_weak_continuous_dynamic_births_per_foliage_view"
+                ]
+            ),
+            "dynamic_birth_target_source_pixels_per_basis": (
+                None
+                if profile[
+                    "dynamic_birth_target_source_pixels_per_basis"
+                ]
+                is None
+                else float(
+                    profile[
+                        "dynamic_birth_target_source_pixels_per_basis"
+                    ]
+                )
+            ),
+            "voxel_size": float(profile["foliage_voxel_size"]),
             "seed": 73,
         }
         rebuild_initialization = not (
-            initialization / "initialization_manifest.json"
+            base_initialization / "initialization_manifest.json"
         ).is_file()
         if not rebuild_initialization:
             current_initialization = json.loads(
                 (
-                    initialization / "initialization_manifest.json"
+                    base_initialization / "initialization_manifest.json"
                 ).read_text()
             )
             rebuild_initialization = (
@@ -1226,7 +1378,7 @@ def main() -> None:
                     "--evidence-store",
                     str(evidence),
                     "--output",
-                    str(initialization),
+                    str(base_initialization),
                     "--rgb-root",
                     str(
                         (
@@ -1279,14 +1431,38 @@ def main() -> None:
                             "minimum_dense_rays_per_foliage_view"
                         ]
                     ),
+                    "--maximum-bound-rays-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_bound_rays_per_foliage_view"
+                        ]
+                    ),
+                    "--maximum-dynamic-births-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_dynamic_births_per_foliage_view"
+                        ]
+                    ),
+                    "--maximum-weak-continuous-dynamic-births-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_weak_continuous_dynamic_births_per_foliage_view"
+                        ]
+                    ),
+                    "--dynamic-birth-target-source-pixels-per-basis",
+                    str(
+                        profile[
+                            "dynamic_birth_target_source_pixels_per_basis"
+                        ]
+                    ),
                     "--maximum-foliage-voxels",
                     "400000",
                     "--voxel-size",
-                    "0.12",
+                    str(profile["foliage_voxel_size"]),
                     "--seed",
                     "73",
                 ]
-            if initialization.exists():
+            if base_initialization.exists():
                 command.append("--replace")
             _run(
                 command,
@@ -1296,6 +1472,80 @@ def main() -> None:
             )
         if args.dry_run:
             return
+        if use_temporal_dav2_witnesses:
+            base_foliage = (
+                base_initialization / "foliage_seed_gaussians.pth"
+            )
+            augmentation_contract = {
+                "protocol": TEMPORAL_DAV2_AUGMENTATION_VERSION,
+                "source_foliage_sha256": sha256_file(base_foliage),
+                "producer_implementation_sha256": sha256_file(
+                    REPO_ROOT
+                    / "scripts/augment_temporal_dav2_foliage.py"
+                ),
+                "same_sequence_two_sided_only": True,
+                "maximum_temporal_gap": 12,
+                "maximum_rays_per_view": 512,
+                "maximum_births_per_view": 512,
+                "every_added_ray_has_exact_birth": True,
+                "maximum_canonical_distance": 3.0,
+                "canonical_birth_count": 0,
+                "localization_landmark_count": 0,
+            }
+            rebuild_augmentation = not (
+                initialization / "initialization_manifest.json"
+            ).is_file()
+            if not rebuild_augmentation:
+                try:
+                    current_augmented = json.loads(
+                        (
+                            initialization
+                            / "initialization_manifest.json"
+                        ).read_text()
+                    )
+                    current_audit = current_augmented["foliage"][
+                        "temporal_dav2_augmentation"
+                    ]
+                    rebuild_augmentation = (
+                        current_augmented.get("version")
+                        != TEMPORAL_DAV2_AUGMENTATION_VERSION
+                        or any(
+                            current_audit.get(key) != value
+                            for key, value in augmentation_contract.items()
+                        )
+                    )
+                except (KeyError, OSError, ValueError):
+                    rebuild_augmentation = True
+            if rebuild_augmentation:
+                command = [
+                    python,
+                    str(
+                        REPO_ROOT
+                        / "scripts/augment_temporal_dav2_foliage.py"
+                    ),
+                    "--source-initialization",
+                    str(base_initialization),
+                    "--evidence-store",
+                    str(evidence),
+                    "--output",
+                    str(initialization),
+                    "--maximum-temporal-gap",
+                    "12",
+                    "--maximum-rays-per-view",
+                    "512",
+                    "--maximum-births-per-view",
+                    "512",
+                    "--maximum-canonical-distance",
+                    "3.0",
+                ]
+                if initialization.exists():
+                    command.append("--replace")
+                _run(
+                    command,
+                    env=env,
+                    log=run / "logs/augment_temporal_dav2.log",
+                    dry_run=args.dry_run,
+                )
         init = json.loads(
             (initialization / "initialization_manifest.json").read_text()
         )
@@ -1305,6 +1555,8 @@ def main() -> None:
             raise RuntimeError("Initialization consumed COLMAP geometry")
         manifest["stages"]["initialize_teacher"] = {
             "status": "complete",
+            "base_initialization": str(base_initialization),
+            "training_initialization": str(initialization),
             "surface": init["surface"],
             "foliage": init["foliage"],
         }
@@ -1424,7 +1676,171 @@ def main() -> None:
                     rigid_teacher / "rigid_surface_handoff.json"
                 ).resolve()
 
+        if (
+            surface_warmstart_ply is not None
+            and bool(
+                profile.get(
+                    "use_rigid_depth_calibrated_foliage", False
+                )
+            )
+        ):
+            calibrated_initialization = (
+                run / "initialization_rigid_depth_calibrated"
+            )
+            calibrated_manifest_path = (
+                calibrated_initialization
+                / "initialization_manifest.json"
+            )
+            calibrated_current = False
+            if (
+                not args.dry_run
+                and calibrated_manifest_path.is_file()
+            ):
+                calibrated_payload = json.loads(
+                    calibrated_manifest_path.read_text(
+                        encoding="utf-8"
+                    )
+                )
+                causal = calibrated_payload.get("causal_reuse", {})
+                calibrated_current = (
+                    calibrated_payload.get("version")
+                    == RIGID_CALIBRATED_INITIALIZATION_VERSION
+                    and calibrated_payload.get("evidence_hash")
+                    == store_hash
+                    and causal.get(
+                        "base_initialization_manifest_sha256"
+                    )
+                    == sha256_file(
+                        base_initialization
+                        / "initialization_manifest.json"
+                    )
+                    and causal.get("rigid_calibration_ply_sha256")
+                    == sha256_file(surface_warmstart_ply)
+                )
+            if not calibrated_current:
+                calibration_command = [
+                    python,
+                    str(
+                        REPO_ROOT
+                        / "scripts/rebuild_foliage_with_rigid_depth.py"
+                    ),
+                    "--base-initialization",
+                    str(base_initialization),
+                    "--evidence-store",
+                    str(evidence),
+                    "--rigid-calibration-ply",
+                    str(surface_warmstart_ply),
+                    "--output",
+                    str(calibrated_initialization),
+                    "--rgb-root",
+                    str(
+                        rgb_images
+                        if rgb_images is not None
+                        else (dataset / "images").resolve()
+                    ),
+                    "--maximum-foliage-voxels",
+                    "400000",
+                    "--selected-foliage-views",
+                    str(profile["selected_foliage_views"]),
+                    "--maximum-dense-rays-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_dense_rays_per_foliage_view"
+                        ]
+                    ),
+                    "--minimum-dense-rays-per-foliage-view",
+                    str(
+                        profile[
+                            "minimum_dense_rays_per_foliage_view"
+                        ]
+                    ),
+                    "--maximum-bound-rays-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_bound_rays_per_foliage_view"
+                        ]
+                    ),
+                    "--maximum-dynamic-births-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_dynamic_births_per_foliage_view"
+                        ]
+                    ),
+                    "--maximum-weak-continuous-dynamic-births-per-foliage-view",
+                    str(
+                        profile[
+                            "maximum_weak_continuous_dynamic_births_per_foliage_view"
+                        ]
+                    ),
+                    "--dynamic-birth-target-source-pixels-per-basis",
+                    str(
+                        profile[
+                            "dynamic_birth_target_source_pixels_per_basis"
+                        ]
+                    ),
+                    "--voxel-size",
+                    str(profile["foliage_voxel_size"]),
+                    "--rigid-calibration-resolution-scale",
+                    str(
+                        profile[
+                            "rigid_calibration_resolution_scale"
+                        ]
+                    ),
+                    "--seed",
+                    "73",
+                ]
+                if profile["maximum_dense_rays_total"] is not None:
+                    calibration_command.extend(
+                        [
+                            "--maximum-dense-rays-total",
+                            str(
+                                profile[
+                                    "maximum_dense_rays_total"
+                                ]
+                            ),
+                        ]
+                    )
+                if calibrated_initialization.exists():
+                    calibration_command.append("--replace")
+                _run(
+                    calibration_command,
+                    env=train_env,
+                    log=run
+                    / "logs/rebuild_rigid_calibrated_foliage.log",
+                    dry_run=args.dry_run,
+                )
+            initialization = calibrated_initialization
+            manifest["stages"]["rigid_depth_calibrated_foliage"] = {
+                "status": "complete",
+                "initialization": str(initialization),
+                "protocol": (
+                    RIGID_CALIBRATED_INITIALIZATION_VERSION
+                ),
+                "rigid_calibration_ply": str(
+                    surface_warmstart_ply
+                ),
+                "continuous_uncertainty": True,
+                "historical_model_initialization": False,
+            }
+            _write_manifest(manifest_path, manifest)
+
         result = teacher / "result.json"
+        # This value is part of the reproducibility contract even when a
+        # mature non-joint handoff disables all surface topology.  In joint
+        # training it bounds both world-space and Chart-UV refinement.
+        surface_densify_until_iteration = int(
+            round(
+                float(args.iterations)
+                * float(
+                    profile.get(
+                        "surface_densify_until_fraction",
+                        profile.get(
+                            "volume_densify_until_fraction", 1.0
+                        ),
+                    )
+                )
+            )
+        )
         result_current = _teacher_result_is_current(
             result,
             evidence_hash=store_hash,
@@ -1442,6 +1858,9 @@ def main() -> None:
             ),
             volume_densify_until_iteration=(
                 args.volume_densify_until_iteration
+            ),
+            surface_densify_until_iteration=(
+                surface_densify_until_iteration
             ),
             surface_warmstart_ply=surface_warmstart_ply,
             surface_warmstart_manifest=surface_warmstart_manifest,
@@ -1489,6 +1908,9 @@ def main() -> None:
                 rgb_images=rgb_images,
                 volume_densify_until_iteration=(
                     args.volume_densify_until_iteration
+                ),
+                surface_densify_until_iteration=(
+                    surface_densify_until_iteration
                 ),
                 surface_warmstart_ply=surface_warmstart_ply,
                 surface_warmstart_manifest=surface_warmstart_manifest,

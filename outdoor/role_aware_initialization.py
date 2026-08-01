@@ -28,6 +28,7 @@ from outdoor.foliage_geometry import (
     _camera_record,
     build_instance_aware_canopy_volume,
     cluster_tree_instances,
+    evidence_conditioned_dynamic_opacity_ceiling,
     evidence_conditioned_leaf_optical_mass,
     quaternion_to_rotation,
     read_cameras_binary,
@@ -46,7 +47,17 @@ from scripts.augment_foliage_seed_with_sfm_tracks import _track_frames
 
 
 INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v47-dav2-observation-patch-contract"
+    "outdoor-role-aware-initialization-v61-camera-complete-strict-depth-"
+    "posterior"
+)
+RIGID_CALIBRATED_INITIALIZATION_VERSION = (
+    "outdoor-role-aware-initialization-v76-native-rigid-depth-continuous-"
+    "posterior-exact-owner-2d-stratified-dual-bandwidth-calibrated-optical"
+)
+TEMPORAL_DAV2_AUGMENTATION_VERSION = (
+    "outdoor-role-aware-initialization-v65-dense-evidence-preserving-exact-"
+    "ray-depth-birth-spatial-coverage-strict-intervals-temporal-dav2-"
+    "witnesses"
 )
 
 SOURCE_COLMAP = 0
@@ -3201,6 +3212,7 @@ def _align_tracks_to_local_hull_instances(
     *,
     association_radius: float = 1.5,
     maximum_component_extent: float = 12.0,
+    persistent_track_count: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Use accepted local hull components as tree-ownership authorities.
 
@@ -3217,23 +3229,13 @@ def _align_tracks_to_local_hull_instances(
     track_xyz = np.asarray(track_xyz, dtype=np.float64).reshape(-1, 3)
     if len(hull_centers) != len(hull_instance_ids):
         raise ValueError("Hull centre/instance arrays have different lengths")
-    if not len(hull_centers):
-        dynamic_ids = cluster_tree_instances(
-            track_xyz,
-            maximum_component_extent=maximum_component_extent,
+    if persistent_track_count is None:
+        persistent_track_count = len(track_xyz)
+    persistent_track_count = int(persistent_track_count)
+    if not 0 <= persistent_track_count <= len(track_xyz):
+        raise ValueError(
+            "persistent_track_count must lie inside the track table"
         )
-        return hull_instance_ids, dynamic_ids, {
-            "association_radius": float(association_radius),
-            "maximum_component_extent": float(maximum_component_extent),
-            "hull_local_instance_count": 0,
-            "associated_track_count": 0,
-            "dynamic_only_track_count": int(len(track_xyz)),
-            "dynamic_only_instance_count": int(
-                len(np.unique(dynamic_ids))
-            ),
-            "association_distance_median": float("nan"),
-            "association_distance_p99": float("nan"),
-        }
 
     # Candidate dilation can leave disconnected accepted islands under one
     # upstream anchor label. Refine labels without deleting any geometry.
@@ -3247,29 +3249,96 @@ def _align_tracks_to_local_hull_instances(
         )
         local_hull_ids[rows] = labels + next_id
         next_id += int(len(np.unique(labels)))
+    hull_local_instance_count = int(next_id)
 
-    distance, nearest = cKDTree(hull_centers).query(track_xyz, k=1)
-    associated = distance <= float(association_radius)
+    if len(hull_centers):
+        distance, nearest = cKDTree(hull_centers).query(track_xyz, k=1)
+        associated = distance <= float(association_radius)
+    else:
+        distance = np.full(len(track_xyz), np.inf, dtype=np.float64)
+        nearest = np.zeros(len(track_xyz), dtype=np.int64)
+        associated = np.zeros(len(track_xyz), dtype=bool)
     track_instance_ids = np.full(len(track_xyz), -1, dtype=np.int32)
-    track_instance_ids[associated] = local_hull_ids[nearest[associated]]
-    dynamic_only = np.flatnonzero(~associated)
-    dynamic_only_instance_count = 0
-    if len(dynamic_only):
+    if bool(associated.any()):
+        track_instance_ids[associated] = local_hull_ids[
+            nearest[associated]
+        ]
+
+    # Renderer-basis rows are incremental consumers of an already measured
+    # ownership graph.  They may inherit a nearby persistent instance or
+    # form new bounded components, but changing their sampling density must
+    # never relabel the persistent MASt3R/Chart/DAV2 rows that define the
+    # canonical and trunk contracts.
+    row_index = np.arange(len(track_xyz))
+    persistent_dynamic_only = np.flatnonzero(
+        (~associated) & (row_index < persistent_track_count)
+    )
+    if len(persistent_dynamic_only):
         labels = cluster_tree_instances(
-            track_xyz[dynamic_only],
+            track_xyz[persistent_dynamic_only],
             maximum_component_extent=maximum_component_extent,
         )
-        track_instance_ids[dynamic_only] = labels + next_id
-        dynamic_only_instance_count = int(len(np.unique(labels)))
+        track_instance_ids[persistent_dynamic_only] = labels + next_id
+        next_id += int(len(np.unique(labels)))
+
+    incremental = np.flatnonzero(row_index >= persistent_track_count)
+    incremental_unassociated = incremental[~associated[incremental]]
+    inherited_incremental = np.empty(0, dtype=np.int64)
+    if len(incremental_unassociated) and persistent_track_count:
+        inherited_distance, inherited_nearest = cKDTree(
+            track_xyz[:persistent_track_count]
+        ).query(track_xyz[incremental_unassociated], k=1)
+        inherit = inherited_distance <= float(association_radius)
+        inherited_incremental = incremental_unassociated[inherit]
+        track_instance_ids[inherited_incremental] = track_instance_ids[
+            inherited_nearest[inherit]
+        ]
+        incremental_unassociated = incremental_unassociated[~inherit]
+    incremental_new_instance_count = 0
+    if len(incremental_unassociated):
+        labels = cluster_tree_instances(
+            track_xyz[incremental_unassociated],
+            maximum_component_extent=maximum_component_extent,
+        )
+        track_instance_ids[incremental_unassociated] = labels + next_id
+        incremental_new_instance_count = int(len(np.unique(labels)))
+        next_id += incremental_new_instance_count
+    if bool((track_instance_ids < 0).any()):
+        raise RuntimeError("Track-instance extension left unassigned rows")
+
+    dynamic_only = np.flatnonzero(~associated)
+    dynamic_only_instance_count = int(
+        len(np.unique(track_instance_ids[dynamic_only]))
+    ) if len(dynamic_only) else 0
     return local_hull_ids, track_instance_ids, {
         "association_radius": float(association_radius),
         "maximum_component_extent": float(maximum_component_extent),
-        "hull_local_instance_count": int(next_id),
+        "hull_local_instance_count": hull_local_instance_count,
         "associated_track_count": int(associated.sum()),
         "dynamic_only_track_count": int((~associated).sum()),
         "dynamic_only_instance_count": dynamic_only_instance_count,
-        "association_distance_median": float(np.median(distance)),
-        "association_distance_p99": float(np.quantile(distance, 0.99)),
+        "persistent_track_count": persistent_track_count,
+        "incremental_track_count": int(
+            len(track_xyz) - persistent_track_count
+        ),
+        "incremental_inherited_track_count": int(
+            len(inherited_incremental)
+        ),
+        "incremental_new_instance_count": int(
+            incremental_new_instance_count
+        ),
+        "incremental_ownership_contract": (
+            "inherit_nearby_persistent_instance_else_new_bounded_component_"
+            "never_relabel_persistent_rows"
+        ),
+        "association_distance_median": (
+            float(np.median(distance)) if len(hull_centers) else float("nan")
+        ),
+        "association_distance_p99": (
+            float(np.quantile(distance, 0.99))
+            if len(hull_centers)
+            else float("nan")
+        ),
     }
 
 
@@ -3508,9 +3577,15 @@ def _nonchart_pointmap_foliage_samples(
                     ),
                 }
             )
-        if len(result) >= int(maximum_samples):
-            break
-    return result[: int(maximum_samples)]
+    # Apply the global cap only after every indexed fixed camera has had a
+    # chance to contribute. The former early break made camera-order prefixes
+    # define the sequence-local canopy evidence.
+    result, _ = _balanced_single_camera_sample_cap(
+        result,
+        maximum_samples,
+        source_name="MASt3R pointmap",
+    )
+    return result
 
 
 def _chart_foliage_samples(
@@ -3881,9 +3956,10 @@ def _dav2_foliage_samples(
     rigid_xyz: np.ndarray,
     *,
     allowed_image_ids: set[int] | None = None,
+    rigid_depth_maps: dict[int, np.ndarray] | None = None,
     samples_per_view: int = 128,
     maximum_samples: int = 120_000,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Back-project sparse per-view leaf owners from scaled DAV2 depth.
 
     A raw monocular depth map has an affine inverse-depth ambiguity.  We fit
@@ -3898,8 +3974,12 @@ def _dav2_foliage_samples(
     records = json.loads(index_path.read_text(encoding="utf-8"))["records"]
     output: list[dict[str, Any]] = []
     accepted_views = 0
+    weak_posterior_views = 0
     rejected_views = 0
+    posterior_confidences: list[float] = []
+    posterior_relative_sigmas: list[float] = []
     rigid_xyz = np.asarray(rigid_xyz, dtype=np.float64)
+    rigid_depth_maps = rigid_depth_maps or {}
     dataset = Path(store["dataset"])
 
     eligible_image_ids = (
@@ -3960,30 +4040,54 @@ def _dav2_foliage_samples(
         translation = np.asarray(
             image_record["tvec"], dtype=np.float64
         )
-        camera_xyz = rigid_xyz @ rotation.T + translation[None]
-        z = camera_xyz[:, 2]
-        columns = np.rint(
-            fx * camera_xyz[:, 0] / np.maximum(z, 1e-8) + cx
-        ).astype(np.int64)
-        rows = np.rint(
-            fy * camera_xyz[:, 1] / np.maximum(z, 1e-8) + cy
-        ).astype(np.int64)
-        valid = (
-            (z > 0.05)
-            & (columns >= 0)
-            & (columns < width)
-            & (rows >= 0)
-            & (rows < height)
-        )
-        zbuffer = np.full(height * width, np.inf, dtype=np.float32)
-        linear = rows[valid] * width + columns[valid]
-        np.minimum.at(zbuffer, linear, z[valid].astype(np.float32))
-        zbuffer = minimum_filter(
-            zbuffer.reshape(height, width),
-            size=5,
-            mode="constant",
-            cval=np.inf,
-        )
+        rendered_rigid_depth = rigid_depth_maps.get(int(image_id))
+        if rendered_rigid_depth is not None:
+            zbuffer = np.asarray(
+                rendered_rigid_depth, dtype=np.float32
+            )
+            if zbuffer.shape != (height, width):
+                finite = np.isfinite(zbuffer) & (zbuffer > 0)
+                values = np.where(finite, zbuffer, 0.0)
+                values = torch.nn.functional.interpolate(
+                    torch.from_numpy(values)[None, None],
+                    size=(height, width),
+                    mode="nearest",
+                )[0, 0].numpy()
+                finite = torch.nn.functional.interpolate(
+                    torch.from_numpy(finite.astype(np.float32))[None, None],
+                    size=(height, width),
+                    mode="nearest",
+                )[0, 0].numpy() > 0.5
+                zbuffer = np.where(finite, values, np.inf).astype(
+                    np.float32
+                )
+            calibration_depth_source = "trained_rigid_surface_render"
+        else:
+            camera_xyz = rigid_xyz @ rotation.T + translation[None]
+            z = camera_xyz[:, 2]
+            columns = np.rint(
+                fx * camera_xyz[:, 0] / np.maximum(z, 1e-8) + cx
+            ).astype(np.int64)
+            rows = np.rint(
+                fy * camera_xyz[:, 1] / np.maximum(z, 1e-8) + cy
+            ).astype(np.int64)
+            valid = (
+                (z > 0.05)
+                & (columns >= 0)
+                & (columns < width)
+                & (rows >= 0)
+                & (rows < height)
+            )
+            zbuffer = np.full(height * width, np.inf, dtype=np.float32)
+            linear = rows[valid] * width + columns[valid]
+            np.minimum.at(zbuffer, linear, z[valid].astype(np.float32))
+            zbuffer = minimum_filter(
+                zbuffer.reshape(height, width),
+                size=5,
+                mode="constant",
+                cval=np.inf,
+            )
+            calibration_depth_source = "sparse_surface_seed_zbuffer"
         key = masks.source_name_for(image_record["name"])
         channels = masks.masks[key]
         resized = [
@@ -4009,7 +4113,78 @@ def _dav2_foliage_samples(
             max_samples=8_000,
             max_relative_rmse=0.35,
         )
+        posterior_status = "accepted"
+        relative_sigma = float(diagnostics.relative_rmse)
         if not diagnostics.accepted:
+            # A finite positive affine map remains useful as a spatially
+            # uncertain ray posterior even when its residual exceeds the
+            # old binary quality threshold.  This is especially important in
+            # tree-dominated frames, where only a narrow rigid strip is
+            # visible.  Invalid scale/sign and insufficient support remain
+            # physically undefined and are still rejected.
+            if (
+                diagnostics.support_pixels >= 64
+                and np.isfinite(diagnostics.alpha)
+                and np.isfinite(diagnostics.beta)
+                and diagnostics.beta > 0
+                and np.isfinite(diagnostics.relative_rmse)
+            ):
+                denominator = (
+                    float(diagnostics.alpha)
+                    + float(diagnostics.beta)
+                    / np.maximum(relative_depth, 1e-6)
+                )
+                positive = (
+                    np.isfinite(relative_depth)
+                    & (relative_depth > 0)
+                    & np.isfinite(denominator)
+                    & (denominator > 1e-6)
+                )
+                aligned = torch.zeros_like(
+                    torch.from_numpy(relative_depth)
+                )
+                aligned.numpy()[positive] = (
+                    1.0 / denominator[positive]
+                ).astype(np.float32)
+                supported_depths = zbuffer[support]
+                lower = max(
+                    float(np.quantile(supported_depths, 0.01)) / 4.0,
+                    1e-4,
+                )
+                upper = max(
+                    float(np.quantile(supported_depths, 0.99)) * 4.0,
+                    lower * 2.0,
+                )
+                aligned[torch.from_numpy(positive)] = aligned[
+                    torch.from_numpy(positive)
+                ].clamp(min=lower, max=upper)
+                posterior_status = "weak_continuous"
+            else:
+                rejected_views += 1
+                continue
+        support_confidence = min(
+            diagnostics.support_pixels / 512.0, 1.0
+        )
+        posterior_confidence = float(
+            np.clip(
+                support_confidence
+                * float(diagnostics.inlier_ratio)
+                * np.exp(
+                    -0.5
+                    * (
+                        max(float(diagnostics.relative_rmse), 0.0)
+                        / 0.35
+                    )
+                    ** 2
+                ),
+                0.01,
+                1.0,
+            )
+        )
+        relative_sigma = float(
+            np.clip(max(relative_sigma, 0.05), 0.05, 1.50)
+        )
+        if not np.isfinite(posterior_confidence):
             rejected_views += 1
             continue
         metric_depth = aligned.numpy()
@@ -4022,6 +4197,10 @@ def _dav2_foliage_samples(
             rejected_views += 1
             continue
         accepted_views += 1
+        if posterior_status == "weak_continuous":
+            weak_posterior_views += 1
+        posterior_confidences.append(posterior_confidence)
+        posterior_relative_sigmas.append(relative_sigma)
         grid_side = max(
             1, int(np.ceil(np.sqrt(float(samples_per_view))))
         )
@@ -4085,6 +4264,13 @@ def _dav2_foliage_samples(
             footprint,
             selected_depth,
         ):
+            absolute_depth_sigma = float(
+                np.clip(
+                    relative_sigma * float(depth_value),
+                    0.05,
+                    3.0,
+                )
+            )
             output.append(
                 {
                     "id": -(10_000_000 + len(output)),
@@ -4092,6 +4278,10 @@ def _dav2_foliage_samples(
                     "rgb": rgb_image[int(row), int(column)],
                     "error": float(
                         max(diagnostics.relative_rmse, 0.02)
+                    ),
+                    "position_sigma": absolute_depth_sigma,
+                    "observation_depth_sigma": (
+                        absolute_depth_sigma
                     ),
                     "image_ids": np.asarray(
                         [image_id], dtype=np.int64
@@ -4119,21 +4309,61 @@ def _dav2_foliage_samples(
                     ),
                     "tree_sequence_count": 1,
                     "tree_fraction": float(
-                        np.clip(
-                            diagnostics.inlier_ratio, 0.55, 1.0
-                        )
+                        posterior_confidence
                     ),
                     "ray_footprint_scale": float(point_scale),
                     "dav2_sequence_local_sample": True,
+                    "dav2_alignment_posterior": (
+                        posterior_confidence
+                    ),
+                    "ray_depth_nll": float(
+                        1.0
+                        / max(posterior_confidence, 1.0e-4) ** 2
+                        - 1.0
+                    ),
+                    "dav2_alignment_status": posterior_status,
+                    "dav2_calibration_depth_source": (
+                        calibration_depth_source
+                    ),
                 }
             )
-        if len(output) >= int(maximum_samples):
-            break
-    return output[: int(maximum_samples)], {
+    output, sample_budget_audit = _balanced_single_camera_sample_cap(
+        output,
+        maximum_samples,
+        source_name="DAV2",
+    )
+    return output, {
         "eligible_views": int(len(eligible_image_ids)),
         "views": int(visited_views),
         "accepted_views": int(accepted_views),
+        "weak_posterior_views": int(weak_posterior_views),
         "rejected_views": int(rejected_views),
+        "trained_rigid_depth_view_count": int(
+            len(rigid_depth_maps)
+        ),
+        "posterior_confidence_percentiles": (
+            [
+                float(value)
+                for value in np.quantile(
+                    posterior_confidences,
+                    [0.0, 0.1, 0.5, 0.9, 1.0],
+                )
+            ]
+            if posterior_confidences
+            else []
+        ),
+        "posterior_relative_sigma_percentiles": (
+            [
+                float(value)
+                for value in np.quantile(
+                    posterior_relative_sigmas,
+                    [0.0, 0.1, 0.5, 0.9, 1.0],
+                )
+            ]
+            if posterior_relative_sigmas
+            else []
+        ),
+        **sample_budget_audit,
     }
 
 
@@ -4197,9 +4427,9 @@ def _line_supported_tree_tracks(
     eligible: np.ndarray,
     *,
     minimum_linearity: float,
-    maximum_radial_spread: float = 0.05,
-    neighbourhood_radius: float = 0.20,
-    minimum_neighbours: int = 4,
+    maximum_radial_spread: float = 0.06,
+    neighbourhood_radius: float = 0.30,
+    minimum_neighbours: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Find cross-view line/cylinder inliers for static trunks and branches.
 
@@ -4252,6 +4482,88 @@ def _line_supported_tree_tracks(
     return supported, local_linearity
 
 
+def _ownership_isolated_track_frames(
+    xyz: np.ndarray,
+    dense_ray_local: np.ndarray,
+    tree_instance_id: np.ndarray,
+    dense_owner_camera_id: np.ndarray,
+    minimum: float,
+    maximum_cross: float,
+    maximum_long: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Estimate frames without crossing geometry or visibility ownership.
+
+    Dense exact-camera births are a sampled optical basis.  Increasing that
+    basis must not alter the nearest-neighbour covariance, scale or rotation
+    of persistent MASt3R/Chart/DAV2 tracks.  A local covariance must also not
+    mix different trees or exact-camera dynamic states: persistent evidence
+    is partitioned by physical tree instance, while renderer-basis rows are
+    partitioned by ``(owner camera, tree instance)``.  The latter rows are
+    never visible outside their owner, so another camera cannot provide a
+    valid local shape measurement for them.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    dense = np.asarray(dense_ray_local, dtype=bool).reshape(-1)
+    instance = np.asarray(tree_instance_id, dtype=np.int64).reshape(-1)
+    owner = np.asarray(dense_owner_camera_id, dtype=np.int64).reshape(-1)
+    if not len(xyz) == len(dense) == len(instance) == len(owner):
+        raise ValueError("Frame ownership arrays must align with track xyz")
+    if bool((owner[dense] < 0).any()):
+        raise ValueError("Every dense-ray row needs one exact owner camera")
+    scales = np.empty((len(xyz), 3), dtype=np.float32)
+    quaternions = np.empty((len(xyz), 4), dtype=np.float32)
+    linearity = np.empty(len(xyz), dtype=np.float32)
+
+    def estimate(rows: np.ndarray) -> None:
+        if not len(rows):
+            return
+        if len(rows) == 1:
+            scales[rows] = float(minimum)
+            quaternions[rows] = np.asarray(
+                [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+            )
+            linearity[rows] = 1.0
+            return
+        local_scales, local_quaternions, local_linearity = _track_frames(
+            xyz[rows], minimum, maximum_cross, maximum_long
+        )
+        scales[rows] = local_scales
+        quaternions[rows] = local_quaternions
+        linearity[rows] = local_linearity
+
+    persistent = np.flatnonzero(~dense)
+    persistent_instances = np.unique(instance[persistent])
+    for instance_id in persistent_instances:
+        estimate(persistent[instance[persistent] == instance_id])
+
+    dense_rows = np.flatnonzero(dense)
+    if len(dense_rows):
+        dense_keys = np.column_stack(
+            [owner[dense_rows], instance[dense_rows]]
+        )
+        _, dense_group = np.unique(
+            dense_keys, axis=0, return_inverse=True
+        )
+        dense_group_count = int(dense_group.max(initial=-1) + 1)
+        for group_id in range(dense_group_count):
+            estimate(dense_rows[dense_group == group_id])
+    else:
+        dense_group_count = 0
+    return scales, quaternions, linearity, {
+        "contract": (
+            "persistent_by_tree_instance__dense_by_exact_owner_camera_and_"
+            "tree_instance"
+        ),
+        "persistent_instance_group_count": int(
+            len(persistent_instances)
+        ),
+        "dense_owner_count": int(len(np.unique(owner[dense_rows]))),
+        "dense_owner_instance_group_count": dense_group_count,
+        "cross_instance_frame_neighbour_count": 0,
+        "cross_owner_frame_neighbour_count": 0,
+    }
+
+
 def _merge_foliage(
     hull: dict[str, np.ndarray],
     tracks: list[dict],
@@ -4286,8 +4598,32 @@ def _merge_foliage(
         ],
         dtype=bool,
     )
-    scales, quaternions, linearity = _track_frames(
-        xyz, 0.008, 0.035, 0.10
+    dense_owner_camera_id = np.full(len(tracks), -1, dtype=np.int64)
+    for row in np.flatnonzero(dense_ray_local):
+        observation_ids = np.asarray(
+            tracks[int(row)].get("observation_camera_ids", ()),
+            dtype=np.int64,
+        ).reshape(-1)
+        observation_ids = observation_ids[observation_ids >= 0]
+        if len(observation_ids) != 1:
+            raise RuntimeError(
+                "A dense renderer-basis row must have exactly one owner "
+                "camera"
+            )
+        dense_owner_camera_id[row] = int(observation_ids[0])
+    (
+        scales,
+        quaternions,
+        linearity,
+        frame_ownership_audit,
+    ) = _ownership_isolated_track_frames(
+        xyz,
+        dense_ray_local,
+        track_instances,
+        dense_owner_camera_id,
+        0.008,
+        0.035,
+        0.10,
     )
     ray_footprint = np.asarray(
         [point.get("ray_footprint_scale", 0.0) for point in tracks],
@@ -4399,6 +4735,21 @@ def _merge_foliage(
         [point["error"] for point in tracks], dtype=np.float32
     )
     covariance_scale = np.maximum(0.008, 0.012 + 0.01 * error)
+    measured_position_sigma = np.asarray(
+        [
+            point.get("position_sigma", np.nan)
+            for point in tracks
+        ],
+        dtype=np.float32,
+    )
+    measured_sigma_valid = (
+        np.isfinite(measured_position_sigma)
+        & (measured_position_sigma > 0)
+    )
+    covariance_scale[measured_sigma_valid] = np.maximum(
+        covariance_scale[measured_sigma_valid],
+        measured_position_sigma[measured_sigma_valid],
+    )
     position_covariance = np.eye(3, dtype=np.float32)[None] * (
         covariance_scale[:, None, None] ** 2
     )
@@ -4444,15 +4795,55 @@ def _merge_foliage(
         [len(point["tree_image_ids"]) for point in tracks],
         dtype=np.int16,
     )
+    track_ray_depth_nll = np.asarray(
+        [
+            point.get(
+                "ray_depth_nll",
+                (
+                    1.0
+                    / max(
+                        float(
+                            point.get(
+                                "dav2_alignment_posterior", 1.0
+                            )
+                        ),
+                        1.0e-4,
+                    )
+                    ** 2
+                    - 1.0
+                    if point.get(
+                        "dav2_alignment_posterior"
+                    )
+                    is not None
+                    else 0.0
+                ),
+            )
+            for point in tracks
+        ],
+        dtype=np.float32,
+    )
+    track_ray_depth_nll = np.nan_to_num(
+        track_ray_depth_nll,
+        nan=1.0e8,
+        posinf=1.0e8,
+        neginf=0.0,
+    )
+    track_ray_depth_nll = np.maximum(
+        track_ray_depth_nll, 0.0
+    ).astype(np.float32)
     dense_initial_opacity, _ = evidence_conditioned_leaf_optical_mass(
         occupancy_probability,
         support_view_count,
         np.zeros(track_count, dtype=np.int16),
-        np.zeros(track_count, dtype=np.float32),
+        track_ray_depth_nll,
         np.zeros(track_count, dtype=np.int16),
     )
     initial_opacity = np.full(track_count, 0.025, dtype=np.float32)
-    initial_opacity[dav2_local] = 0.08
+    initial_opacity[dav2_local] = np.clip(
+        0.01 + 0.07 * occupancy_probability[dav2_local],
+        0.01,
+        0.08,
+    )
     initial_opacity[dense_ray_local] = (
         dense_initial_opacity[dense_ray_local].numpy()
     )
@@ -4490,6 +4881,7 @@ def _merge_foliage(
             [point["tree_sequence_count"] for point in tracks],
             dtype=np.int16,
         ),
+        "ray_depth_nll": track_ray_depth_nll,
     }
     merged = {}
     for key, track_value in values.items():
@@ -4550,8 +4942,10 @@ def _merge_foliage(
             else []
         ),
         "dense_dynamic_optical_mass_contract": (
-            "per_candidate_occupancy_support_depth_free_space_posterior"
+            "exact_owner_support_unknown_free_space_optical_existence_"
+            "separate_from_occupancy_depth_geometry_authority"
         ),
+        "track_frame_ownership": frame_ownership_audit,
         "tree_instances": int(
             max(
                 track_instances.max(),
@@ -4559,6 +4953,114 @@ def _merge_foliage(
             )
         )
         + 1,
+    }
+
+
+def _local_replacement_groups(
+    centers: np.ndarray,
+    layer_role: np.ndarray,
+    tree_instance_id: np.ndarray,
+    *,
+    maximum_center_distance: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Bind dynamic leaves only to a physically local canonical crown cell.
+
+    A tree instance is an ownership region, not a replacement cell.  Assigning
+    every sequence-local leaf to the nearest canonical point anywhere in the
+    same instance allowed metre-scale (and occasionally scene-scale) links.
+    Those links let unrelated leaves deform, recolour and retire a canonical
+    crown cell at a different depth, which appears as a broad translucent
+    smear around both trees and neighbouring facades.
+
+    Canonical rows receive immutable one-row group ids.  A dynamic row joins
+    the nearest canonical row in the *same tree instance* only when their
+    world-space centres fall within a small local radius.  Tree-instance
+    ownership is part of the dynamic deformation, capacity and lifecycle
+    contract; crossing it would make one tree's sequence code move or retire
+    another tree's crown cell.  Instance fragmentation is repaired by the
+    density-supported crown clustering stage, not hidden here.
+    """
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    layer_role = np.asarray(layer_role, dtype=np.int8).reshape(-1)
+    tree_instance_id = np.asarray(
+        tree_instance_id, dtype=np.int32
+    ).reshape(-1)
+    if not (
+        len(centers) == len(layer_role) == len(tree_instance_id)
+    ):
+        raise ValueError(
+            "centres, layer roles and tree instances must have equal length"
+        )
+    maximum_center_distance = float(maximum_center_distance)
+    if not np.isfinite(maximum_center_distance) or maximum_center_distance <= 0:
+        raise ValueError("maximum_center_distance must be finite and positive")
+
+    groups = np.full(len(centers), -1, dtype=np.int64)
+    canonical = np.flatnonzero(layer_role == 0)
+    dynamic = np.flatnonzero(layer_role == 2)
+    groups[canonical] = np.arange(len(canonical), dtype=np.int64)
+    if not len(canonical) or not len(dynamic):
+        return groups, {
+            "maximum_center_distance": maximum_center_distance,
+            "canonical_group_count": int(len(canonical)),
+            "dynamic_count": int(len(dynamic)),
+            "bound_dynamic_count": 0,
+            "unbound_dynamic_count": int(len(dynamic)),
+            "bound_canonical_group_count": 0,
+            "cross_instance_binding_count": 0,
+            "binding_distance_quantiles": [],
+        }
+
+    distance = np.full(len(dynamic), np.inf, dtype=np.float64)
+    nearest_canonical = np.full(len(dynamic), -1, dtype=np.int64)
+    missing_canonical_instances = 0
+    for instance_id in np.unique(tree_instance_id[dynamic]):
+        dynamic_slots = np.flatnonzero(
+            tree_instance_id[dynamic] == instance_id
+        )
+        canonical_rows = canonical[
+            tree_instance_id[canonical] == instance_id
+        ]
+        if not len(canonical_rows):
+            missing_canonical_instances += 1
+            continue
+        local_distance, local_nearest = cKDTree(
+            centers[canonical_rows]
+        ).query(
+            centers[dynamic[dynamic_slots]],
+            k=1,
+            workers=-1,
+        )
+        distance[dynamic_slots] = local_distance
+        nearest_canonical[dynamic_slots] = canonical_rows[local_nearest]
+    bound = (
+        (nearest_canonical >= 0)
+        & np.isfinite(distance)
+        & (distance <= maximum_center_distance)
+    )
+    groups[dynamic[bound]] = groups[nearest_canonical[bound]]
+    bound_distance = distance[bound]
+    return groups, {
+        "maximum_center_distance": maximum_center_distance,
+        "canonical_group_count": int(len(canonical)),
+        "dynamic_count": int(len(dynamic)),
+        "bound_dynamic_count": int(bound.sum()),
+        "unbound_dynamic_count": int((~bound).sum()),
+        "bound_dynamic_fraction": float(bound.mean()),
+        "bound_canonical_group_count": int(
+            len(np.unique(groups[dynamic[bound]]))
+        ),
+        "cross_instance_binding_count": 0,
+        "dynamic_instance_without_canonical_count": int(
+            missing_canonical_instances
+        ),
+        "binding_distance_quantiles": (
+            np.quantile(
+                bound_distance, [0.0, 0.5, 0.9, 0.99, 1.0]
+            ).tolist()
+            if len(bound_distance)
+            else []
+        ),
     }
 
 
@@ -4686,6 +5188,176 @@ def _compact_padded_camera_metadata(
     }
 
 
+def _foliage_posterior_view_pool(
+    view_records,
+    observed_ids,
+    selected_view_count,
+):
+    """Resolve the public ``0 == all fixed cameras`` selection contract."""
+    view_records = list(view_records)
+    requested = int(selected_view_count)
+    if requested <= 0:
+        return (
+            view_records,
+            len(view_records),
+            "all_fixed_database_cameras",
+        )
+    observed_ids = {int(value) for value in observed_ids}
+    observed_views = [
+        view
+        for view in view_records
+        if int(view["image_id"]) in observed_ids
+    ]
+    return (
+        observed_views,
+        min(len(observed_views), max(24, requested)),
+        "bounded_observed_diverse_cameras",
+    )
+
+
+def _select_foliage_posterior_views(
+    posterior_view_pool,
+    posterior_view_limit,
+    posterior_camera_contract,
+    *,
+    support_by_instance=None,
+    minimum_center_distance=0.20,
+):
+    """Apply diversity only when the public contract requests a subset."""
+    posterior_view_pool = list(posterior_view_pool)
+    if posterior_camera_contract == "all_fixed_database_cameras":
+        if int(posterior_view_limit) != len(posterior_view_pool):
+            raise RuntimeError(
+                "All-fixed camera contract has a truncated view limit"
+            )
+        return sorted(
+            posterior_view_pool, key=lambda row: int(row["image_id"])
+        )
+    if support_by_instance:
+        return instance_balanced_diverse_views(
+            posterior_view_pool,
+            support_by_instance=support_by_instance,
+            limit=int(posterior_view_limit),
+            minimum_center_distance=minimum_center_distance,
+        )
+    return greedy_diverse_views(
+        posterior_view_pool,
+        limit=int(posterior_view_limit),
+        minimum_center_distance=minimum_center_distance,
+    )
+
+
+def _select_dav2_foliage_views(view_records, selected_view_count):
+    """Keep per-camera metric depth aligned with the posterior contract."""
+    view_records = list(view_records)
+    requested = int(selected_view_count)
+    if requested <= 0:
+        return (
+            sorted(view_records, key=lambda row: int(row["image_id"])),
+            "all_fixed_database_cameras",
+        )
+    limit = min(len(view_records), max(72, requested * 2))
+    return (
+        sequence_balanced_diverse_views(
+            view_records,
+            limit=limit,
+            minimum_center_distance=0.20,
+        ),
+        "bounded_sequence_balanced_cameras",
+    )
+
+
+def _balanced_single_camera_sample_cap(
+    samples: list[dict[str, Any]],
+    maximum_samples: int,
+    *,
+    source_name: str,
+) -> tuple[list[dict[str, Any]], dict[str, int | bool]]:
+    """Apply a global observation budget without dropping later camera ids.
+
+    Gather bounded per-view samples first, then water-fill the global
+    capacity equally across every accepted camera. At least one row per
+    accepted camera is a hard feasibility requirement: silently keeping a
+    camera in provenance while erasing all of its observations would violate
+    the posterior contract.
+    """
+    maximum_samples = int(maximum_samples)
+    if maximum_samples < 0:
+        raise ValueError("maximum_samples must be non-negative")
+    by_camera: dict[int, list[dict[str, Any]]] = {}
+    for sample in samples:
+        image_ids = np.asarray(
+            sample.get("tree_image_ids", ()), dtype=np.int64
+        ).reshape(-1)
+        if len(image_ids) != 1:
+            raise RuntimeError(
+                f"A sequence-local {source_name} sample must own exactly "
+                "one camera"
+            )
+        by_camera.setdefault(int(image_ids[0]), []).append(sample)
+    camera_ids = sorted(by_camera)
+    raw_count = int(len(samples))
+    camera_count = int(len(camera_ids))
+    if raw_count <= maximum_samples:
+        return list(samples), {
+            "raw_samples": raw_count,
+            "retained_samples": raw_count,
+            "sampled_views": camera_count,
+            "camera_budget_truncated": False,
+        }
+    if maximum_samples < camera_count:
+        raise RuntimeError(
+            f"{source_name} global sample budget cannot preserve one "
+            "observation per "
+            f"accepted camera: budget={maximum_samples}, "
+            f"cameras={camera_count}"
+        )
+
+    quotas = {image_id: 1 for image_id in camera_ids}
+    remaining = maximum_samples - camera_count
+    while remaining > 0:
+        active = [
+            image_id
+            for image_id in camera_ids
+            if quotas[image_id] < len(by_camera[image_id])
+        ]
+        if not active:
+            break
+        share = max(1, remaining // len(active))
+        assigned = 0
+        for image_id in active:
+            addition = min(
+                share,
+                len(by_camera[image_id]) - quotas[image_id],
+                remaining - assigned,
+            )
+            quotas[image_id] += int(addition)
+            assigned += int(addition)
+            if assigned >= remaining:
+                break
+        if assigned <= 0:
+            raise RuntimeError(
+                f"{source_name} balanced budget made no progress"
+            )
+        remaining -= assigned
+
+    retained = [
+        sample
+        for image_id in camera_ids
+        for sample in by_camera[image_id][: quotas[image_id]]
+    ]
+    retained_camera_ids = {
+        int(np.asarray(row["tree_image_ids"]).reshape(-1)[0])
+        for row in retained
+    }
+    return retained, {
+        "raw_samples": raw_count,
+        "retained_samples": int(len(retained)),
+        "sampled_views": int(len(retained_camera_ids)),
+        "camera_budget_truncated": True,
+    }
+
+
 def build_foliage_seed(
     evidence_store: Path,
     surface_seed: Path,
@@ -4698,12 +5370,47 @@ def build_foliage_seed(
     maximum_dense_rays_per_view: int = 16_384,
     maximum_dense_rays_total: int | None = None,
     minimum_dense_rays_per_view: int = 0,
+    maximum_bound_rays_per_view: int = 8192,
+    maximum_dynamic_births_per_view: int = 1024,
+    maximum_weak_continuous_dynamic_births_per_view: int | None = None,
+    dynamic_birth_target_source_pixels_per_basis: float | None = None,
     minimum_track_observations: int = 3,
     minimum_track_sequences: int = 2,
     maximum_reprojection_error: float = 2.0,
     skeleton_linearity: float = 1.8,
+    rigid_calibration_ply: Path | None = None,
+    rigid_calibration_resolution_scale: float = 0.125,
     seed: int = 73,
 ) -> dict[str, Any]:
+    if int(maximum_dynamic_births_per_view) < 0:
+        raise ValueError(
+            "maximum_dynamic_births_per_view must be non-negative"
+        )
+    if (
+        maximum_weak_continuous_dynamic_births_per_view is not None
+        and int(maximum_weak_continuous_dynamic_births_per_view) < 0
+    ):
+        raise ValueError(
+            "maximum_weak_continuous_dynamic_births_per_view must be "
+            "non-negative"
+        )
+    if (
+        dynamic_birth_target_source_pixels_per_basis is not None
+        and (
+            not np.isfinite(
+                float(dynamic_birth_target_source_pixels_per_basis)
+            )
+            or float(dynamic_birth_target_source_pixels_per_basis) <= 0
+        )
+    ):
+        raise ValueError(
+            "dynamic_birth_target_source_pixels_per_basis must be finite "
+            "and positive"
+        )
+    if int(maximum_bound_rays_per_view) < 0:
+        raise ValueError(
+            "maximum_bound_rays_per_view must be non-negative"
+        )
     store = load_evidence_store(evidence_store)
     dataset = Path(store["dataset"])
     semantic = json.loads(
@@ -4731,6 +5438,46 @@ def build_foliage_seed(
         _camera_record(image, cameras[image["camera_id"]], masks)
         for image in images.values()
     ]
+    rigid_calibration_depth_maps: dict[int, np.ndarray] = {}
+    rigid_calibration_audit: dict[str, Any] = {
+        "enabled": False,
+        "depth_view_count": 0,
+        "source": "sparse_surface_seed_zbuffer",
+    }
+    if rigid_calibration_ply is not None:
+        rigid_calibration_ply = (
+            Path(rigid_calibration_ply).expanduser().resolve()
+        )
+        if not rigid_calibration_ply.is_file():
+            raise FileNotFoundError(rigid_calibration_ply)
+        from outdoor.rigid_occlusion import (
+            render_protected_depth_maps,
+        )
+
+        rigid_calibration_depth_maps = render_protected_depth_maps(
+            view_records,
+            structural_ply=rigid_calibration_ply,
+            resolution_scale=float(
+                rigid_calibration_resolution_scale
+            ),
+        )
+        rigid_calibration_audit = {
+            "enabled": True,
+            "depth_view_count": int(
+                len(rigid_calibration_depth_maps)
+            ),
+            "source": "trained_native_rigid_2dgs_surface_render",
+            "structural_ply": str(rigid_calibration_ply),
+            "structural_ply_sha256": sha256_file(
+                rigid_calibration_ply
+            ),
+            "resolution_scale": float(
+                rigid_calibration_resolution_scale
+            ),
+            "role": (
+                "dav2_metric_alignment_and_rigid_occlusion_only"
+            ),
+        }
     mast3r_only = store.get("geometry_source") == "mast3r_only"
     if mast3r_only:
         tracks = _mast3r_tree_tracks(
@@ -4800,14 +5547,10 @@ def build_foliage_seed(
         # initialization time and lets long traversals overwhelm the
         # posterior.  Reserve multiple sequence-balanced, spatially diverse
         # views per requested hull camera and fit depth only there.
-        dav2_view_limit = min(
-            len(view_records),
-            max(72, int(selected_view_count) * 2),
-        )
-        dav2_views = sequence_balanced_diverse_views(
-            view_records,
-            limit=dav2_view_limit,
-            minimum_center_distance=0.20,
+        dav2_views, dav2_camera_contract = (
+            _select_dav2_foliage_views(
+                view_records, selected_view_count
+            )
         )
         dav2_foliage, dav2_audit = _dav2_foliage_samples(
             store,
@@ -4818,7 +5561,23 @@ def build_foliage_seed(
             allowed_image_ids={
                 int(view["image_id"]) for view in dav2_views
             },
+            rigid_depth_maps=rigid_calibration_depth_maps,
         )
+        if dav2_camera_contract == "all_fixed_database_cameras":
+            expected_dav2_views = int(len(dav2_views))
+            if int(dav2_audit.get("views", -1)) != expected_dav2_views:
+                raise RuntimeError(
+                    "All-fixed DAV2 contract did not visit every selected "
+                    f"camera: visited={dav2_audit.get('views')}, "
+                    f"expected={expected_dav2_views}"
+                )
+            if int(dav2_audit.get("sampled_views", -1)) != int(
+                dav2_audit.get("accepted_views", -2)
+            ):
+                raise RuntimeError(
+                    "DAV2 sample cap erased all depth observations from an "
+                    "accepted fixed camera"
+                )
         dav2_foliage, dav2_envelope_rejected, _ = (
             _filter_sequence_local_scene_envelope(
                 dav2_foliage, rigid_xyz
@@ -4869,6 +5628,7 @@ def build_foliage_seed(
         chart_foliage = []
         pointmap_foliage = []
         dav2_foliage = []
+        dav2_camera_contract = "not_applicable"
         dav2_audit = {
             "eligible_views": 0,
             "views": 0,
@@ -4940,11 +5700,6 @@ def build_foliage_seed(
             for row in support_by_instance.values()
             for image_id in row
         }
-        observed_views = [
-            view
-            for view in view_records
-            if int(view["image_id"]) in observed_ids
-        ]
         # ``selected_view_count`` is the quality/cost contract for the
         # posterior itself.  The former extra division by two reduced a
         # requested 96-view hull to 48 cameras; after component/depth
@@ -4952,13 +5707,20 @@ def build_foliage_seed(
         # scene there are just 66 cameras with any retained foliage
         # observation, so consume all of them rather than dropping dense
         # DAV2/Chart views before the probabilistic hull is even built.
-        posterior_view_limit = min(
-            len(observed_views), max(24, int(selected_view_count))
+        (
+            posterior_view_pool,
+            posterior_view_limit,
+            posterior_camera_contract,
+        ) = _foliage_posterior_view_pool(
+            view_records,
+            observed_ids,
+            selected_view_count,
         )
-        selected = instance_balanced_diverse_views(
-            observed_views,
+        selected = _select_foliage_posterior_views(
+            posterior_view_pool,
+            posterior_view_limit,
+            posterior_camera_contract,
             support_by_instance=support_by_instance,
-            limit=posterior_view_limit,
             minimum_center_distance=0.20,
         )
         selected_ids = {int(view["image_id"]) for view in selected}
@@ -4980,9 +5742,19 @@ def build_foliage_seed(
             )
         }
     else:
-        selected = greedy_diverse_views(
+        (
+            posterior_view_pool,
+            posterior_view_limit,
+            posterior_camera_contract,
+        ) = _foliage_posterior_view_pool(
             view_records,
-            limit=selected_view_count,
+            {int(view["image_id"]) for view in view_records},
+            selected_view_count,
+        )
+        selected = _select_foliage_posterior_views(
+            posterior_view_pool,
+            posterior_view_limit,
+            posterior_camera_contract,
             minimum_center_distance=0.75,
         )
         selected_instance_support = {}
@@ -4998,7 +5770,17 @@ def build_foliage_seed(
                 f"{target_rgb_path}"
             )
         view["target_rgb_path"] = str(target_rgb_path)
-    rigid_depth = sparse_rigid_depth_maps(selected, rigid_xyz)
+    if rigid_calibration_depth_maps:
+        rigid_depth = {
+            int(view["image_id"]): rigid_calibration_depth_maps[
+                int(view["image_id"])
+            ]
+            for view in selected
+            if int(view["image_id"])
+            in rigid_calibration_depth_maps
+        }
+    else:
+        rigid_depth = sparse_rigid_depth_maps(selected, rigid_xyz)
     hull = build_instance_aware_canopy_volume(
         hull_tracks,
         images,
@@ -5014,6 +5796,16 @@ def build_foliage_seed(
         maximum_dense_rays_per_view=maximum_dense_rays_per_view,
         maximum_dense_rays_total=maximum_dense_rays_total,
         minimum_dense_rays_per_view=minimum_dense_rays_per_view,
+        maximum_bound_rays_per_view=maximum_bound_rays_per_view,
+        maximum_dynamic_births_per_view=(
+            maximum_dynamic_births_per_view
+        ),
+        maximum_weak_continuous_dynamic_births_per_view=(
+            maximum_weak_continuous_dynamic_births_per_view
+        ),
+        dynamic_birth_target_source_pixels_per_basis=(
+            dynamic_birth_target_source_pixels_per_basis
+        ),
         # The hull builder now requires cross-sequence depth hits, coherent
         # local line/cylinder geometry, wood-compatible RGB, zero confirmed
         # free-space contradictions and bounded ray NLL. This is measured
@@ -5029,6 +5821,7 @@ def build_foliage_seed(
     # sequence-local dynamic birth with a unique lineage.  The local hull
     # alignment below assigns physical ownership without promoting it to the
     # canonical localization map.
+    persistent_track_count = len(tracks)
     dense_dynamic_births = list(
         hull.pop("dense_dynamic_births", ())
     )
@@ -5081,6 +5874,7 @@ def build_foliage_seed(
             track_xyz,
             association_radius=max(1.5, 8.0 * float(voxel_size)),
             maximum_component_extent=12.0,
+            persistent_track_count=persistent_track_count,
         )
         shared_hull_instance_count = int(
             len(np.unique(hull["tree_instance_id"]))
@@ -5105,6 +5899,9 @@ def build_foliage_seed(
         hull.pop("dense_hole_proposal_count", 0)
     )
     dense_ray_budget = dict(hull.pop("dense_ray_budget"))
+    candidate_bound_ray_budget = dict(
+        hull.pop("candidate_bound_ray_budget")
+    )
     rigid_depth_view_count = int(hull.pop("rigid_depth_view_count"))
     hull.pop("tree_instance_count")
     ray_evidence = hull.pop("ray_evidence")
@@ -5191,6 +5988,89 @@ def build_foliage_seed(
         merged["scales"][dense_ray] * 1.10
     ).astype(np.float32)
     merged["scale_ceiling"] = scale_ceiling
+    (
+        merged["replacement_group"],
+        replacement_group_audit,
+    ) = _local_replacement_groups(
+        merged["centers"],
+        merged["layer_role"],
+        merged["tree_instance_id"],
+        # A canonical voxel and an observation-local leaf may differ by more
+        # than one 12 cm cell after posterior interpolation, but a replacement
+        # link spanning more than three cells is no longer a local ownership
+        # relation.
+        maximum_center_distance=max(0.30, 3.0 * float(voxel_size)),
+    )
+    # Exact owner RGB is not independent metric-depth evidence, but its tree
+    # mask *is* independent evidence that optical mass exists somewhere on
+    # that calibrated ray.  Keep the spatial geometry-authority value as an
+    # audit diagnostic; do not project optical alpha onto it.  Ray factors,
+    # topology and the training floor use this uncertainty continuously.
+    dynamic = merged["layer_role"] == 2
+    dynamic_ceiling = (
+        evidence_conditioned_dynamic_opacity_ceiling(
+            merged["occupancy_probability"],
+            merged["support_view_count"],
+            merged["unknown_view_count"],
+            merged["ray_depth_nll"],
+            merged["free_space_violation_count"],
+            merged["replacement_group"],
+            maximum_opacity=0.40,
+        )
+        .numpy()
+        .astype(np.float32)
+    )
+    dense_dynamic = dynamic & (
+        merged["initialization_source"] == SOURCE_DENSE_RAY
+    )
+    ownerless_dense_dynamic = dense_dynamic & (
+        merged["replacement_group"] < 0
+    )
+    dynamic_authority_audit = {
+        "contract": (
+            "diagnostic_continuous_depth_reliability_times_local_"
+            "replacement_or_ownerless_occupancy__not_an_alpha_gate"
+        ),
+        "dynamic_count": int(dynamic.sum()),
+        "dense_dynamic_count": int(dense_dynamic.sum()),
+        "ownerless_dense_dynamic_count": int(
+            ownerless_dense_dynamic.sum()
+        ),
+        "initial_opacity_rows_reduced": 0,
+        "dense_ray_depth_reliability_quantiles": (
+            np.quantile(
+                1.0
+                / np.sqrt(
+                    1.0
+                    + merged["ray_depth_nll"][dense_dynamic]
+                ),
+                [0.0, 0.1, 0.5, 0.9, 1.0],
+            ).tolist()
+            if bool(dense_dynamic.any())
+            else []
+        ),
+        "ownerless_dense_geometry_authority_prior_quantiles": (
+            np.quantile(
+                dynamic_ceiling[ownerless_dense_dynamic],
+                [0.0, 0.1, 0.5, 0.9, 1.0],
+            ).tolist()
+            if bool(ownerless_dense_dynamic.any())
+            else []
+        ),
+    }
+    counts["dense_dynamic_initial_opacity_quantiles"] = (
+        np.quantile(
+            merged["opacities"][dense_dynamic, 0],
+            [0.0, 0.5, 0.9, 0.99, 1.0],
+        ).tolist()
+        if bool(dense_dynamic.any())
+        else []
+    )
+    counts["dense_dynamic_optical_mass_contract"] = (
+        "exact_owner_pixel_optical_existence_prior_separate_from_spatial_"
+        "depth_geometry_authority__rgb_can_reduce_alpha__"
+        "no_hard_per_candidate_alpha_gate"
+    )
     merged_instance_extents = []
     for instance_id in np.unique(merged["tree_instance_id"]):
         rows = merged["centers"][
@@ -5220,7 +6100,8 @@ def build_foliage_seed(
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
         "geometry_version": (
-            "unified_evidence_dense_ray_bounded_instances_v7"
+            "unified_evidence_dense_ray_bounded_instances_v11_exact_owner_"
+            "instance_isolated_bandwidth"
         ),
         "audit": {
             "protocol": INITIALIZATION_VERSION,
@@ -5231,6 +6112,18 @@ def build_foliage_seed(
             ),
             "dense_hole_proposal_count": dense_hole_proposal_count,
             "dense_dynamic_birth_count": dense_dynamic_birth_count,
+            "ray_to_dynamic_basis_ratio": float(
+                dense_observation_ray_count
+                / max(dense_dynamic_birth_count, 1)
+            ),
+            "ray_posterior_renderer_basis_decoupled": bool(
+                dense_observation_ray_count
+                > dense_dynamic_birth_count
+            ),
+            "persistent_track_frame_contract": (
+                "persistent_knn_partitioned_by_tree_instance__dense_knn_"
+                "partitioned_by_exact_owner_camera_and_tree_instance"
+            ),
             "maximum_dense_rays_per_view": int(
                 maximum_dense_rays_per_view
             ),
@@ -5242,12 +6135,47 @@ def build_foliage_seed(
             "minimum_dense_rays_per_view": int(
                 minimum_dense_rays_per_view
             ),
+            "maximum_bound_rays_per_view": int(
+                maximum_bound_rays_per_view
+            ),
+            "maximum_dynamic_births_per_view": int(
+                maximum_dynamic_births_per_view
+            ),
+            "maximum_weak_continuous_dynamic_births_per_view": (
+                None
+                if maximum_weak_continuous_dynamic_births_per_view is None
+                else int(
+                    maximum_weak_continuous_dynamic_births_per_view
+                )
+            ),
+            "dynamic_birth_target_source_pixels_per_basis": (
+                None
+                if dynamic_birth_target_source_pixels_per_basis is None
+                else float(
+                    dynamic_birth_target_source_pixels_per_basis
+                )
+            ),
             "dense_ray_budget": dense_ray_budget,
+            "candidate_bound_ray_budget": (
+                candidate_bound_ray_budget
+            ),
             "camera_metadata_storage": camera_metadata_storage,
             "dense_ray_footprint_ceiling": (
                 "1.10x_initial_then_inherited_and_shrunk_by_split"
             ),
-            "dense_ownerless_hit_has_dynamic_consumer": True,
+            "dense_dynamic_basis_contract": (
+                "instance_balanced_half_two_dimensional_lattice_coverage_"
+                "half_spatial_high_frequency_local_rgb_residual_over_"
+                "shared_canonical_crown"
+            ),
+            "dense_ownerless_hit_has_dynamic_consumer": (
+                "not_guaranteed__spatially_stratified_exact_camera_basis_"
+                "plus_runtime_verified_canonical_fallback"
+            ),
+            "dense_ownerless_dynamic_consumer_guaranteed": False,
+            "dense_ownerless_consumer_coverage_audit": (
+                "foliage_ray_runtime_exact_interval_mass"
+            ),
             "dense_dynamic_rgb_source": (
                 "exact_training_target_raster"
                 if dense_dynamic_births
@@ -5279,12 +6207,21 @@ def build_foliage_seed(
             ),
             "instance_alignment": instance_alignment_audit,
             "merged_instance_extent": instance_extent_audit,
+            "local_replacement_groups": replacement_group_audit,
+            "dynamic_geometry_authority": dynamic_authority_audit,
+            "ungrouped_dynamic_visibility": "exact_owner_only",
             "positive_negative_unknown_evidence": True,
             "real_ray_depth_posterior": True,
-            "sparse_rigid_occlusion_zbuffer": True,
+            "sparse_rigid_occlusion_zbuffer": not bool(
+                rigid_calibration_depth_maps
+            ),
+            "trained_rigid_occlusion_zbuffer": bool(
+                rigid_calibration_depth_maps
+            ),
             "inferred_visual_hull_skeleton_used": False,
             "static_skeleton_evidence": (
-                "cross_sequence_depth_rgb_local_line_cylinder_v1"
+                "cross_sequence_min3_observation_depth_rgb__"
+                "same_instance_min3_local_line_cylinder_v2"
             ),
             "historical_trained_ply_used": False,
             "geometry_source": store.get(
@@ -5292,6 +6229,11 @@ def build_foliage_seed(
             ),
             "colmap_points_or_tracks_used": not mast3r_only,
             **counts,
+            "posterior_camera_contract": (
+                posterior_camera_contract
+            ),
+            "dav2_camera_contract": dav2_camera_contract,
+            "rigid_depth_calibration": rigid_calibration_audit,
             "selected_views": [
                 {
                     "image_id": int(view["image_id"]),

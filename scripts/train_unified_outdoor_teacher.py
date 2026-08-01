@@ -38,6 +38,7 @@ from outdoor.directional_sky import (  # noqa: E402
 )
 from outdoor.evidence_store import load_evidence_store  # noqa: E402
 from outdoor.foliage_geometry import (  # noqa: E402
+    evidence_conditioned_dynamic_opacity_ceiling,
     evidence_conditioned_leaf_optical_mass,
 )
 from outdoor.foliage_view_graph import sequence_id  # noqa: E402
@@ -59,9 +60,39 @@ from scene import GaussianModel  # noqa: E402
 from utils.loss_utils import ssim  # noqa: E402
 
 
-PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v32_preserved_handoff_topology_contract"
+PREDECESSOR_PROTOCOL = (
+    "cambridge_native_hybrid_teacher_v35_atomic_volume_replace_split"
 )
+PROTOCOL = (
+    "cambridge_native_hybrid_teacher_v40_projected_optical_footprint"
+)
+COUNTERFACTUAL_TRANSPARENCY_CONTRACT = (
+    "detached_surface_only_relative_rgb_advantage_routes_only_volume_"
+    "optical_depth"
+)
+RAY_EPOCH_BOUNDARY_CONTRACT = (
+    "short_tail_never_wraps_into_next_camera_epoch"
+)
+RAY_EPOCH_CAPACITY_CONTRACT = (
+    "sum_per_camera_ceil_rows_over_batch_lte_scheduled_calls"
+)
+VOLUME_TOPOLOGY_SETTLE_CONTRACT = (
+    "screen_adaptive_until_configured_end__disabled_during_"
+    "canonical_polish_settle"
+)
+CONDITIONED_SETTLE_CONTRACT = (
+    "canonical_polish_disables_topology_not_conditioned_optimization"
+)
+V38_CAUSAL_REPAIR_PREDECESSOR = {
+    "protocol": PREDECESSOR_PROTOCOL,
+    "trainer": "774a5d9beb6a1a6dad71a067108922c93d86a9ecdf9bdd4fb46d6fb836afdc3c",
+    "training_evidence": (
+        "aed7a5d0b63755c43e3b9046423fd00afe4dbb70f85c5509d52359f719ce35e3"
+    ),
+    "iteration": 9_000,
+    "schedule_horizon": 12_000,
+    "volume_densify_until_iteration": 10_000,
+}
 REJECTED_INITIALIZATION_PROTOCOLS = {
     # This protocol persisted every in-front-of-posterior projection as a
     # free-space violation, including invalid and rigidly occluded rays. Its
@@ -116,6 +147,25 @@ BOUNDARY_SUPERVISION_CONTRACT = (
 VOLUME_REALLOCATION_CONTRACT = (
     "role_matched_lineage_safe_retire_then_evidence_adaptive_split"
 )
+VOLUME_TOPOLOGY_MUTATION_CONTRACT = (
+    "single_materialization_retire_and_adaptive_split_then_single_adam_migration"
+)
+DYNAMIC_LIFECYCLE_REPAIR_PREDECESSOR = (
+    "persistent_observation_identity_survives_sampling_windows"
+)
+DYNAMIC_LIFECYCLE_REPAIR_TARGET = (
+    "observation_identity_is_provenance__strong_confirmed_free_"
+    "overrides__weak_conflict_protected_only_by_independent_"
+    "cross_sequence_positive_support"
+)
+RIGID_PATCH_NMS_REPAIR_PREDECESSOR = (
+    "detached_rigid_residual_times_target_edge_local_pool"
+)
+RIGID_PATCH_NMS_REPAIR_TARGET = (
+    "detached_rigid_residual_times_target_edge_spatial_nms_pool"
+)
+CHART_TOPOLOGY_HORIZON_REPAIR_PREDECESSOR = 3_000
+CHART_TOPOLOGY_HORIZON_REPAIR_TARGET = 10_000
 SURFACE_OWNERSHIP_REPAIR_PREDECESSOR = {
     "trainer": "bf58ca503999a4269c7dfd7bbd6c0331f6d19beb085c86ed69148ade320c9304",
     "iteration": 10_000,
@@ -252,6 +302,29 @@ def _validate_initialization_protocol(initialization: dict) -> None:
             "free-space contradiction metadata; rebuild the initialization "
             "with v15 or newer before training"
         )
+
+
+def _trainer_repair_hash_change_is_allowed(
+    changed: set[str], *, enabled: bool
+) -> bool:
+    """Authorize only model-state-compatible Python repair resumes.
+
+    A causal repair can live entirely in the Chart/evidence module while the
+    trainer entrypoint itself stays byte-identical.  Requiring ``trainer`` to
+    change made the explicit repair flag unusable for exactly that case.
+    CUDA, renderer and Gaussian-model changes remain excluded.
+    """
+    return bool(
+        enabled
+        and changed
+        and changed.issubset(
+            {
+                "trainer",
+                "training_evidence",
+                "chart_surface_model",
+            }
+        )
+    )
 
 
 def _validate_initialization_rgb_source(
@@ -529,14 +602,94 @@ def _parse_args():
         ),
     )
     parser.add_argument("--chart-anchor-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--chart-atlas-lr",
+        type=float,
+        default=2e-3,
+        help=(
+            "Learning rate of the bounded coarse/fine Chart inverse-depth "
+            "residual. The base calibrated depth and camera rays are fixed."
+        ),
+    )
+    parser.add_argument(
+        "--chart-atlas-regularization-weight",
+        type=float,
+        default=2e-3,
+    )
+    parser.add_argument(
+        "--chart-quadtree-growth-fraction",
+        type=float,
+        default=0.30,
+        help=(
+            "Fraction of each surface net-growth budget reserved for "
+            "error/radius-driven UV four-child replace-and-retire."
+        ),
+    )
+    parser.add_argument(
+        "--chart-quadtree-maximum-level",
+        type=int,
+        default=3,
+        help=(
+            "Maximum UV subdivision depth. The 128x72 fine atlas needs at "
+            "most three binary levels to reach a 640x360 RGB target."
+        ),
+    )
     parser.add_argument("--ownership-weight", type=float, default=0.08)
     parser.add_argument(
         "--conditioned-ownership-weight", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--counterfactual-transparency-weight",
+        type=float,
+        default=0.06,
+        help=(
+            "Weight of the detached surface-only RGB counterfactual. It "
+            "reduces volume optical depth only where the existing rigid "
+            "surface explains the target better than the jointly rendered "
+            "volume, including facade pixels inside a coarse canopy mask."
+        ),
+    )
+    parser.add_argument(
+        "--counterfactual-transparency-margin",
+        type=float,
+        default=0.02,
+        help=(
+            "RGB-L1 advantage required before the smooth counterfactual "
+            "responsibility strongly favors surface transparency."
+        ),
+    )
+    parser.add_argument(
+        "--counterfactual-transparency-temperature",
+        type=float,
+        default=0.015,
+        help=(
+            "Temperature of the continuous surface-versus-mixed "
+            "responsibility; this is never used as a hard ownership gate."
+        ),
+    )
+    parser.add_argument(
+        "--conditioned-counterfactual-every",
+        type=int,
+        default=4,
+        help=(
+            "Evaluate the extra conditioned surface-only counterfactual at "
+            "this cadence. The canonical pass reuses its existing rigid "
+            "render every iteration."
+        ),
     )
     parser.add_argument("--occupancy-weight", type=float, default=0.06)
     parser.add_argument("--dynamic-weight", type=float, default=0.65)
     parser.add_argument("--appearance-weight", type=float, default=0.06)
     parser.add_argument("--high-frequency-weight", type=float, default=0.08)
+    parser.add_argument(
+        "--rigid-residual-patch-weight",
+        type=float,
+        default=0.08,
+        help=(
+            "Weight of the error/edge-ranked local rigid patch pool used for "
+            "facade, window, railing and tree/building-boundary repair."
+        ),
+    )
     parser.add_argument(
         "--maximum-surface-gaussians",
         type=int,
@@ -629,7 +782,7 @@ def _parse_args():
             "Smoothstep ramp from zero to the configured per-event volume "
             "growth budget. This lets ray-hit optical mass form before "
             "screen-bandwidth refinement starts. The handoff profile "
-            "defaults to 8% of the fixed phase horizon; other profiles "
+            "defaults to 8%% of the fixed phase horizon; other profiles "
             "default to zero."
         ),
     )
@@ -684,7 +837,16 @@ def _parse_args():
         type=int,
         default=96,
     )
-    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=3000,
+        help=(
+            "Rolling checkpoint cadence. The full mixed state is about "
+            "1.5 GB at the production budget, so the default aligns with "
+            "the retained 3k quality milestones."
+        ),
+    )
     parser.add_argument(
         "--retain-checkpoint-iterations",
         type=int,
@@ -713,6 +875,18 @@ def _parse_args():
             "Allow a checkpoint to cross a trainer-only causal repair while "
             "still requiring identical evidence, schedules, budgets, model "
             "implementations, and CUDA kernels."
+        ),
+    )
+    parser.add_argument(
+        "--allow-conditioned-schedule-repair-resume",
+        action="store_true",
+        help=(
+            "Allow only the conditioned-camera schedule to migrate from the "
+            "legacy in-place evidence replacement to the coverage-preserving "
+            "weighted epoch. Evidence, model/CUDA implementations, all other "
+            "schedules, optimizer state and training geometry remain bound "
+            "to the resumed checkpoint. Use together with "
+            "--allow-trainer-repair-resume."
         ),
     )
     parser.add_argument(
@@ -753,6 +927,17 @@ def _parse_args():
             "event-bounded evidence allocator may reduce optical mass."
         ),
     )
+    parser.add_argument(
+        "--allow-v38-causal-repair-resume",
+        action="store_true",
+        help=(
+            "Resume only the exact v35 9k/12k-horizon checkpoint into the "
+            "resume-aware exact per-camera ray epoch, counterfactual-"
+            "transparency and settled volume-topology repair. Cameras, "
+            "evidence, model/CUDA state and all sampling schedules remain "
+            "identical. Use together with --allow-trainer-repair-resume."
+        ),
+    )
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     profile = TRAINING_PROFILES[args.training_profile]
@@ -764,6 +949,34 @@ def _parse_args():
         args.phase_schedule_horizon = int(profile["iterations"])
     if args.phase_schedule_horizon <= 0:
         parser.error("--phase-schedule-horizon must be positive")
+    if (
+        args.allow_conditioned_schedule_repair_resume
+        and (
+            args.resume is None
+            or not args.allow_trainer_repair_resume
+        )
+    ):
+        parser.error(
+            "--allow-conditioned-schedule-repair-resume requires both "
+            "--resume and --allow-trainer-repair-resume"
+        )
+    if args.allow_v38_causal_repair_resume and (
+        args.resume is None or not args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "--allow-v38-causal-repair-resume requires both --resume and "
+            "--allow-trainer-repair-resume"
+        )
+    if args.counterfactual_transparency_weight < 0:
+        parser.error("--counterfactual-transparency-weight cannot be negative")
+    if args.counterfactual_transparency_margin < 0:
+        parser.error("--counterfactual-transparency-margin cannot be negative")
+    if args.counterfactual_transparency_temperature <= 0:
+        parser.error(
+            "--counterfactual-transparency-temperature must be positive"
+        )
+    if args.conditioned_counterfactual_every <= 0:
+        parser.error("--conditioned-counterfactual-every must be positive")
     if args.maximum_rigid_completion_seeds < 0:
         parser.error("--maximum-rigid-completion-seeds cannot be negative")
     if args.iterations > args.phase_schedule_horizon:
@@ -787,6 +1000,20 @@ def _parse_args():
         )
     if args.maximum_surface_growth_multiplier < 1.0:
         parser.error("--maximum-surface-growth-multiplier must be >= 1")
+    if args.chart_atlas_lr <= 0:
+        parser.error("--chart-atlas-lr must be positive")
+    if args.chart_atlas_regularization_weight < 0:
+        parser.error(
+            "--chart-atlas-regularization-weight cannot be negative"
+        )
+    if not 0 <= args.chart_quadtree_growth_fraction <= 1:
+        parser.error(
+            "--chart-quadtree-growth-fraction must lie in [0, 1]"
+        )
+    if args.chart_quadtree_maximum_level < 0:
+        parser.error("--chart-quadtree-maximum-level cannot be negative")
+    if args.rigid_residual_patch_weight < 0:
+        parser.error("--rigid-residual-patch-weight cannot be negative")
     if args.maximum_volume_growth_multiplier < 1.0:
         parser.error("--maximum-volume-growth-multiplier must be >= 1")
     if args.maximum_surface_scale <= 0:
@@ -1071,6 +1298,20 @@ def _dynamic_enabled(
     )
 
 
+def _conditioned_branch_active(
+    step: int, schedule_horizon: int, training_profile: str
+) -> bool:
+    """Keep conditioned leaves trainable while final topology settles.
+
+    ``canonical_polish`` is a topology-stable convergence phase, not a
+    request to freeze the conditioned image-formation branch.  Freezing both
+    at once left dynamic children created by the final replace/split event
+    with only a few dozen owner-view updates while canonical volume continued
+    to compensate for them during the remaining polish window.
+    """
+    return _dynamic_enabled(step, schedule_horizon, training_profile)
+
+
 def _surface_topology_active(step: int, args) -> bool:
     """Return the explicit surface-topology schedule, independent of phase."""
     if getattr(
@@ -1081,6 +1322,45 @@ def _surface_topology_active(step: int, args) -> bool:
     return (
         iteration >= max(int(args.densify_from_iter), 1)
         and iteration <= int(args.densify_until_iter)
+    )
+
+
+def _chart_topology_active(step: int, args) -> bool:
+    """Apply the mature handoff policy to every owner of surface geometry.
+
+    Chart rows are rendered from the external inverse-depth atlas, so freezing
+    only ``surface._xyz`` while continuing to update/split the atlas does not
+    preserve the rigid handoff.  In particular, the mixed-stage ownership
+    loss can otherwise move facade geometry even though the runtime audit
+    reports ``geometry_trainable=False``.  Atlas optimization and UV topology
+    therefore remain active only for the explicit ``joint`` policy.
+    """
+    iteration = int(step) + 1
+    return (
+        getattr(
+            args, "mature_handoff_surface_policy", "joint"
+        )
+        == "joint"
+        and
+        iteration >= max(int(args.densify_from_iter), 1)
+        and iteration <= int(args.densify_until_iter)
+        and float(args.chart_quadtree_growth_fraction) > 0
+    )
+
+
+def _volume_topology_active(step: int, args, phase: str) -> bool:
+    """Keep the final polish phase topology-stable.
+
+    A split changes both support and optimizer state.  Creating children in
+    the last few updates leaves no time for their opacity, covariance and SH
+    coefficients to settle, which turns high-frequency canopy evidence into
+    displaced speckle.  ``volume_densify_until_iteration`` remains the outer
+    absolute horizon, while the named polish phase is an explicit
+    convergence stage rather than another topology stage.
+    """
+    return (
+        (int(step) + 1) <= int(args.volume_densify_until_iteration)
+        and str(phase) != "canonical_polish"
     )
 
 
@@ -1166,6 +1446,92 @@ def _dynamic_opacity_floor(foliage) -> torch.Tensor:
     )
     legacy_floor = torch.full_like(evidence_floor, 0.015)
     return torch.where(dense_dynamic, evidence_floor, legacy_floor)
+
+
+def _dynamic_opacity_ceiling(
+    foliage, maximum_opacity: float
+) -> torch.Tensor:
+    """Return continuous spatial alpha authority for uncertain depth births."""
+    evidence_ceiling = evidence_conditioned_dynamic_opacity_ceiling(
+        foliage.occupancy_probability,
+        foliage.support_view_count,
+        foliage.unknown_view_count,
+        foliage.ray_depth_nll,
+        foliage.free_space_violation_count,
+        foliage.replacement_group,
+        maximum_opacity=maximum_opacity,
+    )
+    uncertain_depth_birth = foliage.dynamic_leaf_mask & (
+        (foliage.initialization_source == 3)
+        | (foliage.initialization_source == 4)
+    )
+    global_ceiling = torch.full_like(
+        evidence_ceiling, float(maximum_opacity)
+    )
+    return torch.where(
+        uncertain_depth_birth, evidence_ceiling, global_ceiling
+    )
+
+
+def _volume_topology_authority(foliage) -> torch.Tensor:
+    """Return continuous geometry authority for adaptive volume bandwidth.
+
+    Visibility and a non-zero image gradient establish that a primitive needs
+    more screen-space bandwidth; they do not establish that its uncertain 3D
+    location deserves the same number of children as a multi-view lineage.
+    Keep every hypothesis eligible, but weight its topology demand by the
+    stored depth posterior. An ungrouped dynamic birth has no local
+    replace-and-retire mass denominator, so it additionally pays a continuous
+    occupancy factor. Positive floors deliberately avoid turning this
+    posterior into another accept/reject gate.
+    """
+    depth_authority = torch.rsqrt(
+        1.0 + foliage.ray_depth_nll.clamp_min(0)
+    ).clamp(0.05, 1.0)
+    occupancy_authority = (
+        0.05
+        + 0.95 * foliage.occupancy_probability.clamp(0.0, 1.0)
+    )
+    local_authority = torch.where(
+        foliage.dynamic_leaf_mask & (foliage.replacement_group < 0),
+        occupancy_authority,
+        torch.ones_like(depth_authority),
+    )
+    return (depth_authority * local_authority).clamp(0.0025, 1.0)
+
+
+def _dense_exact_ray_bandwidth_mask(foliage) -> torch.Tensor:
+    """Identify sequence-local renderer bases with one calibrated owner.
+
+    These rows are not independent metric geometry.  They are samples of an
+    already-established optical ray posterior and may therefore gain image
+    bandwidth without claiming stronger depth evidence.
+    """
+    observation_count = (foliage.observation_camera_ids >= 0).sum(dim=1)
+    return (
+        foliage.dynamic_leaf_mask
+        & (foliage.initialization_source == 4)
+        & (observation_count == 1)
+    )
+
+
+def _volume_split_authority(foliage) -> torch.Tensor:
+    """Separate 3D geometry authority from exact-ray optical subdivision.
+
+    A weak depth posterior must limit creation of new 3D occupancy.  It must
+    not suppress subdivision of a broad exact-owner EWA footprint in the
+    calibrated image plane: that mutation preserves depth and covariance and
+    only increases deployable RGB bandwidth.  Visibility, non-zero owner
+    gradient and projected radius remain mandatory eligibility evidence in
+    ``_adapt_volume``.
+    """
+    geometry_authority = _volume_topology_authority(foliage)
+    exact_ray_bandwidth = _dense_exact_ray_bandwidth_mask(foliage)
+    return torch.where(
+        exact_ray_bandwidth,
+        torch.ones_like(geometry_authority),
+        geometry_authority,
+    )
 
 
 @torch.no_grad()
@@ -1371,7 +1737,7 @@ def _dynamic_observation_factor(
     ).norm(dim=1)
     observation_depth_sigma = foliage.position_covariance[
         primitive_indices
-    ].diagonal(dim1=-2, dim2=-1).sum(dim=1).sqrt().clamp(0.03, 0.30)
+    ].diagonal(dim1=-2, dim2=-1).sum(dim=1).sqrt().clamp(0.03, 3.00)
     depth_error = (
         depth[valid] - target_depth[valid]
     ) / observation_depth_sigma
@@ -1463,7 +1829,7 @@ def _dynamic_observation_factor(
     # there is no global hard confidence gate.
     observation_reliability = (
         0.15 / (observation_depth_sigma + 0.15)
-    ).clamp(0.20, 1.0)
+    ).clamp(0.02, 1.0)
     lineage_reliability = torch.zeros_like(maxima)
     lineage_reliability.scatter_reduce_(
         0,
@@ -1472,7 +1838,7 @@ def _dynamic_observation_factor(
         reduce="amax",
         include_self=False,
     )
-    lineage_reliability = lineage_reliability.clamp(0.20, 1.0)
+    lineage_reliability = lineage_reliability.clamp(0.02, 1.0)
     hit_loss = (
         -torch.log(hit_alpha + 1e-4) * lineage_reliability
     ).sum() / lineage_reliability.sum().clamp_min(1)
@@ -1566,42 +1932,233 @@ def _balanced_evidence_fraction(
     return float(np.clip(fraction, 0.15, 0.65))
 
 
+def _complete_evidence_epoch_batch_size(
+    configured_batch: int,
+    effective_rows: int,
+    schedule_horizon: int,
+    factor_every: int,
+    *,
+    margin: float = 1.05,
+    per_camera_rows: tuple[int, ...] | list[int] | None = None,
+    available_factor_calls: int | None = None,
+) -> tuple[int, int, int]:
+    """Return a prefix-stable ray batch capable of one complete epoch.
+
+    Ray evidence is consumed by independent per-camera samplers.  Therefore
+    aggregate capacity ``batch * calls >= rows`` is necessary but not
+    sufficient: every camera tail consumes a separate factor call.  When the
+    immutable per-camera table sizes are available, solve the exact discrete
+    contract ``sum(ceil(camera_rows / batch)) <= calls`` by binary search.
+    """
+    if (
+        int(configured_batch) <= 0
+        or int(effective_rows) < 0
+        or int(schedule_horizon) <= 0
+        or int(factor_every) <= 0
+        or float(margin) < 1.0
+    ):
+        raise ValueError("Invalid foliage ray epoch capacity contract")
+    factor_calls = (
+        int(available_factor_calls)
+        if available_factor_calls is not None
+        else int(schedule_horizon) // int(factor_every)
+    )
+    if factor_calls <= 0:
+        raise ValueError("Foliage ray epoch has no available factor calls")
+    minimum = int(
+        np.ceil(float(margin) * int(effective_rows) / factor_calls)
+    )
+    if per_camera_rows is None:
+        return max(int(configured_batch), minimum), minimum, factor_calls
+
+    camera_rows = tuple(int(count) for count in per_camera_rows)
+    if any(count < 0 for count in camera_rows):
+        raise ValueError("Per-camera foliage ray counts cannot be negative")
+    if sum(camera_rows) != int(effective_rows):
+        raise ValueError(
+            "Per-camera foliage ray counts do not sum to effective_rows"
+        )
+    nonempty = tuple(count for count in camera_rows if count > 0)
+    if not nonempty:
+        return max(int(configured_batch), minimum), 0, factor_calls
+    if len(nonempty) > factor_calls:
+        raise ValueError(
+            "Scheduled foliage ray factor calls cannot visit every camera"
+        )
+
+    def required_calls(batch: int) -> int:
+        return sum(
+            (count + int(batch) - 1) // int(batch)
+            for count in nonempty
+        )
+
+    lower = max(
+        1,
+        (int(effective_rows) + factor_calls - 1) // factor_calls,
+    )
+    upper = max(nonempty)
+    while lower < upper:
+        candidate = (lower + upper) // 2
+        if required_calls(candidate) <= factor_calls:
+            upper = candidate
+        else:
+            lower = candidate + 1
+    exact_minimum = lower
+    return (
+        max(int(configured_batch), minimum, exact_minimum),
+        exact_minimum,
+        factor_calls,
+    )
+
+
 def _evidence_biased_schedule(
     rgb_schedule: np.ndarray,
     evidence_indices: list[int],
     *,
     fraction: float,
     seed: int,
+    active_mask: np.ndarray | None = None,
+    minimum_full_scene_visits: int = 3,
 ) -> tuple[np.ndarray, dict[str, int | float]]:
-    """Mix full-scene RGB views with an evenly spaced evidence-view cycle.
+    """Mix full-scene RGB views with a coverage-preserving evidence cycle.
 
     Volume statistics are reset at every adaptation event. Under a 1,487-view
     uniform schedule, most exact foliage cameras were never visited inside a
     200-step window, so their observation gradients could not make the split
     candidate set. The conditioned branch gets its own schedule while the
     canonical branch retains the unchanged full-scene epoch.
+
+    Evidence oversampling must not erase the only conditioned RGB visits of a
+    non-evidence camera.  That happened when 65% of a full-scene epoch was
+    replaced in-place: after 9k steps 63 StMarys database views had never
+    trained conditioned appearance, including view 00408.  Reserve up to
+    ``minimum_full_scene_visits`` occurrences of every camera inside the
+    interval where the conditioned branch is actually active, then distribute
+    the requested evidence steps across the remaining positions.  The
+    evidence fraction is therefore an upper bound when the schedule is too
+    short to satisfy both contracts.
     """
     rgb_schedule = np.asarray(rgb_schedule, dtype=np.int64)
     result = rgb_schedule.copy()
     fraction = float(np.clip(fraction, 0.0, 1.0))
     evidence_indices = sorted(set(map(int, evidence_indices)))
-    if not evidence_indices or fraction <= 0.0 or not len(result):
+    minimum_full_scene_visits = max(int(minimum_full_scene_visits), 0)
+    if active_mask is None:
+        active = np.ones(len(result), dtype=bool)
+    else:
+        active = np.asarray(active_mask, dtype=bool).reshape(-1)
+        if len(active) != len(result):
+            raise ValueError(
+                "Conditioned active mask must match the RGB schedule"
+            )
+    active_positions = np.flatnonzero(active)
+    active_view_ids = np.unique(rgb_schedule)
+    if len(active_positions) and len(active_view_ids):
+        # A resumed active suffix can cut through the beginning and end of
+        # two different RGB epochs. Reusing that clipped subsequence leaves a
+        # few cameras with only two visits even when three complete visits fit
+        # mathematically. Build a fresh full-scene conditioned epoch only
+        # inside the active positions; the canonical RGB schedule itself stays
+        # byte-identical and is independently checked on resume.
+        result[active_positions] = _cycle_schedule(
+            active_view_ids.tolist(),
+            len(active_positions),
+            seed + 104_729,
+        )
+    protected = np.zeros(len(result), dtype=bool)
+    protected_per_view = min(
+        minimum_full_scene_visits,
+        (
+            len(active_positions) // max(len(active_view_ids), 1)
+            if len(active_positions)
+            else 0
+        ),
+    )
+    if protected_per_view > 0:
+        # Do not protect the first K occurrences of every view.  That packs
+        # all guaranteed full-scene visits into the front of the conditioned
+        # interval and delays the evidence stream by K complete camera
+        # epochs (4.2k steps for StMarys).  Canonical RGB already keeps its
+        # independent full-scene epoch; conditioned sampling needs exact
+        # owner evidence from the beginning while retaining a hard final
+        # coverage guarantee.
+        #
+        # Spread exactly K*V protected slots over the complete active
+        # interval, then fill them with K independently shuffled full-scene
+        # cycles.  This guarantees K visits for every camera and makes both
+        # protected RGB and evidence steps prefix-stable instead of running
+        # them as two consecutive phases.
+        protected_steps = protected_per_view * len(active_view_ids)
+        cumulative = np.floor(
+            np.arange(1, len(active_positions) + 1, dtype=np.float64)
+            * protected_steps
+            / max(len(active_positions), 1)
+        )
+        previous = np.concatenate(
+            [np.zeros(1, dtype=np.float64), cumulative[:-1]]
+        )
+        protected_local = cumulative > previous
+        protected_positions = active_positions[protected_local]
+        if len(protected_positions) != protected_steps:
+            raise RuntimeError(
+                "Coverage scheduler failed to allocate exact protected slots"
+            )
+        protected[protected_positions] = True
+        result[protected_positions] = _cycle_schedule(
+            active_view_ids.tolist(),
+            protected_steps,
+            seed + 209_759,
+        )
+    replaceable = active & ~protected
+    replaceable_positions = np.flatnonzero(replaceable)
+    requested_evidence_steps = int(
+        np.floor(len(active_positions) * fraction)
+    )
+    evidence_steps = min(
+        requested_evidence_steps, len(replaceable_positions)
+    )
+    base_audit = {
+        "active_steps": int(len(active_positions)),
+        "active_view_count": int(len(active_view_ids)),
+        "minimum_full_scene_visits": int(protected_per_view),
+        "protected_full_scene_steps": int(protected.sum()),
+        "protected_placement": "uniform_interleaved_complete_epochs",
+        "replaceable_steps": int(len(replaceable_positions)),
+        "requested_evidence_steps": int(requested_evidence_steps),
+        "coverage_preserving": True,
+    }
+    if (
+        not evidence_indices
+        or fraction <= 0.0
+        or not len(result)
+        or evidence_steps <= 0
+    ):
         return result, {
             "evidence_view_count": len(evidence_indices),
             "evidence_steps": 0,
             "rgb_steps": int(len(result)),
             "requested_fraction": fraction,
             "realized_fraction": 0.0,
+            **base_audit,
         }
-    # Error-diffusion placement gives every prefix approximately the requested
-    # ratio instead of clustering evidence renders at the beginning/end.
+    # Error-diffusion placement over the replaceable positions keeps evidence
+    # renders spread across the complete active interval. Protected visits
+    # stay in their original full-scene epoch order.
     cumulative = np.floor(
-        np.arange(1, len(result) + 1, dtype=np.float64) * fraction
+        np.arange(
+            1, len(replaceable_positions) + 1, dtype=np.float64
+        )
+        * evidence_steps
+        / max(len(replaceable_positions), 1)
     )
     previous = np.concatenate(
         [np.zeros(1, dtype=np.float64), cumulative[:-1]]
     )
-    choose = cumulative > previous
+    choose_replaceable = cumulative > previous
+    choose = np.zeros(len(result), dtype=bool)
+    choose[
+        replaceable_positions[choose_replaceable]
+    ] = True
     evidence_steps = int(choose.sum())
     evidence_schedule = _cycle_schedule(
         evidence_indices, evidence_steps, seed
@@ -1612,7 +2169,88 @@ def _evidence_biased_schedule(
         "evidence_steps": evidence_steps,
         "rgb_steps": int(len(result) - evidence_steps),
         "requested_fraction": fraction,
-        "realized_fraction": evidence_steps / max(len(result), 1),
+        "realized_fraction": (
+            evidence_steps / max(len(active_positions), 1)
+        ),
+        **base_audit,
+    }
+
+
+def _resume_conditioned_visit_counts(
+    state: dict,
+    view_count: int,
+) -> tuple[np.ndarray, dict]:
+    """Restore the visits that really reached the conditioned optimizer.
+
+    A schedule-repair resume deliberately replaces only the *future*
+    conditioned camera schedule.  Recounting the repaired schedule from step
+    zero would therefore invent visits that never occurred before the resume
+    boundary.  New checkpoints persist an explicit runtime ledger; legacy
+    checkpoints are migrated exactly once from their own saved schedule and
+    phase contract.
+    """
+    view_count = max(int(view_count), 0)
+    explicit = state.get("conditioned_visit_counts")
+    if explicit is not None:
+        if torch.is_tensor(explicit):
+            explicit = explicit.detach().cpu().numpy()
+        counts = np.asarray(explicit)
+        if (
+            counts.ndim != 1
+            or len(counts) != view_count
+            or not np.issubdtype(counts.dtype, np.integer)
+            or bool((counts < 0).any())
+        ):
+            raise RuntimeError(
+                "Resume conditioned visit ledger is invalid"
+            )
+        return counts.astype(np.int64, copy=True), {
+            "source": "explicit_runtime_ledger",
+            "carried_conditioned_steps": int(counts.sum()),
+        }
+
+    schedule = state.get("schedules", {}).get("conditioned")
+    profile = state.get(
+        "training_profile",
+        state.get("training_contract", {}).get("training_profile"),
+    )
+    horizon = int(
+        state.get(
+            "schedule_horizon",
+            state.get("training_contract", {}).get(
+                "schedule_horizon", 0
+            ),
+        )
+    )
+    stop = int(state.get("iteration", 0))
+    if schedule is None or profile not in TRAINING_PROFILES or horizon <= 0:
+        raise RuntimeError(
+            "Resume checkpoint cannot reconstruct conditioned visits"
+        )
+    schedule = np.asarray(schedule, dtype=np.int64).reshape(-1)
+    stop = min(max(stop, 0), len(schedule), horizon)
+    active_steps = np.asarray(
+        [
+            step
+            for step in range(stop)
+            if _dynamic_enabled(step, horizon, str(profile))
+            and _phase(step, horizon, str(profile))
+            != "canonical_polish"
+        ],
+        dtype=np.int64,
+    )
+    active = schedule[active_steps] if len(active_steps) else schedule[:0]
+    if active.size and (
+        int(active.min()) < 0 or int(active.max()) >= view_count
+    ):
+        raise RuntimeError(
+            "Resume conditioned schedule contains an invalid camera"
+        )
+    counts = np.bincount(active, minlength=view_count)[:view_count]
+    return counts.astype(np.int64, copy=False), {
+        "source": "legacy_saved_schedule_exact_migration",
+        "carried_conditioned_steps": int(active.size),
+        "resume_iteration": stop,
     }
 
 
@@ -1636,8 +2274,10 @@ def _resume_training_contract_differences(
     current: dict,
     *,
     allow_trainer_repair_migration: bool = False,
+    allow_conditioned_schedule_repair_migration: bool = False,
     allow_volume_capacity_repair_migration: bool = False,
     allow_surface_ownership_repair_migration: bool = False,
+    allow_v38_causal_repair_migration: bool = False,
 ) -> set[str]:
     """Compare optimization identity without treating an RGB cache as K.
 
@@ -1660,6 +2300,80 @@ def _resume_training_contract_differences(
         ):
             if key not in saved and key in current:
                 saved[key] = current[key]
+        if (
+            saved.get("dynamic_lifecycle_contract")
+            == DYNAMIC_LIFECYCLE_REPAIR_PREDECESSOR
+            and current.get("dynamic_lifecycle_contract")
+            == DYNAMIC_LIFECYCLE_REPAIR_TARGET
+        ):
+            saved["dynamic_lifecycle_contract"] = (
+                DYNAMIC_LIFECYCLE_REPAIR_TARGET
+            )
+        saved_patch = saved.get("rigid_residual_patch")
+        current_patch = current.get("rigid_residual_patch")
+        if isinstance(saved_patch, dict) and isinstance(
+            current_patch, dict
+        ):
+            saved_patch_without_selection = {
+                key: value
+                for key, value in saved_patch.items()
+                if key != "selection"
+            }
+            current_patch_without_selection = {
+                key: value
+                for key, value in current_patch.items()
+                if key != "selection"
+            }
+            if (
+                saved_patch.get("selection")
+                == RIGID_PATCH_NMS_REPAIR_PREDECESSOR
+                and current_patch.get("selection")
+                == RIGID_PATCH_NMS_REPAIR_TARGET
+                and saved_patch_without_selection
+                == current_patch_without_selection
+            ):
+                saved["rigid_residual_patch"] = current_patch
+        # v21 explicitly extended evidence-driven volume topology to 10k but
+        # accidentally left the continuous Chart UV quadtree on the generic
+        # 3k default. Permit only this exact horizon repair; camera/evidence,
+        # optimizer and phase schedules remain identical.
+        if (
+            saved.get("densify_until_iter")
+            == CHART_TOPOLOGY_HORIZON_REPAIR_PREDECESSOR
+            and current.get("densify_until_iter")
+            == CHART_TOPOLOGY_HORIZON_REPAIR_TARGET
+            and saved.get("volume_densify_until_iteration")
+            == CHART_TOPOLOGY_HORIZON_REPAIR_TARGET
+            and current.get("volume_densify_until_iteration")
+            == CHART_TOPOLOGY_HORIZON_REPAIR_TARGET
+        ):
+            saved["densify_until_iter"] = (
+                CHART_TOPOLOGY_HORIZON_REPAIR_TARGET
+            )
+    if allow_conditioned_schedule_repair_migration:
+        saved = dict(saved)
+        saved_sampling = saved.get("conditioned_sampling", {})
+        current_sampling = current.get("conditioned_sampling", {})
+        if not (
+            isinstance(saved_sampling, dict)
+            and isinstance(current_sampling, dict)
+            and not bool(saved_sampling.get("coverage_preserving", False))
+            and bool(current_sampling.get("coverage_preserving", False))
+        ):
+            raise RuntimeError(
+                "Conditioned schedule repair requires a legacy replacing "
+                "schedule and a coverage-preserving target"
+            )
+        # The digest changes only because the conditioned camera sequence is
+        # repaired. ``schedule_hash`` below remains the stronger full-array
+        # check; RGB, geometry and topology schedules are compared there
+        # before this optimization-contract migration is accepted.
+        saved["sampling_schedule_sha256"] = current[
+            "sampling_schedule_sha256"
+        ]
+        saved["conditioned_sampling"] = current[
+            "conditioned_sampling"
+        ]
     if allow_volume_capacity_repair_migration:
         saved = dict(saved)
         expected_old = {
@@ -1725,6 +2439,176 @@ def _resume_training_contract_differences(
                     f"{key}: {current.get(key)} != {value}"
                 )
             saved[key] = value
+    if allow_v38_causal_repair_migration:
+        saved = dict(saved)
+        if (
+            saved.get("schedule_horizon") != 12_000
+            or current.get("schedule_horizon") != 12_000
+            or saved.get("volume_densify_until_iteration") != 10_000
+            or current.get("volume_densify_until_iteration") != 12_000
+        ):
+            raise RuntimeError(
+                "v38 migration requires an unchanged 12k schedule horizon "
+                "and only the audited 10k->12k volume topology extension"
+            )
+        expected_counterfactual = {
+            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+            "weight": 0.06,
+            "margin": 0.02,
+            "temperature": 0.015,
+            "conditioned_every": 4,
+            "gradient_owner": "volume_opacity_only",
+            "responsibility_gradient": "detached",
+        }
+        if current.get("counterfactual_transparency") != (
+            expected_counterfactual
+        ):
+            raise RuntimeError(
+                "v38 counterfactual transparency parameters differ from "
+                "the audited causal-repair target"
+            )
+        if "counterfactual_transparency" in saved:
+            raise RuntimeError(
+                "v38 migration predecessor unexpectedly already contains "
+                "the counterfactual transparency contract"
+            )
+        saved["counterfactual_transparency"] = expected_counterfactual
+        saved["volume_densify_until_iteration"] = 12_000
+        saved_ray = dict(saved.get("ray_evidence_epoch_capacity", {}))
+        current_ray = current.get("ray_evidence_epoch_capacity", {})
+        expected_saved_ray_keys = {
+            "scheduled_factor_calls",
+            "effective_row_count",
+            "minimum_batch_with_five_percent_margin",
+            "complete_epoch_capacity",
+        }
+        if (
+            set(saved_ray) != expected_saved_ray_keys
+            or not bool(saved_ray.get("complete_epoch_capacity", False))
+            or saved_ray.get("scheduled_factor_calls")
+            != current_ray.get("scheduled_factor_calls")
+            or saved_ray.get("effective_row_count")
+            != current_ray.get("full_effective_row_count")
+            or saved_ray.get("minimum_batch_with_five_percent_margin")
+            != current_ray.get(
+                "clean_epoch_aggregate_minimum_batch_with_five_percent_margin"
+            )
+            or saved.get("ray_posterior_maximum_rays")
+            != saved_ray.get("minimum_batch_with_five_percent_margin")
+        ):
+            raise RuntimeError(
+                "v38 predecessor ray epoch is not the exact audited "
+                "aggregate-capacity contract"
+            )
+        expected_current_ray_keys = {
+            "batch_boundary_contract",
+            "capacity_contract",
+            "capacity_scope",
+            "scheduled_factor_calls",
+            "prior_factor_calls",
+            "available_factor_calls",
+            "camera_table_count",
+            "full_effective_row_count",
+            "remaining_unvisited_row_count",
+            "clean_epoch_aggregate_minimum_batch_with_five_percent_margin",
+            "clean_epoch_minimum_batch_for_complete_per_camera_epoch",
+            "clean_epoch_effective_batch",
+            "runtime_aggregate_minimum_batch_with_five_percent_margin",
+            "minimum_batch_for_runtime_completion",
+            "required_factor_calls",
+            "unused_factor_calls",
+            "complete_epoch_capacity",
+        }
+        current_batch = int(current.get("ray_posterior_maximum_rays", -1))
+        scheduled_calls = int(
+            current_ray.get("scheduled_factor_calls", -1)
+        )
+        prior_calls = int(current_ray.get("prior_factor_calls", -1))
+        available_calls = int(
+            current_ray.get("available_factor_calls", -1)
+        )
+        required_calls = int(current_ray.get("required_factor_calls", -1))
+        exact_minimum = int(
+            current_ray.get(
+                "minimum_batch_for_runtime_completion", -1
+            )
+        )
+        aggregate_minimum = int(
+            current_ray.get(
+                "runtime_aggregate_minimum_batch_with_five_percent_margin",
+                -1,
+            )
+        )
+        clean_exact_minimum = int(
+            current_ray.get(
+                "clean_epoch_minimum_batch_for_complete_per_camera_epoch",
+                -1,
+            )
+        )
+        clean_aggregate_minimum = int(
+            current_ray.get(
+                "clean_epoch_aggregate_minimum_batch_with_five_percent_margin",
+                -1,
+            )
+        )
+        configured_batch = int(
+            current.get("ray_posterior_configured_maximum_rays", -1)
+        )
+        if (
+            set(current_ray) != expected_current_ray_keys
+            or current_ray.get("batch_boundary_contract")
+            != RAY_EPOCH_BOUNDARY_CONTRACT
+            or current_ray.get("capacity_contract")
+            != RAY_EPOCH_CAPACITY_CONTRACT
+            or current_ray.get("capacity_scope")
+            != "resume_remaining_unvisited_rows"
+            or int(current_ray.get("camera_table_count", 0)) <= 0
+            or prior_calls != 2_250
+            or available_calls != scheduled_calls - prior_calls
+            or int(current_ray.get("remaining_unvisited_row_count", 0))
+            <= 0
+            or int(current_ray.get("remaining_unvisited_row_count", -1))
+            >= int(current_ray.get("full_effective_row_count", -1))
+            or int(current_ray.get("clean_epoch_effective_batch", -1))
+            != max(
+                configured_batch,
+                clean_aggregate_minimum,
+                clean_exact_minimum,
+            )
+            or current_batch
+            != max(configured_batch, aggregate_minimum, exact_minimum)
+            or required_calls < 0
+            or required_calls > available_calls
+            or int(current_ray.get("unused_factor_calls", -1))
+            != available_calls - required_calls
+            or not bool(current_ray.get("complete_epoch_capacity", False))
+        ):
+            raise RuntimeError(
+                "v38 target does not satisfy the resume-aware exact per-"
+                "camera ray epoch capacity contract"
+            )
+        if current.get("volume_topology_phase_contract") != (
+            VOLUME_TOPOLOGY_SETTLE_CONTRACT
+        ):
+            raise RuntimeError(
+                "v38 volume topology does not reserve canonical_polish for "
+                "settling"
+            )
+        if current.get("conditioned_settle_contract") != (
+            CONDITIONED_SETTLE_CONTRACT
+        ):
+            raise RuntimeError(
+                "v39 conditioned settle must keep the conditioned branch "
+                "active after volume topology stops"
+            )
+        saved["ray_posterior_maximum_rays"] = current_batch
+        saved["ray_evidence_epoch_capacity"] = current_ray
+        saved["volume_topology_phase_contract"] = (
+            VOLUME_TOPOLOGY_SETTLE_CONTRACT
+        )
+        saved["conditioned_settle_contract"] = (
+            CONDITIONED_SETTLE_CONTRACT
+        )
     differences = {
         key
         for key in set(saved) | set(current)
@@ -2092,6 +2976,134 @@ def _high_frequency_loss(
     )
 
 
+def _rigid_residual_patch_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    rigid_weight: torch.Tensor,
+    *,
+    maximum_patches: int = 64,
+    radius: int = 5,
+) -> tuple[torch.Tensor, dict[str, int | float]]:
+    """Focus local bandwidth on high-error rigid texture and boundaries.
+
+    Patch selection is detached, while every selected pixel keeps the normal
+    RGB/SSIM/gradient derivative.  Ranking combines current residual and
+    target image edges, so flat sky/tree regions cannot consume the pool and
+    a small window frame is no longer diluted by the full 640x360 image.
+    """
+    zero = prediction.new_zeros(())
+    if maximum_patches <= 0 or radius <= 0:
+        return zero, {"patches": 0, "pixels": 0}
+    with torch.no_grad():
+        residual = (prediction - target).abs().mean(0)
+        edge = torch.zeros_like(residual)
+        edge[:, 1:] += (
+            target[:, :, 1:] - target[:, :, :-1]
+        ).abs().mean(0)
+        edge[1:, :] += (
+            target[:, 1:, :] - target[:, :-1, :]
+        ).abs().mean(0)
+        support = rigid_weight.clamp(0, 1)
+        score = residual * (0.05 + edge) * support
+        kernel = 2 * int(radius) + 1
+        pooled = F.avg_pool2d(
+            score[None, None],
+            kernel,
+            stride=1,
+            padding=int(radius),
+        )[0, 0]
+        pooled[:radius] = 0
+        pooled[-radius:] = 0
+        pooled[:, :radius] = 0
+        pooled[:, -radius:] = 0
+        # A raw top-k over the dense pooled map selects many adjacent centres
+        # around one strong edge.  In a real 640x360 Cambridge view the
+        # nominal 64 x 11x11 pool consequently covered only ~1.1k pixels,
+        # leaving most windows, railings and re-exposed facade holes without
+        # any local bandwidth. Select spatially independent local maxima
+        # instead. A suppression radius of 2r makes the resulting (2r+1)
+        # patches non-redundant without imposing any scene- or loss-valued
+        # quality gate. A dense stride-one 21x21 max-pool is unnecessarily
+        # expensive for this detached scheduling decision. Partition the
+        # raster into non-overlapping suppression cells and retain the exact
+        # maximum (and its source index) from each cell. This bounds duplicate
+        # centres per local feature while reducing the comparison count by
+        # roughly the suppression-cell area.
+        suppression_cell = max(2 * kernel - 1, 1)
+        cell_score, cell_index = F.max_pool2d(
+            pooled[None, None],
+            suppression_cell,
+            stride=suppression_cell,
+            ceil_mode=True,
+            return_indices=True,
+        )
+        cell_score = cell_score.reshape(-1)
+        cell_index = cell_index.reshape(-1)
+        valid_cell = cell_score > 0
+        peak_count = int(valid_cell.sum())
+        preliminary_count = min(
+            max(int(maximum_patches) * 8, int(maximum_patches)),
+            peak_count,
+        )
+        if preliminary_count <= 0:
+            return zero, {"patches": 0, "pixels": 0}
+        ranked_cells = torch.where(
+            valid_cell, cell_score, torch.zeros_like(cell_score)
+        )
+        preliminary_cells = torch.topk(
+            ranked_cells, k=preliminary_count
+        ).indices
+        preliminary_indices = (
+            cell_index[preliminary_cells].detach().cpu().tolist()
+        )
+        selected_indices = []
+        selected_coordinates = []
+        minimum_separation = 2 * int(radius)
+        width = int(pooled.shape[1])
+        for flat_index in preliminary_indices:
+            y, x = divmod(int(flat_index), width)
+            if any(
+                max(abs(y - other_y), abs(x - other_x))
+                <= minimum_separation
+                for other_y, other_x in selected_coordinates
+            ):
+                continue
+            selected_indices.append(int(flat_index))
+            selected_coordinates.append((y, x))
+            if len(selected_indices) >= int(maximum_patches):
+                break
+        count = len(selected_indices)
+        if count <= 0:
+            return zero, {"patches": 0, "pixels": 0}
+        indices = torch.as_tensor(
+            selected_indices, device=pooled.device, dtype=torch.long
+        )
+        centres = torch.zeros_like(pooled)
+        centres.reshape(-1)[indices] = 1
+        patch_mask = F.max_pool2d(
+            centres[None, None],
+            kernel,
+            stride=1,
+            padding=int(radius),
+        )[0, 0]
+        patch_weight = patch_mask * support
+    pixels = int((patch_weight > 0).sum())
+    loss = _photo_loss(
+        prediction, target, patch_weight, 0.10
+    ) + 0.25 * _high_frequency_loss(
+        prediction, target, patch_weight
+    )
+    return loss, {
+        "patches": int(count),
+        "pixels": pixels,
+        "independent_peak_candidates": peak_count,
+        "mean_rank_score": float(pooled.reshape(-1)[indices].mean()),
+        "selection": (
+            "detached_rigid_residual_times_target_edge_spatial_nms_pool"
+        ),
+    }
+
+
 def _boundary_evidence_weight(
     task_or_boundary: dict[str, torch.Tensor] | torch.Tensor,
 ) -> torch.Tensor:
@@ -2186,6 +3198,80 @@ def _soft_surface_canopy_conflict(
     canopy_probability = task.get("p_canopy", task["p_canopy_core"])
     weight = canopy_probability * _boundary_evidence_weight(task)
     return _weighted_mean(surface_alpha * conflict_gate, weight)
+
+
+def _counterfactual_volume_transparency_loss(
+    mixed_prediction: torch.Tensor,
+    surface_prediction: torch.Tensor,
+    target: torch.Tensor,
+    volume_alpha: torch.Tensor,
+    surface_alpha: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    *,
+    margin: float = 0.02,
+    temperature: float = 0.015,
+) -> tuple[torch.Tensor, dict[str, float | int | str]]:
+    """Route detached local RGB evidence only to volume transmittance.
+
+    A coarse semantic canopy region cannot say whether an individual pixel
+    is an opaque leaf or a view of the rigid surface through a leaf gap.  The
+    renderer already produces a surface-only counterfactual for rigid RGB
+    ownership.  Compare that image with the authoritative mixed image at the
+    same calibrated ray, detach the comparison, and softly assign
+    transparency responsibility wherever the existing surface is the better
+    explanation.  Only ``volume_alpha`` remains differentiable, so neither
+    surface colour nor geometry can game this evidence.
+
+    The sigmoid is deliberately continuous: ray hit likelihood can retain a
+    real leaf when it explains the target, while facade pixels mislabeled by
+    a coarse tree mask can still ask the volume to open a gap.
+    """
+    if mixed_prediction.shape != surface_prediction.shape:
+        raise ValueError("Mixed and surface counterfactual RGB shapes differ")
+    if mixed_prediction.shape != target.shape:
+        raise ValueError("Counterfactual target RGB shape differs")
+    if mixed_prediction.ndim != 3 or mixed_prediction.shape[0] != 3:
+        raise ValueError("Counterfactual RGB tensors must have shape [3,H,W]")
+    mixed_error = (mixed_prediction - target).abs().mean(0).detach()
+    surface_error = (surface_prediction - target).abs().mean(0).detach()
+    relative_advantage = mixed_error - surface_error
+    responsibility = torch.sigmoid(
+        (relative_advantage - float(margin)) / float(temperature)
+    )
+    static_semantic = (
+        task["p_rigid"] + task.get("p_canopy", task["p_canopy_core"])
+    ).clamp(0.0, 1.0)
+    evidence_weight = (
+        responsibility
+        * surface_alpha.detach().reshape_as(responsibility).clamp(0.0, 1.0)
+        * static_semantic
+        * task.get("w_rgb", torch.ones_like(static_semantic))
+        * (1.0 - task.get("p_transient", torch.zeros_like(static_semantic)))
+        * _boundary_evidence_weight(task)
+    ).detach()
+    alpha = volume_alpha.clamp(0.0, 1.0 - 1e-5)
+    optical_depth = -torch.log1p(-alpha)
+    loss = _weighted_mean(optical_depth, evidence_weight)
+    supported = evidence_weight > 1e-4
+    return loss, {
+        "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+        "supported_pixels": int(supported.sum()),
+        "mean_responsibility": float(
+            responsibility[evidence_weight > 0].mean()
+        )
+        if bool((evidence_weight > 0).any())
+        else 0.0,
+        "mean_relative_rgb_advantage": float(
+            relative_advantage[evidence_weight > 0].mean()
+        )
+        if bool((evidence_weight > 0).any())
+        else 0.0,
+        "mean_volume_alpha_on_support": float(
+            alpha.detach().reshape_as(responsibility)[supported].mean()
+        )
+        if bool(supported.any())
+        else 0.0,
+    }
 
 
 def _initialize_surface(
@@ -2291,6 +3377,26 @@ def _validate_surface_warmstart(
     actual_sha256 = _file_sha256(surface_ply)
     if payload.get("surface_ply_sha256") != actual_sha256:
         raise RuntimeError("Rigid surface handoff PLY digest mismatch")
+    chart_surface_state = payload.get("chart_surface_state")
+    if chart_surface_state is not None:
+        chart_surface_state = (
+            Path(chart_surface_state).expanduser().resolve()
+        )
+        if not chart_surface_state.is_file():
+            raise FileNotFoundError(
+                f"Rigid Chart-atlas handoff is missing: "
+                f"{chart_surface_state}"
+            )
+        actual_chart_sha256 = _file_sha256(chart_surface_state)
+        if (
+            payload.get("chart_surface_state_sha256")
+            != actual_chart_sha256
+        ):
+            raise RuntimeError(
+                "Rigid Chart-atlas handoff digest mismatch"
+            )
+        payload["chart_surface_state"] = str(chart_surface_state)
+        payload["chart_surface_state_sha256"] = actual_chart_sha256
     if bool(payload.get("historical_gaussian_input_used", True)):
         raise RuntimeError("Historical Gaussian warm-starts are forbidden")
     if bool(payload.get("colmap_points_or_tracks_used", True)):
@@ -2451,6 +3557,7 @@ def _write_rigid_stage_surface_handoff(
     fixed_camera_validation: dict,
     geometry_audit: dict,
     surface_optimizer: dict,
+    chart_surface_state: Path | None = None,
 ) -> Path:
     """Close the geometry-trained rigid-stage -> mixed-stage contract.
 
@@ -2473,6 +3580,13 @@ def _write_rigid_stage_surface_handoff(
         raise FileNotFoundError(
             f"Rigid-stage surface PLY was not persisted: {surface_ply}"
         )
+    if chart_surface_state is not None:
+        chart_surface_state = chart_surface_state.expanduser().resolve()
+        if not chart_surface_state.is_file():
+            raise FileNotFoundError(
+                f"Rigid-stage Chart atlas was not persisted: "
+                f"{chart_surface_state}"
+            )
     initialization_manifest = (
         initialization_directory / "initialization_manifest.json"
     ).resolve()
@@ -2597,6 +3711,23 @@ def _write_rigid_stage_surface_handoff(
         },
         "fixed_camera_validation": fixed_camera_validation,
     }
+    if chart_surface_state is not None:
+        # The PLY contains a portable, baked 2DGS snapshot. Exact staged
+        # continuation additionally needs the continuous inverse-depth atlas
+        # and UV-quadtree topology; otherwise child cells become ordinary
+        # world-space Gaussians on the next stage and silently lose their
+        # calibrated ray ownership.
+        handoff.update(
+            {
+                "chart_surface_state": str(chart_surface_state),
+                "chart_surface_state_sha256": _file_sha256(
+                    chart_surface_state
+                ),
+                "chart_surface_handoff_contract": (
+                    "continuous_inverse_depth_atlas_and_uv_quadtree"
+                ),
+            }
+        )
     destination = output / "rigid_surface_handoff.json"
     destination.write_text(
         json.dumps(handoff, indent=2) + "\n", encoding="utf-8"
@@ -2888,6 +4019,13 @@ def _migrate_volume_optimizer(
     previous,
     new_to_old,
 ):
+    """Move Adam state to a replaced topology with bounded transient memory.
+
+    ``previous`` is dead after this call.  Pop one parameter state at a time
+    and release its old parameter reference as soon as the mapped state is
+    installed.  Keeping the complete old optimizer alive while accumulating
+    a complete new one doubled Adam residency at the 2M topology boundary.
+    """
     current = _volume_optimizer(args, foliage, appearance, sky)
     previous_groups = {
         group["name"]: group for group in previous.param_groups
@@ -2904,26 +4042,39 @@ def _migrate_volume_optimizer(
         old = previous_groups.get(group["name"])
         if old is None or len(old["params"]) != len(group["params"]):
             continue
-        for old_parameter, new_parameter in zip(
-            old["params"], group["params"]
+        for parameter_index, (old_parameter, new_parameter) in enumerate(
+            zip(old["params"], group["params"])
         ):
-            state = previous.state.get(old_parameter)
+            state = previous.state.pop(old_parameter, None)
             if not state:
+                old["params"][parameter_index] = new_parameter
+                continue
+            if old_parameter is new_parameter:
+                # Appearance and sky parameters do not change identity; the
+                # state object can be transferred without any tensor copy.
+                current.state[new_parameter] = state
+                old["params"][parameter_index] = new_parameter
                 continue
             migrated = {}
-            for key, value in state.items():
+            for key in list(state):
+                value = state.pop(key)
                 if (
                     group["name"] in primitive
                     and torch.is_tensor(value)
                     and value.ndim > 0
                     and value.shape[0] == old_parameter.shape[0]
                 ):
-                    migrated[key] = value[new_to_old].clone()
+                    # Advanced indexing already creates independent storage;
+                    # cloning it once more only doubles the largest transient.
+                    migrated[key] = value[new_to_old]
                 elif torch.is_tensor(value):
-                    migrated[key] = value.clone()
+                    migrated[key] = value
                 else:
                     migrated[key] = value
+                del value
             current.state[new_parameter] = migrated
+            old["params"][parameter_index] = new_parameter
+            del state
     return current
 
 
@@ -3076,6 +4227,7 @@ def _balanced_instance_topk(
     xyz: torch.Tensor | None = None,
     spatial_cell_size: float = 1.0,
     context_id: torch.Tensor | None = None,
+    lineage_family_id: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select high-score candidates without context/spatial starvation.
 
@@ -3091,15 +4243,27 @@ def _balanced_instance_topk(
     same crown compete for the same cells; the highest-gradient view can take
     an entire event while another exact owner gets no topology update.  When
     ``context_id`` is supplied, allocate capacity fairly across the observed
-    owner contexts first, then apply the same instance/spatial rule inside
-    each context.  Unused capacity is always refilled, so this is not a fixed
-    per-camera quota or a quality gate.
+    owner contexts first.  ``lineage_family_id`` adds a second hierarchy
+    inside each owner so a high-confidence DAV2 lineage cannot consume every
+    slot while a broad exact-ray RGB basis receives none.  The final level is
+    the same instance/spatial rule.  Unused capacity is always refilled, so
+    this is neither a fixed per-camera quota nor an eligibility gate.
     """
     quota = min(max(int(quota), 0), int(len(indices)))
     if quota == 0:
         return indices[:0]
     if quota == len(indices):
         return indices
+    if lineage_family_id is not None:
+        lineage_family_id = torch.as_tensor(
+            lineage_family_id,
+            device=indices.device,
+            dtype=torch.int64,
+        ).reshape(-1)
+        if len(lineage_family_id) != len(tree_instance_id):
+            raise ValueError(
+                "lineage_family_id must have one value per topology row"
+            )
     if context_id is not None:
         context_id = torch.as_tensor(
             context_id,
@@ -3178,12 +4342,102 @@ def _balanced_instance_topk(
                     int(allocations[context_offset]),
                     xyz=xyz,
                     spatial_cell_size=spatial_cell_size,
+                    lineage_family_id=lineage_family_id,
                 )
             )
         selected = (
             torch.cat(selected_parts)
             if selected_parts
             else indices[:0]
+        )
+        if len(selected) < quota:
+            remaining_indices = indices[
+                ~torch.isin(indices, selected)
+            ]
+            extra = min(quota - len(selected), len(remaining_indices))
+            if extra:
+                remaining_score = torch.nan_to_num(
+                    score[remaining_indices],
+                    nan=-torch.inf,
+                    neginf=-torch.inf,
+                )
+                selected = torch.cat(
+                    [
+                        selected,
+                        remaining_indices[
+                            torch.topk(remaining_score, extra).indices
+                        ],
+                    ]
+                )
+        return selected
+    if lineage_family_id is not None:
+        candidate_family = lineage_family_id[indices]
+        families, inverse, family_counts = torch.unique(
+            candidate_family,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        family_score = torch.full(
+            (len(families),),
+            -torch.inf,
+            device=score.device,
+            dtype=score.dtype,
+        )
+        safe_candidate_score = torch.nan_to_num(
+            score[indices], nan=-torch.inf, neginf=-torch.inf
+        )
+        family_score.scatter_reduce_(
+            0,
+            inverse,
+            safe_candidate_score,
+            reduce="amax",
+            include_self=True,
+        )
+        allocations = torch.zeros_like(family_counts)
+        remaining = quota
+        while remaining:
+            active = torch.nonzero(
+                allocations < family_counts, as_tuple=False
+            ).flatten()
+            if not len(active):
+                break
+            if remaining < len(active):
+                ranked = active[
+                    torch.topk(
+                        family_score[active], remaining, sorted=True
+                    ).indices
+                ]
+                allocations[ranked] += 1
+                remaining = 0
+                break
+            level = max(remaining // len(active), 1)
+            addition = torch.minimum(
+                family_counts[active] - allocations[active],
+                torch.full_like(allocations[active], level),
+            )
+            assigned = int(addition.sum())
+            allocations[active] += addition
+            remaining -= assigned
+            if assigned == 0:
+                break
+        selected_parts = []
+        for family_offset in torch.nonzero(
+            allocations > 0, as_tuple=False
+        ).flatten():
+            local = indices[inverse == family_offset]
+            selected_parts.append(
+                _balanced_instance_topk(
+                    local,
+                    score,
+                    tree_instance_id,
+                    int(allocations[family_offset]),
+                    xyz=xyz,
+                    spatial_cell_size=spatial_cell_size,
+                )
+            )
+        selected = (
+            torch.cat(selected_parts) if selected_parts else indices[:0]
         )
         if len(selected) < quota:
             remaining_indices = indices[
@@ -3261,6 +4515,7 @@ def _evidence_adaptive_role_quotas(
     capacity: int,
     *,
     observable_counts: dict[str, int] | None = None,
+    effective_eligible_mass: dict[str, float] | None = None,
 ) -> dict[str, int]:
     """Allocate capacity from the unresolved fraction of each physical role.
 
@@ -3280,14 +4535,17 @@ def _evidence_adaptive_role_quotas(
     its representation with a screen-bandwidth deficit was smaller.
 
     Eligible rows already encode screen-bandwidth deficit, evidence validity,
-    rendered contribution and role-specific observation support.  Normalize
-    them by the *observable population in this topology epoch*, then use
-    deterministic capped weighted apportionment.  This distinction matters
-    for the per-camera dynamic branch: rows belonging to cameras not sampled
-    in the last epoch are not evidence that the sampled owner views have no
-    unresolved bandwidth.  Falling back to the full live population preserves
-    legacy callers.  Every role remains eligible in every phase; there is no
-    fixed role percentage or pass/fail gate.
+    rendered contribution and role-specific observation support. Their
+    optional effective mass additionally carries continuous spatial geometry
+    authority; normalize that mass by the *observable population in this
+    topology epoch*, then use deterministic capped weighted apportionment.
+    This distinction matters for the per-camera dynamic branch: rows belonging
+    to cameras not sampled in the last epoch are not evidence that the sampled
+    owner views have no unresolved bandwidth, while a weak single-view depth
+    posterior is not equivalent to a multi-view canonical lineage. Falling
+    back to raw eligible counts preserves legacy callers. Every role remains
+    eligible in every phase; there is no fixed role percentage or pass/fail
+    gate.
     """
     role_order = (
         "static_skeleton",
@@ -3316,15 +4574,27 @@ def _evidence_adaptive_role_quotas(
             for role in role_order
         }
     )
+    effective_mass = (
+        {role: float(counts[role]) for role in role_order}
+        if effective_eligible_mass is None
+        else {
+            role: float(effective_eligible_mass.get(role, 0.0))
+            for role in role_order
+        }
+    )
     if any(
         value < 0
         for value in (
             *counts.values(),
             *populations.values(),
             *observable.values(),
+            *effective_mass.values(),
         )
     ):
-        raise ValueError("Eligible and population role counts must be non-negative")
+        raise ValueError(
+            "Eligible, population and effective role demand must be "
+            "non-negative"
+        )
     for role in role_order:
         if counts[role] > populations[role]:
             raise ValueError(
@@ -3338,6 +4608,10 @@ def _evidence_adaptive_role_quotas(
             raise ValueError(
                 f"Eligible {role} count exceeds its observable population"
             )
+        if effective_mass[role] > counts[role] + 1e-5:
+            raise ValueError(
+                f"Effective eligible {role} mass exceeds its eligible count"
+            )
     requested = max(int(capacity), 0)
     total = sum(counts.values())
     allocatable = min(requested, total)
@@ -3348,7 +4622,7 @@ def _evidence_adaptive_role_quotas(
     order_index = {role: index for index, role in enumerate(role_order)}
     demand = {
         role: (
-            counts[role] / float(observable[role])
+            effective_mass[role] / float(observable[role])
             if observable[role] > 0
             else 0.0
         )
@@ -3624,6 +4898,7 @@ def _adapt_volume(
     volume_budget: int | None = None,
     phase: str | None = None,
     split_capacity_scale: float = 1.0,
+    camera_forward_lookup: torch.Tensor | None = None,
 ):
     """Prune contradictions first, then split residuals in one mutation.
 
@@ -3646,20 +4921,50 @@ def _adapt_volume(
     )
     contribution_floor = torch.quantile(stats["contribution"], 0.10)
     low_contribution = stats["contribution"] <= contribution_floor
-    low_opacity = foliage.opacities < 0.002
+    # A fixed 0.002 cutoff sat below the effective opacity distribution in
+    # real v95 checkpoints (minimum ~=0.00209), making the weak contradiction
+    # branch unreachable.  Use a role-agnostic lower-tail statistic instead:
+    # it expresses relative utility and adapts to the current opacity schedule.
+    opacity_floor = torch.quantile(foliage.opacities, 0.10)
+    low_opacity = foliage.opacities <= opacity_floor
+    confirmed_free = foliage.free_space_violation_count.float()
     strong_contradiction = (
-        (contradiction_ratio >= 0.55)
+        (
+            (contradiction_ratio >= 0.50)
+            & (confirmed_free >= 2)
+        )
         | (foliage.occupancy_probability < 0.06)
     )
     weak_contradiction = (
         (contradiction_ratio >= 0.30)
         | (foliage.occupancy_probability < 0.12)
     )
-    remove = strong_contradiction | (
-        weak_contradiction & low_contribution & low_opacity
+    # Observation identity is provenance, not permanent proof of existence.
+    # Protect weak/conflicting candidates only when *independent* positive
+    # evidence still outweighs the contradiction.  Strong free-space
+    # contradiction always wins, including for rows that happened to be
+    # sampled in the current topology window.  The former absolute
+    # ``observed once => never prune`` rule accumulated exactly the persistent
+    # low-opacity fog that the posterior was supposed to retire.
+    independently_verified_positive = (
+        (foliage.support_view_count >= 2)
+        & (foliage.support_sequence_count >= 2)
+        & (contradiction_ratio < 0.50)
     )
-    # A real observation ray is stronger existence evidence than transient
-    # render contribution. Do not prune it merely because opacity collapsed.
+    weak_free_remove = (
+        (contradiction_ratio >= 0.30)
+        & (confirmed_free >= 1)
+        & low_contribution
+        & ~independently_verified_positive
+    )
+    weak_occupancy_remove = (
+        (foliage.occupancy_probability < 0.12)
+        & low_contribution
+        & low_opacity
+        & ~independently_verified_positive
+    )
+    weak_remove = weak_free_remove | weak_occupancy_remove
+    remove = strong_contradiction | weak_remove
     observation_count = stats.get(
         "observation_count", torch.zeros_like(stats["contribution"])
     )
@@ -3690,13 +4995,26 @@ def _adapt_volume(
         (foliage.observation_camera_ids >= 0).any(dim=1)
         & foliage.dynamic_leaf_mask
     )
-    # Existence evidence is a persistent observation identity, not a
-    # sampling event in the current 200-step topology window.  The old test
-    # protected only leaves selected by this window's 2,048-row factor and
-    # could therefore delete an exact UV/depth birth simply because its
-    # camera had not yet been visited.  Ray/observation likelihood may move
-    # or refine these leaves; transient RGB contribution cannot erase them.
-    remove &= ~(observed_before_prune | persistent_observation)
+    observed_identity = observed_before_prune | persistent_observation
+    weak_positive_protected = (
+        weak_contradiction
+        & low_contribution
+        & independently_verified_positive
+    )
+    static_skeleton_contradiction_protected = (
+        remove & foliage.static_skeleton_mask
+    )
+    # Trunk/branch skeleton is a separate physical owner.  It can be refined
+    # by its line/rigidity factors but must not be deleted by a canopy
+    # free-space posterior.  Apply that contract before recording the actual
+    # contradiction-prune mask so the audit cannot claim a protected trunk was
+    # removed.
+    remove &= ~foliage.static_skeleton_mask
+    observed_unverified_prunable = (
+        observed_identity
+        & remove
+        & ~independently_verified_positive
+    )
     contradiction_remove = remove.clone()
     effective_budget = (
         args.maximum_volume_gaussians
@@ -3754,12 +5072,10 @@ def _adapt_volume(
                 & (pre_gradient > 0)
             )
         )
-    posterior_reliability_before = torch.rsqrt(
-        1.0 + foliage.ray_depth_nll.clamp_min(0)
-    ).clamp(0.05, 1.0)
+    topology_authority_before = _volume_split_authority(foliage)
     integrated_demand = (
         coverage_demand
-        * posterior_reliability_before
+        * topology_authority_before
         * (canonical_demand | dynamic_demand).to(coverage_demand.dtype)
     ).sum()
     requested_splits = min(
@@ -3872,11 +5188,23 @@ def _adapt_volume(
             ).sum()
         ),
     }
+    pre_effective_eligible_mass = {
+        "static_skeleton": float(
+            topology_authority_before[pre_skeleton_eligible].sum()
+        ),
+        "canonical_crown": float(
+            topology_authority_before[pre_canonical_eligible].sum()
+        ),
+        "dynamic_leaf": float(
+            topology_authority_before[pre_dynamic_eligible].sum()
+        ),
+    }
     retirement_quota_by_role = _evidence_adaptive_role_quotas(
         pre_eligible_counts,
         pre_population_counts,
         retirement_requested,
         observable_counts=pre_observable_counts,
+        effective_eligible_mass=pre_effective_eligible_mass,
     )
     reallocation_remove, reallocation_audit = (
         _select_volume_reallocation_retirements(
@@ -3888,12 +5216,17 @@ def _adapt_volume(
         )
     )
     remove |= reallocation_remove
-    pruned, kept_old = foliage.prune(remove)
-    working_stats = {
-        name: value[kept_old] for name, value in stats.items()
-    }
+    # Keep selection in the original index space.  The old implementation
+    # materialized a complete pruned model here and a second complete model in
+    # ``split_adaptive`` below while Adam still owned the original tensors.
+    # At the 2M budget that transient three-topology residency caused the
+    # observed 10k OOM.  Retired rows are now masked from all selection
+    # statistics and the final replace+split is materialized exactly once.
+    keep = ~remove
+    pruned = int(remove.sum())
+    working_stats = stats
 
-    count = len(foliage)
+    count = int(keep.sum())
     gradient = (
         working_stats["gradient"]
         / working_stats["gradient_count"].clamp_min(1)
@@ -3909,39 +5242,40 @@ def _adapt_volume(
     observation_gradient = (
         working_stats.get(
             "observation_gradient",
-            observation_gradient_sum[kept_old],
+            observation_gradient_sum,
         )
         / working_stats.get(
-            "observation_count", observation_count[kept_old]
+            "observation_count", observation_count
         ).clamp_min(1)
     )
     observation_evidence = (
         working_stats.get(
-            "observation_count", observation_count[kept_old]
+            "observation_count", observation_count
         )
         > 0
-    )
+    ) & keep
     persistent_observation = (
         (foliage.observation_camera_ids >= 0).any(dim=1)
         & foliage.dynamic_leaf_mask
+        & keep
     )
     conditioned_gradient = (
         working_stats.get(
             "conditioned_gradient",
-            conditioned_gradient_sum[kept_old],
+            conditioned_gradient_sum,
         )
         / working_stats.get(
             "conditioned_gradient_count",
-            conditioned_gradient_count[kept_old],
+            conditioned_gradient_count,
         ).clamp_min(1)
     )
     conditioned_evidence = (
         working_stats.get(
             "conditioned_gradient_count",
-            conditioned_gradient_count[kept_old],
+            conditioned_gradient_count,
         )
         > 0
-    )
+    ) & keep
     # Current checkpoints carry a dedicated exact-owner conditioned channel.
     # Legacy checkpoints do not, but their rendered contribution and
     # observation factor are still valid evidence that a dynamic row was
@@ -3955,17 +5289,18 @@ def _adapt_volume(
             observation_evidence
             | (working_stats["contribution"] > 0)
         )
-    )
+    ) & keep
     topology_radius = torch.where(
         foliage.dynamic_leaf_mask,
         working_stats.get(
-            "conditioned_radius", conditioned_radius[kept_old]
+            "conditioned_radius", conditioned_radius
         ),
         working_stats["radius"],
     )
     evidence_eligible = (
         (working_stats["contribution"] > 0)
         & (rigid < 0.15)
+        & keep
     )
     coverage_deficit = (
         topology_radius / max(args.volume_split_radius, 1e-6)
@@ -3985,10 +5320,16 @@ def _adapt_volume(
     # information matrix was overconfident or the leaf moved between
     # traversals.  It should not receive the same split priority as a
     # geometrically coherent cell merely because RGB residual is high.
-    posterior_reliability = torch.rsqrt(
-        1.0 + foliage.ray_depth_nll.clamp_min(0)
-    ).clamp(0.05, 1.0)
-    split_score = split_score * posterior_reliability
+    topology_authority = _volume_split_authority(foliage)
+    exact_ray_bandwidth = (
+        _dense_exact_ray_bandwidth_mask(foliage) & keep
+    )
+    dynamic_optical_authority = torch.where(
+        exact_ray_bandwidth,
+        torch.ones_like(foliage.occupancy_probability),
+        foliage.occupancy_probability.clamp(0.05, 1.0),
+    )
+    split_score = split_score * topology_authority
     dynamic_split_score = (
         # Screen-space gradient is the primary deployable topology signal.
         # The ray/depth observation factor remains a continuous refinement
@@ -3998,7 +5339,8 @@ def _adapt_volume(
             + 0.25 * torch.log1p(observation_gradient)
         )
         * (1.0 + coverage_deficit)
-        * foliage.occupancy_probability.clamp(0.05, 1.0)
+        * dynamic_optical_authority
+        * topology_authority
     )
     skeleton_eligible = (
         evidence_eligible
@@ -4074,7 +5416,7 @@ def _adapt_volume(
     )
     split_parents = 0
     children = 0
-    final_to_kept = torch.arange(count, device=foliage.xyz.device)
+    final_to_old = torch.nonzero(keep, as_tuple=False).flatten()
     role_split_counts = {
         "static_skeleton": 0,
         "canonical_crown": 0,
@@ -4089,9 +5431,15 @@ def _adapt_volume(
         "dynamic_leaf": int(dynamic_eligible.sum()),
     }
     population_counts = {
-        "static_skeleton": int(foliage.static_skeleton_mask.sum()),
-        "canonical_crown": int(foliage.canonical_crown_mask.sum()),
-        "dynamic_leaf": int(foliage.dynamic_leaf_mask.sum()),
+        "static_skeleton": int(
+            (foliage.static_skeleton_mask & keep).sum()
+        ),
+        "canonical_crown": int(
+            (foliage.canonical_crown_mask & keep).sum()
+        ),
+        "dynamic_leaf": int(
+            (foliage.dynamic_leaf_mask & keep).sum()
+        ),
     }
     conditioned_context_id = working_stats.get(
         "conditioned_context_id",
@@ -4104,6 +5452,7 @@ def _adapt_volume(
     # legacy rows so a resume neither loses capacity nor invents a context.
     missing_context = (
         foliage.dynamic_leaf_mask
+        & keep
         & dynamic_observable_evidence
         & (conditioned_context_id < 0)
     )
@@ -4122,12 +5471,14 @@ def _adapt_volume(
         "static_skeleton": int(
             (
                 foliage.static_skeleton_mask
+                & keep
                 & (working_stats["radius"] > 0)
             ).sum()
         ),
         "canonical_crown": int(
             (
                 foliage.canonical_crown_mask
+                & keep
                 & (working_stats["radius"] > 0)
                 & (working_stats["contribution"] > 0)
             ).sum()
@@ -4135,9 +5486,21 @@ def _adapt_volume(
         "dynamic_leaf": int(
             (
                 foliage.dynamic_leaf_mask
+                & keep
                 & dynamic_observable_evidence
                 & (conditioned_context_id >= 0)
             ).sum()
+        ),
+    }
+    effective_eligible_mass = {
+        "static_skeleton": float(
+            topology_authority[skeleton_eligible].sum()
+        ),
+        "canonical_crown": float(
+            topology_authority[canonical_eligible].sum()
+        ),
+        "dynamic_leaf": float(
+            topology_authority[dynamic_eligible].sum()
         ),
     }
     role_quotas = _evidence_adaptive_role_quotas(
@@ -4145,6 +5508,7 @@ def _adapt_volume(
         population_counts,
         capacity,
         observable_counts=observable_counts,
+        effective_eligible_mass=effective_eligible_mass,
     )
     if bool(all_eligible_mask.any()) and capacity > 0:
         selected_parts = []
@@ -4167,6 +5531,11 @@ def _adapt_volume(
                     if name == "dynamic_leaf"
                     else None
                 )
+                role_lineage_family = (
+                    foliage.initialization_source
+                    if name == "dynamic_leaf"
+                    else None
+                )
                 # A four-child mutation costs three net rows and halves
                 # projected scale in one step.  Reserve it for parents at
                 # least twice the target radius; smaller deficits retain the
@@ -4186,6 +5555,7 @@ def _adapt_volume(
                     quaternary_count,
                     xyz=foliage.xyz,
                     context_id=role_context,
+                    lineage_family_id=role_lineage_family,
                 )
                 remaining_growth = int(growth_quota) - 3 * int(
                     len(quaternary)
@@ -4200,6 +5570,7 @@ def _adapt_volume(
                     remaining_growth,
                     xyz=foliage.xyz,
                     context_id=role_context,
+                    lineage_family_id=role_lineage_family,
                 )
                 chosen = torch.cat([quaternary, binary])
                 child_counts = torch.cat(
@@ -4263,6 +5634,7 @@ def _adapt_volume(
         ].float()
         selected_demand = coverage_deficit[selected].float()
         selected_dynamic = selected[foliage.dynamic_leaf_mask[selected]]
+        selected_exact_ray_bandwidth = exact_ray_bandwidth[selected]
         eligible_dynamic_contexts = torch.unique(
             conditioned_context_id[dynamic_eligible]
         )
@@ -4301,6 +5673,14 @@ def _adapt_volume(
                 "splits_per_selected_camera_maximum": int(
                     context_split_counts.max()
                 ),
+                "eligible_owner_camera_ids": [
+                    int(value)
+                    for value in eligible_dynamic_contexts.tolist()
+                ],
+                "selected_owner_camera_ids": [
+                    int(value)
+                    for value in selected_dynamic_contexts.tolist()
+                ],
             }
         else:
             dynamic_context_audit = {
@@ -4311,7 +5691,20 @@ def _adapt_volume(
                 "splits_per_selected_camera_minimum": 0,
                 "splits_per_selected_camera_median": 0.0,
                 "splits_per_selected_camera_maximum": 0,
+                "eligible_owner_camera_ids": [
+                    int(value)
+                    for value in eligible_dynamic_contexts.tolist()
+                ],
+                "selected_owner_camera_ids": [],
             }
+        selected_source_counts = {
+            str(int(source)): int(
+                (foliage.initialization_source[selected] == source).sum()
+            )
+            for source in torch.unique(
+                foliage.initialization_source[selected]
+            )
+        }
         selection_audit = {
             "radius_pixels_minimum": float(selected_radius.min()),
             "radius_pixels_median": float(selected_radius.median()),
@@ -4330,16 +5723,75 @@ def _adapt_volume(
             ),
             "net_growth_slots": selected_growth,
             "dynamic_owner_context": dynamic_context_audit,
+            "initialization_source_split_parents": selected_source_counts,
+            "exact_ray_camera_plane_split_parents": int(
+                selected_exact_ray_bandwidth.sum()
+            ),
         }
-        split_event = foliage.split_adaptive(
+        split_plane_normals = torch.full(
+            (len(selected), 3),
+            float("nan"),
+            device=foliage.xyz.device,
+            dtype=foliage.xyz.dtype,
+        )
+        if bool(selected_exact_ray_bandwidth.any()):
+            if camera_forward_lookup is None:
+                raise RuntimeError(
+                    "Exact-ray optical subdivision requires calibrated "
+                    "camera forward vectors"
+                )
+            camera_forward_lookup = torch.as_tensor(
+                camera_forward_lookup,
+                device=foliage.xyz.device,
+                dtype=foliage.xyz.dtype,
+            ).reshape(-1, 3)
+            exact_selected_rows = torch.nonzero(
+                selected_exact_ray_bandwidth, as_tuple=False
+            ).flatten()
+            owner_camera_ids = conditioned_context_id[
+                selected[exact_selected_rows]
+            ].to(torch.long)
+            valid_owner = (
+                (owner_camera_ids >= 0)
+                & (owner_camera_ids < len(camera_forward_lookup))
+            )
+            if not bool(valid_owner.all()):
+                raise RuntimeError(
+                    "Exact-ray split selected a row without a calibrated "
+                    "owner camera"
+                )
+            owner_forward = camera_forward_lookup[owner_camera_ids]
+            if not bool(torch.isfinite(owner_forward).all()):
+                raise RuntimeError(
+                    "Exact-ray split owner camera has no finite forward "
+                    "vector"
+                )
+            split_plane_normals[exact_selected_rows] = owner_forward
+        split_event = foliage.replace_and_split_adaptive(
+            remove,
             selected,
             selected_child_counts,
             allow_static_skeleton=True,
+            split_plane_normals=split_plane_normals,
+        )
+        camera_plane_parent_count = int(
+            split_event.get("camera_plane_parents", 0)
+        )
+        expected_camera_plane_parent_count = int(
+            selected_exact_ray_bandwidth.sum()
+        )
+        if camera_plane_parent_count != expected_camera_plane_parent_count:
+            raise RuntimeError(
+                "Exact-ray selection and camera-plane mutation counts "
+                "diverged"
+            )
+        selection_audit["camera_plane_mutated_parents"] = (
+            camera_plane_parent_count
         )
         split_parents = int(split_event["split_parents"])
         children = int(split_event["children"])
         net_growth = int(split_event["net_growth"])
-        final_to_kept = split_event["_new_to_old"]
+        final_to_old = split_event["_new_to_old"]
     else:
         instance_split_counts = {}
         selected_spatial_group_count = 0
@@ -4366,9 +5818,24 @@ def _adapt_volume(
                 "splits_per_selected_camera_minimum": 0,
                 "splits_per_selected_camera_median": 0.0,
                 "splits_per_selected_camera_maximum": 0,
+                "eligible_owner_camera_ids": [],
+                "selected_owner_camera_ids": [],
             },
+            "initialization_source_split_parents": {},
+            "exact_ray_camera_plane_split_parents": 0,
+            "camera_plane_mutated_parents": 0,
         }
-    final_to_old = kept_old[final_to_kept]
+        prune_event = foliage.replace_and_split_adaptive(
+            remove,
+            torch.empty(
+                0, dtype=torch.long, device=foliage.xyz.device
+            ),
+            torch.empty(
+                0, dtype=torch.long, device=foliage.xyz.device
+            ),
+            allow_static_skeleton=True,
+        )
+        final_to_old = prune_event["_new_to_old"]
     mutated = pruned > 0 or split_parents > 0
     return {
         "old_count": old_count,
@@ -4378,9 +5845,36 @@ def _adapt_volume(
         "net_growth": net_growth,
         "pruned": pruned,
         "contradiction_pruned": int(contradiction_remove.sum()),
+        "contradiction_prune_evidence": {
+            "contract": (
+                "strong_confirmed_free_overrides_observation_identity__"
+                "weak_low_utility_conflict_protects_only_independent_"
+                "cross_sequence_positive_support"
+            ),
+            "strong_contradiction_candidates": int(
+                strong_contradiction.sum()
+            ),
+            "weak_contradiction_candidates": int(
+                weak_contradiction.sum()
+            ),
+            "independently_verified_positive_rows": int(
+                independently_verified_positive.sum()
+            ),
+            "weak_positive_rows_protected": int(
+                weak_positive_protected.sum()
+            ),
+            "static_skeleton_rows_protected": int(
+                static_skeleton_contradiction_protected.sum()
+            ),
+            "observed_identity_rows": int(observed_identity.sum()),
+            "observed_unverified_rows_prunable": int(
+                observed_unverified_prunable.sum()
+            ),
+        },
         "reallocated_pruned": int(reallocation_remove.sum()),
         "capacity_reallocation": reallocation_audit,
         "capacity_reallocation_contract": VOLUME_REALLOCATION_CONTRACT,
+        "topology_mutation_contract": VOLUME_TOPOLOGY_MUTATION_CONTRACT,
         "integrated_split_demand": float(integrated_demand),
         "requested_splits": int(requested_splits),
         "configured_split_limit": int(args.maximum_volume_splits),
@@ -4404,6 +5898,14 @@ def _adapt_volume(
             "conditioned_nonzero_gradient_rows": int(
                 (conditioned_gradient > 0).sum()
             ),
+            "exact_ray_bandwidth_rows": int(exact_ray_bandwidth.sum()),
+            "exact_ray_eligible_rows": int(
+                (dynamic_eligible & exact_ray_bandwidth).sum()
+            ),
+            "geometry_authority_contract": (
+                "metric_depth_authority_for_3d_growth__unit_authority_for_"
+                "depth_preserving_exact_owner_camera_plane_subdivision"
+            ),
         },
         "population_count_by_role": population_counts,
         "observable_count_by_role": observable_counts,
@@ -4415,6 +5917,16 @@ def _adapt_volume(
             )
             for role in eligible_counts
         },
+        "effective_eligible_demand_by_role": (
+            effective_eligible_mass
+        ),
+        "mean_topology_authority_by_eligible_role": {
+            role: (
+                effective_eligible_mass[role]
+                / max(eligible_counts[role], 1)
+            )
+            for role in eligible_counts
+        },
         "requested_split_quota_by_role": role_quotas,
         "split_capacity": int(capacity),
         "split_capacity_saturated": bool(
@@ -4423,9 +5935,11 @@ def _adapt_volume(
         "selection_audit": selection_audit,
         "selection_contract": (
             "continuous_screen_demand_then_lineage_safe_replace_retire_then_"
-            "observable_population_normalized_role_capacity_then_"
+            "posterior_authority_weighted_observable_population_normalized_"
+            "role_capacity_then_"
             "owner_context_instance_spatial_utility_then_"
-            "screen_severity_adaptive_2_or_4_child_split"
+            "lineage_family_then_screen_severity_adaptive_2_or_4_child_"
+            "split_with_exact_ray_camera_plane_refinement"
         ),
         "phase": phase,
         "_new_to_old": final_to_old if mutated else None,
@@ -4466,13 +5980,22 @@ def _apply_volume_role_gradients(
     ):
         if parameter.grad is not None:
             parameter.grad[~dynamic] = 0
-            if not dynamic_active or phase == "canonical_polish":
+            # ``canonical_polish`` is topology-stable, not a canonical-only
+            # optimizer phase.  The last topology event creates/replaces
+            # dynamic descendants immediately before this interval; zeroing
+            # their conditioned bases here left those rows with only a few
+            # appearance updates and made the final checkpoint look like an
+            # unsettled topology snapshot.  Freeze these bases only before
+            # the conditioned branch is actually active.
+            if not dynamic_active:
                 parameter.grad[dynamic] = 0
 
 
 def _apply_mature_surface_gradient_policy(
     surface,
     policy: str,
+    *,
+    chart_surface=None,
 ) -> dict[str, object]:
     """Keep a validated rigid handoff from becoming a second pretrain.
 
@@ -4496,6 +6019,7 @@ def _apply_mature_surface_gradient_policy(
             "policy": policy,
             "topology_trainable": True,
             "geometry_trainable": True,
+            "chart_geometry_trainable": True,
             "appearance_trainable": True,
             "opacity_trainable": True,
             "opacity_gradient_contract": "all_losses",
@@ -4508,6 +6032,14 @@ def _apply_mature_surface_gradient_policy(
     for parameter in geometry:
         if parameter.grad is not None:
             parameter.grad.zero_()
+    # Chart-owned rows do not use ``surface._xyz`` as their rendered centre:
+    # their position, normal and tangent footprint come from the inverse-depth
+    # atlas.  Clear (rather than merely zero) these gradients so Adam cannot
+    # advance a resumed momentum buffer under an appearance-only/frozen
+    # handoff.
+    if chart_surface is not None:
+        for parameter in chart_surface.parameters():
+            parameter.grad = None
     if surface._opacity.grad is not None:
         surface._opacity.grad.zero_()
     if policy == "frozen":
@@ -4521,6 +6053,7 @@ def _apply_mature_surface_gradient_policy(
         "policy": policy,
         "topology_trainable": False,
         "geometry_trainable": False,
+        "chart_geometry_trainable": False,
         "appearance_trainable": policy == "appearance_only",
         "opacity_trainable": False,
         "opacity_gradient_contract": "frozen_event_bounded_retirement",
@@ -5417,6 +6950,37 @@ def main():
                 + "; ".join(gate_failures)
             )
     resume = _load(args.resume.resolve()) if args.resume else None
+    v38_causal_repair_resume = False
+    if args.allow_v38_causal_repair_resume:
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        saved_contract = (resume or {}).get("training_contract", {})
+        v38_causal_repair_resume = bool(
+            resume is not None
+            and resume.get("protocol")
+            == V38_CAUSAL_REPAIR_PREDECESSOR["protocol"]
+            and int(resume.get("iteration", -1))
+            == V38_CAUSAL_REPAIR_PREDECESSOR["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == V38_CAUSAL_REPAIR_PREDECESSOR["schedule_horizon"]
+            and saved_contract.get("volume_densify_until_iteration")
+            == V38_CAUSAL_REPAIR_PREDECESSOR[
+                "volume_densify_until_iteration"
+            ]
+            and int(args.phase_schedule_horizon)
+            == V38_CAUSAL_REPAIR_PREDECESSOR["schedule_horizon"]
+            and int(args.volume_densify_until_iteration) == 12_000
+            and all(
+                resume_hashes.get(name)
+                == V38_CAUSAL_REPAIR_PREDECESSOR[name]
+                for name in ("trainer", "training_evidence")
+            )
+        )
+        if not v38_causal_repair_resume:
+            raise RuntimeError(
+                "v38 causal repair resume does not match the exact v35 "
+                "9k checkpoint, implementation hashes, 12k schedule horizon "
+                "and 10k->12k volume-topology extension"
+            )
     if output.exists() and any(output.iterdir()) and resume is None:
         raise FileExistsError(f"Refusing non-empty output: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -5477,6 +7041,12 @@ def main():
         dtype=torch.int32,
         device="cuda",
     )
+    camera_forward_lookup = torch.full(
+        (maximum_camera_id + 1, 3),
+        float("nan"),
+        dtype=torch.float32,
+        device="cuda",
+    )
     for view in views:
         camera_sequence_lookup[int(view.colmap_id)] = sequence_index[
             sequence_id(view.image_name)
@@ -5484,6 +7054,12 @@ def main():
         stem = Path(str(view.image_name)).stem
         camera_frame_lookup[int(view.colmap_id)] = int(
             stem.rsplit("frame", 1)[-1]
+        )
+        camera_forward = view.world_view_transform[:3, 2].to(
+            device="cuda", dtype=torch.float32
+        )
+        camera_forward_lookup[int(view.colmap_id)] = (
+            camera_forward / camera_forward.norm().clamp_min(1e-8)
         )
     if resume is None:
         if surface_warmstart is None:
@@ -5513,7 +7089,10 @@ def main():
                 ),
             )
     else:
-        if resume.get("protocol") != PROTOCOL:
+        if (
+            resume.get("protocol") != PROTOCOL
+            and not v38_causal_repair_resume
+        ):
             raise RuntimeError("Unified teacher resume protocol mismatch")
         if resume["evidence_hash"] != evidence_store["evidence_hash"]:
             raise RuntimeError("Resume/evidence hash mismatch")
@@ -5587,6 +7166,81 @@ def main():
             resume.get("foliage_ray_runtime_state")
         )
     foliage_ray_evidence_audit = foliage_rays.audit()
+    per_camera_ray_rows = tuple(
+        int(audit["count"])
+        for audit in foliage_ray_evidence_audit[
+            "camera_epoch_audits"
+        ].values()
+    )
+    per_camera_unvisited_ray_rows = tuple(
+        int(audit["never_visited"])
+        for audit in foliage_ray_evidence_audit[
+            "camera_epoch_audits"
+        ].values()
+    )
+    # The per-camera epoch scheduler cannot finish one evidence pass when the
+    # configured batch capacity is smaller than the immutable free/hit table.
+    # Derive a deterministic lower bound from the final schedule horizon, not
+    # the length of a diagnostic prefix, so prefix/resume runs keep exactly
+    # the same factor contract.
+    (
+        clean_epoch_batch,
+        clean_epoch_minimum_batch,
+        scheduled_ray_factor_calls,
+    ) = _complete_evidence_epoch_batch_size(
+        args.ray_posterior_maximum_rays,
+        foliage_ray_evidence_audit["interval_effective_rows"],
+        args.phase_schedule_horizon,
+        args.ray_posterior_every,
+        per_camera_rows=per_camera_ray_rows,
+    )
+    prior_ray_factor_calls = int(
+        foliage_ray_evidence_audit["interval_factor_calls"]
+    )
+    available_ray_factor_calls = (
+        scheduled_ray_factor_calls - prior_ray_factor_calls
+    )
+    if available_ray_factor_calls <= 0:
+        raise RuntimeError(
+            "No scheduled foliage ray calls remain after checkpoint resume"
+        )
+    remaining_unvisited_ray_rows = sum(
+        per_camera_unvisited_ray_rows
+    )
+    (
+        effective_ray_posterior_maximum_rays,
+        ray_epoch_minimum_batch,
+        capacity_ray_factor_calls,
+    ) = _complete_evidence_epoch_batch_size(
+        args.ray_posterior_maximum_rays,
+        remaining_unvisited_ray_rows,
+        args.phase_schedule_horizon,
+        args.ray_posterior_every,
+        per_camera_rows=per_camera_unvisited_ray_rows,
+        available_factor_calls=available_ray_factor_calls,
+    )
+    clean_epoch_aggregate_minimum_batch = int(
+        np.ceil(
+            1.05
+            * foliage_ray_evidence_audit["interval_effective_rows"]
+            / scheduled_ray_factor_calls
+        )
+    )
+    runtime_epoch_aggregate_minimum_batch = int(
+        np.ceil(
+            1.05
+            * remaining_unvisited_ray_rows
+            / capacity_ray_factor_calls
+        )
+    )
+    required_ray_factor_calls = sum(
+        (
+            count + effective_ray_posterior_maximum_rays - 1
+        )
+        // effective_ray_posterior_maximum_rays
+        for count in per_camera_unvisited_ray_rows
+        if count > 0
+    )
     view_by_camera_id = {
         int(view.colmap_id): view for view in views
     }
@@ -5608,8 +7262,34 @@ def main():
             "foliage ray table has no confirmed free-space interval"
         )
     chart_surface = ChartSurfaceModel(
-        Path(initialization["surface_seed"]), seed=args.seed + 19
+        Path(initialization["surface_seed"]),
+        evidence_store=args.evidence_store,
+        seed=args.seed + 19,
+        maximum_tangent_scale=args.maximum_surface_scale,
+    ).cuda()
+    # The provider changes only the native 2D surfel geometry tensors passed
+    # to the mixed rasterizer. It does not alter the renderer API or create a
+    # second compositing pass.
+    surface._chart_geometry_provider = chart_surface
+    if resume is not None and resume.get("chart_surface") is not None:
+        chart_surface.restore(resume["chart_surface"])
+    elif (
+        surface_warmstart is not None
+        and surface_warmstart.get("chart_surface_state") is not None
+    ):
+        chart_surface.restore(
+            _load(Path(surface_warmstart["chart_surface_state"]))
+        )
+    chart_atlas_optimizer = torch.optim.Adam(
+        list(chart_surface.parameters()), lr=args.chart_atlas_lr
     )
+    if (
+        resume is not None
+        and resume.get("chart_atlas_optimizer") is not None
+    ):
+        chart_atlas_optimizer.load_state_dict(
+            resume["chart_atlas_optimizer"]
+        )
     appearance = OutdoorAppearanceUncertainty(
         [view.image_name for view in views],
         rank=args.dynamic_rank,
@@ -5687,12 +7367,42 @@ def main():
                 len(views), len(dynamic_evidence_indices)
             )
         )
+    conditioned_active_mask = np.asarray(
+        [
+            _dynamic_enabled(
+                step,
+                args.phase_schedule_horizon,
+                args.training_profile,
+            )
+            and _phase(
+                step,
+                args.phase_schedule_horizon,
+                args.training_profile,
+            )
+            != "canonical_polish"
+            for step in range(args.phase_schedule_horizon)
+        ],
+        dtype=bool,
+    )
+    if (
+        resume is not None
+        and args.allow_conditioned_schedule_repair_resume
+    ):
+        # A repair continuation cannot retroactively consume protected visits.
+        # Rebuild the coverage contract over the remaining active suffix so
+        # every database view receives as many complete visits as the
+        # remaining schedule can physically hold.
+        conditioned_active_mask[
+            : int(resume["iteration"])
+        ] = False
     conditioned_schedule, conditioned_schedule_audit = (
         _evidence_biased_schedule(
             rgb_schedule,
             dynamic_evidence_indices,
             fraction=args.dynamic_evidence_view_fraction,
             seed=args.seed + 4,
+            active_mask=conditioned_active_mask,
+            minimum_full_scene_visits=3,
         )
     )
     conditioned_schedule_audit.update(
@@ -5913,18 +7623,28 @@ def main():
             "max035_decay"
         ),
         "dynamic_optical_mass_contract": (
-            "per_candidate_occupancy_support_depth_free_space_"
-            "initialization_and_floor"
+            "exact_owner_support_unknown_free_space_initial_optical_mass_"
+            "separate_from_occupancy_depth_geometry_floor__spatial_"
+            "uncertainty_routes_geometry_ray_and_topology_authority__"
+            "rgb_can_reduce_or_raise_optical_prior__role_wide_safety_"
+            "ceiling_only__canonical_dynamic_handoff_measured_in_current_"
+            "camera_projected_cross_section"
         ),
         "dynamic_gradient_ownership_contract": (
             "conditioned_base_gradients_exact_dynamic_owner_only__"
             "foliage_photo_gradients_canopy_pixels_only__"
             "rigid_sky_context_updates_appearance_only__"
-            "canonical_and_skeleton_forward_occluders_read_only__"
+            "canonical_group_pools_visible_dynamic_low_rank_state__"
+            "skeleton_forward_occluders_read_only__"
             "temporal_fallback_updates_low_rank_residuals_only"
         ),
+        "shared_canonical_conditioning_contract": (
+            "canonical_base_state_plus_visibility_weighted_group_"
+            "sequence_time_deformation_feature_opacity__"
+            "local_dynamic_birth_death_residual_with_optical_mass_handoff"
+        ),
         "dynamic_lifecycle_contract": (
-            "persistent_observation_identity_survives_sampling_windows"
+            DYNAMIC_LIFECYCLE_REPAIR_TARGET
         ),
         "boundary_supervision_contract": BOUNDARY_SUPERVISION_CONTRACT,
         "volume_reallocation_contract": VOLUME_REALLOCATION_CONTRACT,
@@ -5955,7 +7675,18 @@ def main():
             ),
         },
         "dense_ray_scale_ceiling_contract": (
-            "source_footprint_x1.10_inherited_and_shrunk_by_split"
+            "source_footprint_x1.10_inherited__exact_ray_split_shrinks_"
+            "camera_plane_axes_and_preserves_depth_extent"
+        ),
+        "exact_ray_render_footprint_contract": (
+            "metric_depth_posterior_retained_in_position_covariance__"
+            "visible_ewa_depth_axis_bounded_to_4x_middle_tangent_scale__"
+            "tangent_colour_opacity_unchanged"
+        ),
+        "exact_ray_topology_contract": (
+            "owner_conditioned_gradient_plus_screen_bandwidth__depth_"
+            "posterior_limits_3d_growth_but_not_depth_preserving_camera_"
+            "plane_subdivision__owner_then_lineage_family_capacity"
         ),
         "surface_optimizer": {
             "position_lr_init": float(opt.position_lr_init),
@@ -6025,15 +7756,58 @@ def main():
             args.geometry_gradient_ratio
         ),
         "chart_anchor_weight": float(args.chart_anchor_weight),
+        "chart_atlas": {
+            "representation": (
+                "bounded_coarse_fine_inverse_depth_residual"
+            ),
+            "learning_rate": float(args.chart_atlas_lr),
+            "regularization_weight": float(
+                args.chart_atlas_regularization_weight
+            ),
+            "quadtree_growth_fraction": float(
+                args.chart_quadtree_growth_fraction
+            ),
+            "quadtree_maximum_level": int(
+                args.chart_quadtree_maximum_level
+            ),
+            "renderer_binding": (
+                "native_2d_surfel_geometry_same_mixed_cuda_sort"
+            ),
+            "final_export": "baked_standard_2dgs_geometry",
+        },
         "structure_weight": float(args.structure_weight),
         "ownership_weight": float(args.ownership_weight),
         "conditioned_ownership_weight": float(
             args.conditioned_ownership_weight
         ),
+        "counterfactual_transparency": {
+            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+            "weight": float(args.counterfactual_transparency_weight),
+            "margin": float(args.counterfactual_transparency_margin),
+            "temperature": float(
+                args.counterfactual_transparency_temperature
+            ),
+            "conditioned_every": int(
+                args.conditioned_counterfactual_every
+            ),
+            "gradient_owner": "volume_opacity_only",
+            "responsibility_gradient": "detached",
+        },
         "occupancy_weight": float(args.occupancy_weight),
         "dynamic_weight": float(args.dynamic_weight),
         "appearance_weight": float(args.appearance_weight),
         "high_frequency_weight": float(args.high_frequency_weight),
+        "rigid_residual_patch": {
+            "weight": float(args.rigid_residual_patch_weight),
+            "maximum_patches_per_view": 64,
+            "patch_size": 11,
+            "selection": (
+                "detached_rigid_residual_times_target_edge_spatial_nms_pool"
+            ),
+            "targets": (
+                "facade_window_stone_small_object_tree_boundary_rigid_side"
+            ),
+        },
         "maximum_surface_gaussians": int(surface_budget),
         "maximum_surface_growth_per_event": int(
             args.maximum_surface_growth_per_event
@@ -6046,13 +7820,59 @@ def main():
         "volume_densify_until_iteration": int(
             args.volume_densify_until_iteration
         ),
+        "volume_topology_phase_contract": VOLUME_TOPOLOGY_SETTLE_CONTRACT,
+        "conditioned_settle_contract": CONDITIONED_SETTLE_CONTRACT,
         "maximum_volume_radius_pixels": float(
             args.maximum_volume_radius_pixels
         ),
         "ray_posterior_every": int(args.ray_posterior_every),
         "ray_posterior_maximum_rays": int(
+            effective_ray_posterior_maximum_rays
+        ),
+        "ray_posterior_configured_maximum_rays": int(
             args.ray_posterior_maximum_rays
         ),
+        "ray_evidence_epoch_capacity": {
+            "batch_boundary_contract": RAY_EPOCH_BOUNDARY_CONTRACT,
+            "capacity_contract": RAY_EPOCH_CAPACITY_CONTRACT,
+            "capacity_scope": (
+                "clean_epoch_start"
+                if prior_ray_factor_calls == 0
+                else "resume_remaining_unvisited_rows"
+            ),
+            "scheduled_factor_calls": int(scheduled_ray_factor_calls),
+            "prior_factor_calls": int(prior_ray_factor_calls),
+            "available_factor_calls": int(capacity_ray_factor_calls),
+            "camera_table_count": int(len(per_camera_ray_rows)),
+            "full_effective_row_count": int(
+                foliage_ray_evidence_audit[
+                    "interval_effective_rows"
+                ]
+            ),
+            "remaining_unvisited_row_count": int(
+                remaining_unvisited_ray_rows
+            ),
+            "clean_epoch_aggregate_minimum_batch_with_five_percent_margin": int(
+                clean_epoch_aggregate_minimum_batch
+            ),
+            "clean_epoch_minimum_batch_for_complete_per_camera_epoch": int(
+                clean_epoch_minimum_batch
+            ),
+            "clean_epoch_effective_batch": int(clean_epoch_batch),
+            "runtime_aggregate_minimum_batch_with_five_percent_margin": int(
+                runtime_epoch_aggregate_minimum_batch
+            ),
+            "minimum_batch_for_runtime_completion": int(
+                ray_epoch_minimum_batch
+            ),
+            "required_factor_calls": int(required_ray_factor_calls),
+            "unused_factor_calls": int(
+                capacity_ray_factor_calls - required_ray_factor_calls
+            ),
+            "complete_epoch_capacity": bool(
+                required_ray_factor_calls <= capacity_ray_factor_calls
+            ),
+        },
         "ray_posterior_maximum_candidates": int(
             args.ray_posterior_maximum_candidates
         ),
@@ -6129,9 +7949,9 @@ def main():
                     for key, value in PERFORMANCE_RESUME_PREDECESSOR.items()
                 )
             )
-            trainer_repair = (
-                args.allow_trainer_repair_resume
-                and changed == {"trainer"}
+            trainer_repair = _trainer_repair_hash_change_is_allowed(
+                changed,
+                enabled=bool(args.allow_trainer_repair_resume),
             )
             volume_capacity_repair = (
                 args.allow_volume_capacity_repair_resume
@@ -6177,7 +7997,16 @@ def main():
                     "Resume implementation/CUDA hash mismatch; start a new "
                     "unified run"
                 )
-            if surface_ownership_repair:
+            if v38_causal_repair_resume:
+                print(
+                    "Resuming the exact v35 9k checkpoint into v39: ray "
+                    "epochs stop at camera-table boundaries with capacity "
+                    "derived from the persisted sampler cursors, detached "
+                    "surface counterfactuals route only volume transparency, "
+                    "and canonical_polish freezes topology while conditioned "
+                    "leaf optimization continues."
+                )
+            elif surface_ownership_repair:
                 print(
                     "Resuming the exact retained v83 10k checkpoint into "
                     "cross-sequence local surface retirement with a bounded "
@@ -6216,7 +8045,31 @@ def main():
                     "I/O/allocator-only compatibility enabled."
                 )
     if resume is not None and resume["schedule_hash"] != schedule_hash:
-        raise RuntimeError("Resume camera schedules changed")
+        if not args.allow_conditioned_schedule_repair_resume:
+            raise RuntimeError("Resume camera schedules changed")
+        saved_schedules = resume.get("schedules", {})
+        unchanged_schedule_names = ("rgb", "geometry", "topology")
+        changed_non_conditioned = [
+            name
+            for name in unchanged_schedule_names
+            if not np.array_equal(
+                np.asarray(saved_schedules.get(name, []), dtype=np.int64),
+                {
+                    "rgb": rgb_schedule,
+                    "geometry": geometry_schedule,
+                    "topology": topology_schedule,
+                }[name],
+            )
+        ]
+        if changed_non_conditioned:
+            raise RuntimeError(
+                "Conditioned schedule repair changed unrelated camera "
+                f"schedules: {changed_non_conditioned}"
+            )
+        print(
+            "Resuming with the coverage-preserving conditioned-camera "
+            "schedule; RGB, geometry and topology schedules are identical."
+        )
     contract_differences = (
         _resume_training_contract_differences(
             resume.get("training_contract", {}),
@@ -6224,11 +8077,17 @@ def main():
             allow_trainer_repair_migration=bool(
                 args.allow_trainer_repair_resume
             ),
+            allow_conditioned_schedule_repair_migration=bool(
+                args.allow_conditioned_schedule_repair_resume
+            ),
             allow_volume_capacity_repair_migration=bool(
                 args.allow_volume_capacity_repair_resume
             ),
             allow_surface_ownership_repair_migration=bool(
                 args.allow_surface_ownership_repair_resume
+            ),
+            allow_v38_causal_repair_migration=bool(
+                v38_causal_repair_resume
             ),
         )
         if resume is not None
@@ -6379,6 +8238,13 @@ def main():
     )
     if resume is None:
         start_step = 0
+        conditioned_visit_counts = np.zeros(
+            len(views), dtype=np.int64
+        )
+        conditioned_visit_provenance = {
+            "source": "new_runtime_ledger",
+            "carried_conditioned_steps": 0,
+        }
         volume_stats = _volume_stats(foliage)
         replacement_stats = None
         topology_events = []
@@ -6397,6 +8263,10 @@ def main():
         )
     else:
         start_step = int(resume["iteration"])
+        (
+            conditioned_visit_counts,
+            conditioned_visit_provenance,
+        ) = _resume_conditioned_visit_counts(resume, len(views))
         volume_stats = {
             name: value.cuda()
             for name, value in resume["volume_stats"].items()
@@ -6507,24 +8377,19 @@ def main():
             requested.append(
                 views[int(rgb_schedule[future_step])]
             )
-            if (
-                _dynamic_enabled(
-                    future_step,
-                    args.phase_schedule_horizon,
-                    args.training_profile,
-                )
-                and _phase(
-                    future_step,
-                    args.phase_schedule_horizon,
-                    args.training_profile,
-                )
-                != "canonical_polish"
+            if _conditioned_branch_active(
+                future_step,
+                args.phase_schedule_horizon,
+                args.training_profile,
             ):
                 requested.append(
                     views[int(conditioned_schedule[future_step])]
                 )
             if (
-                _surface_topology_active(future_step, args)
+                (
+                    _surface_topology_active(future_step, args)
+                    or _chart_topology_active(future_step, args)
+                )
                 and (future_step + 1) >= anchor_release_iteration
                 and args.topology_every > 0
                 and (future_step + 1) % args.topology_every == 0
@@ -6565,9 +8430,9 @@ def main():
         foliage_active = _foliage_enabled(
             step, args.phase_schedule_horizon, args.training_profile
         )
-        dynamic_active = _dynamic_enabled(
+        dynamic_active = _conditioned_branch_active(
             step, args.phase_schedule_horizon, args.training_profile
-        ) and phase != "canonical_polish"
+        )
         # A 24k rigid handoff is a mature reconstruction, not a fresh seed.
         # Restarting its exponential xyz schedule at iteration one raised the
         # position LR by roughly 40x and destroyed the scaffold within the
@@ -6585,6 +8450,7 @@ def main():
             surface.oneupSHdegree()
         surface.optimizer.zero_grad(set_to_none=True)
         volume_optimizer.zero_grad(set_to_none=True)
+        chart_atlas_optimizer.zero_grad(set_to_none=True)
         view = views[int(rgb_schedule[step])]
         task = fields.fields(
             view.image_name,
@@ -6720,6 +8586,16 @@ def main():
         )
         rigid_photo = isolated_rgb["rigid"]
         rigid_high_frequency = isolated_rgb["rigid_high_frequency"]
+        (
+            rigid_residual_patch,
+            rigid_residual_patch_audit,
+        ) = _rigid_residual_patch_loss(
+            structural_prediction,
+            target,
+            task["p_rigid"]
+            * (1.0 - task["p_transient"])
+            * _boundary_evidence_weight(task),
+        )
         dav2_patch_uv = dav2_observation_patches.get(
             str(Path(str(view.image_name)).stem)
         )
@@ -6734,6 +8610,31 @@ def main():
             package,
             task,
         )
+        counterfactual_transparency = canonical.new_zeros(())
+        counterfactual_transparency_audit = {
+            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+            "supported_pixels": 0,
+            "mean_responsibility": 0.0,
+            "mean_relative_rgb_advantage": 0.0,
+            "mean_volume_alpha_on_support": 0.0,
+        }
+        if (
+            foliage_active
+            and args.counterfactual_transparency_weight > 0
+        ):
+            (
+                counterfactual_transparency,
+                counterfactual_transparency_audit,
+            ) = _counterfactual_volume_transparency_loss(
+                canonical,
+                structural_prediction,
+                target,
+                package.volume_alpha,
+                structural_package.surface_alpha,
+                task,
+                margin=args.counterfactual_transparency_margin,
+                temperature=args.counterfactual_transparency_temperature,
+            )
         volume_in_rigid = _weighted_mean(
             package.volume_alpha,
             task["p_rigid"],
@@ -6817,7 +8718,7 @@ def main():
                 ray_loss, ray_audit = foliage_rays.interval_factor(
                     view_by_camera_id[ray_camera_id],
                     foliage,
-                    maximum_rays=args.ray_posterior_maximum_rays,
+                    maximum_rays=effective_ray_posterior_maximum_rays,
                     maximum_candidates_per_ray=(
                         args.ray_posterior_maximum_candidates
                     ),
@@ -6860,11 +8761,17 @@ def main():
             photo
             + 0.45 * rigid_photo
             + 0.12 * rigid_high_frequency
+            + args.rigid_residual_patch_weight
+            * rigid_residual_patch
             + args.dav2_observation_patch_weight
             * dav2_observation_photo
             + args.ownership_weight * ownership
+            + args.counterfactual_transparency_weight
+            * counterfactual_transparency
             + args.occupancy_weight * occupancy
             + (0.015 * geometry_floor if foliage_active else 0.0)
+            + args.chart_atlas_regularization_weight
+            * chart_surface.regularizer()
         )
         # Rigid/sky RGB, geometry and ownership update their normal owners.
         # Canopy RGB is differentiated only with respect to the foliage
@@ -6928,6 +8835,15 @@ def main():
         _accumulate_volume_stats(volume_stats, package)
 
         conditioned_loss = canonical_loss.new_zeros(())
+        conditioned_counterfactual_transparency = canonical_loss.new_zeros(())
+        conditioned_counterfactual_audit = {
+            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+            "scheduled": False,
+            "supported_pixels": 0,
+            "mean_responsibility": 0.0,
+            "mean_relative_rgb_advantage": 0.0,
+            "mean_volume_alpha_on_support": 0.0,
+        }
         uncertainty_loss = canonical_loss.new_zeros(())
         high_frequency_loss = canonical_loss.new_zeros(())
         conditioned_ownership = canonical_loss.new_zeros(())
@@ -6945,6 +8861,7 @@ def main():
         conditioned_view = None
         if dynamic_active:
             conditioned_view_index = int(conditioned_schedule[step])
+            conditioned_visit_counts[conditioned_view_index] += 1
             conditioned_view = views[conditioned_view_index]
             conditioned_task_fields = fields.fields(
                 conditioned_view.image_name,
@@ -7042,6 +8959,50 @@ def main():
                 conditioned_package.alpha,
                 sky(conditioned_view),
             )
+            if (
+                args.counterfactual_transparency_weight > 0
+                and (step + 1)
+                % args.conditioned_counterfactual_every
+                == 0
+            ):
+                # This render is evidence only.  Keeping it out of autograd
+                # avoids a second surface/sky owner and leaves the mixed
+                # package's volume alpha as the sole trainable quantity.
+                with torch.no_grad():
+                    conditioned_surface_package = render_hybrid(
+                        conditioned_view,
+                        surface,
+                        foliage,
+                        background=background,
+                        include_dynamic=False,
+                        volume_opacity_scale=0.0,
+                        structural_trainable_start=None,
+                    )
+                    conditioned_surface_prediction = (
+                        composite_white_background(
+                            conditioned_surface_package.render,
+                            conditioned_surface_package.alpha,
+                            sky(conditioned_view),
+                        )
+                    )
+                (
+                    conditioned_counterfactual_transparency,
+                    conditioned_counterfactual_audit,
+                ) = _counterfactual_volume_transparency_loss(
+                    conditioned_base,
+                    conditioned_surface_prediction,
+                    conditioned_target,
+                    conditioned_package.volume_alpha,
+                    conditioned_surface_package.surface_alpha,
+                    conditioned_task_fields,
+                    margin=args.counterfactual_transparency_margin,
+                    temperature=args.counterfactual_transparency_temperature,
+                )
+                conditioned_counterfactual_audit["scheduled"] = True
+                del (
+                    conditioned_surface_package,
+                    conditioned_surface_prediction,
+                )
             # Appearance routing must use the same deployable primitive
             # ownership as HybridTeacherAPI.  Ground-truth masks define loss
             # support only; feeding them into the appearance decoder during
@@ -7174,6 +9135,8 @@ def main():
                 + args.high_frequency_weight * high_frequency_loss
                 + args.conditioned_ownership_weight
                 * conditioned_ownership
+                + args.counterfactual_transparency_weight
+                * conditioned_counterfactual_transparency
                 + 0.02 * dynamic_regularization
                 + 0.02 * dynamic_presence
                 + 0.10 * dynamic_observation_loss
@@ -7202,7 +9165,8 @@ def main():
                         ).sum()
                     ),
                     "ownership_contract": (
-                        "exact_base_soft_temporal_residual"
+                        "exact_base_soft_temporal_residual_plus_"
+                        "shared_canonical_group_conditioning"
                     ),
                 }
             )
@@ -7418,6 +9382,12 @@ def main():
             geometry_values["chart_anchor_matched"] = int(
                 chart_anchor_audit["matched"]
             )
+            geometry_values["chart_uv_edges_sampled"] = int(
+                chart_anchor_audit.get("uv_edges_sampled", 0)
+            )
+            geometry_values["chart_uv_edges_matched"] = int(
+                chart_anchor_audit.get("uv_edges_matched", 0)
+            )
             geometry_loss = geometry_loss + (
                 args.track_weight
                 * (track_observation_loss + 0.10 * track_loss)
@@ -7503,7 +9473,10 @@ def main():
 
         topology_loss = canonical_loss.new_zeros(())
         if (
-            _surface_topology_active(step, args)
+            (
+                _surface_topology_active(step, args)
+                or _chart_topology_active(step, args)
+            )
             and anchors_released
             and args.topology_every > 0
             and (step + 1) % args.topology_every == 0
@@ -7698,6 +9671,17 @@ def main():
                 surface_rgb_means2d_gradient_norm
             ),
         )
+        if chart_surface.atlas is not None:
+            gradient_audit.update(
+                {
+                    "chart_atlas_coarse_inverse_depth": _gradient_norm(
+                        chart_surface.atlas.coarse_residual
+                    ),
+                    "chart_atlas_fine_inverse_depth": _gradient_norm(
+                        chart_surface.atlas.fine_residual
+                    ),
+                }
+            )
         if (
             step == 0
             and (
@@ -7719,12 +9703,16 @@ def main():
             _apply_mature_surface_gradient_policy(
                 surface,
                 args.mature_handoff_surface_policy,
+                chart_surface=chart_surface,
             )
         )
         surface.optimizer.step()
         volume_optimizer.step()
+        if args.mature_handoff_surface_policy == "joint":
+            chart_atlas_optimizer.step()
         surface.optimizer.zero_grad(set_to_none=True)
         volume_optimizer.zero_grad(set_to_none=True)
+        chart_atlas_optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             foliage.quaternions.copy_(
                 F.normalize(foliage.quaternions, dim=-1)
@@ -7749,6 +9737,17 @@ def main():
                 foliage.canonical_crown_mask,
                 crown_opacity_ceiling,
             )
+            # Geometry uncertainty controls initialization, ray-factor
+            # strength, visibility and topology authority.  It must not be a
+            # hard upper bound on optical existence: a broad single-view
+            # depth posterior can still contain a very real opaque leaf in
+            # its exact owner image.  The former per-row projection pinned
+            # weak DAV2 births near alpha=0.02 (versus ~0.09 before the
+            # projection), so RGB could never fill the crown even when its
+            # residual supplied direct evidence.  Retain only the ordinary
+            # role-wide safety bound here; free-space/ray evidence remains a
+            # differentiable spatial constraint instead of a representational
+            # gate.
             _masked_clamp_max_(
                 foliage.opacity_logits,
                 foliage.dynamic_leaf_mask,
@@ -7848,23 +9847,74 @@ def main():
                 )
 
         topology_event = None
-        if _surface_topology_active(step, args) and anchors_released:
+        if (
+            _surface_topology_active(step, args)
+            or _chart_topology_active(step, args)
+        ) and anchors_released:
             if (step + 1) % args.densification_interval == 0:
                 before_count = len(surface.get_xyz)
-                surface_event = surface.densify_and_prune_bounded(
-                    args.densify_grad_threshold,
-                    args.opacity_cull,
-                    scene.cameras_extent,
-                    64,
-                    max_points=surface_budget,
-                    max_growth=args.maximum_surface_growth_per_event,
-                    observation_reference_count=max(len(views), 1),
+                chart_priority_snapshot = (
+                    chart_surface.topology_priority_snapshot(
+                        surface,
+                        gradient_threshold=args.densify_grad_threshold,
+                        radius_target=8.0,
+                    )
+                )
+                chart_growth_budget = int(
+                    round(
+                        args.maximum_surface_growth_per_event
+                        * args.chart_quadtree_growth_fraction
+                    )
+                )
+                ordinary_growth_budget = max(
+                    args.maximum_surface_growth_per_event
+                    - chart_growth_budget,
+                    0,
+                )
+                if (
+                    _surface_topology_active(step, args)
+                    and ordinary_growth_budget > 0
+                ):
+                    surface_event = surface.densify_and_prune_bounded(
+                        args.densify_grad_threshold,
+                        args.opacity_cull,
+                        scene.cameras_extent,
+                        64,
+                        max_points=surface_budget,
+                        max_growth=ordinary_growth_budget,
+                        observation_reference_count=max(len(views), 1),
+                    )
+                else:
+                    surface_event = {
+                        "enabled": False,
+                        "reason": (
+                            "mature_surface_world_topology_frozen"
+                            if not _surface_topology_active(step, args)
+                            else "entire_budget_reserved_for_chart_uv"
+                        ),
+                        "before": len(surface.get_xyz),
+                        "after": len(surface.get_xyz),
+                        "net_growth": 0,
+                    }
+                chart_event = chart_surface.adapt_uv_quadtree(
+                    surface,
+                    maximum_net_growth=(
+                        chart_growth_budget
+                        if _chart_topology_active(step, args)
+                        else 0
+                    ),
+                    maximum_points=surface_budget,
+                    gradient_threshold=args.densify_grad_threshold,
+                    radius_target=8.0,
+                    maximum_level=args.chart_quadtree_maximum_level,
+                    priority_snapshot=chart_priority_snapshot,
                 )
                 topology_event = {
                     "iteration": step + 1,
                     "surface_before": before_count,
                     "surface_after": len(surface.get_xyz),
                     "surface": surface_event,
+                    "chart_uv_quadtree": chart_event,
                     "renderer_evidence_witnesses_released": (
                         anchors_released
                     ),
@@ -7881,7 +9931,7 @@ def main():
             if topology_event is not None:
                 topology_events.append(topology_event)
         if (
-            (step + 1) <= args.volume_densify_until_iteration
+            _volume_topology_active(step, args, phase)
             and foliage_active
             and (step + 1) % args.volume_densify_every == 0
             and len(foliage)
@@ -7895,6 +9945,7 @@ def main():
                 split_capacity_scale=_volume_topology_ramp_scale(
                     step, args
                 ),
+                camera_forward_lookup=camera_forward_lookup,
             )
             new_to_old = event.pop("_new_to_old", None)
             if new_to_old is not None:
@@ -7935,6 +9986,8 @@ def main():
             canonical_loss.detach()
             + canopy_photo.detach()
             + conditioned_loss.detach()
+            + args.counterfactual_transparency_weight
+            * conditioned_counterfactual_transparency.detach()
             + geometry_loss.detach()
             + 0.20 * topology_loss.detach()
         )
@@ -7951,6 +10004,10 @@ def main():
                 "rigid_high_frequency": float(
                     rigid_high_frequency.detach()
                 ),
+                "rigid_residual_patch": {
+                    "loss": float(rigid_residual_patch.detach()),
+                    **rigid_residual_patch_audit,
+                },
                 "dav2_observation_photo": float(
                     dav2_observation_photo.detach()
                 ),
@@ -7985,9 +10042,19 @@ def main():
                 "surface_canopy_front_conflict": float(
                     surface_in_canopy.detach()
                 ),
+                "counterfactual_transparency": {
+                    "loss": float(counterfactual_transparency.detach()),
+                    **counterfactual_transparency_audit,
+                },
                 "conditioned_ownership": float(
                     conditioned_ownership.detach()
                 ),
+                "conditioned_counterfactual_transparency": {
+                    "loss": float(
+                        conditioned_counterfactual_transparency.detach()
+                    ),
+                    **conditioned_counterfactual_audit,
+                },
                 "dynamic_observation": {
                     "loss": float(dynamic_observation_loss.detach()),
                     **dynamic_observation_audit,
@@ -8081,11 +10148,21 @@ def main():
                         "geometry": geometry_schedule,
                         "topology": topology_schedule,
                     },
+                    "conditioned_visit_counts": (
+                        conditioned_visit_counts.copy()
+                    ),
+                    "conditioned_visit_provenance": (
+                        conditioned_visit_provenance
+                    ),
                     "implementation_hashes": implementation_hashes,
                     "runtime_provenance": runtime_provenance,
                     "phase": phase,
                     "surface": surface.capture(),
                     "surface_audit": surface_audit,
+                    "chart_surface": chart_surface.capture(),
+                    "chart_atlas_optimizer": (
+                        chart_atlas_optimizer.state_dict()
+                    ),
                     "anchors_released": anchors_released,
                     "anchor_release_iteration": anchor_release_iteration,
                     "anchor_release_events": anchor_release_events,
@@ -8228,6 +10305,12 @@ def main():
         final_cleanup["removed"] = (
             final_cleanup["before"] - final_cleanup["after"]
         )
+        # Persist the current atlas geometry into ordinary 2DGS tensors.  The
+        # training checkpoint retains the atlas for exact continuation, while
+        # point_cloud.ply is now directly consumable by an unmodified native
+        # 2DGS renderer/localization stack.
+        chart_bake = chart_surface.bake_into_surface(surface)
+        final_cleanup["chart_atlas_bake"] = chart_bake
         final_scale = surface.get_scaling.max(dim=1).values
         final_dav2 = (
             surface._source_type
@@ -8340,11 +10423,18 @@ def main():
                 "geometry": geometry_schedule,
                 "topology": topology_schedule,
             },
+            "conditioned_visit_counts": (
+                conditioned_visit_counts.copy()
+            ),
+            "conditioned_visit_provenance": (
+                conditioned_visit_provenance
+            ),
             "implementation_hashes": implementation_hashes,
             "runtime_provenance": runtime_provenance,
             "surface": surface.capture(),
             "surface_audit": surface_audit,
             "surface_warmstart": surface_warmstart,
+            "chart_surface": chart_surface.capture(),
             "foliage": foliage.capture(),
             "foliage_ray_evidence_audit": foliage_rays.audit(),
             "camera_ownership_contract": {
@@ -8374,6 +10464,8 @@ def main():
     scene.save(args.iterations)
     rigid_surface_handoff = None
     if args.training_profile == "hybrid_rigid_stage1":
+        chart_surface_state = output / "chart_surface_state.pth"
+        torch.save(chart_surface.capture(), chart_surface_state)
         geometry_audit_for_handoff = geometry.audit()
         geometry_audit_for_handoff.update(
             {
@@ -8399,6 +10491,7 @@ def main():
             fixed_camera_validation=fixed_camera_validation,
             geometry_audit=geometry_audit_for_handoff,
             surface_optimizer=training_contract["surface_optimizer"],
+            chart_surface_state=chart_surface_state,
         )
     eval_indices = [
         int(value)

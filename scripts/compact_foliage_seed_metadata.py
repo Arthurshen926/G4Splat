@@ -17,7 +17,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from outdoor.evidence_store import sha256_file  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
-    INITIALIZATION_VERSION,
     _compact_padded_camera_metadata,
 )
 
@@ -49,6 +48,10 @@ def main() -> None:
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
+    source_manifest = json.loads(
+        source_manifest_path.read_text(encoding="utf-8")
+    )
+    source_protocol = str(source_manifest["version"])
 
     output.mkdir(parents=True)
     for name in ("surface_seed.npz", "surface_seed.json"):
@@ -77,13 +80,13 @@ def main() -> None:
         str(payload.get("geometry_version", "unknown"))
         + "_compact_camera_slots_v1"
     )
-    payload.setdefault("audit", {})["protocol"] = INITIALIZATION_VERSION
+    payload.setdefault("audit", {})["protocol"] = source_protocol
     payload["audit"]["camera_metadata_storage"] = storage
     foliage_path = output / "foliage_seed_gaussians.pth"
     torch.save(payload, foliage_path)
 
     summary = json.loads(source_summary_path.read_text(encoding="utf-8"))
-    summary["protocol"] = INITIALIZATION_VERSION
+    summary["protocol"] = source_protocol
     summary["camera_metadata_storage"] = storage
     summary["migrated_from"] = {
         "initialization": str(source),
@@ -94,10 +97,8 @@ def main() -> None:
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
 
-    manifest = json.loads(
-        source_manifest_path.read_text(encoding="utf-8")
-    )
-    manifest["version"] = INITIALIZATION_VERSION
+    manifest = source_manifest
+    manifest["version"] = source_protocol
     manifest["surface_seed"] = str(output / "surface_seed.npz")
     manifest["foliage_seed"] = str(foliage_path)
     manifest["foliage"] = summary
@@ -117,7 +118,7 @@ def main() -> None:
         json.dumps(
             {
                 "output": str(output),
-                "version": INITIALIZATION_VERSION,
+                "version": source_protocol,
                 "foliage_seed_sha256": sha256_file(foliage_path),
                 **storage,
             },

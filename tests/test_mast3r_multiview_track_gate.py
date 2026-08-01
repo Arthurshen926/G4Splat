@@ -4,14 +4,31 @@ import numpy as np
 import pytest
 
 from outdoor.mast3r_track_graph import (
+    CameraUniqueUnionFind,
     _PointmapCache,
     TRACK_GRAPH_VERSION,
+    descriptor_cycle_consistency,
+    descriptor_view_direction_cost,
     _project,
     _target_raster_observations,
     _triangulate,
     _unproject,
     validate_track_gate,
 )
+
+
+def test_union_find_rejects_transitive_duplicate_camera_observation():
+    union = CameraUniqueUnionFind()
+    camera0_first = union.add(0)
+    camera1 = union.add(1)
+    camera2 = union.add(2)
+    camera0_second = union.add(0)
+
+    assert union.union(camera0_first, camera1)
+    assert union.union(camera1, camera2)
+    assert not union.union(camera2, camera0_second)
+    assert union.find(camera0_first) == union.find(camera2)
+    assert union.find(camera0_second) != union.find(camera2)
 from outdoor.training_evidence import _rigid_global_track_mask
 
 
@@ -108,6 +125,27 @@ def test_projection_uses_anisotropic_offcenter_exact_k():
     assert depth[0] == pytest.approx(4.0)
     assert u[0] == pytest.approx(501.0)
     assert v[0] == pytest.approx(349.0)
+
+
+def test_descriptor_pairing_rejects_opposite_optical_axes():
+    source = np.asarray([0.0, 0.0, 1.0])
+    target = np.asarray(
+        [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]
+    )
+    cost = descriptor_view_direction_cost(source, target)
+    np.testing.assert_allclose(cost, [0.0, 2.0])
+
+
+def test_descriptor_cycle_audit_is_not_an_unconditional_one():
+    no_loop_rank, pair_consistency = descriptor_cycle_consistency(
+        0.5, 1.5, descriptor_edge_count=1, observation_node_count=2
+    )
+    loop_rank, loop_consistency = descriptor_cycle_consistency(
+        0.5, 1.5, descriptor_edge_count=3, observation_node_count=3
+    )
+    assert no_loop_rank == 0
+    assert loop_rank == 1
+    assert 0.5 < pair_consistency < loop_consistency < 1.0
 
 
 def test_unprojection_round_trips_an_independent_exact_k_observation():

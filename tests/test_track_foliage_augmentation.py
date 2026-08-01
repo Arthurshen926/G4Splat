@@ -72,3 +72,29 @@ def test_dense_tree_instance_uses_bounded_neighbour_graph():
     )
 
     assert len(np.unique(labels)) == 1
+
+
+def test_sparse_bridge_does_not_merge_two_dense_tree_crowns():
+    rng = np.random.default_rng(4)
+    first = rng.normal(scale=0.12, size=(40, 3))
+    second = rng.normal(scale=0.12, size=(40, 3))
+    second[:, 0] += 5.0
+    bridge = np.column_stack(
+        [
+            np.arange(1.0, 5.0, 1.0),
+            np.zeros(4),
+            np.zeros(4),
+        ]
+    )
+
+    labels = cluster_tree_instances(
+        np.concatenate([first, bridge, second], axis=0),
+        connection_radius=1.1,
+        minimum_tracks=8,
+        maximum_component_extent=12.0,
+        minimum_core_neighbours=4,
+    )
+
+    assert len(np.unique(labels[:40])) == 1
+    assert len(np.unique(labels[-40:])) == 1
+    assert labels[0] != labels[-1]

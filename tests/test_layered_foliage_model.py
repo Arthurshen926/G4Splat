@@ -8,8 +8,10 @@ from outdoor.hybrid_gaussian_renderer import (
     LAYER_DYNAMIC_LEAF,
     LAYER_STATIC_SKELETON,
     VolumetricFoliageModel,
+    bounded_exact_ray_render_scales,
     conserve_local_temporal_fallback_mass,
     local_optical_mass_replacement,
+    projected_gaussian_cross_section,
 )
 from scripts.train_layered_foliage_v6 import (
     _adaptive_topology,
@@ -106,6 +108,57 @@ def test_adaptive_quaternary_split_spends_three_net_growth_slots():
     assert len(torch.unique(model.xyz[-4:], dim=0)) == 4
 
 
+def test_exact_ray_split_refines_camera_plane_without_tightening_depth():
+    payload = _payload()
+    payload["centers"] = payload["centers"][:1].clone()
+    payload["scales"] = torch.tensor([[0.10, 0.20, 0.30]])
+    payload["quaternions"] = payload["quaternions"][:1].clone()
+    payload["opacities"] = payload["opacities"][:1].clone()
+    payload["colors"] = payload["colors"][:1].clone()
+    payload["primitive_role"] = payload["primitive_role"][:1].clone()
+    payload["track_linearity"] = payload["track_linearity"][:1].clone()
+    payload["track_id"] = payload["track_id"][:1].clone()
+    payload["tree_instance_id"] = payload["tree_instance_id"][:1].clone()
+    payload["support_camera_ids"] = payload["support_camera_ids"][:1].clone()
+    payload["support_view_count"] = payload["support_view_count"][:1].clone()
+    payload["support_sequence_count"] = payload[
+        "support_sequence_count"
+    ][:1].clone()
+    payload["occupancy_probability"] = payload[
+        "occupancy_probability"
+    ][:1].clone()
+    payload["position_covariance"] = torch.diag(
+        torch.tensor([0.01, 0.02, 0.50])
+    )[None]
+    payload["reprojection_error"] = payload[
+        "reprojection_error"
+    ][:1].clone()
+    model = VolumetricFoliageModel(0, device="cpu")
+    model.initialize_from_volume_state(payload)
+    before_center = model.xyz[0].clone()
+    before_covariance = model.position_covariance[0].clone()
+
+    report = model.split_adaptive(
+        torch.tensor([0]),
+        torch.tensor([4]),
+        split_plane_normals=torch.tensor([[0.0, 0.0, 1.0]]),
+    )
+
+    assert report["camera_plane_parents"] == 1
+    torch.testing.assert_close(
+        model.scales,
+        torch.tensor([[0.05, 0.10, 0.30]]).repeat(4, 1),
+    )
+    torch.testing.assert_close(
+        model.position_covariance,
+        before_covariance[None].repeat(4, 1, 1),
+    )
+    torch.testing.assert_close(
+        model.xyz[:, 2], before_center[2].repeat(4)
+    )
+    assert len(torch.unique(model.xyz[:, :2], dim=0)) == 4
+
+
 def test_candidate_state_remaps_by_stable_structural_index():
     remapped = _remap_candidate_values(
         torch.tensor([7, 2, 9, 4]),
@@ -160,6 +213,86 @@ def test_local_optical_mass_replacement_is_split_invariant():
         split_scales,
     )
     assert torch.allclose(parent, children, atol=1.0e-6)
+
+
+def test_projected_optical_mass_is_camera_plane_split_invariant():
+    roles = torch.tensor(
+        [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF], dtype=torch.int8
+    )
+    groups = torch.zeros(2, dtype=torch.int32)
+    opacity = torch.tensor([[0.08], [0.04]])
+    scales = torch.tensor([[0.2, 0.2, 0.2], [0.1, 0.2, 1.0]])
+    rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1)
+    view_vectors = torch.tensor([[0.0, 0.0, 2.0]]).repeat(2, 1)
+    parent = local_optical_mass_replacement(
+        roles,
+        groups,
+        opacity,
+        scales,
+        rotations=rotations,
+        view_vectors=view_vectors,
+    )
+
+    child_roles = torch.tensor(
+        [LAYER_CANONICAL_CROWN] + [LAYER_DYNAMIC_LEAF] * 4,
+        dtype=torch.int8,
+    )
+    child_groups = torch.zeros(5, dtype=torch.int32)
+    child_opacity = torch.cat([opacity[:1], opacity[1:].repeat(4, 1)])
+    child_scales = torch.cat(
+        [scales[:1], torch.tensor([[0.05, 0.10, 1.0]]).repeat(4, 1)]
+    )
+    child_rotations = rotations[:1].repeat(5, 1)
+    child_views = view_vectors[:1].repeat(5, 1)
+    children = local_optical_mass_replacement(
+        child_roles,
+        child_groups,
+        child_opacity,
+        child_scales,
+        rotations=child_rotations,
+        view_vectors=child_views,
+    )
+    torch.testing.assert_close(parent, children, atol=1.0e-7, rtol=1.0e-6)
+
+
+def test_projected_cross_section_excludes_depth_axis_in_owner_view():
+    scales = torch.tensor([[0.1, 0.2, 1.0]])
+    rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    view = torch.tensor([[0.0, 0.0, 2.0]])
+    area = projected_gaussian_cross_section(scales, rotation, view)
+    torch.testing.assert_close(area, torch.tensor([0.1 * 0.2 / 4.0]))
+
+
+def test_exact_ray_render_bound_changes_only_visible_exact_ray_footprint():
+    foliage = SimpleNamespace(
+        dynamic_leaf_mask=torch.tensor([True, True, True, False]),
+        initialization_source=torch.tensor([4, 4, 3, 4]),
+        observation_camera_ids=torch.tensor(
+            [[7, -1], [7, -1], [7, -1], [7, -1]]
+        ),
+        position_covariance=torch.eye(3).repeat(4, 1, 1),
+    )
+    scales = torch.tensor(
+        [[0.01, 0.02, 1.0]] * 4, requires_grad=True
+    )
+    gate = torch.tensor([1.0, 0.25, 0.25, 0.25])
+    before_covariance = foliage.position_covariance.clone()
+    bounded = bounded_exact_ray_render_scales(
+        foliage, scales, gate, maximum_depth_to_tangent_ratio=8.0
+    )
+
+    torch.testing.assert_close(
+        bounded[0], torch.tensor([0.01, 0.02, 0.16])
+    )
+    torch.testing.assert_close(
+        bounded[1], torch.tensor([0.01, 0.02, 0.16])
+    )
+    torch.testing.assert_close(bounded[2:], scales[2:])
+    torch.testing.assert_close(
+        foliage.position_covariance, before_covariance
+    )
+    bounded.sum().backward()
+    assert scales.grad[1, 2].item() == 0.0
 
 
 def test_local_optical_mass_replacement_accumulates_local_descendants():
@@ -217,6 +350,25 @@ def test_temporal_fallback_fills_but_cannot_exceed_local_canonical_mass():
     )
     torch.testing.assert_close(adjusted[1], opacity[1])
     assert bool((adjusted[2:] < opacity[2:] * 0.5).all())
+
+
+def test_oversubscribed_exact_descendants_remain_direct_observations():
+    roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    groups = torch.zeros(3, dtype=torch.int32)
+    scales = torch.full((3, 3), 0.1)
+    opacity = torch.tensor([[0.04], [0.40], [0.40]])
+    gate = torch.ones(3)
+    adjusted = conserve_local_temporal_fallback_mass(
+        roles, groups, opacity, scales, gate
+    )
+    torch.testing.assert_close(adjusted, opacity)
 
 
 def test_temporal_fallback_mass_cap_is_split_invariant():

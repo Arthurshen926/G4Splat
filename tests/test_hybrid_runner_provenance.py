@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 from outdoor.evidence_store import sha256_file
 from scripts.run_cambridge_hybrid_teacher import (
@@ -12,14 +14,49 @@ from scripts.run_cambridge_hybrid_teacher import (
 )
 
 
+def test_scene_contract_entrypoint_imports_repo_from_any_working_directory(
+    tmp_path,
+):
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/build_cambridge_scene_manifest.py"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
     profile = PROFILES["quality"]
 
-    assert "dav2-cross-ray-posterior-exact-rgb-contract" in PIPELINE_VERSION
-    assert profile["selected_foliage_views"] == 256
-    assert profile["maximum_dense_rays_per_foliage_view"] == 8_192
+    assert (
+        "native-rigid-depth-calibrated-continuous-all-camera-posterior"
+        in PIPELINE_VERSION
+    )
+    assert profile["selected_foliage_views"] == 0
+    assert profile["maximum_dense_rays_per_foliage_view"] == 2_048
     assert profile["maximum_dense_rays_total"] == 1_572_864
-    assert profile["minimum_dense_rays_per_foliage_view"] == 4_096
+    assert profile["minimum_dense_rays_per_foliage_view"] == 512
+    assert profile["maximum_bound_rays_per_foliage_view"] == 8_192
+    assert profile["maximum_dynamic_births_per_foliage_view"] == 384
+    assert (
+        profile[
+            "maximum_weak_continuous_dynamic_births_per_foliage_view"
+        ]
+        == 2_048
+    )
+    assert (
+        profile["dynamic_birth_target_source_pixels_per_basis"]
+        == 192.0
+    )
+    assert profile["use_temporal_dav2_witnesses"] is False
+    assert profile["use_rigid_depth_calibrated_foliage"] is True
+    assert profile["rigid_calibration_resolution_scale"] == 0.125
+    assert profile["foliage_voxel_size"] == 0.12
     assert profile["maximum_mast3r_pointmap_seeds"] == 240_000
     assert profile["mast3r_pointmap_seeds_per_view"] == 7_000
     assert (
@@ -50,6 +87,37 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
             "surface_retirement_optical_mass_fraction_per_event"
         ]
         == 0.0025
+    )
+    runner = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/run_cambridge_hybrid_teacher.py"
+    ).read_text(encoding="utf-8")
+    assert "initialization_temporal_dav2" in runner
+    assert "augment_temporal_dav2_foliage.py" in runner
+    assert "TEMPORAL_DAV2_AUGMENTATION_VERSION" in runner
+    assert "rebuild_foliage_with_rigid_depth.py" in runner
+    assert "RIGID_CALIBRATED_INITIALIZATION_VERSION" in runner
+
+
+def test_fast_profile_shortens_training_without_halving_foliage_evidence():
+    fast = PROFILES["fast"]
+    quality = PROFILES["quality"]
+
+    assert fast["iterations"] < quality["iterations"]
+    assert fast["selected_foliage_views"] == 0
+    assert (
+        fast["selected_foliage_views"]
+        == quality["selected_foliage_views"]
+    )
+    assert (
+        fast["maximum_dense_rays_total"]
+        == quality["maximum_dense_rays_total"]
+        == 1_572_864
+    )
+    assert (
+        fast["foliage_voxel_size"]
+        == quality["foliage_voxel_size"]
+        == 0.12
     )
 
 

@@ -93,7 +93,17 @@ def _parse_args() -> argparse.Namespace:
         default=0.25,
     )
     parser.add_argument("--maximum-foliage-voxels", type=int, default=400_000)
-    parser.add_argument("--selected-foliage-views", type=int, default=64)
+    parser.add_argument(
+        "--selected-foliage-views",
+        type=int,
+        default=64,
+        help=(
+            "Number of sequence/pose-diverse cameras used by the foliage "
+            "posterior. Use 0 for every fixed database camera; the global "
+            "dense-ray budget still controls ownerless observation-space "
+            "evidence cardinality."
+        ),
+    )
     parser.add_argument(
         "--maximum-dense-rays-per-foliage-view",
         type=int,
@@ -122,7 +132,62 @@ def _parse_args() -> argparse.Namespace:
             "Per-view coverage floor used with --maximum-dense-rays-total."
         ),
     )
+    parser.add_argument(
+        "--maximum-bound-rays-per-foliage-view",
+        type=int,
+        default=8192,
+        help=(
+            "Maximum persistent canonical candidate-bound interval factors "
+            "per selected camera. Visual-hull verification still uses every "
+            "candidate/camera projection; this bounds only the finite "
+            "runtime factor basis."
+        ),
+    )
+    parser.add_argument(
+        "--maximum-dynamic-births-per-foliage-view",
+        type=int,
+        default=1024,
+        help=(
+            "Maximum sequence-local renderer basis size per selected view. "
+            "The complete dense-ray posterior remains external evidence; "
+            "nearby rays share finite-footprint births and adaptive splits."
+        ),
+    )
+    parser.add_argument(
+        "--maximum-weak-continuous-dynamic-births-per-foliage-view",
+        type=int,
+        default=None,
+        help=(
+            "Optional larger renderer-basis cap for views whose observed "
+            "foliage tracks only have a weak-continuous DAV2 posterior. "
+            "Metric geometry confidence remains weak; this only restores "
+            "the optical bandwidth needed to explain measured tree pixels."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-birth-target-source-pixels-per-basis",
+        type=float,
+        default=None,
+        help=(
+            "Optional continuous local renderer-bandwidth target measured "
+            "in eligible source-raster tree pixels per dynamic basis row."
+        ),
+    )
     parser.add_argument("--voxel-size", type=float, default=0.12)
+    parser.add_argument(
+        "--rigid-calibration-ply",
+        type=Path,
+        help=(
+            "Optional trained native rigid 2DGS surface used only to render "
+            "per-camera depth for DAV2 metric alignment and foliage "
+            "occlusion. It is not copied into the mixed initialization."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-calibration-resolution-scale",
+        type=float,
+        default=0.125,
+    )
     parser.add_argument("--seed", type=int, default=73)
     parser.add_argument(
         "--reuse-foliage-initialization",
@@ -132,6 +197,16 @@ def _parse_args() -> argparse.Namespace:
             "with the same Evidence Store and exact RGB contract. This is "
             "intended for causal surface-front-end repairs; provenance and "
             "content hashes are persisted in the new manifest."
+        ),
+    )
+    parser.add_argument(
+        "--resume-existing-surface",
+        action="store_true",
+        help=(
+            "Resume an interrupted initialization after surface_seed.npz "
+            "and surface_seed.json were written. The seed must use the "
+            "current protocol and the same Evidence Store; foliage and the "
+            "final manifest are rebuilt normally."
         ),
     )
     parser.add_argument("--replace", action="store_true")
@@ -205,11 +280,15 @@ def _validated_reused_foliage(
 def main() -> None:
     args = _parse_args()
     output = args.output.expanduser().resolve()
-    if output.exists():
+    if args.resume_existing_surface and args.replace:
+        raise ValueError(
+            "--resume-existing-surface and --replace are mutually exclusive"
+        )
+    if output.exists() and not args.resume_existing_surface:
         if not args.replace:
             raise FileExistsError(output)
         shutil.rmtree(output)
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=args.resume_existing_surface)
     store = load_evidence_store(args.evidence_store)
     dataset = Path(store["dataset"]).expanduser().resolve()
     rgb_root = (
@@ -221,34 +300,74 @@ def main() -> None:
         SimpleNamespace(source_path=str(dataset), images=str(rgb_root))
     )
     surface_path = output / "surface_seed.npz"
-    surface = build_surface_seed(
-        args.evidence_store,
-        surface_path,
-        rgb_root=rgb_root,
-        chart_seeds_per_view=args.chart_seeds_per_view,
-        maximum_chart_seeds=args.maximum_chart_seeds,
-        mast3r_pointmap_seeds_per_view=(
-            args.mast3r_pointmap_seeds_per_view
-        ),
-        maximum_mast3r_pointmap_seeds=(
-            args.maximum_mast3r_pointmap_seeds
-        ),
-        mast3r_pointmap_minimum_confidence=(
-            args.mast3r_pointmap_minimum_confidence
-        ),
-        mast3r_cross_sequence_radius=args.mast3r_cross_sequence_radius,
-        mast3r_pointmap_voxel_size=args.mast3r_pointmap_voxel_size,
-        mast3r_maximum_single_sequence_fraction=(
-            args.mast3r_maximum_single_sequence_seed_fraction
-        ),
-        maximum_dav2_rigid_seeds=args.maximum_dav2_rigid_seeds,
-        dav2_rigid_selected_views=args.dav2_rigid_selected_views,
-        dav2_rigid_seeds_per_view=args.dav2_rigid_seeds_per_view,
-        dav2_rigid_cross_sequence_radius=(
-            args.dav2_rigid_cross_sequence_radius
-        ),
-        seed=args.seed,
-    )
+    surface_resume = None
+    if args.resume_existing_surface:
+        surface_audit_path = surface_path.with_suffix(".json")
+        if not surface_path.is_file() or not surface_audit_path.is_file():
+            raise FileNotFoundError(
+                "Interrupted initialization has no complete surface seed"
+            )
+        surface = json.loads(
+            surface_audit_path.read_text(encoding="utf-8")
+        )
+        if (
+            surface.get("version") != INITIALIZATION_VERSION
+            or surface.get("evidence_hash") != store["evidence_hash"]
+        ):
+            raise RuntimeError(
+                "Interrupted surface seed does not match the current "
+                "initialization/evidence contract"
+            )
+        forbidden = {
+            "historical_trained_ply_used": False,
+            "all_real_rgb_initialization_used": False,
+            "colmap_points_or_tracks_used": False,
+            "geometry_source": "mast3r_only",
+        }
+        mismatched = [
+            name
+            for name, expected in forbidden.items()
+            if surface.get(name) != expected
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "Interrupted surface seed violates the no-history/no-COLMAP "
+                "contract: " + ", ".join(mismatched)
+            )
+        surface_resume = {
+            "policy": "validated_current_protocol_interrupted_surface_resume",
+            "surface_seed_sha256": sha256_file(surface_path),
+            "surface_audit_sha256": sha256_file(surface_audit_path),
+        }
+    else:
+        surface = build_surface_seed(
+            args.evidence_store,
+            surface_path,
+            rgb_root=rgb_root,
+            chart_seeds_per_view=args.chart_seeds_per_view,
+            maximum_chart_seeds=args.maximum_chart_seeds,
+            mast3r_pointmap_seeds_per_view=(
+                args.mast3r_pointmap_seeds_per_view
+            ),
+            maximum_mast3r_pointmap_seeds=(
+                args.maximum_mast3r_pointmap_seeds
+            ),
+            mast3r_pointmap_minimum_confidence=(
+                args.mast3r_pointmap_minimum_confidence
+            ),
+            mast3r_cross_sequence_radius=args.mast3r_cross_sequence_radius,
+            mast3r_pointmap_voxel_size=args.mast3r_pointmap_voxel_size,
+            mast3r_maximum_single_sequence_fraction=(
+                args.mast3r_maximum_single_sequence_seed_fraction
+            ),
+            maximum_dav2_rigid_seeds=args.maximum_dav2_rigid_seeds,
+            dav2_rigid_selected_views=args.dav2_rigid_selected_views,
+            dav2_rigid_seeds_per_view=args.dav2_rigid_seeds_per_view,
+            dav2_rigid_cross_sequence_radius=(
+                args.dav2_rigid_cross_sequence_radius
+            ),
+            seed=args.seed,
+        )
     foliage_reuse = None
     if args.reuse_foliage_initialization is None:
         foliage_path = output / "foliage_seed_gaussians.pth"
@@ -266,6 +385,22 @@ def main() -> None:
             maximum_dense_rays_total=args.maximum_dense_rays_total,
             minimum_dense_rays_per_view=(
                 args.minimum_dense_rays_per_foliage_view
+            ),
+            maximum_bound_rays_per_view=(
+                args.maximum_bound_rays_per_foliage_view
+            ),
+            maximum_dynamic_births_per_view=(
+                args.maximum_dynamic_births_per_foliage_view
+            ),
+            maximum_weak_continuous_dynamic_births_per_view=(
+                args.maximum_weak_continuous_dynamic_births_per_foliage_view
+            ),
+            dynamic_birth_target_source_pixels_per_basis=(
+                args.dynamic_birth_target_source_pixels_per_basis
+            ),
+            rigid_calibration_ply=args.rigid_calibration_ply,
+            rigid_calibration_resolution_scale=(
+                args.rigid_calibration_resolution_scale
             ),
             seed=args.seed,
         )
@@ -326,13 +461,52 @@ def main() -> None:
             "minimum_dense_rays_per_foliage_view": int(
                 args.minimum_dense_rays_per_foliage_view
             ),
+            "maximum_bound_rays_per_foliage_view": int(
+                args.maximum_bound_rays_per_foliage_view
+            ),
+            "maximum_dynamic_births_per_foliage_view": int(
+                args.maximum_dynamic_births_per_foliage_view
+            ),
+            "maximum_weak_continuous_dynamic_births_per_foliage_view": (
+                None
+                if args.maximum_weak_continuous_dynamic_births_per_foliage_view
+                is None
+                else int(
+                    args.maximum_weak_continuous_dynamic_births_per_foliage_view
+                )
+            ),
+            "dynamic_birth_target_source_pixels_per_basis": (
+                None
+                if args.dynamic_birth_target_source_pixels_per_basis is None
+                else float(
+                    args.dynamic_birth_target_source_pixels_per_basis
+                )
+            ),
             "voxel_size": float(args.voxel_size),
+            "rigid_calibration_ply": (
+                None
+                if args.rigid_calibration_ply is None
+                else str(
+                    args.rigid_calibration_ply.expanduser().resolve()
+                )
+            ),
+            "rigid_calibration_ply_sha256": (
+                None
+                if args.rigid_calibration_ply is None
+                else sha256_file(
+                    args.rigid_calibration_ply.expanduser().resolve()
+                )
+            ),
+            "rigid_calibration_resolution_scale": float(
+                args.rigid_calibration_resolution_scale
+            ),
             "seed": int(args.seed),
             "foliage_reuse": foliage_reuse,
         },
         "surface_seed": str(surface_path),
         "foliage_seed": str(foliage_path),
         "surface": surface,
+        "surface_resume": surface_resume,
         "foliage": foliage,
         "ownership": {
             "surface_canopy_seed_count": 0,

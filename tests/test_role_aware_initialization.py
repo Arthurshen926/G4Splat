@@ -5,10 +5,14 @@ import pytest
 import torch
 from PIL import Image
 
-from outdoor.chart_surface_model import ChartSurfaceModel
+from outdoor.chart_surface_model import (
+    ChartSurfaceModel,
+    LearnableInverseDepthAtlas,
+)
 from outdoor.evidence_store import ROLE_CANOPY, ROLE_RIGID
 from outdoor.role_aware_initialization import (
     _align_tracks_to_local_hull_instances,
+    _balanced_single_camera_sample_cap,
     _balanced_pointmap_seed_cap,
     _chart_hypothesis_authority,
     _compact_padded_camera_metadata,
@@ -16,14 +20,19 @@ from outdoor.role_aware_initialization import (
     _different_sequence_nearest_distance,
     _effective_posterior_budget,
     _filter_sequence_local_scene_envelope,
+    _foliage_posterior_view_pool,
     _line_supported_tree_tracks,
+    _local_replacement_groups,
     _load_pointmap_cross_sequence_posterior,
     _native_pointmap_shape,
     _nonchart_pointmap_foliage_samples,
+    _ownership_isolated_track_frames,
     _pointmap_fixed_camera_validity,
     _pointmap_surface_frames,
     _rigid_scene_envelope_mask,
     _sampled_point_footprint_multiplier,
+    _select_dav2_foliage_views,
+    _select_foliage_posterior_views,
     _selection_mask,
     _surface_frames,
     _uniform_confidence_samples,
@@ -34,6 +43,131 @@ from scripts.initialize_unified_outdoor_scene import (
     _validated_reused_foliage,
 )
 from scene.gaussian_model import GaussianModel
+
+
+def test_zero_foliage_view_limit_reaches_all_fixed_camera_selection_layer():
+    views = [{"image_id": value} for value in range(30)]
+    observed = {2, 7, 11}
+
+    pool, limit, contract = _foliage_posterior_view_pool(
+        views, observed, 0
+    )
+    assert [row["image_id"] for row in pool] == list(range(30))
+    assert limit == 30
+    assert contract == "all_fixed_database_cameras"
+    selected = _select_foliage_posterior_views(
+        pool,
+        limit,
+        contract,
+        support_by_instance={
+            0: {2: 5, 7: 4, 11: 3},
+        },
+    )
+    assert [row["image_id"] for row in selected] == list(range(30))
+
+    pool, limit, contract = _foliage_posterior_view_pool(
+        views, observed, 2
+    )
+    assert [row["image_id"] for row in pool] == [2, 7, 11]
+    assert limit == 3
+    assert contract == "bounded_observed_diverse_cameras"
+
+
+def test_zero_foliage_view_limit_preserves_all_dav2_depth_cameras():
+    views = [
+        {
+            "image_id": value,
+            "image_name": f"seq{value % 2}__frame{value:05d}.png",
+            "sequence_id": f"seq{value % 2}",
+            "canopy_fraction": 0.1,
+            "camera_center": np.asarray([value, 0.0, 0.0]),
+        }
+        for value in range(100)
+    ]
+
+    selected, contract = _select_dav2_foliage_views(views, 0)
+    assert [row["image_id"] for row in selected] == list(range(100))
+    assert contract == "all_fixed_database_cameras"
+
+    selected, contract = _select_dav2_foliage_views(views, 12)
+    assert len(selected) == 72
+    assert contract == "bounded_sequence_balanced_cameras"
+
+
+def test_dav2_global_cap_is_camera_balanced_not_prefix_truncated():
+    samples = [
+        {
+            "tree_image_ids": np.asarray([image_id], dtype=np.int32),
+            "sample_index": sample_index,
+        }
+        for image_id in (2, 7, 11)
+        for sample_index in range(5)
+    ]
+
+    retained, audit = _balanced_single_camera_sample_cap(
+        samples, 8, source_name="DAV2"
+    )
+
+    retained_ids = [
+        int(np.asarray(row["tree_image_ids"]).reshape(-1)[0])
+        for row in retained
+    ]
+    assert set(retained_ids) == {2, 7, 11}
+    assert {
+        image_id: retained_ids.count(image_id)
+        for image_id in set(retained_ids)
+    } == {2: 3, 7: 3, 11: 2}
+    assert audit == {
+        "raw_samples": 15,
+        "retained_samples": 8,
+        "sampled_views": 3,
+        "camera_budget_truncated": True,
+    }
+
+
+def test_dav2_global_cap_rejects_false_all_camera_provenance():
+    samples = [
+        {
+            "tree_image_ids": np.asarray([image_id], dtype=np.int32),
+        }
+        for image_id in range(5)
+    ]
+
+    with pytest.raises(RuntimeError, match="one observation per"):
+        _balanced_single_camera_sample_cap(
+            samples, 4, source_name="DAV2"
+        )
+
+
+def test_replacement_groups_are_local_not_merely_same_tree():
+    centers = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [5.1, 0.0, 0.0],
+        ]
+    )
+    roles = np.asarray([0, 0, 2, 2, 2], dtype=np.int8)
+    # Rows 0, 2 and 3 deliberately share a coarse tree instance. Row 4 is
+    # spatially local to canonical row 1 but belongs to another instance, so
+    # it must remain owner-local rather than borrowing another tree's state.
+    instances = np.asarray([7, 8, 7, 7, 9], dtype=np.int32)
+
+    groups, audit = _local_replacement_groups(
+        centers,
+        roles,
+        instances,
+        maximum_center_distance=0.36,
+    )
+
+    assert groups.tolist() == [0, 1, 0, -1, -1]
+    assert audit["bound_dynamic_count"] == 1
+    assert audit["unbound_dynamic_count"] == 2
+    assert audit["cross_instance_binding_count"] == 0
+    assert audit["dynamic_instance_without_canonical_count"] == 1
+    assert max(audit["binding_distance_quantiles"]) <= 0.36
 
 
 def test_chart_observations_are_separate_from_renderer_birth_authority():
@@ -262,6 +396,154 @@ def test_hull_instances_do_not_absorb_distant_dynamic_observations():
     assert track_ids[2] not in set(local_hull.tolist())
     assert audit["associated_track_count"] == 2
     assert audit["dynamic_only_instance_count"] == 1
+
+
+def test_incremental_renderer_basis_does_not_relabel_persistent_tracks():
+    hull = np.asarray([[0.0, 0.0, 0.0], [0.4, 0.0, 0.0]])
+    hull_ids = np.zeros(2, dtype=np.int32)
+    persistent = np.asarray(
+        [[0.2, 0.0, 0.0], [20.0, 0.0, 0.0], [20.4, 0.0, 0.0]]
+    )
+    local_base, persistent_ids, _ = _align_tracks_to_local_hull_instances(
+        hull,
+        hull_ids,
+        persistent,
+        association_radius=1.0,
+        maximum_component_extent=12.0,
+    )
+    incremental = np.asarray(
+        [
+            [20.2, 0.1, 0.0],
+            [40.0, 0.0, 0.0],
+            [40.3, 0.0, 0.0],
+        ]
+    )
+    local_full, full_ids, audit = _align_tracks_to_local_hull_instances(
+        hull,
+        hull_ids,
+        np.concatenate([persistent, incremental]),
+        association_radius=1.0,
+        maximum_component_extent=12.0,
+        persistent_track_count=len(persistent),
+    )
+
+    np.testing.assert_array_equal(local_full, local_base)
+    np.testing.assert_array_equal(full_ids[: len(persistent)], persistent_ids)
+    assert full_ids[len(persistent)] == persistent_ids[1]
+    assert full_ids[-1] == full_ids[-2]
+    assert full_ids[-1] not in set(persistent_ids.tolist())
+    assert audit["incremental_inherited_track_count"] == 1
+    assert audit["incremental_new_instance_count"] == 1
+
+
+def test_dense_renderer_bandwidth_does_not_change_persistent_track_frames():
+    persistent = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.03, 0.0, 0.0],
+            [0.06, 0.01, 0.0],
+            [0.09, 0.01, 0.01],
+        ]
+    )
+    base_scale, base_rotation, base_linearity = (
+        _ownership_isolated_track_frames(
+            persistent,
+            np.zeros(len(persistent), dtype=bool),
+            np.full(len(persistent), 7, dtype=np.int32),
+            np.full(len(persistent), -1, dtype=np.int32),
+            0.008,
+            0.035,
+            0.10,
+        )[:3]
+    )
+    dense = np.asarray(
+        [
+            [0.001, 0.001, 0.001],
+            [0.002, 0.002, 0.002],
+            [0.003, 0.003, 0.003],
+        ]
+    )
+    xyz = np.concatenate([persistent, dense])
+    dense_mask = np.arange(len(xyz)) >= len(persistent)
+    scale, rotation, linearity, audit = _ownership_isolated_track_frames(
+        xyz,
+        dense_mask,
+        np.full(len(xyz), 7, dtype=np.int32),
+        np.concatenate(
+            [
+                np.full(len(persistent), -1, dtype=np.int32),
+                np.full(len(dense), 1949, dtype=np.int32),
+            ]
+        ),
+        0.008,
+        0.035,
+        0.10,
+    )
+
+    np.testing.assert_array_equal(scale[: len(persistent)], base_scale)
+    np.testing.assert_array_equal(rotation[: len(persistent)], base_rotation)
+    np.testing.assert_array_equal(
+        linearity[: len(persistent)], base_linearity
+    )
+    assert audit["cross_instance_frame_neighbour_count"] == 0
+    assert audit["cross_owner_frame_neighbour_count"] == 0
+
+
+def test_dense_frames_do_not_cross_exact_owner_or_tree_instance():
+    owned = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.03, 0.0, 0.0],
+            [0.06, 0.01, 0.0],
+        ]
+    )
+    base = _ownership_isolated_track_frames(
+        owned,
+        np.ones(len(owned), dtype=bool),
+        np.full(len(owned), 5, dtype=np.int32),
+        np.full(len(owned), 408, dtype=np.int32),
+        0.008,
+        0.035,
+        0.10,
+    )
+    foreign = np.asarray(
+        [
+            [0.001, 0.001, 0.001],
+            [0.002, 0.002, 0.002],
+            [0.003, 0.003, 0.003],
+            [0.004, 0.004, 0.004],
+        ]
+    )
+    xyz = np.concatenate([owned, foreign, foreign + 0.001])
+    dense = np.ones(len(xyz), dtype=bool)
+    instance = np.concatenate(
+        [
+            np.full(len(owned), 5),
+            np.full(len(foreign), 5),
+            np.full(len(foreign), 6),
+        ]
+    )
+    owner = np.concatenate(
+        [
+            np.full(len(owned), 408),
+            np.full(len(foreign), 409),
+            np.full(len(foreign), 408),
+        ]
+    )
+    full = _ownership_isolated_track_frames(
+        xyz,
+        dense,
+        instance,
+        owner,
+        0.008,
+        0.035,
+        0.10,
+    )
+
+    for actual, expected in zip(full[:3], base[:3]):
+        np.testing.assert_array_equal(actual[: len(owned)], expected)
+    assert full[3]["dense_owner_count"] == 2
+    assert full[3]["dense_owner_instance_group_count"] == 3
 
 
 def test_sequence_local_envelope_removes_only_gross_depth_outliers():
@@ -684,3 +966,280 @@ def test_chart_anchor_factor_maps_gapped_persistent_evidence_ids(tmp_path):
     loss, audit = model.factor(Surface(), maximum_anchors=1)
     assert audit["matched"] == 1
     assert float(loss) == 0.0
+
+
+def test_chart_uv_edges_resolve_from_all_live_witnesses_not_anchor_batch(
+    tmp_path,
+):
+    path = tmp_path / "surface_seed.npz"
+    np.savez_compressed(
+        path,
+        source_type=np.full(3, 2, dtype=np.int8),
+        persistent_geometry_evidence=np.ones(3, dtype=bool),
+        xyz=np.asarray(
+            [[0, 0, 2], [1, 0, 2], [2, 0, 2]], dtype=np.float32
+        ),
+        position_sigma=np.full(3, 0.02, dtype=np.float32),
+        scales=np.full((3, 2), 0.02, dtype=np.float32),
+        track_id=np.asarray([-2, -3, -4], dtype=np.int64),
+        chart_id=np.zeros(3, dtype=np.int32),
+        chart_uv=np.asarray(
+            [[0.1, 0.2], [0.2, 0.2], [0.3, 0.2]], dtype=np.float32
+        ),
+    )
+    model = ChartSurfaceModel(path)
+
+    class Surface:
+        get_xyz = torch.tensor(
+            [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [2.0, 0.0, 2.0]]
+        )
+        _source_type = torch.full((3,), 2, dtype=torch.int16)
+        _track_id = torch.tensor([-2, -3, -4], dtype=torch.int64)
+
+    _, audit = model.factor(Surface(), maximum_anchors=1)
+
+    # Only one anchor is sampled, so the former minibatch-coupled endpoint
+    # lookup could not possibly match both ends of an edge.
+    assert audit["matched"] == 1
+    assert audit["live_chart_rows"] == 3
+    assert audit["uv_edges_sampled"] == 1
+    assert audit["uv_edges_matched"] == 1
+
+
+def test_chart_uv_priority_robustly_bounds_screen_gradient_outliers():
+    class AtlasProbe:
+        def _bound_geometry(self, surface):
+            rows = torch.arange(4)
+            return rows, rows, (
+                torch.zeros(4, 3),
+                torch.ones(4, 2),
+                torch.zeros(4, 4),
+            )
+
+    class Surface:
+        get_xyz = torch.zeros(4, 3)
+        _track_id = torch.tensor([-2, -3, -4, -5])
+        _geometry_confidence = torch.ones(4)
+        xyz_gradient_accum = torch.tensor(
+            [[1e-3], [2e-3], [3e-3], [1e12]]
+        )
+        denom = torch.ones(4, 1)
+        max_radii2D = torch.tensor([2.0, 4.0, 8.0, 1e9])
+
+    audit = LearnableInverseDepthAtlas.topology_priority_snapshot(
+        AtlasProbe(),
+        Surface(),
+        gradient_threshold=2e-4,
+        radius_target=8.0,
+    )
+    assert torch.isfinite(audit["priority"]).all()
+    assert float(audit["priority"].max()) <= 16.0
+    assert float(audit["raw_gradient_maximum"]) == pytest.approx(1e12)
+
+
+def test_chart_uv_priority_is_integrated_over_projected_cell_area():
+    class AtlasProbe:
+        def _bound_geometry(self, surface):
+            rows = torch.arange(2)
+            return rows, rows, (
+                torch.zeros(2, 3),
+                torch.ones(2, 2),
+                torch.zeros(2, 4),
+            )
+
+    class Surface:
+        get_xyz = torch.zeros(2, 3)
+        _track_id = torch.tensor([-2, -3])
+        _geometry_confidence = torch.ones(2)
+        # Identical saturated gradient density, but only the first cell has
+        # enough projected area for a split to reduce image error.
+        xyz_gradient_accum = torch.full((2, 1), 1e3)
+        denom = torch.ones(2, 1)
+        max_radii2D = torch.tensor([8.0, 0.25])
+
+    audit = LearnableInverseDepthAtlas.topology_priority_snapshot(
+        AtlasProbe(),
+        Surface(),
+        gradient_threshold=2e-4,
+        radius_target=8.0,
+    )
+
+    assert float(audit["priority"][0]) > 1.0
+    assert float(audit["priority"][1]) < 1.0
+
+
+def test_chart_jacobian_frame_owns_both_tangent_scales_and_orientation():
+    centre = torch.zeros(1, 3, requires_grad=True)
+    right = torch.tensor([[2.0, 0.0, 0.0]], requires_grad=True)
+    # The UV-v derivative contains shear along u; only its orthogonal
+    # component is the second 2DGS tangent scale.
+    down = torch.tensor([[1.0, 3.0, 0.0]], requires_grad=True)
+
+    scales, quaternion = LearnableInverseDepthAtlas._jacobian_frame(
+        centre, right, down
+    )
+
+    torch.testing.assert_close(scales, torch.tensor([[2.0, 3.0]]))
+    torch.testing.assert_close(
+        quaternion,
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    (scales.sum() + quaternion.sum()).backward()
+    assert torch.isfinite(centre.grad).all()
+    assert torch.isfinite(right.grad).all()
+    assert torch.isfinite(down.grad).all()
+
+
+def test_chart_runtime_geometry_applies_physical_tangent_scale_contract():
+    class AtlasProbe:
+        maximum_tangent_scale = 0.5
+
+        def _live_rows(self, surface):
+            return (
+                torch.tensor([0]),
+                torch.tensor([0]),
+                {
+                    "chart_id": torch.tensor([0]),
+                    "uv": torch.tensor([[0.5, 0.5]]),
+                    "half_uv": torch.tensor([[0.25, 0.25]]),
+                    "base_rho": torch.tensor([0.5]),
+                },
+            )
+
+        def _points(self, chart_id, uv, fallback):
+            del chart_id
+            return torch.cat([10.0 * uv, fallback[:, None]], dim=1), fallback
+
+        _jacobian_frame = staticmethod(
+            LearnableInverseDepthAtlas._jacobian_frame
+        )
+
+    primitive, _, geometry = LearnableInverseDepthAtlas._bound_geometry(
+        AtlasProbe(), object()
+    )
+
+    assert primitive.tolist() == [0]
+    scales = geometry[1]
+    torch.testing.assert_close(scales, torch.full((1, 2), 0.5))
+
+
+def test_chart_uv_split_uses_current_jacobian_frame_at_atlas_border():
+    class AtlasProbe:
+        evidence_id = np.asarray([-2], dtype=np.int64)
+        chart_id = np.asarray([0], dtype=np.int32)
+        uv = np.asarray([[0.9, 0.9]], dtype=np.float32)
+        half_uv = np.asarray([[0.2, 0.2]], dtype=np.float32)
+        base_rho = np.asarray([0.5], dtype=np.float32)
+        base_tangent_scale = np.asarray(
+            [[0.1, 0.1]], dtype=np.float32
+        )
+        level = np.asarray([0], dtype=np.int16)
+        next_evidence_id = -3
+        quadtree_events = []
+        _jacobian_frame = staticmethod(
+            LearnableInverseDepthAtlas._jacobian_frame
+        )
+
+        def _bound_geometry(self, surface):
+            return (
+                torch.tensor([0]),
+                torch.tensor([0]),
+                (
+                    surface.get_xyz,
+                    torch.ones(1, 2),
+                    torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+                ),
+            )
+
+        def _topology(self, device):
+            return {
+                "uv": torch.from_numpy(self.uv).to(device),
+                "half_uv": torch.from_numpy(self.half_uv).to(device),
+                "chart_id": torch.from_numpy(self.chart_id).to(device),
+                "base_rho": torch.from_numpy(self.base_rho).to(device),
+                "level": torch.from_numpy(self.level).to(device),
+            }
+
+        def _points(self, chart_id, uv, fallback):
+            xyz = torch.cat(
+                [uv, fallback[:, None].reciprocal()], dim=1
+            )
+            return xyz, fallback
+
+        def _invalidate_cache(self):
+            pass
+
+    class Surface:
+        def __init__(self):
+            self.get_xyz = torch.tensor([[0.9, 0.9, 2.0]])
+            self._track_id = torch.tensor([-2], dtype=torch.int64)
+            self._features_dc = torch.zeros(1, 1, 3)
+            self._features_rest = torch.zeros(1, 0, 3)
+            self._opacity = torch.zeros(1, 1)
+            self.appended = None
+
+        def _point_metadata_from_indices(self, rows, **kwargs):
+            del kwargs
+            return {"track_id": self._track_id[rows].clone()}
+
+        def densification_postfix(
+            self,
+            xyz,
+            features_dc,
+            features_rest,
+            opacity,
+            scaling,
+            rotation,
+            *,
+            metadata,
+        ):
+            del features_dc, features_rest, opacity
+            self.appended = (xyz, scaling, rotation, metadata)
+            self.get_xyz = torch.cat([self.get_xyz, xyz])
+
+        def prune_points(self, remove):
+            self.get_xyz = self.get_xyz[~remove]
+
+    atlas = AtlasProbe()
+    surface = Surface()
+    event = LearnableInverseDepthAtlas.adapt_uv_quadtree(
+        atlas,
+        surface,
+        maximum_net_growth=3,
+        maximum_points=10,
+        gradient_threshold=1e-4,
+        radius_target=8.0,
+        priority_snapshot={
+            "evidence_id": torch.tensor([-2]),
+            "priority": torch.tensor([2.0]),
+        },
+    )
+
+    assert event["parents_replaced"] == 1
+    assert event["children"] == 4
+    assert len(surface.get_xyz) == 4
+    _, scaling, rotation, metadata = surface.appended
+    assert torch.isfinite(scaling).all()
+    assert torch.isfinite(rotation).all()
+    assert metadata["track_id"].tolist() == [-3, -4, -5, -6]
+
+    capped_atlas = AtlasProbe()
+    capped_atlas.level = np.asarray([3], dtype=np.int16)
+    capped_event = LearnableInverseDepthAtlas.adapt_uv_quadtree(
+        capped_atlas,
+        Surface(),
+        maximum_net_growth=3,
+        maximum_points=10,
+        gradient_threshold=1e-4,
+        radius_target=8.0,
+        maximum_level=3,
+        priority_snapshot={
+            "evidence_id": torch.tensor([-2]),
+            "priority": torch.tensor([2.0]),
+        },
+    )
+    assert capped_event["parents_replaced"] == 0
+    assert capped_event["eligible"] == 0
+    assert capped_event["configured_maximum_level"] == 3

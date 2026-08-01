@@ -39,11 +39,13 @@ def evidence_conditioned_leaf_optical_mass(
 
     Visual-hull occupancy is an existence probability, not the alpha target
     of every overlapping Gaussian. Conversely, initializing every exact
-    observation-space birth at alpha=0.015 leaves a sparsely sampled canopy
-    nearly transparent for thousands of owner-camera updates. This contract
-    uses occupancy only as one reliability term and returns a moderately
-    mature initialization plus a lower training floor that still lets RGB
-    reduce alpha.
+    observation-space birth near alpha=0.10 leaves a basis representing
+    roughly two hundred source pixels almost transparent: on a real StMarys
+    checkpoint, three owner-camera visits moved its median only to 0.12 while
+    an opacity-only counterfactual peaked around 0.35--0.40. Calibrate the
+    initialization to that independently measured optical coverage, while
+    retaining the much lower geometry-aware training floor so RGB is free to
+    retire a false or over-opaque hypothesis.
 
     Both outputs are spatial/per-candidate values. No historical model or RGB
     fit is consumed, and free-space/depth contradictions reduce them
@@ -67,16 +69,92 @@ def evidence_conditioned_leaf_optical_mass(
     support_strength = 0.75 + 0.25 * (
         1.0 - torch.exp(-support / 2.0)
     )
-    reliability = (
+    # Optical existence and metric placement are different posteriors.  A
+    # tree-labelled owner pixel proves that some foreground optical mass is
+    # present along its ray even when a monocular depth fit is broad.  Let
+    # support/unknown/free-space evidence initialize that optical mass, while
+    # occupancy and depth NLL continue to govern the geometry-training floor.
+    optical_existence = (
+        known_fraction
+        * support_strength
+        * torch.exp(-0.5 * free)
+    ).clamp(0.0, 1.0)
+    geometry_reliability = (
         occupancy.clamp(0.0, 1.0)
         * known_fraction
         * support_strength
         * torch.rsqrt(1.0 + depth_nll)
         * torch.exp(-0.5 * free)
     ).clamp(0.0, 1.0)
-    initial_opacity = 0.035 + 0.065 * reliability
-    training_floor = 0.020 + 0.040 * reliability
+    initial_opacity = (
+        0.08 + 0.32 * optical_existence
+    ).clamp(0.08, 0.40)
+    training_floor = 0.020 + 0.040 * geometry_reliability
     return initial_opacity, training_floor
+
+
+def evidence_conditioned_dynamic_opacity_ceiling(
+    occupancy_probability,
+    support_view_count,
+    unknown_view_count,
+    ray_depth_nll,
+    free_space_violation_count,
+    replacement_group,
+    *,
+    maximum_opacity=0.40,
+) -> torch.Tensor:
+    """Bound dynamic alpha by spatial geometry and ownership authority.
+
+    An exact owner-view RGB residual can validate appearance along a ray, but
+    it cannot turn a high-variance single-view depth hypothesis into an
+    opaque 3D occluder.  ``ray_depth_nll`` stores that per-candidate
+    uncertainty.  A physically local canonical replacement group supplies an
+    optical-mass denominator; an ownerless row additionally has to pay its
+    occupancy probability because otherwise it is an unconserved additive
+    layer.
+
+    This is a continuous per-primitive ceiling, not an accept/reject gate.
+    Reliable or locally confirmed rows retain the configured global maximum,
+    while weak ownerless hypotheses remain near their evidence-conditioned
+    survival floor.  Split children inherit every input, so the bound is
+    invariant to topology refinement.
+    """
+    occupancy = torch.as_tensor(occupancy_probability)
+    if not occupancy.is_floating_point():
+        occupancy = occupancy.float()
+    device, dtype = occupancy.device, occupancy.dtype
+
+    def value(x):
+        return torch.as_tensor(x, device=device, dtype=dtype)
+
+    _, floor = evidence_conditioned_leaf_optical_mass(
+        occupancy,
+        support_view_count,
+        unknown_view_count,
+        ray_depth_nll,
+        free_space_violation_count,
+    )
+    depth_reliability = torch.rsqrt(
+        1.0 + value(ray_depth_nll).clamp_min(0.0)
+    ).clamp(0.0, 1.0)
+    groups = torch.as_tensor(
+        replacement_group, device=device
+    ).reshape(-1)
+    if groups.shape != occupancy.shape:
+        raise ValueError(
+            "replacement_group and occupancy_probability must match"
+        )
+    local_authority = torch.where(
+        groups >= 0,
+        torch.ones_like(occupancy),
+        occupancy.clamp(0.0, 1.0),
+    )
+    authority = (depth_reliability * local_authority).clamp(0.0, 1.0)
+    maximum = value(maximum_opacity).clamp(1.0e-6, 1.0 - 1.0e-6)
+    ceiling = floor + authority * (maximum - floor)
+    return torch.maximum(floor, ceiling).clamp(
+        1.0e-6, 1.0 - 1.0e-6
+    )
 
 
 def _bounded_extent_union_roots_python(
@@ -630,15 +708,17 @@ def cluster_tree_instances(
     minimum_tracks=8,
     maximum_component_extent=12.0,
     maximum_neighbours=24,
+    minimum_core_neighbours=4,
 ):
-    """Cluster tree tracks without single-link chains spanning the scene.
+    """Cluster tree tracks without sparse single-link bridges.
 
     A radius-only graph is vulnerable to chaining: a few erroneous or
-    touching-canopy samples can join trees hundreds of metres apart into one
-    instance. That collapses per-tree dynamics, balanced densification and
-    local replacement into a single global group. Merge nearest pairs first,
-    but reject a union whose bounding-box diagonal exceeds a generous
-    physical crown extent.
+    touching-canopy samples can join distinct crowns into one instance even
+    when the resulting extent remains below the generous physical-crown cap.
+    Establish connectivity through density-supported core observations;
+    border observations may attach to one nearby core but may not themselves
+    bridge two cores. A fully sparse component falls back to the bounded
+    radius graph so weak evidence is retained rather than deleted.
     """
     from scipy.spatial import cKDTree
 
@@ -648,6 +728,8 @@ def cluster_tree_instances(
         return np.empty(0, dtype=np.int32)
     if int(maximum_neighbours) <= 0:
         raise ValueError("maximum_neighbours must be positive")
+    if int(minimum_core_neighbours) <= 0:
+        raise ValueError("minimum_core_neighbours must be positive")
     # ``query_pairs`` materializes every radius-graph edge.  A 12 cm visual
     # hull queried with a 1.5 m ownership radius can have thousands of edges
     # per voxel, even though only a sparse local graph is needed to establish
@@ -669,12 +751,45 @@ def cluster_tree_instances(
         neighbours.shape,
     )
     valid = (neighbours < len(xyz)) & (neighbours != rows)
-    pairs = np.column_stack(
+    all_pairs = np.column_stack(
         [rows[valid], neighbours[valid].astype(np.int64)]
     )
-    if len(pairs):
-        pairs.sort(axis=1)
-        pairs = np.unique(pairs, axis=0)
+    if len(all_pairs):
+        all_pairs.sort(axis=1)
+        all_pairs = np.unique(all_pairs, axis=0)
+    degree = valid.sum(axis=1)
+    core = degree >= int(minimum_core_neighbours)
+    if bool(core.any()):
+        # Core-to-core edges establish components. Each border row gets at
+        # most one attachment, so a sparse run of noisy samples cannot perform
+        # transitive single-link merging between two well-supported crowns.
+        core_pairs = all_pairs[
+            core[all_pairs[:, 0]] & core[all_pairs[:, 1]]
+        ]
+        border_pairs = []
+        distances, nearest = cKDTree(xyz[core]).query(
+            xyz[~core],
+            k=1,
+            distance_upper_bound=float(connection_radius),
+            workers=-1,
+        )
+        core_indices = np.flatnonzero(core)
+        border_indices = np.flatnonzero(~core)
+        attached = np.isfinite(distances) & (nearest < len(core_indices))
+        if bool(attached.any()):
+            border_pairs = np.column_stack(
+                [
+                    border_indices[attached],
+                    core_indices[nearest[attached]],
+                ]
+            )
+        pairs = (
+            np.concatenate([core_pairs, border_pairs], axis=0)
+            if len(border_pairs)
+            else core_pairs
+        )
+    else:
+        pairs = all_pairs
     if len(pairs):
         distance = np.linalg.norm(
             xyz[pairs[:, 0]] - xyz[pairs[:, 1]], axis=1
@@ -902,6 +1017,448 @@ def _allocate_dense_ray_budgets(
     return budgets, audit
 
 
+def _invert_track_image_incidence(
+    track_images,
+    selected_image_ids,
+):
+    """Index observation rows once instead of scanning tracks per camera.
+
+    The all-fixed Cambridge posterior has roughly 1,500 cameras and hundreds
+    of thousands of observation rows.  Rebuilding
+    ``[image_id in values for values in track_images]`` for every camera (and
+    doing it once for the component raster and again for the ray posterior)
+    performs more than a billion Python membership checks.  The incidence
+    graph is immutable, so invert it in one pass and construct each temporary
+    boolean mask with vectorized indexing.
+    """
+    selected = {int(value) for value in selected_image_ids}
+    rows_by_image = {image_id: [] for image_id in selected}
+    for row, image_ids in enumerate(track_images):
+        for image_id in image_ids:
+            image_id = int(image_id)
+            if image_id in rows_by_image:
+                rows_by_image[image_id].append(int(row))
+    return {
+        image_id: np.asarray(rows, dtype=np.int64)
+        for image_id, rows in rows_by_image.items()
+    }
+
+
+def _incidence_mask(rows, row_count):
+    mask = np.zeros(int(row_count), dtype=bool)
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if len(rows):
+        mask[rows] = True
+    return mask
+
+
+def _dynamic_birth_limit_for_view(
+    tracks,
+    observed_track_mask,
+    *,
+    ordinary_limit,
+    weak_continuous_limit,
+    eligible_pixel_count=0,
+    target_pixels_per_birth=None,
+):
+    """Allocate local optical bandwidth from measured pixels and uncertainty.
+
+    The ordinary limit is a coverage floor.  Large tree silhouettes need
+    proportionally more finite-footprint basis rows even when their DAV2
+    metric fit is accepted; broad weak-continuous fits additionally use the
+    configured ceiling because smaller local splats are safer than enlarging
+    one uncertain 3D primitive.  Neither condition changes geometry
+    confidence or ray-factor strength.
+    """
+    observed = np.asarray(observed_track_mask, dtype=bool).reshape(-1)
+    if len(observed) != len(tracks):
+        raise ValueError("Observed-track mask must align with tracks")
+    ordinary_limit = max(int(ordinary_limit), 0)
+    weak_limit = (
+        ordinary_limit
+        if weak_continuous_limit is None
+        else max(int(weak_continuous_limit), 0)
+    )
+    eligible_pixel_count = max(int(eligible_pixel_count), 0)
+    if target_pixels_per_birth is None:
+        area_limit = ordinary_limit
+    else:
+        target_pixels_per_birth = float(target_pixels_per_birth)
+        if (
+            not np.isfinite(target_pixels_per_birth)
+            or target_pixels_per_birth <= 0
+        ):
+            raise ValueError(
+                "target_pixels_per_birth must be finite and positive"
+            )
+        area_limit = int(
+            np.ceil(eligible_pixel_count / target_pixels_per_birth)
+        )
+        area_limit = max(ordinary_limit, area_limit)
+        # The weak-continuous cap is also the explicit maximum adaptive
+        # renderer-basis budget.  This keeps silhouette allocation bounded by
+        # the already persisted per-view ray budget.
+        area_limit = min(area_limit, max(ordinary_limit, weak_limit))
+    weak = any(
+        str(tracks[row].get("dav2_alignment_status", ""))
+        == "weak_continuous"
+        for row in np.flatnonzero(observed)
+    )
+    limit = max(area_limit, weak_limit) if weak else area_limit
+    return limit, weak, area_limit
+
+
+def _spatially_stratified_coverage_rows(
+    rows: np.ndarray,
+    sample_u: np.ndarray,
+    sample_v: np.ndarray,
+    count: int,
+) -> np.ndarray:
+    """Choose deterministic 2D coverage witnesses from raster-ordered rows.
+
+    Dense ray rows are stored in raster order. Applying ``linspace`` to their
+    one-dimensional indices therefore traces scanlines/diagonals rather than
+    covering the two-dimensional crown, and the resulting exact-RGB splats
+    remain visible as coherent bands after training. This routine places a
+    lattice over the observed image-space extent and assigns one distinct
+    nearest row to each lattice site. The result is invariant to input row
+    order and preserves the requested finite renderer-basis size exactly.
+    """
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    count = min(max(int(count), 0), len(rows))
+    if count == 0:
+        return np.empty(0, dtype=np.int64)
+    if count == len(rows):
+        return np.sort(rows)
+    rows = np.sort(rows)
+    u = np.asarray(sample_u, dtype=np.float64)[rows]
+    v = np.asarray(sample_v, dtype=np.float64)[rows]
+    u_min, u_max = float(u.min()), float(u.max())
+    v_min, v_max = float(v.min()), float(v.max())
+    u_span = max(u_max - u_min, 1.0)
+    v_span = max(v_max - v_min, 1.0)
+    aspect = np.clip(u_span / v_span, 1.0 / count, float(count))
+    columns = max(1, int(np.ceil(np.sqrt(count * aspect))))
+    row_count = max(1, int(np.ceil(count / columns)))
+    normalized = np.column_stack(
+        [(u - u_min) / u_span, (v - v_min) / v_span]
+    )
+    # A dense posterior may contain hundreds of thousands of valid pixels in
+    # one camera.  Per-target nearest-neighbour scans are quadratic, while a
+    # KD-tree per camera still spends most initialization time rebuilding the
+    # same regular image-space index.  Assign candidates to the target lattice
+    # in one vectorized pass, select the closest row to every occupied cell,
+    # then distribute any refill across the remaining cells.  This is linear
+    # apart from one deterministic sort and preserves exact cardinality.
+    cell_x = np.minimum(
+        np.floor(normalized[:, 0] * columns).astype(np.int64),
+        columns - 1,
+    )
+    cell_y = np.minimum(
+        np.floor(normalized[:, 1] * row_count).astype(np.int64),
+        row_count - 1,
+    )
+    cell = cell_y * columns + cell_x
+    cell_center_x = (cell_x.astype(np.float64) + 0.5) / columns
+    cell_center_y = (cell_y.astype(np.float64) + 0.5) / row_count
+    center_distance = (
+        (normalized[:, 0] - cell_center_x) ** 2
+        + (normalized[:, 1] - cell_center_y) ** 2
+    )
+    order = np.lexsort((rows, center_distance, cell))
+    ordered_cell = cell[order]
+    first = np.concatenate(
+        [
+            np.asarray([True]),
+            ordered_cell[1:] != ordered_cell[:-1],
+        ]
+    )
+    selected_local = order[first]
+    if len(selected_local) > count:
+        selected_local = selected_local[
+            np.linspace(
+                0, len(selected_local) - 1, count, dtype=np.int64
+            )
+        ]
+    elif len(selected_local) < count:
+        remaining_local = order[~first]
+        required = count - len(selected_local)
+        refill = remaining_local[
+            np.linspace(
+                0,
+                len(remaining_local) - 1,
+                required,
+                dtype=np.int64,
+            )
+        ]
+        selected_local = np.concatenate([selected_local, refill])
+    return np.sort(rows[selected_local])
+
+
+def _bounded_candidate_ray_rows(
+    ray_indices,
+    pixel_u,
+    pixel_v,
+    observation_type,
+    *,
+    maximum_rows,
+):
+    """Keep a spatial/type-stratified finite factor basis for one camera.
+
+    Visual-hull verification is evaluated against every selected fixed
+    camera, but persisting every candidate-camera pair couples camera
+    coverage to factor cardinality.  In an all-database-camera run that turns
+    a bounded dense posterior into tens of millions of redundant bound rows.
+    Keep positive, confirmed-free and explicit-unknown semantics represented,
+    then distribute the remaining budget by square-root class support and a
+    deterministic image-space grid.
+
+    This is a persistent factor-basis selection, not the runtime evidence
+    sampler.  Runtime still uses independent per-camera shuffled epochs over
+    every retained row.
+    """
+    rows = np.asarray(ray_indices, dtype=np.int64).reshape(-1)
+    maximum_rows = int(maximum_rows)
+    if maximum_rows < 0:
+        raise ValueError("maximum_rows must be non-negative")
+    if maximum_rows == 0 or not len(rows):
+        return np.empty(0, dtype=np.int64)
+    if len(rows) <= maximum_rows:
+        return rows.copy()
+    pixel_u = np.asarray(pixel_u, dtype=np.float64).reshape(-1)
+    pixel_v = np.asarray(pixel_v, dtype=np.float64).reshape(-1)
+    observation_type = np.asarray(observation_type, dtype=np.int8).reshape(-1)
+    if (
+        len(pixel_u) != len(observation_type)
+        or len(pixel_v) != len(observation_type)
+    ):
+        raise ValueError("Ray pixel/type arrays must have equal length")
+    if int(rows.max()) >= len(observation_type) or int(rows.min()) < 0:
+        raise ValueError("Ray row lies outside the pixel/type arrays")
+
+    # Hits and confirmed free-space are physical factors. Unknown rows remain
+    # explicit provenance but receive the last minimum slot if an unusually
+    # tiny caller budget cannot represent all three classes.
+    class_order = (1, -1, 0)
+    class_rows = [
+        rows[observation_type[rows] == value] for value in class_order
+    ]
+    present = np.asarray([len(value) > 0 for value in class_rows], dtype=bool)
+    counts = np.asarray([len(value) for value in class_rows], dtype=np.int64)
+    quotas = np.zeros(len(class_order), dtype=np.int64)
+    first = np.flatnonzero(present)[:maximum_rows]
+    quotas[first] = 1
+    remaining = maximum_rows - int(quotas.sum())
+    capacity = counts - quotas
+    while remaining > 0 and bool((capacity > 0).any()):
+        active = capacity > 0
+        weights = np.sqrt(counts.astype(np.float64))
+        weights[~active] = 0.0
+        ideal = remaining * weights / float(weights.sum())
+        addition = np.minimum(
+            np.floor(ideal).astype(np.int64), capacity
+        )
+        if int(addition.sum()) == 0:
+            fractional = ideal - np.floor(ideal)
+            order = np.lexsort(
+                (
+                    np.arange(len(class_order), dtype=np.int64),
+                    -counts,
+                    -fractional,
+                )
+            )
+            order = order[active[order]]
+            addition[order[: min(remaining, len(order))]] = 1
+        quotas += addition
+        capacity -= addition
+        remaining -= int(addition.sum())
+
+    selected = []
+    for candidates, quota in zip(class_rows, quotas):
+        quota = int(quota)
+        if quota <= 0:
+            continue
+        if len(candidates) <= quota:
+            selected.append(candidates)
+            continue
+        u = pixel_u[candidates]
+        v = pixel_v[candidates]
+        grid_side = max(1, int(np.ceil(np.sqrt(quota))))
+        u_span = max(float(u.max() - u.min()), 1.0)
+        v_span = max(float(v.max() - v.min()), 1.0)
+        cell_x = np.minimum(
+            np.floor(
+                (u - float(u.min())) / u_span * grid_side
+            ).astype(np.int64),
+            grid_side - 1,
+        )
+        cell_y = np.minimum(
+            np.floor(
+                (v - float(v.min())) / v_span * grid_side
+            ).astype(np.int64),
+            grid_side - 1,
+        )
+        cell = cell_y * grid_side + cell_x
+        order = np.lexsort((candidates, u, v, cell))
+        ordered_cells = cell[order]
+        first_in_cell = np.concatenate(
+            [
+                np.asarray([True]),
+                ordered_cells[1:] != ordered_cells[:-1],
+            ]
+        )
+        winners = candidates[order[first_in_cell]]
+        if len(winners) > quota:
+            winners = winners[
+                np.linspace(
+                    0, len(winners) - 1, quota, dtype=np.int64
+                )
+            ]
+        if len(winners) < quota:
+            unselected = candidates[
+                ~np.isin(candidates, winners, assume_unique=False)
+            ]
+            refill = unselected[
+                np.linspace(
+                    0,
+                    len(unselected) - 1,
+                    quota - len(winners),
+                    dtype=np.int64,
+                )
+            ]
+            winners = np.concatenate([winners, refill])
+        selected.append(winners)
+    if not selected:
+        return np.empty(0, dtype=np.int64)
+    result = np.unique(np.concatenate(selected))
+    if len(result) != maximum_rows:
+        raise RuntimeError(
+            "Candidate ray factor basis did not fill its bounded budget: "
+            f"expected={maximum_rows}, actual={len(result)}"
+        )
+    return np.sort(result)
+
+
+def strict_foliage_hit_interval_bounds(
+    depth,
+    sigma,
+    *,
+    free_space_margin=0.25,
+    minimum_depth=0.05,
+):
+    """Build disjoint free-space and hit intervals in camera-z depth.
+
+    A hit posterior has two different statements: space *before* the lower
+    confidence bound is empty, while mass inside the confidence interval is
+    supported.  Using ``depth - free_space_margin`` as the free endpoint
+    without intersecting it with ``depth - 2.5 * sigma`` makes those two
+    statements overlap whenever the posterior uncertainty exceeds
+    ``free_space_margin / 2.5``.  That contradiction used to affect every
+    Cambridge hit row and pushed foliage mass into broad, rearward layers.
+    """
+    depth = np.asarray(depth, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    depth, sigma = np.broadcast_arrays(depth, sigma)
+    if (
+        np.any(~np.isfinite(depth))
+        or np.any(~np.isfinite(sigma))
+        or np.any(depth <= 0)
+        or np.any(sigma < 0)
+    ):
+        raise ValueError("Foliage hit depth and sigma must be finite and valid")
+    minimum_depth = max(float(minimum_depth), 0.0)
+    hit_start = np.maximum(
+        depth - 2.5 * sigma, minimum_depth
+    )
+    hit_end = np.maximum(
+        depth + 2.5 * sigma, hit_start + 1.0e-4
+    )
+    free_end = np.maximum(
+        np.minimum(
+            depth - float(free_space_margin), hit_start
+        ),
+        0.0,
+    )
+    if not (
+        np.all(free_end <= hit_start)
+        and np.all(hit_start < hit_end)
+    ):
+        raise RuntimeError("Failed to construct strict foliage ray intervals")
+    return (
+        free_end.astype(np.float32),
+        hit_start.astype(np.float32),
+        hit_end.astype(np.float32),
+    )
+
+
+def enforce_strict_foliage_ray_intervals(
+    free_end,
+    hit_start,
+    hit_end,
+    observation_type,
+    *,
+    minimum_depth=0.05,
+):
+    """Repair a persisted ray table without changing non-hit semantics."""
+    free_end = np.asarray(free_end, dtype=np.float32).copy()
+    hit_start = np.asarray(hit_start, dtype=np.float32).copy()
+    hit_end = np.asarray(hit_end, dtype=np.float32).copy()
+    observation_type = np.asarray(observation_type).reshape(-1)
+    if not (
+        free_end.shape
+        == hit_start.shape
+        == hit_end.shape
+        == observation_type.shape
+    ):
+        raise ValueError("Foliage ray interval arrays must have equal shape")
+    hit = observation_type > 0
+    original_free = free_end.copy()
+    original_start = hit_start.copy()
+    original_end = hit_end.copy()
+    hit_start[hit] = np.maximum(
+        hit_start[hit], max(float(minimum_depth), 0.0)
+    )
+    hit_end[hit] = np.maximum(
+        hit_end[hit], hit_start[hit] + 1.0e-4
+    )
+    free_end[hit] = np.maximum(
+        np.minimum(free_end[hit], hit_start[hit]), 0.0
+    )
+    finite = (
+        np.isfinite(free_end[hit])
+        & np.isfinite(hit_start[hit])
+        & np.isfinite(hit_end[hit])
+    )
+    valid = (
+        finite
+        & (free_end[hit] <= hit_start[hit])
+        & (hit_start[hit] < hit_end[hit])
+    )
+    if not bool(valid.all()):
+        raise RuntimeError("Persisted foliage hit intervals remain invalid")
+    changed = hit & (
+        (free_end != original_free)
+        | (hit_start != original_start)
+        | (hit_end != original_end)
+    )
+    return free_end, hit_start, hit_end, {
+        "hit_rows": int(hit.sum()),
+        "changed_hit_rows": int(changed.sum()),
+        "overlap_rows_before": int(
+            (hit & (original_free > original_start)).sum()
+        ),
+        "overlap_rows_after": int(
+            (hit & (free_end > hit_start)).sum()
+        ),
+        "negative_hit_start_rows_before": int(
+            (hit & (original_start < 0)).sum()
+        ),
+        "strict_interval_contract": (
+            "zero_le_free_end_le_hit_start_lt_hit_end"
+        ),
+    }
+
+
 def _dense_component_ray_posterior(
     view,
     observation_xyz,
@@ -910,6 +1467,7 @@ def _dense_component_ray_posterior(
     observation_colors,
     observed_track_mask,
     *,
+    observation_depth_sigmas=None,
     rigid_depth=None,
     depth_neighbor_pixels=48.0,
     depth_sigma_floor=0.20,
@@ -917,6 +1475,8 @@ def _dense_component_ray_posterior(
     free_space_margin=0.25,
     maximum_rays=4096,
     maximum_proposals=512,
+    maximum_dynamic_births=1024,
+    renderer_reference_width=640,
     instance_raster=None,
 ):
     """Interpolate calibrated hit intervals over observed tree components.
@@ -929,11 +1489,14 @@ def _dense_component_ray_posterior(
     The returned ray rows are independent of renderer primitive identities.
     A bounded subset of their hit points is also returned as supplemental
     (single-view) proposals; the normal multi-view hull tests still decide
-    whether any proposal is allowed into the canonical model.  Every valid
-    hit is additionally returned as a sequence-local dynamic birth
-    observation.  Canonical rejection must not make a real calibrated tree
-    ray disappear: adaptive split can refine an existing footprint, but it
-    cannot create coverage in an ownerless silhouette hole.
+    whether any proposal is allowed into the canonical model.  The complete
+    valid ray table is retained as training evidence, while a spatially
+    stratified basis of sequence-local dynamic births consumes it.  These are
+    deliberately different cardinalities: one anisotropic Gaussian covers a
+    finite image patch and can explain several nearby calibrated rays.
+    Instantiating one renderer primitive per evidence row exhausts the global
+    volume budget before topology measures either canonical or dynamic
+    screen-bandwidth demand.
     """
     from scipy.spatial import cKDTree
 
@@ -957,18 +1520,13 @@ def _dense_component_ray_posterior(
     eligible_rows, eligible_columns = np.nonzero(eligible)
     if not len(eligible_rows):
         return None, [], []
-    eligible_pixel_count = int(len(eligible_rows))
-    # A deterministic evenly spaced subset covers the whole silhouette and
-    # avoids a random sample being dominated by one large connected crown.
-    if len(eligible_rows) > int(maximum_rays):
-        chosen = np.linspace(
-            0,
-            len(eligible_rows) - 1,
-            int(maximum_rays),
-            dtype=np.int64,
-        )
-        eligible_rows = eligible_rows[chosen]
-        eligible_columns = eligible_columns[chosen]
+    # Do not spend the renderer-ray budget before posterior validity is
+    # known.  The old ordering sampled ``maximum_rays`` silhouette pixels and
+    # then discarded rows without a local depth anchor or rows occluded by
+    # rigid geometry.  Difficult crowns therefore retained only about half
+    # their allocated owner rows, and no later split could recreate the lost
+    # camera/ray ownership.  Evaluate the observation domain first and take a
+    # deterministic, spatially even subset of *valid* rows below.
     mask_height, mask_width = instance_raster.shape
     sample_u = (
         (eligible_columns.astype(np.float64) + 0.5)
@@ -991,6 +1549,14 @@ def _dense_component_ray_posterior(
     observed_errors = np.asarray(observation_errors, dtype=np.float64)[
         observed_track_mask
     ]
+    if observation_depth_sigmas is None:
+        observed_depth_sigmas = np.full(
+            len(observed_xyz), np.nan, dtype=np.float64
+        )
+    else:
+        observed_depth_sigmas = np.asarray(
+            observation_depth_sigmas, dtype=np.float64
+        )[observed_track_mask]
     observed_colors = np.asarray(observation_colors, dtype=np.float64)[
         observed_track_mask
     ]
@@ -1037,12 +1603,30 @@ def _dense_component_ray_posterior(
         )
         errors = observed_errors[track_choice][neighbors]
         error = (weights * errors).sum(axis=1) / denominator
-        sigma = np.maximum(
+        geometric_sigma = np.maximum(
             float(depth_sigma_floor),
             spread
             + error
             * mean
             / max(float(view["fx"]), float(view["fy"]), 1e-6),
+        )
+        supplied_sigma = observed_depth_sigmas[track_choice][neighbors]
+        supplied_valid = np.isfinite(supplied_sigma) & (
+            supplied_sigma > 0
+        )
+        supplied_weight = weights * supplied_valid
+        supplied_denominator = supplied_weight.sum(axis=1)
+        supplied_rms = np.sqrt(
+            (
+                supplied_weight
+                * np.where(supplied_valid, supplied_sigma, 0.0) ** 2
+            ).sum(axis=1)
+            / np.maximum(supplied_denominator, 1e-8)
+        )
+        sigma = np.where(
+            supplied_denominator > 0,
+            np.sqrt(geometric_sigma**2 + supplied_rms**2),
+            geometric_sigma,
         )
         colors = observed_colors[track_choice][neighbors]
         mean_color = (
@@ -1086,9 +1670,22 @@ def _dense_component_ray_posterior(
             )
         )
         keep &= ~occluded
-    indices = np.flatnonzero(keep)
-    if not len(indices):
+    valid_indices = np.flatnonzero(keep)
+    if not len(valid_indices):
         return None, [], []
+    indices = valid_indices
+    if len(indices) > int(maximum_rays):
+        # ``valid_indices`` follows raster scan order.  A one-dimensional
+        # linspace over that array selects coherent scanline/diagonal bands;
+        # exact-view Gaussians then make those bands visible in RGB even when
+        # all later ownership and depth contracts are correct.  Select the
+        # fixed evidence budget directly in image space instead.
+        indices = _spatially_stratified_coverage_rows(
+            indices,
+            sample_u,
+            sample_v,
+            int(maximum_rays),
+        )
     confidence = np.exp(
         -0.5
         * (
@@ -1102,6 +1699,15 @@ def _dense_component_ray_posterior(
         / np.maximum(posterior_sigma[indices], depth_sigma_floor),
         0.10,
         1.0,
+    )
+    confidence_by_row = np.zeros(
+        len(sample_u), dtype=np.float64
+    )
+    confidence_by_row[indices] = confidence
+    free_end, hit_start, hit_end = strict_foliage_hit_interval_bounds(
+        posterior_depth[indices],
+        posterior_sigma[indices],
+        free_space_margin=free_space_margin,
     )
     record = {
         # -1 denotes an observation-space row with no seed owner.
@@ -1118,37 +1724,242 @@ def _dense_component_ray_posterior(
             ),
             (len(indices), 1),
         ),
-        "free_end": (
-            posterior_depth[indices] - float(free_space_margin)
-        ).astype(np.float32),
-        "hit_start": (
-            posterior_depth[indices]
-            - 2.5 * posterior_sigma[indices]
-        ).astype(np.float32),
-        "hit_end": (
-            posterior_depth[indices]
-            + 2.5 * posterior_sigma[indices]
-        ).astype(np.float32),
+        "free_end": free_end,
+        "hit_start": hit_start,
+        "hit_end": hit_end,
         "type": np.ones(len(indices), dtype=np.int8),
         "confidence": confidence.astype(np.float32),
     }
 
-    # One observation-domain sample represents a finite patch of the tree
-    # component.  Persist that native-pixel footprint in world units instead
-    # of giving every birth the unrelated 3.5 cm track cap.  At render time
-    # this produces overlapping, porous support rather than 1--2 px dots.
-    source_pixel_area_per_ray = (
-        float(eligible_pixel_count)
-        * float(view["width"])
+    # Load immutable owner-view RGB before selecting the renderer basis.  The
+    # full ray posterior above remains untouched, but a compact appearance
+    # basis must preserve image bandwidth rather than silhouette area alone.
+    target_rgb = view.get("target_rgb")
+    target_rgb_path = view.get("target_rgb_path")
+    if target_rgb is None and target_rgb_path is not None:
+        from PIL import Image
+
+        with Image.open(target_rgb_path) as image:
+            target_rgb = np.asarray(image.convert("RGB"))
+    if target_rgb is not None:
+        target_rgb = np.asarray(target_rgb)
+        if (
+            target_rgb.ndim != 3
+            or target_rgb.shape[2] != 3
+            or target_rgb.shape[0] <= 0
+            or target_rgb.shape[1] <= 0
+        ):
+            raise ValueError(
+                "Dense posterior target RGB must have shape [H,W,3]"
+            )
+        luminance = (
+            0.2126 * target_rgb[..., 0].astype(np.float32)
+            + 0.7152 * target_rgb[..., 1].astype(np.float32)
+            + 0.0722 * target_rgb[..., 2].astype(np.float32)
+        )
+        gradient_x = np.zeros_like(luminance)
+        gradient_y = np.zeros_like(luminance)
+        gradient_x[:, 1:-1] = np.abs(
+            luminance[:, 2:] - luminance[:, :-2]
+        )
+        gradient_y[1:-1] = np.abs(
+            luminance[2:] - luminance[:-2]
+        )
+        target_rows_all = np.clip(
+            np.floor(
+                sample_v
+                / float(view["height"])
+                * target_rgb.shape[0]
+            ).astype(np.int64),
+            0,
+            target_rgb.shape[0] - 1,
+        )
+        target_columns_all = np.clip(
+            np.floor(
+                sample_u
+                / float(view["width"])
+                * target_rgb.shape[1]
+            ).astype(np.int64),
+            0,
+            target_rgb.shape[1] - 1,
+        )
+        high_frequency_score = (
+            gradient_x[target_rows_all, target_columns_all]
+            + gradient_y[target_rows_all, target_columns_all]
+        )
+    else:
+        high_frequency_score = np.zeros(len(sample_u), dtype=np.float32)
+
+    # Select a renderer basis independently of the immutable posterior rows.
+    # Every visible tree instance receives coverage before the residual
+    # budget is distributed in proportion to sqrt(area). Within an instance,
+    # half the quota is a deterministic uniform scaffold and half is a
+    # spatially distributed high-frequency residual pool. A later split can
+    # refine geometry, but cannot recreate a discarded owner-view RGB sample.
+    dynamic_rows = np.empty(0, dtype=np.int64)
+    dynamic_detail_rows = np.empty(0, dtype=np.int64)
+    dynamic_budget = min(
+        max(int(maximum_dynamic_births), 0), len(indices)
+    )
+    if dynamic_budget:
+        row_instances = sample_instance[indices]
+        instances, instance_counts = np.unique(
+            row_instances, return_counts=True
+        )
+        quotas = np.zeros(len(instances), dtype=np.int64)
+        if dynamic_budget >= len(instances):
+            quotas[:] = 1
+        else:
+            order = np.lexsort((instances, -instance_counts))
+            quotas[order[:dynamic_budget]] = 1
+        remaining = dynamic_budget - int(quotas.sum())
+        capacity = instance_counts.astype(np.int64) - quotas
+        while remaining > 0 and bool((capacity > 0).any()):
+            active = capacity > 0
+            weights = np.sqrt(instance_counts.astype(np.float64))
+            weights[~active] = 0.0
+            ideal = remaining * weights / weights.sum()
+            addition = np.minimum(
+                np.floor(ideal).astype(np.int64), capacity
+            )
+            if int(addition.sum()) == 0:
+                remainder = ideal - np.floor(ideal)
+                order = np.lexsort(
+                    (instances, -instance_counts, -remainder)
+                )
+                order = order[active[order]]
+                addition[order[: min(remaining, len(order))]] = 1
+            quotas += addition
+            capacity -= addition
+            remaining -= int(addition.sum())
+        selected_dynamic_rows = []
+        selected_detail_rows = []
+        for instance, quota in zip(instances, quotas):
+            if int(quota) <= 0:
+                continue
+            instance_rows = indices[row_instances == instance]
+            # Always reserve separate coverage and frequency-residual bases,
+            # including when the birth budget retains every evidence row.
+            # The old full-retention shortcut classified every row as a broad
+            # coverage kernel, erasing the narrow high-frequency half exactly
+            # in weak-continuous crowns that receive the largest budget.
+            quota = min(int(quota), len(instance_rows))
+            uniform_count = max(1, (quota + 1) // 2)
+            uniform = _spatially_stratified_coverage_rows(
+                instance_rows,
+                sample_u,
+                sample_v,
+                uniform_count,
+            )
+            residual_count = quota - len(uniform)
+            remaining_rows = instance_rows[
+                ~np.isin(instance_rows, uniform, assume_unique=False)
+            ]
+            detail = np.empty(0, dtype=np.int64)
+            if residual_count == len(remaining_rows):
+                # Full retention: every non-coverage row is necessarily a
+                # residual row.  Avoid constructing and iterating thousands
+                # of detail cells merely to select the complete remainder.
+                detail = remaining_rows
+            elif residual_count > 0 and len(remaining_rows):
+                grid_side = max(
+                    1, int(np.ceil(np.sqrt(2 * residual_count)))
+                )
+                u = sample_u[remaining_rows]
+                v = sample_v[remaining_rows]
+                u_span = max(float(u.max() - u.min()), 1.0)
+                v_span = max(float(v.max() - v.min()), 1.0)
+                cell_x = np.minimum(
+                    np.floor(
+                        (u - float(u.min())) / u_span * grid_side
+                    ).astype(np.int64),
+                    grid_side - 1,
+                )
+                cell_y = np.minimum(
+                    np.floor(
+                        (v - float(v.min())) / v_span * grid_side
+                    ).astype(np.int64),
+                    grid_side - 1,
+                )
+                cell = cell_y * grid_side + cell_x
+                cell_winners = []
+                for cell_id in np.unique(cell):
+                    rows = remaining_rows[cell == cell_id]
+                    order = np.lexsort(
+                        (rows, -high_frequency_score[rows])
+                    )
+                    cell_winners.append(rows[order[0]])
+                cell_winners = np.asarray(
+                    cell_winners, dtype=np.int64
+                )
+                winner_order = np.lexsort(
+                    (
+                        cell_winners,
+                        -high_frequency_score[cell_winners],
+                    )
+                )
+                detail = cell_winners[
+                    winner_order[:residual_count]
+                ]
+                if len(detail) < residual_count:
+                    refill = remaining_rows[
+                        ~np.isin(
+                            remaining_rows,
+                            detail,
+                            assume_unique=False,
+                        )
+                    ]
+                    refill_order = np.lexsort(
+                        (refill, -high_frequency_score[refill])
+                    )
+                    detail = np.concatenate(
+                        [
+                            detail,
+                            refill[
+                                refill_order[
+                                    : residual_count - len(detail)
+                                ]
+                            ],
+                        ]
+                    )
+            selected_dynamic_rows.append(
+                np.concatenate([uniform, detail])
+            )
+            selected_detail_rows.append(detail)
+        if selected_dynamic_rows:
+            dynamic_rows = np.sort(
+                np.concatenate(selected_dynamic_rows)
+            )
+            if selected_detail_rows:
+                dynamic_detail_rows = np.sort(
+                    np.concatenate(selected_detail_rows)
+                )
+    dynamic_instance = sample_instance[dynamic_rows]
+    # Each birth represents its share of one connected tree instance, not its
+    # share of the entire image.  This keeps overlap stable if only the
+    # evidence-ray sampling density changes.
+    source_pixel_spacing = np.ones(
+        len(dynamic_rows), dtype=np.float64
+    )
+    raster_to_source_area = (
+        float(view["width"])
         / float(mask_width)
         * float(view["height"])
         / float(mask_height)
-        / max(len(sample_u), 1)
     )
-    source_pixel_spacing = np.sqrt(
-        max(source_pixel_area_per_ray, 1.0)
-    )
-    dynamic_rows = indices
+    for instance in np.unique(dynamic_instance):
+        birth_choice = dynamic_instance == instance
+        instance_eligible = int(
+            np.count_nonzero(sample_instance == instance)
+        )
+        source_pixel_spacing[birth_choice] = np.sqrt(
+            max(
+                instance_eligible
+                * raster_to_source_area
+                / max(int(birth_choice.sum()), 1),
+                1.0,
+            )
+        )
     dynamic_z = posterior_depth[dynamic_rows]
     dynamic_camera_xyz = np.column_stack(
         [
@@ -1171,13 +1982,36 @@ def _dense_component_ray_posterior(
         0.2,
         10.0,
     )
+    # Preserve two distinct optical bandwidths. Uniform rows are a bounded
+    # exact-view coverage scaffold (about 2.4 px at the reference raster);
+    # gradient-selected rows are sharp local residual witnesses (about
+    # 0.9 px). Applying the residual cap to both pools created holes in the
+    # conditioned branch, while enlarging both pools recreated the old smooth
+    # opacity blanket.
+    reference_downsample = max(
+        float(view["width"]) / max(float(renderer_reference_width), 1.0),
+        1.0,
+    )
+    dynamic_is_detail = np.isin(
+        dynamic_rows,
+        dynamic_detail_rows,
+        assume_unique=True,
+    )
+    represented_pixel_spacing = np.minimum(
+        source_pixel_spacing,
+        np.where(
+            dynamic_is_detail,
+            1.5 * reference_downsample,
+            4.0 * reference_downsample,
+        ),
+    )
     dynamic_footprint = np.clip(
         0.60
         * dynamic_z
-        * source_pixel_spacing
+        * represented_pixel_spacing
         / np.sqrt(float(view["fx"]) * float(view["fy"])),
         0.008,
-        0.20,
+        0.12,
     )
     # Dynamic leaves are conditioned on this exact database image. Their
     # colour must therefore come from the immutable RGB target raster used by
@@ -1185,24 +2019,7 @@ def _dense_component_ray_posterior(
     # anchors. The latter is still appropriate for the multi-view canonical
     # proposals below, but it removes leaf-scale frequencies and can be badly
     # wrong across an occlusion boundary.
-    target_rgb = view.get("target_rgb")
-    target_rgb_path = view.get("target_rgb_path")
-    if target_rgb is None and target_rgb_path is not None:
-        from PIL import Image
-
-        with Image.open(target_rgb_path) as image:
-            target_rgb = np.asarray(image.convert("RGB"))
     if target_rgb is not None:
-        target_rgb = np.asarray(target_rgb)
-        if (
-            target_rgb.ndim != 3
-            or target_rgb.shape[2] != 3
-            or target_rgb.shape[0] <= 0
-            or target_rgb.shape[1] <= 0
-        ):
-            raise ValueError(
-                "Dense posterior target RGB must have shape [H,W,3]"
-            )
         target_rows = np.clip(
             np.floor(
                 sample_v[dynamic_rows]
@@ -1240,6 +2057,13 @@ def _dense_component_ray_posterior(
                     np.rint(dynamic_rgb[local]), 0, 255
                 ).astype(np.uint8),
                 "error": float(dynamic_reprojection_error[local]),
+                "position_sigma": float(
+                    np.clip(
+                        posterior_sigma[row],
+                        float(depth_sigma_floor),
+                        3.0,
+                    )
+                ),
                 "image_ids": np.asarray(
                     [int(view["image_id"])], dtype=np.int32
                 ),
@@ -1263,8 +2087,19 @@ def _dense_component_ray_posterior(
                     [dynamic_z[local]], dtype=np.float32
                 ),
                 "tree_sequence_count": 1,
-                "tree_fraction": float(
-                    0.65 + 0.35 * confidence[local]
+                # Existence authority must stay proportional to the actual
+                # local ray/depth posterior.  The former 0.65 base converted
+                # even a 6% DAV2 posterior into 67% occupancy and then
+                # initialized hundreds of broad exact-view occluders.
+                "tree_fraction": float(confidence_by_row[row]),
+                # Downstream topology, opacity and loss routing already use
+                # ``1 / sqrt(1 + ray_depth_nll)`` as reliability.  Encode the
+                # measured dense-ray confidence in that native contract
+                # instead of leaving every single-view birth at NLL=0.
+                "ray_depth_nll": float(
+                    1.0
+                    / max(float(confidence_by_row[row]), 1.0e-4) ** 2
+                    - 1.0
                 ),
                 "ray_footprint_scale": float(
                     dynamic_footprint[local]
@@ -1272,6 +2107,11 @@ def _dense_component_ray_posterior(
                 "_tree_instance_id": int(sample_instance[row]),
                 "_dense_ray_dynamic_birth": True,
                 "_dense_ray_rgb_source": dynamic_rgb_source,
+                "_dense_ray_basis_role": (
+                    "frequency_residual"
+                    if bool(dynamic_is_detail[local])
+                    else "coverage"
+                ),
             }
         )
 
@@ -1586,7 +2426,11 @@ def build_instance_aware_canopy_volume(
     maximum_dense_rays_per_view=4096,
     maximum_dense_rays_total=None,
     minimum_dense_rays_per_view=0,
+    maximum_bound_rays_per_view=8192,
     maximum_dense_proposals_per_view=512,
+    maximum_dynamic_births_per_view=1024,
+    maximum_weak_continuous_dynamic_births_per_view=None,
+    dynamic_birth_target_source_pixels_per_basis=None,
     allow_inferred_skeleton=False,
     seed=0,
 ):
@@ -1598,6 +2442,35 @@ def build_instance_aware_canopy_volume(
     """
     from scipy.spatial import cKDTree
 
+    if int(maximum_dynamic_births_per_view) < 0:
+        raise ValueError(
+            "maximum_dynamic_births_per_view must be non-negative"
+        )
+    if (
+        maximum_weak_continuous_dynamic_births_per_view is not None
+        and int(maximum_weak_continuous_dynamic_births_per_view) < 0
+    ):
+        raise ValueError(
+            "maximum_weak_continuous_dynamic_births_per_view must be "
+            "non-negative"
+        )
+    if (
+        dynamic_birth_target_source_pixels_per_basis is not None
+        and (
+            not np.isfinite(
+                float(dynamic_birth_target_source_pixels_per_basis)
+            )
+            or float(dynamic_birth_target_source_pixels_per_basis) <= 0
+        )
+    ):
+        raise ValueError(
+            "dynamic_birth_target_source_pixels_per_basis must be finite "
+            "and positive"
+        )
+    if int(maximum_bound_rays_per_view) < 0:
+        raise ValueError(
+            "maximum_bound_rays_per_view must be non-negative"
+        )
     if not tracks:
         raise RuntimeError("No independent semantic SfM tree tracks were found")
     if candidate_tracks is None:
@@ -1612,6 +2485,13 @@ def build_instance_aware_canopy_volume(
     observation_xyz = np.stack([point["xyz"] for point in tracks])
     observation_errors = np.asarray(
         [point["error"] for point in tracks], dtype=np.float64
+    )
+    observation_depth_sigmas = np.asarray(
+        [
+            point.get("observation_depth_sigma", np.nan)
+            for point in tracks
+        ],
+        dtype=np.float64,
     )
     observation_colors = np.stack(
         [point["rgb"] for point in tracks]
@@ -1663,9 +2543,18 @@ def build_instance_aware_canopy_volume(
             _camera_record(image, cameras[image["camera_id"]], mask_lookup)
             for image in images.values()
         ]
+        # A non-positive limit means every fixed database camera. The dense
+        # ray allocator still enforces one global posterior budget and assigns
+        # zero rows to cameras without measured tree support, so expanding
+        # camera coverage does not imply expanding evidence cardinality.
+        selection_limit = (
+            len(view_records)
+            if int(selected_view_count) <= 0
+            else int(selected_view_count)
+        )
         selected = greedy_diverse_views(
             view_records,
-            limit=selected_view_count,
+            limit=selection_limit,
             minimum_center_distance=minimum_baseline,
         )
     else:
@@ -1674,6 +2563,10 @@ def build_instance_aware_canopy_volume(
         {int(value) for value in point.get("tree_image_ids", ())}
         for point in tracks
     ]
+    observation_rows_by_image = _invert_track_image_incidence(
+        track_images,
+        [int(view["image_id"]) for view in selected],
+    )
     # Build observation-space posterior rows before the voxel proposal set.
     # This is the missing birth path for silhouette regions that had no
     # pre-existing candidate centre.  Dense hit points remain supplemental:
@@ -1682,11 +2575,15 @@ def build_instance_aware_canopy_volume(
     dense_ray_records: list[dict[str, np.ndarray]] = []
     dense_proposals: list[dict] = []
     dense_dynamic_births: list[dict] = []
+    dense_ray_per_view_audit: list[dict[str, int]] = []
     dense_instance_rasters: dict[int, np.ndarray] = {}
     for view in selected:
         image_id = int(view["image_id"])
-        observed = np.asarray(
-            [image_id in values for values in track_images], dtype=bool
+        observed = _incidence_mask(
+            observation_rows_by_image.get(
+                image_id, np.empty(0, dtype=np.int64)
+            ),
+            len(track_images),
         )
         _, instance_raster = _component_instance_map(
             view,
@@ -1706,10 +2603,34 @@ def build_instance_aware_canopy_volume(
     )
     for view in selected:
         image_id = int(view["image_id"])
-        observed = np.asarray(
-            [image_id in values for values in track_images], dtype=bool
+        observed = _incidence_mask(
+            observation_rows_by_image.get(
+                image_id, np.empty(0, dtype=np.int64)
+            ),
+            len(track_images),
         )
         instance_raster = dense_instance_rasters[image_id]
+        eligible_pixel_count = int(
+            np.count_nonzero(instance_raster >= 0)
+        )
+        (
+            dynamic_birth_limit,
+            weak_continuous_posterior,
+            area_birth_limit,
+        ) = (
+            _dynamic_birth_limit_for_view(
+                tracks,
+                observed,
+                ordinary_limit=maximum_dynamic_births_per_view,
+                weak_continuous_limit=(
+                    maximum_weak_continuous_dynamic_births_per_view
+                ),
+                eligible_pixel_count=eligible_pixel_count,
+                target_pixels_per_birth=(
+                    dynamic_birth_target_source_pixels_per_basis
+                ),
+            )
+        )
         record, proposals, dynamic_births = _dense_component_ray_posterior(
             view,
             observation_xyz,
@@ -1717,6 +2638,7 @@ def build_instance_aware_canopy_volume(
             observation_errors,
             observation_colors,
             observed,
+            observation_depth_sigmas=observation_depth_sigmas,
             rigid_depth=rigid_depth_maps.get(image_id),
             depth_neighbor_pixels=depth_neighbor_pixels,
             depth_sigma_floor=depth_sigma_floor,
@@ -1724,12 +2646,30 @@ def build_instance_aware_canopy_volume(
             free_space_margin=free_space_margin,
             maximum_rays=dense_ray_budgets[image_id],
             maximum_proposals=maximum_dense_proposals_per_view,
+            maximum_dynamic_births=dynamic_birth_limit,
             instance_raster=instance_raster,
         )
         if record is not None:
             dense_ray_records.append(record)
         dense_proposals.extend(proposals)
         dense_dynamic_births.extend(dynamic_births)
+        dense_ray_per_view_audit.append(
+            {
+                "image_id": image_id,
+                "eligible": eligible_pixel_count,
+                "allocated": int(dense_ray_budgets[image_id]),
+                "accepted_rays": (
+                    0 if record is None else int(len(record["camera_id"]))
+                ),
+                "dynamic_births": int(len(dynamic_births)),
+                "dynamic_birth_limit": int(dynamic_birth_limit),
+                "dynamic_birth_area_limit": int(area_birth_limit),
+                "weak_continuous_depth_posterior": bool(
+                    weak_continuous_posterior
+                ),
+            }
+        )
+    dense_ray_budget_audit["per_view"] = dense_ray_per_view_audit
     if dense_proposals:
         dense_xyz = np.stack(
             [point["xyz"] for point in dense_proposals]
@@ -1783,10 +2723,20 @@ def build_instance_aware_canopy_volume(
     ray_records: list[dict[str, np.ndarray]] = list(
         dense_ray_records
     )
+    bound_ray_available_total = 0
+    bound_ray_stored_total = 0
+    bound_ray_truncated_view_count = 0
+    dense_audit_by_image = {
+        int(row["image_id"]): row
+        for row in dense_ray_per_view_audit
+    }
     for view_index, view in enumerate(selected):
         image_id = int(view["image_id"])
-        observed = np.asarray(
-            [image_id in values for values in track_images], dtype=bool
+        observed = _incidence_mask(
+            observation_rows_by_image.get(
+                image_id, np.empty(0, dtype=np.int64)
+            ),
+            len(track_images),
         )
         raster_instance = dense_instance_rasters.pop(image_id)
         u, v, depth, valid = _project(centers, view)
@@ -1909,10 +2859,43 @@ def build_instance_aware_canopy_volume(
         ambiguous = valid & ~(supported | confirmed_negative)
         ray_valid = valid & posterior_found & matched_instance
         ray_indices = np.nonzero(ray_valid)[0]
+        candidate_observation_type = np.zeros(count, dtype=np.int8)
+        candidate_observation_type[supported] = 1
+        candidate_observation_type[confirmed_negative] = -1
+        available_bound_rows = int(len(ray_indices))
+        ray_indices = _bounded_candidate_ray_rows(
+            ray_indices,
+            u,
+            v,
+            candidate_observation_type,
+            maximum_rows=min(
+                int(maximum_bound_rays_per_view),
+                available_bound_rows,
+            ),
+        )
+        stored_bound_rows = int(len(ray_indices))
+        bound_ray_available_total += available_bound_rows
+        bound_ray_stored_total += stored_bound_rows
+        bound_ray_truncated_view_count += int(
+            stored_bound_rows < available_bound_rows
+        )
+        dense_audit_by_image[image_id].update(
+            {
+                "candidate_bound_available": available_bound_rows,
+                "candidate_bound_stored": stored_bound_rows,
+            }
+        )
         if len(ray_indices):
-            observation_type = np.zeros(len(ray_indices), dtype=np.int8)
-            observation_type[supported[ray_indices]] = 1
-            observation_type[confirmed_negative[ray_indices]] = -1
+            observation_type = candidate_observation_type[ray_indices]
+            (
+                candidate_free_end,
+                candidate_hit_start,
+                candidate_hit_end,
+            ) = strict_foliage_hit_interval_bounds(
+                posterior_depth[ray_indices],
+                posterior_sigma[ray_indices],
+                free_space_margin=free_space_margin,
+            )
             ray_records.append(
                 {
                     "candidate": ray_indices.astype(np.int64),
@@ -1934,18 +2917,9 @@ def build_instance_aware_canopy_volume(
                         ),
                         (len(ray_indices), 1),
                     ),
-                    "free_end": (
-                        posterior_depth[ray_indices]
-                        - float(free_space_margin)
-                    ).astype(np.float32),
-                    "hit_start": (
-                        posterior_depth[ray_indices]
-                        - 2.5 * posterior_sigma[ray_indices]
-                    ).astype(np.float32),
-                    "hit_end": (
-                        posterior_depth[ray_indices]
-                        + 2.5 * posterior_sigma[ray_indices]
-                    ).astype(np.float32),
+                    "free_end": candidate_free_end,
+                    "hit_start": candidate_hit_start,
+                    "hit_end": candidate_hit_end,
                     "type": observation_type,
                     "confidence": np.exp(
                         -0.5
@@ -2152,6 +3126,15 @@ def build_instance_aware_canopy_volume(
         ray_image_size = np.concatenate(
             [record["image_size"] for record in ray_records]
         )[ray_keep]
+        # Projection validity is evaluated in float64, while the persistent
+        # ray table is float32.  A coordinate infinitesimally below the
+        # bottom/right endpoint can round to exactly ``height``/``width``
+        # during that cast (observed once in 1.5 M Cambridge rays).  Keep the
+        # half-open raster contract after serialization without accepting a
+        # genuinely invalid producer coordinate.
+        ray_pixel = half_open_raster_coordinates(
+            ray_pixel, ray_image_size
+        )
         ray_free_end = np.concatenate(
             [record["free_end"] for record in ray_records]
         )[ray_keep]
@@ -2167,6 +3150,22 @@ def build_instance_aware_canopy_volume(
         ray_confidence = np.concatenate(
             [record["confidence"] for record in ray_records]
         )[ray_keep]
+        (
+            ray_free_end,
+            ray_hit_start,
+            ray_hit_end,
+            interval_audit,
+        ) = enforce_strict_foliage_ray_intervals(
+            ray_free_end,
+            ray_hit_start,
+            ray_hit_end,
+            ray_type,
+        )
+        if int(interval_audit["changed_hit_rows"]) != 0:
+            raise RuntimeError(
+                "A foliage ray producer emitted overlapping or invalid hit "
+                f"intervals: {interval_audit}"
+            )
         # Keep seed-bound rows in primitive-prefix order so the traditional
         # offset table remains a valid lineage diagnostic.  Dense
         # observation-space rays form an ownerless suffix and therefore
@@ -2271,6 +3270,17 @@ def build_instance_aware_canopy_volume(
         "dense_dynamic_birth_count": int(len(dense_dynamic_births)),
         "dense_dynamic_births": dense_dynamic_births,
         "dense_ray_budget": dense_ray_budget_audit,
+        "candidate_bound_ray_budget": {
+            "contract": (
+                "per_camera_type_and_image_space_stratified_finite_basis"
+            ),
+            "maximum_per_view": int(maximum_bound_rays_per_view),
+            "available_total": int(bound_ray_available_total),
+            "stored_total": int(bound_ray_stored_total),
+            "truncated_view_count": int(
+                bound_ray_truncated_view_count
+            ),
+        },
         "tree_instance_count": int(center_instances.max()) + 1,
         "rigid_depth_view_count": len(rigid_depth_maps),
         "ray_evidence": ray_evidence,
@@ -2290,6 +3300,45 @@ def _project(points, view):
         & (v < view["height"])
     )
     return u, v, depth, valid
+
+
+def half_open_raster_coordinates(
+    pixels: np.ndarray, image_sizes: np.ndarray
+) -> np.ndarray:
+    """Preserve a half-open raster domain after float32 serialization.
+
+    Coordinates are validated before this helper in float64.  Casting an
+    in-bounds value just below an integer endpoint can nevertheless round it
+    to exactly that endpoint.  Repair only this sub-pixel representation
+    effect and reject any materially invalid producer coordinate.
+    """
+    pixels = np.asarray(pixels, dtype=np.float32)
+    image_sizes = np.asarray(image_sizes, dtype=np.int32)
+    if pixels.ndim != 2 or pixels.shape[1] != 2:
+        raise ValueError("pixels must have shape [N, 2]")
+    if image_sizes.shape != pixels.shape:
+        raise ValueError("image_sizes must have shape [N, 2]")
+    finite = np.isfinite(pixels).all(axis=1)
+    gross_outside = (
+        ~finite
+        | (pixels < -1e-4).any(axis=1)
+        | (
+            pixels > image_sizes.astype(np.float32) + 1e-4
+        ).any(axis=1)
+    )
+    if np.any(gross_outside):
+        raise RuntimeError(
+            "Foliage ray producer emitted coordinates outside its declared "
+            "source raster"
+        )
+    upper = np.nextafter(
+        image_sizes.astype(np.float32),
+        np.full_like(pixels, -np.inf, dtype=np.float32),
+    )
+    return np.minimum(
+        np.maximum(pixels, np.float32(0.0)),
+        upper,
+    )
 
 
 def build_canopy_volume(

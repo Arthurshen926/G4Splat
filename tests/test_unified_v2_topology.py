@@ -118,7 +118,21 @@ def test_teacher_prunes_then_splits_and_migrates_adam_state():
     initial_loss.backward()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+    old_xyz_parameter = model.xyz
+    old_xyz_moment = optimizer.state[old_xyz_parameter][
+        "exp_avg"
+    ].detach().clone()
 
+    def _legacy_two_stage_mutation(*_args, **_kwargs):
+        raise AssertionError(
+            "topology adaptation must use one atomic replace-and-split"
+        )
+
+    # A regression to prune() followed by split_adaptive() is numerically
+    # correct on this tiny fixture but holds three full topologies resident at
+    # the real 2M budget. Ensure the trainer uses the fused mutation instead.
+    model.prune = _legacy_two_stage_mutation
+    model.split_adaptive = _legacy_two_stage_mutation
     event = _adapt_volume(args, model, _stats(4))
     assert event["pruned"] == 1
     # The requested capacity is expressed in net-growth slots. After the
@@ -127,6 +141,7 @@ def test_teacher_prunes_then_splits_and_migrates_adam_state():
     assert event["split_parents"] == 2
     assert event["net_growth"] == 2
     assert 0 not in event["_new_to_old"].tolist()
+    previous_optimizer = optimizer
     optimizer = _migrate_volume_optimizer(
         args,
         model,
@@ -135,6 +150,12 @@ def test_teacher_prunes_then_splits_and_migrates_adam_state():
         optimizer,
         event["_new_to_old"],
     )
+    torch.testing.assert_close(
+        optimizer.state[model.xyz]["exp_avg"],
+        old_xyz_moment[event["_new_to_old"]],
+    )
+    assert old_xyz_parameter not in previous_optimizer.state
+    assert not previous_optimizer.state
     assert optimizer.param_groups[0]["params"][0] is model.xyz
     before = model.xyz.detach().clone()
     model.xyz.square().sum().backward()
