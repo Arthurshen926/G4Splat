@@ -24,6 +24,10 @@ from outdoor.evidence_store import (
     artifact_path,
     load_evidence_store,
 )
+from outdoor.blue_noise_sampling import (
+    deterministic_blue_noise_rows,
+    stable_sampling_seed,
+)
 from outdoor.foliage_geometry import (
     _camera_record,
     build_instance_aware_canopy_volume,
@@ -51,8 +55,8 @@ INITIALIZATION_VERSION = (
     "posterior"
 )
 RIGID_CALIBRATED_INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v76-native-rigid-depth-continuous-"
-    "posterior-exact-owner-2d-stratified-dual-bandwidth-calibrated-optical"
+    "outdoor-role-aware-initialization-v77-native-rigid-depth-continuous-"
+    "posterior-camera-dephased-blue-noise-full-rgb-anisotropic-ray-frame"
 )
 TEMPORAL_DAV2_AUGMENTATION_VERSION = (
     "outdoor-role-aware-initialization-v65-dense-evidence-preserving-exact-"
@@ -69,6 +73,31 @@ SOURCE_CHART = 2
 SOURCE_DAV2 = 3
 SOURCE_DENSE_RAY = 4
 SOURCE_SURFACE_DAV2 = 4
+
+
+def _bilinear_rgb_at_pixel_centres(
+    image: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """Sample an immutable full-resolution RGB raster at exact coordinates."""
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("RGB image must have shape [H, W, 3]")
+    x = np.clip(np.asarray(x, dtype=np.float64), 0.0, image.shape[1] - 1.0)
+    y = np.clip(np.asarray(y, dtype=np.float64), 0.0, image.shape[0] - 1.0)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.minimum(x0 + 1, image.shape[1] - 1)
+    y1 = np.minimum(y0 + 1, image.shape[0] - 1)
+    wx = (x - x0)[:, None]
+    wy = (y - y0)[:, None]
+    return (
+        image[y0, x0] * (1.0 - wx) * (1.0 - wy)
+        + image[y0, x1] * wx * (1.0 - wy)
+        + image[y1, x0] * (1.0 - wx) * wy
+        + image[y1, x1] * wx * wy
+    )
 
 
 def _effective_posterior_budget(
@@ -357,6 +386,9 @@ def _dav2_rigid_hole_completion_samples(
             holes,
             hole_distance,
             samples_per_view,
+            seed=stable_sampling_seed(
+                "dav2-rigid-hole", image_record["name"], int(image_id)
+            ),
         )
         if not len(selected):
             continue
@@ -1418,8 +1450,10 @@ def _uniform_confidence_samples(
     valid: np.ndarray,
     confidence: np.ndarray,
     maximum: int,
+    *,
+    seed: int = 0,
 ) -> np.ndarray:
-    """Retain image-wide coverage before spending budget on local detail."""
+    """Retain image-wide coverage without imposing a camera-plane lattice."""
     valid = np.asarray(valid, dtype=bool)
     confidence = np.asarray(confidence, dtype=np.float32)
     height, width = valid.shape
@@ -1427,41 +1461,15 @@ def _uniform_confidence_samples(
     limit = min(max(int(maximum), 0), len(candidates))
     if limit <= 0:
         return np.empty(0, dtype=np.int64)
-    rows, columns = np.divmod(candidates, width)
-    aspect = max(width / max(height, 1), 1e-6)
-    grid_x = max(1, int(np.ceil(np.sqrt(limit * aspect))))
-    grid_y = max(1, int(np.ceil(limit / grid_x)))
-    cells = (
-        np.minimum(rows * grid_y // max(height, 1), grid_y - 1)
-        * grid_x
-        + np.minimum(
-            columns * grid_x // max(width, 1), grid_x - 1
-        )
+    raster_rows, raster_columns = np.indices((height, width))
+    return deterministic_blue_noise_rows(
+        candidates,
+        raster_columns.reshape(-1),
+        raster_rows.reshape(-1),
+        limit,
+        seed=int(seed),
+        score=confidence.reshape(-1),
     )
-    confidence_flat = confidence.reshape(-1)
-    ranked = np.argsort(confidence_flat[candidates], kind="stable")[::-1]
-    occupied = np.zeros(grid_x * grid_y, dtype=bool)
-    coverage = []
-    coverage_candidate_indices = []
-    for candidate_index in ranked:
-        cell = int(cells[candidate_index])
-        if occupied[cell]:
-            continue
-        occupied[cell] = True
-        coverage.append(int(candidates[candidate_index]))
-        coverage_candidate_indices.append(int(candidate_index))
-        if len(coverage) == limit:
-            break
-    remaining = limit - len(coverage)
-    if remaining:
-        available = np.ones(len(candidates), dtype=bool)
-        available[np.asarray(coverage_candidate_indices, dtype=np.int64)] = False
-        detail = candidates[available]
-        detail = detail[
-            np.argsort(confidence_flat[detail], kind="stable")[-remaining:]
-        ]
-        coverage.extend(map(int, detail))
-    return np.asarray(coverage, dtype=np.int64)
 
 
 def _sample_dense_mast3r_rigid_seeds(
@@ -1599,21 +1607,36 @@ def _sample_dense_mast3r_rigid_seeds(
             & fixed_camera_valid
         )
         selected = _uniform_confidence_samples(
-            valid, confidence, samples_per_view
+            valid,
+            confidence,
+            samples_per_view,
+            seed=stable_sampling_seed(
+                "mast3r-rigid", stem, int(view_id)
+            ),
         )
         if not len(selected):
             continue
         rows, columns = np.divmod(selected, width)
         xyz = pointmap.reshape(-1, 3)[selected].astype(np.float32)
         with Image.open(image_path) as image_handle:
-            image = image_handle.convert("RGB").resize(
-                (width, height), Image.Resampling.BILINEAR
+            source_rgb = np.asarray(
+                image_handle.convert("RGB"), dtype=np.uint8
             )
-            rgb = (
-                np.asarray(image, dtype=np.float32)
-                .reshape(-1, 3)[selected]
-                / 255.0
-            )
+        source_x = (
+            (columns.astype(np.float64) + 0.5)
+            * source_rgb.shape[1]
+            / float(width)
+            - 0.5
+        )
+        source_y = (
+            (rows.astype(np.float64) + 0.5)
+            * source_rgb.shape[0]
+            / float(height)
+            - 0.5
+        )
+        rgb = _bilinear_rgb_at_pixel_centres(
+            source_rgb, source_x, source_y
+        ) / 255.0
         scales, quaternions, normals = _pointmap_surface_frames(
             pointmap, rows, columns
         )
@@ -2036,43 +2059,21 @@ def _sample_chart_seeds(
             if not len(flat):
                 continue
             limit = min(int(per_chart), len(flat))
-            # Spend most of the budget on UV coverage: take the strongest
-            # valid sample in each approximately uniform image cell.  The
-            # remaining budget is confidence-ranked detail.  A global
-            # strongest/random mixture left large textureless wall regions
-            # without any structural primitive.
-            aspect = max(width / max(height, 1), 1e-6)
-            grid_x = max(1, int(np.ceil(np.sqrt(limit * aspect))))
-            grid_y = max(1, int(np.ceil(limit / grid_x)))
-            rows_all, columns_all = np.unravel_index(flat, (height, width))
-            cells = (
-                np.minimum(rows_all * grid_y // max(height, 1), grid_y - 1)
-                * grid_x
-                + np.minimum(
-                    columns_all * grid_x // max(width, 1), grid_x - 1
-                )
-            )
+            # Preserve UV coverage without transferring a shared rectangular
+            # sampling phase into every Chart. Confidence remains a smooth
+            # priority, while coordinate hashing dephases equal-score areas.
             confidence_flat = conf.reshape(-1)
-            order = np.argsort(confidence_flat[flat])[::-1]
-            occupied = np.zeros(grid_x * grid_y, dtype=bool)
-            coverage = []
-            for candidate in order:
-                cell = int(cells[candidate])
-                if not occupied[cell]:
-                    occupied[cell] = True
-                    coverage.append(int(flat[candidate]))
-                    if len(coverage) == limit:
-                        break
-            coverage = np.asarray(coverage, dtype=np.int64)
-            remaining = limit - len(coverage)
-            if remaining:
-                pool = np.setdiff1d(flat, coverage, assume_unique=False)
-                detail = pool[
-                    np.argsort(confidence_flat[pool])[-remaining:]
-                ]
-                chosen = np.concatenate([coverage, detail])
-            else:
-                chosen = coverage
+            raster_rows, raster_columns = np.indices((height, width))
+            chosen = deterministic_blue_noise_rows(
+                flat,
+                raster_columns.reshape(-1),
+                raster_rows.reshape(-1),
+                limit,
+                seed=stable_sampling_seed(
+                    "chart-rigid", image_name, int(chart_index), int(seed)
+                ),
+                score=confidence_flat,
+            )
             xyz = pointmap.reshape(-1, 3)[chosen].astype(np.float32)
             conf_value = conf.reshape(-1)[chosen].astype(np.float32)
             trust_value = consensus_trust.reshape(-1)[chosen]
@@ -2085,12 +2086,26 @@ def _sample_chart_seeds(
             image_path = files[chart_index]
             if not image_path.is_file():
                 image_path = dataset / "images" / image_name
-            image = Image.open(image_path).convert("RGB").resize(
-                (width, height), Image.Resampling.BILINEAR
+            rows, columns = np.unravel_index(chosen, (height, width))
+            with Image.open(image_path) as image_handle:
+                source_rgb = np.asarray(
+                    image_handle.convert("RGB"), dtype=np.uint8
+                )
+            source_x = (
+                (columns.astype(np.float64) + 0.5)
+                * source_rgb.shape[1]
+                / float(width)
+                - 0.5
             )
-            color = np.asarray(image, dtype=np.float32).reshape(-1, 3)[
-                chosen
-            ] / 255.0
+            source_y = (
+                (rows.astype(np.float64) + 0.5)
+                * source_rgb.shape[0]
+                / float(height)
+                - 0.5
+            )
+            color = _bilinear_rgb_at_pixel_centres(
+                source_rgb, source_x, source_y
+            ) / 255.0
             # Confidence is used only as an uncertainty proxy and remains
             # source-labelled; it is not converted into a universal truth.
             base_confidence = conf[valid]
@@ -2124,7 +2139,6 @@ def _sample_chart_seeds(
             selected_chart_id.append(
                 np.full(len(xyz), int(chart_index), dtype=np.int32)
             )
-            rows, columns = np.unravel_index(chosen, (height, width))
             left = pointmap[rows, np.maximum(columns - 1, 0)]
             right = pointmap[rows, np.minimum(columns + 1, width - 1)]
             up = pointmap[np.maximum(rows - 1, 0), columns]
@@ -3472,40 +3486,36 @@ def _nonchart_pointmap_foliage_samples(
             confidence
             * np.sqrt(np.clip(posterior_precision, 0.03, 1.0))
         ).reshape(-1)
-        ranked = candidates[
-            np.argsort(
-                confidence_score[candidates], kind="stable"
-            )[::-1]
-        ]
-        grid_side = max(
-            1, int(np.ceil(np.sqrt(float(samples_per_view))))
+        raster_rows, raster_columns = np.indices((height, width))
+        selected = deterministic_blue_noise_rows(
+            candidates,
+            raster_columns.reshape(-1),
+            raster_rows.reshape(-1),
+            int(samples_per_view),
+            seed=stable_sampling_seed(
+                "nonchart-pointmap", stem, int(image_id)
+            ),
+            score=confidence_score,
         )
-        rows, columns = np.divmod(ranked, width)
-        cells = (
-            (rows * grid_side // height) * grid_side
-            + columns * grid_side // width
-        )
-        _, first = np.unique(cells, return_index=True)
-        coverage = ranked[np.sort(first)]
-        if len(coverage) < int(samples_per_view):
-            detail_mask = np.ones(len(ranked), dtype=bool)
-            detail_mask[np.sort(first)] = False
-            coverage = np.concatenate(
-                [
-                    coverage,
-                    ranked[detail_mask][
-                        : int(samples_per_view) - len(coverage)
-                    ],
-                ]
-            )
-        selected = coverage[: int(samples_per_view)]
+        # Pointmaps may be much smaller than the calibrated Cambridge raster.
+        # Seed appearance from the immutable native image at the centre of
+        # the corresponding pointmap pixel.  Resizing the whole RGB raster
+        # first bakes a spatially periodic low-pass kernel into every seed.
         with Image.open(image_path) as handle:
-            rgb = np.asarray(
-                handle.convert("RGB").resize(
-                    (width, height), Image.Resampling.BILINEAR
-                ),
-                dtype=np.uint8,
-            ).reshape(-1, 3)
+            source_rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+        selected_columns = (selected % width).astype(np.float64)
+        selected_rows = (selected // width).astype(np.float64)
+        source_x = (
+            (selected_columns + 0.5) * source_rgb.shape[1] / float(width)
+            - 0.5
+        )
+        source_y = (
+            (selected_rows + 0.5) * source_rgb.shape[0] / float(height)
+            - 0.5
+        )
+        selected_rgb = _bilinear_rgb_at_pixel_centres(
+            source_rgb, source_x, source_y
+        ).clip(0, 255).astype(np.uint8)
         rotation = quaternion_to_rotation(images[image_id]["qvec"])
         translation = np.asarray(
             images[image_id]["tvec"], dtype=np.float64
@@ -3524,7 +3534,7 @@ def _nonchart_pointmap_foliage_samples(
                 {
                     "id": -(20_000_000 + len(result)),
                     "xyz": selected_xyz[offset],
-                    "rgb": rgb[flat],
+                    "rgb": selected_rgb[offset],
                     "error": float(
                         np.clip(
                             0.5
@@ -3554,8 +3564,8 @@ def _nonchart_pointmap_foliage_samples(
                     "observation_uv": np.asarray(
                         [
                             [
-                                (int(flat) % width) / width,
-                                (int(flat) // width) / height,
+                                (int(flat) % width + 0.5) / width,
+                                (int(flat) // width + 0.5) / height,
                             ]
                         ],
                         dtype=np.float32,
@@ -3810,48 +3820,40 @@ def _chart_foliage_samples(
             # boughs and leaves most of the projected canopy transparent.
             # First retain the best point in each image-space cell, then use
             # the remaining confidence-ranked samples to add local detail.
-            ranked = candidates[
-                np.argsort(
-                    conf.reshape(-1)[candidates], kind="stable"
-                )[::-1]
-            ]
-            grid_side = max(
-                1, int(np.ceil(np.sqrt(float(samples_per_view))))
+            raster_rows, raster_columns = np.indices((height, width))
+            order = deterministic_blue_noise_rows(
+                candidates,
+                raster_columns.reshape(-1),
+                raster_rows.reshape(-1),
+                int(samples_per_view),
+                seed=stable_sampling_seed(
+                    "chart-foliage", int(chart_index), int(image_id)
+                ),
+                score=conf.reshape(-1),
             )
-            rows, columns = np.divmod(ranked, width)
-            cells = (
-                (rows * grid_side // height) * grid_side
-                + columns * grid_side // width
+            color_path = (
+                image_path
+                if image_path.is_file()
+                else Path(store["dataset"])
+                / "images"
+                / images[image_id]["name"]
             )
-            _, first = np.unique(cells, return_index=True)
-            first = np.sort(first)
-            coverage = ranked[first]
-            if len(coverage) < int(samples_per_view):
-                detail_mask = np.ones(len(ranked), dtype=bool)
-                detail_mask[first] = False
-                coverage = np.concatenate(
-                    [
-                        coverage,
-                        ranked[detail_mask][
-                            : int(samples_per_view) - len(coverage)
-                        ],
-                    ]
-                )
-            order = coverage[: int(samples_per_view)]
-            if image_path.is_file():
-                image = Image.open(image_path).convert("RGB").resize(
-                    (width, height), Image.Resampling.BILINEAR
-                )
-            else:
-                image = Image.open(
-                    Path(store["dataset"])
-                    / "images"
-                    / images[image_id]["name"]
-                ).convert("RGB").resize(
-                    (width, height), Image.Resampling.BILINEAR
-                )
-            rgb = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
-            for flat in order:
+            with Image.open(color_path) as handle:
+                source_rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+            order_columns = (order % width).astype(np.float64)
+            order_rows = (order // width).astype(np.float64)
+            source_x = (
+                (order_columns + 0.5) * source_rgb.shape[1] / float(width)
+                - 0.5
+            )
+            source_y = (
+                (order_rows + 0.5) * source_rgb.shape[0] / float(height)
+                - 0.5
+            )
+            order_rgb = _bilinear_rgb_at_pixel_centres(
+                source_rgb, source_x, source_y
+            ).clip(0, 255).astype(np.uint8)
+            for order_offset, flat in enumerate(order):
                 value = corrected_xyz.reshape(-1, 3)[flat].astype(
                     np.float64
                 )
@@ -3868,7 +3870,7 @@ def _chart_foliage_samples(
                     {
                         "id": -(len(result) + 1),
                         "xyz": value,
-                        "rgb": rgb[flat],
+                        "rgb": order_rgb[order_offset],
                         "error": float(
                             (0.5 if active[int(chart_index)] else 1.0)
                             / max(
@@ -3891,8 +3893,8 @@ def _chart_foliage_samples(
                         "observation_uv": np.asarray(
                             [
                                 [
-                                    (int(flat) % width) / width,
-                                    (int(flat) // width) / height,
+                                    (int(flat) % width + 0.5) / width,
+                                    (int(flat) // width + 0.5) / height,
                                 ]
                             ],
                             dtype=np.float32,
@@ -4033,6 +4035,8 @@ def _dav2_foliage_samples(
             cx, cy = map(float, camera["params"][1:3])
         else:
             fx, fy, cx, cy = map(float, camera["params"][:4])
+        native_fx, native_fy = float(fx), float(fy)
+        native_cx, native_cy = float(cx), float(cy)
         sx = width / float(camera["width"])
         sy = height / float(camera["height"])
         fx, fy, cx, cy = fx * sx, fy * sy, cx * sx, cy * sy
@@ -4201,40 +4205,113 @@ def _dav2_foliage_samples(
             weak_posterior_views += 1
         posterior_confidences.append(posterior_confidence)
         posterior_relative_sigmas.append(relative_sigma)
-        grid_side = max(
-            1, int(np.ceil(np.sqrt(float(samples_per_view))))
-        )
         candidate_rows, candidate_columns = np.divmod(
             candidates, width
         )
-        cells = (
-            (candidate_rows * grid_side // height) * grid_side
-            + candidate_columns * grid_side // width
+        # Depth remains on the compact DAV2 raster, but sampling phase and RGB
+        # must not.  Map every candidate centre back to the exact calibrated
+        # raster and select coverage/detail with independent blue-noise seeds.
+        candidate_native_x = (
+            (candidate_columns.astype(np.float64) + 0.5)
+            * float(camera["width"])
+            / float(width)
+            - 0.5
         )
-        # Prefer central pixels in every cell; this is spatial coverage, not
-        # a confidence hard gate.
-        cell_center_x = (
-            (cells % grid_side + 0.5) * width / grid_side
+        candidate_native_y = (
+            (candidate_rows.astype(np.float64) + 0.5)
+            * float(camera["height"])
+            / float(height)
+            - 0.5
         )
-        cell_center_y = (
-            (cells // grid_side + 0.5) * height / grid_side
+        image_path = dataset / "images" / image_record["name"]
+        with Image.open(image_path) as handle:
+            source_rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+        source_x = (
+            (candidate_native_x + 0.5)
+            * source_rgb.shape[1]
+            / float(camera["width"])
+            - 0.5
         )
-        distance = (
-            (candidate_columns - cell_center_x) ** 2
-            + (candidate_rows - cell_center_y) ** 2
+        source_y = (
+            (candidate_native_y + 0.5)
+            * source_rgb.shape[0]
+            / float(camera["height"])
+            - 0.5
         )
-        ranked = candidates[np.argsort(distance, kind="stable")]
-        ranked_cells = cells[np.argsort(distance, kind="stable")]
-        _, first = np.unique(ranked_cells, return_index=True)
-        selected = ranked[np.sort(first)][: int(samples_per_view)]
+        luminance = (
+            0.2126 * source_rgb[..., 0].astype(np.float32)
+            + 0.7152 * source_rgb[..., 1].astype(np.float32)
+            + 0.0722 * source_rgb[..., 2].astype(np.float32)
+        )
+        gradient_x = np.zeros_like(luminance)
+        gradient_y = np.zeros_like(luminance)
+        gradient_x[:, 1:-1] = np.abs(luminance[:, 2:] - luminance[:, :-2])
+        gradient_y[1:-1] = np.abs(luminance[2:] - luminance[:-2])
+        gradient = gradient_x + gradient_y
+        candidate_source_columns = np.clip(
+            np.rint(source_x).astype(np.int64), 0, source_rgb.shape[1] - 1
+        )
+        candidate_source_rows = np.clip(
+            np.rint(source_y).astype(np.int64), 0, source_rgb.shape[0] - 1
+        )
+        detail_score = np.zeros(height * width, dtype=np.float32)
+        detail_score[candidates] = gradient[
+            candidate_source_rows, candidate_source_columns
+        ]
+        sample_count = min(max(int(samples_per_view), 0), len(candidates))
+        coverage_count = min((sample_count + 1) // 2, len(candidates))
+        native_x = np.zeros(height * width, dtype=np.float64)
+        native_y = np.zeros(height * width, dtype=np.float64)
+        native_x[candidates] = candidate_native_x
+        native_y[candidates] = candidate_native_y
+        coverage = deterministic_blue_noise_rows(
+            candidates,
+            native_x,
+            native_y,
+            coverage_count,
+            seed=stable_sampling_seed(
+                "dav2", stem, int(image_id), "coverage"
+            ),
+        )
+        remaining_candidates = np.setdiff1d(
+            candidates, coverage, assume_unique=True
+        )
+        detail = deterministic_blue_noise_rows(
+            remaining_candidates,
+            native_x,
+            native_y,
+            sample_count - len(coverage),
+            seed=stable_sampling_seed(
+                "dav2", stem, int(image_id), "detail"
+            ),
+            score=detail_score,
+        )
+        selected = np.sort(np.concatenate([coverage, detail]))
+        detail_rows = np.isin(selected, detail, assume_unique=True)
         selected_rows, selected_columns = np.divmod(selected, width)
+        selected_native_x = (
+            (selected_columns.astype(np.float64) + 0.5)
+            * float(camera["width"])
+            / float(width)
+            - 0.5
+        )
+        selected_native_y = (
+            (selected_rows.astype(np.float64) + 0.5)
+            * float(camera["height"])
+            / float(height)
+            - 0.5
+        )
         selected_depth = metric_depth[
             selected_rows, selected_columns
         ].astype(np.float64)
         camera_points = np.stack(
             [
-                (selected_columns - cx) * selected_depth / fx,
-                (selected_rows - cy) * selected_depth / fy,
+                (selected_native_x - native_cx)
+                * selected_depth
+                / native_fx,
+                (selected_native_y - native_cy)
+                * selected_depth
+                / native_fy,
                 selected_depth,
             ],
             axis=1,
@@ -4242,26 +4319,78 @@ def _dav2_foliage_samples(
         world_points = (
             camera_points - translation[None]
         ) @ rotation
-        image_path = dataset / "images" / image_record["name"]
-        rgb_image = np.asarray(
-            Image.open(image_path).convert("RGB").resize(
-                (width, height), Image.Resampling.BILINEAR
+        selected_source_x = (
+            (selected_native_x + 0.5)
+            * source_rgb.shape[1]
+            / float(camera["width"])
+            - 0.5
+        )
+        selected_source_y = (
+            (selected_native_y + 0.5)
+            * source_rgb.shape[0]
+            / float(camera["height"])
+            - 0.5
+        )
+        selected_rgb = np.clip(
+            np.rint(
+                _bilinear_rgb_at_pixel_centres(
+                    source_rgb, selected_source_x, selected_source_y
+                )
             ),
-            dtype=np.uint8,
+            0,
+            255,
+        ).astype(np.uint8)
+        nominal_spacing = np.sqrt(
+            max(float(len(candidates)), 1.0) / max(sample_count, 1)
         )
-        footprint = np.clip(
-            selected_depth
-            * (min(height, width) / grid_side)
-            / max(0.5 * (fx + fy), 1e-6)
-            * 0.65,
-            0.06,
-            0.35,
+        spacing_x = (
+            nominal_spacing * float(camera["width"]) / float(width)
         )
-        for point, row, column, point_scale, depth_value in zip(
+        spacing_y = (
+            nominal_spacing * float(camera["height"]) / float(height)
+        )
+        bandwidth = np.where(detail_rows, 0.32, 0.72)
+        tangent_u = np.clip(
+            selected_depth * spacing_x / max(native_fx, 1.0e-6) * bandwidth,
+            0.004,
+            0.25,
+        )
+        tangent_v = np.clip(
+            selected_depth * spacing_y / max(native_fy, 1.0e-6) * bandwidth,
+            0.004,
+            0.25,
+        )
+        camera_frame_xyzw = Rotation.from_matrix(rotation.T).as_quat()
+        camera_frame_wxyz = np.asarray(
+            [
+                camera_frame_xyzw[3],
+                camera_frame_xyzw[0],
+                camera_frame_xyzw[1],
+                camera_frame_xyzw[2],
+            ],
+            dtype=np.float32,
+        )
+        for (
+            point,
+            row,
+            column,
+            native_x_value,
+            native_y_value,
+            rgb_value,
+            tangent_u_value,
+            tangent_v_value,
+            is_detail,
+            depth_value,
+        ) in zip(
             world_points,
             selected_rows,
             selected_columns,
-            footprint,
+            selected_native_x,
+            selected_native_y,
+            selected_rgb,
+            tangent_u,
+            tangent_v,
+            detail_rows,
             selected_depth,
         ):
             absolute_depth_sigma = float(
@@ -4275,7 +4404,7 @@ def _dav2_foliage_samples(
                 {
                     "id": -(10_000_000 + len(output)),
                     "xyz": point.astype(np.float64),
-                    "rgb": rgb_image[int(row), int(column)],
+                    "rgb": rgb_value,
                     "error": float(
                         max(diagnostics.relative_rmse, 0.02)
                     ),
@@ -4298,8 +4427,10 @@ def _dav2_foliage_samples(
                     "observation_uv": np.asarray(
                         [
                             [
-                                float(column) / width,
-                                float(row) / height,
+                                (float(native_x_value) + 0.5)
+                                / float(camera["width"]),
+                                (float(native_y_value) + 0.5)
+                                / float(camera["height"]),
                             ]
                         ],
                         dtype=np.float32,
@@ -4311,7 +4442,29 @@ def _dav2_foliage_samples(
                     "tree_fraction": float(
                         posterior_confidence
                     ),
-                    "ray_footprint_scale": float(point_scale),
+                    "ray_footprint_scale": float(
+                        max(tangent_u_value, tangent_v_value)
+                    ),
+                    "ray_tangent_scale_u": float(tangent_u_value),
+                    "ray_tangent_scale_v": float(tangent_v_value),
+                    # Geometry posterior uncertainty is retained above.  The
+                    # rendered depth axis is a compact basis, not a demand to
+                    # paint the whole uncertain interval as opaque volume.
+                    "ray_render_depth_scale": float(
+                        np.clip(
+                            min(
+                                absolute_depth_sigma,
+                                max(tangent_u_value, tangent_v_value)
+                                * (1.0 if is_detail else 2.0),
+                            ),
+                            0.004,
+                            0.35,
+                        )
+                    ),
+                    "ray_frame_quaternion": camera_frame_wxyz.copy(),
+                    "dav2_basis_role": (
+                        "frequency_residual" if is_detail else "coverage"
+                    ),
                     "dav2_sequence_local_sample": True,
                     "dav2_alignment_posterior": (
                         posterior_confidence
@@ -4333,6 +4486,17 @@ def _dav2_foliage_samples(
         source_name="DAV2",
     )
     return output, {
+        "sampling_policy": (
+            "per_camera_dephased_deterministic_blue_noise_coverage_detail"
+        ),
+        "rgb_sampling_policy": (
+            "original_full_resolution_pixel_center_bilinear"
+        ),
+        "uv_contract": "pixel_center_exact_calibration_raster",
+        "covariance_contract": (
+            "camera_ray_frame_anisotropic_tangent_u_tangent_v_depth_"
+            "posterior_separate_from_render_depth_basis"
+        ),
         "eligible_views": int(len(eligible_image_ids)),
         "views": int(visited_views),
         "accepted_views": int(accepted_views),
@@ -4629,14 +4793,64 @@ def _merge_foliage(
         [point.get("ray_footprint_scale", 0.0) for point in tracks],
         dtype=np.float32,
     )
-    scales[dav2_local] = np.maximum(
-        scales[dav2_local],
-        ray_footprint[dav2_local, None],
+    ray_tangent_u = np.asarray(
+        [
+            point.get("ray_tangent_scale_u", point.get("ray_footprint_scale", 0.0))
+            for point in tracks
+        ],
+        dtype=np.float32,
     )
-    scales[dense_ray_local] = np.maximum(
-        scales[dense_ray_local],
-        ray_footprint[dense_ray_local, None],
+    ray_tangent_v = np.asarray(
+        [
+            point.get("ray_tangent_scale_v", point.get("ray_footprint_scale", 0.0))
+            for point in tracks
+        ],
+        dtype=np.float32,
     )
+    ray_depth_scale = np.asarray(
+        [
+            point.get("ray_render_depth_scale", point.get("ray_footprint_scale", 0.0))
+            for point in tracks
+        ],
+        dtype=np.float32,
+    )
+    ray_frames = np.asarray(
+        [
+            point.get("ray_frame_quaternion", [np.nan] * 4)
+            for point in tracks
+        ],
+        dtype=np.float32,
+    ).reshape(-1, 4)
+    ray_local = dav2_local | dense_ray_local
+    valid_ray_frame = (
+        ray_local
+        & np.isfinite(ray_frames).all(axis=1)
+        & (ray_tangent_u > 0)
+        & (ray_tangent_v > 0)
+        & (ray_depth_scale > 0)
+    )
+    scales[valid_ray_frame] = np.column_stack(
+        [
+            ray_tangent_u[valid_ray_frame],
+            ray_tangent_v[valid_ray_frame],
+            ray_depth_scale[valid_ray_frame],
+        ]
+    )
+    quaternions[valid_ray_frame] = ray_frames[valid_ray_frame]
+    # Legacy inputs without an explicit ray frame retain their estimated
+    # covariance.  Never apply an image-plane footprint as a lower bound to
+    # all three world axes: that turns sparse coverage seeds into thick blobs.
+    legacy_ray = ray_local & ~valid_ray_frame
+    if bool(legacy_ray.any()):
+        ordered = np.argsort(scales[legacy_ray], axis=1)
+        legacy_scales = scales[legacy_ray]
+        rows = np.arange(len(legacy_scales))[:, None]
+        tangent_axes = ordered[:, :2]
+        legacy_scales[rows, tangent_axes] = np.maximum(
+            legacy_scales[rows, tangent_axes],
+            ray_footprint[legacy_ray, None],
+        )
+        scales[legacy_ray] = legacy_scales
     track_count = len(tracks)
     support_capacity = max(
         int(hull["support_camera_ids"].shape[1]),
@@ -4753,6 +4967,30 @@ def _merge_foliage(
     position_covariance = np.eye(3, dtype=np.float32)[None] * (
         covariance_scale[:, None, None] ** 2
     )
+    if bool(valid_ray_frame.any()):
+        frame_xyzw = np.column_stack(
+            [
+                ray_frames[valid_ray_frame, 1],
+                ray_frames[valid_ray_frame, 2],
+                ray_frames[valid_ray_frame, 3],
+                ray_frames[valid_ray_frame, 0],
+            ]
+        )
+        frame_matrix = Rotation.from_quat(frame_xyzw).as_matrix().astype(
+            np.float32
+        )
+        posterior_axes = np.column_stack(
+            [
+                ray_tangent_u[valid_ray_frame],
+                ray_tangent_v[valid_ray_frame],
+                covariance_scale[valid_ray_frame],
+            ]
+        )
+        position_covariance[valid_ray_frame] = (
+            frame_matrix
+            @ np.eye(3, dtype=np.float32)[None]
+            * np.square(posterior_axes)[:, None, :]
+        ) @ np.transpose(frame_matrix, (0, 2, 1))
     sequence_support = np.asarray(
         [point["tree_sequence_count"] for point in tracks],
         dtype=np.int16,
@@ -5840,7 +6078,7 @@ def build_foliage_seed(
         for point in dense_dynamic_births
     }
     if dense_dynamic_births and dense_dynamic_rgb_sources != {
-        "exact_training_target_raster"
+        "exact_training_target_raster_pixel_center_bilinear"
     }:
         raise RuntimeError(
             "Production dense dynamic births were not initialized from the "
@@ -6164,12 +6402,12 @@ def build_foliage_seed(
                 "1.10x_initial_then_inherited_and_shrunk_by_split"
             ),
             "dense_dynamic_basis_contract": (
-                "instance_balanced_half_two_dimensional_lattice_coverage_"
-                "half_spatial_high_frequency_local_rgb_residual_over_"
-                "shared_canonical_crown"
+                "instance_balanced_independent_camera_dephased_blue_noise_"
+                "coverage_and_high_frequency_detail__full_resolution_"
+                "pixel_center_rgb"
             ),
             "dense_ownerless_hit_has_dynamic_consumer": (
-                "not_guaranteed__spatially_stratified_exact_camera_basis_"
+                "not_guaranteed__camera_dephased_blue_noise_exact_camera_basis_"
                 "plus_runtime_verified_canonical_fallback"
             ),
             "dense_ownerless_dynamic_consumer_guaranteed": False,
@@ -6177,7 +6415,7 @@ def build_foliage_seed(
                 "foliage_ray_runtime_exact_interval_mass"
             ),
             "dense_dynamic_rgb_source": (
-                "exact_training_target_raster"
+                "exact_training_target_raster_pixel_center_bilinear"
                 if dense_dynamic_births
                 else "not_applicable"
             ),

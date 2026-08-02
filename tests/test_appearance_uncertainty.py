@@ -83,7 +83,7 @@ def test_effective_temporal_code_has_non_collapsing_norm():
     assert torch.isclose(code.norm(), torch.tensor(0.25), atol=1e-6)
 
 
-def test_spatial_uncertainty_is_a_dense_field():
+def test_uncertainty_is_global_and_legacy_camera_grid_is_inert():
     model = OutdoorAppearanceUncertainty(
         ["seq1__frame00001"],
         rank=2,
@@ -95,7 +95,9 @@ def test_spatial_uncertainty_is_a_dense_field():
         model.spatial_uncertainty_basis[0, 0, 0, 0] = 2.0
     _, sigma = model._spatial_fields("seq1__frame00001", (12, 16))
     assert sigma.shape == (2, 12, 16)
-    assert sigma[0].std().item() > 0
+    assert sigma[0].std().item() == 0
+    assert model.spatial_uncertainty_basis.requires_grad is False
+    assert model.local_canopy_basis.requires_grad is False
 
 
 def test_legacy_shared_code_checkpoint_migrates_to_split_latents():

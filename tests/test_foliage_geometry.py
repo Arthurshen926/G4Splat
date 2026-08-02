@@ -15,6 +15,10 @@ from outdoor.foliage_geometry import (
     _supported_view_geometry_statistics,
     semantic_tree_tracks,
 )
+from outdoor.blue_noise_sampling import (
+    deterministic_blue_noise_rows,
+    stable_sampling_seed,
+)
 from outdoor.foliage_view_graph import (
     greedy_diverse_views,
     sequence_balanced_diverse_views,
@@ -118,11 +122,42 @@ def test_dynamic_coverage_scaffold_is_two_dimensional_and_order_invariant():
     )
 
     np.testing.assert_array_equal(selected, shuffled)
-    quadrant = (
-        (sample_v[selected] >= height / 2).astype(np.int64) * 2
-        + (sample_u[selected] >= width / 2).astype(np.int64)
+    assert np.ptp(sample_u[selected]) >= width / 2
+    assert np.ptp(sample_v[selected]) >= height / 2
+    pairwise = np.sqrt(
+        (sample_u[selected, None] - sample_u[selected][None]) ** 2
+        + (sample_v[selected, None] - sample_v[selected][None]) ** 2
     )
-    np.testing.assert_array_equal(np.sort(quadrant), np.arange(4))
+    assert pairwise[np.triu_indices(len(selected), 1)].min() >= 1.0
+
+
+def test_blue_noise_sampling_is_camera_dephased_without_12_or_24_column_peak():
+    height, width = 360, 640
+    rows, columns = np.indices((height, width))
+    candidates = np.arange(height * width, dtype=np.int64)
+    first = deterministic_blue_noise_rows(
+        candidates,
+        columns.reshape(-1),
+        rows.reshape(-1),
+        128,
+        seed=stable_sampling_seed("camera", 408),
+    )
+    second = deterministic_blue_noise_rows(
+        candidates[::-1],
+        columns.reshape(-1),
+        rows.reshape(-1),
+        128,
+        seed=stable_sampling_seed("camera", 409),
+    )
+    assert len(first) == 128
+    assert not np.array_equal(first, second)
+    density = np.zeros((height, width), dtype=np.float64)
+    density.reshape(-1)[first] = 1.0
+    spectrum = np.abs(np.fft.rfft(density.sum(axis=0)))
+    # A 24/12-column camera-plane lattice produces exact harmonics at these
+    # bins with amplitude close to the DC sample count.
+    for grid_columns in (12, 24):
+        assert spectrum[grid_columns] < 0.35 * len(first)
 
 
 def test_global_dense_ray_budget_preserves_coverage_and_exact_total():
@@ -614,7 +649,7 @@ def test_dense_dynamic_births_use_exact_contracted_target_rgb():
     )
     assert {
         row["_dense_ray_rgb_source"] for row in dynamic_births
-    } == {"exact_training_target_raster"}
+    } == {"exact_training_target_raster_pixel_center_bilinear"}
     assert all(
         np.array_equal(row["rgb"], [240, 240, 240])
         for row in proposals
@@ -725,7 +760,9 @@ def test_dense_ray_table_is_decoupled_from_instance_balanced_birth_basis():
     ]
     assert min(coverage_scale) > max(residual_scale)
     confidence_by_uv = {
-        tuple(pixel / np.asarray([width, height])): confidence
+        tuple(
+            (pixel + 0.5) / np.asarray([width, height])
+        ): confidence
         for pixel, confidence in zip(
             record["pixel"], record["confidence"]
         )

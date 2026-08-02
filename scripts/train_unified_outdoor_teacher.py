@@ -64,7 +64,8 @@ PREDECESSOR_PROTOCOL = (
     "cambridge_native_hybrid_teacher_v35_atomic_volume_replace_split"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v40_projected_optical_footprint"
+    "cambridge_native_hybrid_teacher_v42_blue_noise_static_optical_handoff_"
+    "owner_color_refresh"
 )
 COUNTERFACTUAL_TRANSPARENCY_CONTRACT = (
     "detached_surface_only_relative_rgb_advantage_routes_only_volume_"
@@ -79,6 +80,16 @@ RAY_EPOCH_CAPACITY_CONTRACT = (
 VOLUME_TOPOLOGY_SETTLE_CONTRACT = (
     "screen_adaptive_until_configured_end__disabled_during_"
     "canonical_polish_settle"
+)
+VOLUME_OPACITY_SETTLE_CONTRACT = (
+    "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
+    "growth_momentum_constrained__temporal_opacity_frozen__geometry_scale_"
+    "rotation_and_sh_continue__retirement_window_then_automatic_freeze"
+)
+VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT = (
+    "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
+    "growth_momentum_constrained__temporal_opacity_frozen__geometry_scale_"
+    "rotation_and_sh_continue"
 )
 CONDITIONED_SETTLE_CONTRACT = (
     "canonical_polish_disables_topology_not_conditioned_optimization"
@@ -548,6 +559,40 @@ def _parse_args():
             "have acquired the corresponding bandwidth."
         ),
     )
+    parser.add_argument(
+        "--volume-opacity-settle-policy",
+        choices=("none", "freeze", "retirement_only"),
+        default=None,
+        help=(
+            "Policy after the calibrated optical-mass stage. 'freeze' "
+            "holds base and temporal opacity fixed; 'retirement_only' still "
+            "allows base opacity to decrease while preventing further "
+            "optical-mass growth. Geometry, covariance and SH colour remain "
+            "trainable. The handoff profile defaults to retirement_only."
+        ),
+    )
+    parser.add_argument(
+        "--volume-opacity-settle-start-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Last iteration with unconstrained volume-opacity Adam updates. "
+            "For the mature handoff profile this defaults to half the fixed "
+            "schedule horizon; other profiles default to the configured "
+            "volume-topology end."
+        ),
+    )
+    parser.add_argument(
+        "--volume-opacity-retirement-until-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Last iteration of retirement-only base-opacity refinement. "
+            "After this point opacity is frozen while geometry/covariance/"
+            "SH continue. The handoff default is a bounded 25%%-horizon "
+            "window after settle begins, preventing indefinite thinning."
+        ),
+    )
     parser.add_argument("--volume-scale-lr", type=float, default=4e-4)
     parser.add_argument("--volume-rotation-lr", type=float, default=2e-4)
     parser.add_argument("--dynamic-lr", type=float, default=3e-4)
@@ -823,6 +868,26 @@ def _parse_args():
         "--canonical-crown-opacity-ceiling", type=float, default=0.35
     )
     parser.add_argument(
+        "--optical-replacement-policy",
+        choices=("view_depth_local", "group_projected", "disabled"),
+        default="view_depth_local",
+        help=(
+            "Training-time persistent-envelope to exact-detail handoff. "
+            "The default is local in tree cell, active view and depth."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-child-support-color-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Refresh split canonical visual-hull children from their bounded "
+            "cross-sequence support-camera set. The negative form is an "
+            "explicit causal diagnostic; exact-depth canonical observations "
+            "and exact-owner dynamic refresh remain enabled."
+        ),
+    )
+    parser.add_argument(
         "--dynamic-leaf-opacity-ceiling", type=float, default=0.40
     )
     parser.add_argument(
@@ -918,6 +983,27 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--allow-volume-topology-settle-resume",
+        action="store_true",
+        help=(
+            "Resume the exact 6k/12k-horizon diagnostic checkpoint while "
+            "ending volume topology at 6k. Camera/loss/ray schedules, model "
+            "state, evidence, budgets and CUDA kernels remain unchanged; "
+            "only post-6k split/retire churn is disabled. Use together with "
+            "--allow-trainer-repair-resume."
+        ),
+    )
+    parser.add_argument(
+        "--allow-volume-opacity-settle-resume",
+        action="store_true",
+        help=(
+            "Resume the exact audited 6k/12k-horizon checkpoint into either "
+            "post-6k opacity freeze or retirement-only optical refinement. "
+            "Camera/loss schedules, tensors, evidence and CUDA kernels stay "
+            "unchanged. Use together with --allow-trainer-repair-resume."
+        ),
+    )
+    parser.add_argument(
         "--allow-surface-ownership-repair-resume",
         action="store_true",
         help=(
@@ -966,6 +1052,20 @@ def _parse_args():
         parser.error(
             "--allow-v38-causal-repair-resume requires both --resume and "
             "--allow-trainer-repair-resume"
+        )
+    if args.allow_volume_topology_settle_resume and (
+        args.resume is None or not args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "--allow-volume-topology-settle-resume requires both --resume "
+            "and --allow-trainer-repair-resume"
+        )
+    if args.allow_volume_opacity_settle_resume and (
+        args.resume is None or not args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "--allow-volume-opacity-settle-resume requires both --resume "
+            "and --allow-trainer-repair-resume"
         )
     if args.counterfactual_transparency_weight < 0:
         parser.error("--counterfactual-transparency-weight cannot be negative")
@@ -1133,6 +1233,55 @@ def _parse_args():
         parser.error(
             "--volume-densify-until-iteration must lie in [1, "
             "--phase-schedule-horizon]"
+        )
+    if args.volume_opacity_settle_policy is None:
+        args.volume_opacity_settle_policy = (
+            "retirement_only"
+            if args.training_profile == "hybrid_handoff_quality"
+            else "none"
+        )
+    if args.volume_opacity_settle_start_iteration is None:
+        if args.training_profile == "hybrid_handoff_quality":
+            args.volume_opacity_settle_start_iteration = min(
+                int(args.volume_densify_until_iteration),
+                int(round(0.50 * args.phase_schedule_horizon)),
+            )
+        else:
+            args.volume_opacity_settle_start_iteration = int(
+                args.volume_densify_until_iteration
+            )
+    if not (
+        0
+        <= args.volume_opacity_settle_start_iteration
+        <= args.phase_schedule_horizon
+    ):
+        parser.error(
+            "--volume-opacity-settle-start-iteration must lie in [0, "
+            "--phase-schedule-horizon]"
+        )
+    if args.volume_opacity_retirement_until_iteration is None:
+        if args.volume_opacity_settle_policy == "retirement_only":
+            args.volume_opacity_retirement_until_iteration = min(
+                int(args.phase_schedule_horizon),
+                int(args.volume_opacity_settle_start_iteration)
+                + int(round(0.25 * args.phase_schedule_horizon)),
+            )
+        elif args.volume_opacity_settle_policy == "freeze":
+            args.volume_opacity_retirement_until_iteration = int(
+                args.volume_opacity_settle_start_iteration
+            )
+        else:
+            args.volume_opacity_retirement_until_iteration = int(
+                args.phase_schedule_horizon
+            )
+    if not (
+        args.volume_opacity_settle_start_iteration
+        <= args.volume_opacity_retirement_until_iteration
+        <= args.phase_schedule_horizon
+    ):
+        parser.error(
+            "--volume-opacity-retirement-until-iteration must lie between "
+            "the settle start and --phase-schedule-horizon"
         )
     topology_end = next(
         end for name, end in profile["phases"] if name == "topology"
@@ -2011,6 +2160,42 @@ def _complete_evidence_epoch_batch_size(
     )
 
 
+def _prefix_stable_resume_ray_batch(
+    computed_batch: int,
+    resume: dict | None,
+    per_camera_remaining_rows: tuple[int, ...] | list[int],
+    available_factor_calls: int,
+) -> int:
+    """Keep the full-horizon ray batch fixed across exact-prefix resumes."""
+
+    computed_batch = int(computed_batch)
+    if resume is None:
+        return computed_batch
+    saved = int(
+        resume.get("training_contract", {}).get(
+            "ray_posterior_maximum_rays", -1
+        )
+    )
+    if saved <= 0:
+        raise RuntimeError(
+            "Resume checkpoint has no fixed foliage ray batch contract"
+        )
+    required_calls = sum(
+        (int(count) + saved - 1) // saved
+        for count in per_camera_remaining_rows
+        if int(count) > 0
+    )
+    if required_calls > int(available_factor_calls):
+        raise RuntimeError(
+            "Resume checkpoint foliage ray batch cannot complete the "
+            "remaining per-camera evidence epoch"
+        )
+    # Re-solving the same epoch after rows have been consumed may change the
+    # mathematical minimum by one or more rays.  That is a runtime optimum,
+    # not permission to change the objective's batch/normalization mid-run.
+    return saved
+
+
 def _evidence_biased_schedule(
     rgb_schedule: np.ndarray,
     evidence_indices: list[int],
@@ -2269,6 +2454,95 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _immutable_ray_epoch_capacity(value: dict) -> dict:
+    """Validate a runtime ray-capacity audit and return its fixed identity.
+
+    A checkpoint restores per-camera cursors, so ``prior_factor_calls`` and
+    ``remaining_unvisited_row_count`` must change at every resume boundary.
+    They are runtime provenance, not a different optimization contract.  The
+    clean full-horizon batch, camera table and evidence row count are the
+    immutable identity that makes a truncated run an exact prefix.
+    """
+
+    required = {
+        "batch_boundary_contract",
+        "capacity_contract",
+        "capacity_scope",
+        "scheduled_factor_calls",
+        "prior_factor_calls",
+        "available_factor_calls",
+        "camera_table_count",
+        "full_effective_row_count",
+        "remaining_unvisited_row_count",
+        "clean_epoch_aggregate_minimum_batch_with_five_percent_margin",
+        "clean_epoch_minimum_batch_for_complete_per_camera_epoch",
+        "clean_epoch_effective_batch",
+        "runtime_aggregate_minimum_batch_with_five_percent_margin",
+        "minimum_batch_for_runtime_completion",
+        "required_factor_calls",
+        "unused_factor_calls",
+        "complete_epoch_capacity",
+    }
+    if set(value) != required:
+        raise RuntimeError(
+            "Ray evidence epoch capacity audit has an invalid schema"
+        )
+    scheduled = int(value["scheduled_factor_calls"])
+    prior = int(value["prior_factor_calls"])
+    available = int(value["available_factor_calls"])
+    full_rows = int(value["full_effective_row_count"])
+    remaining = int(value["remaining_unvisited_row_count"])
+    required_calls = int(value["required_factor_calls"])
+    unused_calls = int(value["unused_factor_calls"])
+    expected_scope = (
+        "clean_epoch_start" if prior == 0 else "resume_remaining_unvisited_rows"
+    )
+    clean_batch = int(value["clean_epoch_effective_batch"])
+    clean_minimum = int(
+        value["clean_epoch_minimum_batch_for_complete_per_camera_epoch"]
+    )
+    clean_aggregate = int(
+        value[
+            "clean_epoch_aggregate_minimum_batch_with_five_percent_margin"
+        ]
+    )
+    if (
+        value["batch_boundary_contract"] != RAY_EPOCH_BOUNDARY_CONTRACT
+        or value["capacity_contract"] != RAY_EPOCH_CAPACITY_CONTRACT
+        or value["capacity_scope"] != expected_scope
+        or scheduled <= 0
+        or prior < 0
+        or prior >= scheduled
+        or available != scheduled - prior
+        or int(value["camera_table_count"]) <= 0
+        or full_rows <= 0
+        or remaining <= 0
+        or remaining > full_rows
+        or clean_batch < max(clean_minimum, clean_aggregate)
+        or required_calls < 0
+        or required_calls > available
+        or unused_calls != available - required_calls
+        or not bool(value["complete_epoch_capacity"])
+    ):
+        raise RuntimeError(
+            "Ray evidence epoch capacity audit is internally inconsistent"
+        )
+    return {
+        "batch_boundary_contract": value["batch_boundary_contract"],
+        "capacity_contract": value["capacity_contract"],
+        "scheduled_factor_calls": scheduled,
+        "camera_table_count": int(value["camera_table_count"]),
+        "full_effective_row_count": full_rows,
+        "clean_epoch_aggregate_minimum_batch_with_five_percent_margin": (
+            clean_aggregate
+        ),
+        "clean_epoch_minimum_batch_for_complete_per_camera_epoch": (
+            clean_minimum
+        ),
+        "clean_epoch_effective_batch": clean_batch,
+    }
+
+
 def _resume_training_contract_differences(
     saved: dict,
     current: dict,
@@ -2276,6 +2550,8 @@ def _resume_training_contract_differences(
     allow_trainer_repair_migration: bool = False,
     allow_conditioned_schedule_repair_migration: bool = False,
     allow_volume_capacity_repair_migration: bool = False,
+    allow_volume_topology_settle_migration: bool = False,
+    allow_volume_opacity_settle_migration: bool = False,
     allow_surface_ownership_repair_migration: bool = False,
     allow_v38_causal_repair_migration: bool = False,
 ) -> set[str]:
@@ -2421,6 +2697,80 @@ def _resume_training_contract_differences(
         saved["maximum_volume_splits_per_event"] = current[
             "maximum_volume_splits_per_event"
         ]
+    if allow_volume_topology_settle_migration:
+        saved = dict(saved)
+        if (
+            saved.get("schedule_horizon") != 12_000
+            or current.get("schedule_horizon") != 12_000
+            or saved.get("volume_densify_until_iteration") != 12_000
+            or current.get("volume_densify_until_iteration") != 6_000
+        ):
+            raise RuntimeError(
+                "Topology-settle migration requires an unchanged 12k "
+                "schedule and exactly the audited 12k->6k volume topology "
+                "end"
+            )
+        saved["volume_densify_until_iteration"] = 6_000
+    if allow_volume_opacity_settle_migration:
+        saved = dict(saved)
+        saved_settle = saved.get("volume_opacity_settle")
+        current_settle = current.get("volume_opacity_settle")
+        predecessor_without_window = bool(
+            isinstance(saved_settle, dict)
+            and isinstance(current_settle, dict)
+            and saved_settle.get("contract")
+            == VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT
+            and current_settle.get("contract")
+            == VOLUME_OPACITY_SETTLE_CONTRACT
+            and saved_settle.get("policy")
+            == current_settle.get("policy")
+            and saved_settle.get("start_iteration")
+            == current_settle.get("start_iteration")
+            and saved_settle.get("trainable_after_settle")
+            == current_settle.get("trainable_after_settle")
+            and current_settle.get("retirement_until_iteration")
+            in {9_000, 12_000}
+        )
+        retirement_to_freeze = bool(
+            isinstance(saved_settle, dict)
+            and isinstance(current_settle, dict)
+            and saved_settle.get("contract")
+            in {
+                VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT,
+                VOLUME_OPACITY_SETTLE_CONTRACT,
+            }
+            and current_settle.get("contract")
+            == VOLUME_OPACITY_SETTLE_CONTRACT
+            and saved_settle.get("policy") == "retirement_only"
+            and current_settle.get("policy") == "freeze"
+            and saved_settle.get("start_iteration")
+            == current_settle.get("start_iteration")
+            and saved_settle.get("trainable_after_settle")
+            == current_settle.get("trainable_after_settle")
+        )
+        if (
+            saved.get("schedule_horizon") != 12_000
+            or current.get("schedule_horizon") != 12_000
+            or not isinstance(current_settle, dict)
+            or current_settle.get("contract")
+            != VOLUME_OPACITY_SETTLE_CONTRACT
+            or current_settle.get("policy")
+            not in {"freeze", "retirement_only"}
+            or current_settle.get("start_iteration") != 6_000
+            or (
+                "volume_opacity_settle" in saved
+                and not predecessor_without_window
+                and not retirement_to_freeze
+            )
+        ):
+            raise RuntimeError(
+                "Opacity-settle migration requires an unchanged 12k "
+                "schedule, the audited 6k settle point, a freeze or "
+                "retirement-only target, and either a predecessor without "
+                "this contract or the exact retirement-only -> freeze "
+                "polish transition"
+            )
+        saved["volume_opacity_settle"] = current_settle
     if allow_surface_ownership_repair_migration:
         saved = dict(saved)
         old_policy = SURFACE_OWNERSHIP_REPAIR_PREDECESSOR[
@@ -2609,6 +2959,32 @@ def _resume_training_contract_differences(
         saved["conditioned_settle_contract"] = (
             CONDITIONED_SETTLE_CONTRACT
         )
+    # Runtime cursor/capacity fields necessarily advance between an exact
+    # prefix and its resume.  Validate both complete audits, then compare only
+    # the fixed full-horizon evidence identity.  This does not waive evidence
+    # changes: camera count, row count, schedule and clean batch remain bound.
+    saved_ray = saved.get("ray_evidence_epoch_capacity")
+    current_ray = current.get("ray_evidence_epoch_capacity")
+    modern_ray_keys = {
+        "batch_boundary_contract",
+        "capacity_contract",
+        "capacity_scope",
+    }
+    if (
+        isinstance(saved_ray, dict)
+        and isinstance(current_ray, dict)
+        and modern_ray_keys.issubset(saved_ray)
+        and modern_ray_keys.issubset(current_ray)
+    ):
+        saved = dict(saved)
+        current = dict(current)
+        saved["ray_evidence_epoch_capacity"] = (
+            _immutable_ray_epoch_capacity(saved_ray)
+        )
+        current["ray_evidence_epoch_capacity"] = (
+            _immutable_ray_epoch_capacity(current_ray)
+        )
+
     differences = {
         key
         for key in set(saved) | set(current)
@@ -3959,6 +4335,23 @@ def _initialize_surface_from_ply(
     }
 
 
+def _trainable_parameters(module):
+    """Return only parameters that may legally be explicit backward inputs.
+
+    Compatibility tensors can remain registered in a module so historical
+    checkpoints load exactly while the current image-formation contract keeps
+    them frozen.  Passing those tensors through ``autograd.backward(inputs=)``
+    asks PyTorch to retain gradients on ``requires_grad=False`` leaves and
+    fails exactly when the conditioned branch first becomes active.
+    """
+
+    return tuple(
+        parameter
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    )
+
+
 def _volume_optimizer(args, foliage, appearance, sky):
     return torch.optim.Adam(
         [
@@ -3997,7 +4390,7 @@ def _volume_optimizer(args, foliage, appearance, sky):
                 "name": "dynamic",
             },
             {
-                "params": list(appearance.parameters()),
+                "params": list(_trainable_parameters(appearance)),
                 "lr": args.appearance_lr,
                 "name": "appearance",
             },
@@ -4890,6 +5283,338 @@ def _select_volume_reallocation_retirements(
 
 
 @torch.no_grad()
+def _refresh_split_child_owner_colors(
+    foliage,
+    *,
+    child_start: int,
+    owner_camera_ids: torch.Tensor,
+    view_by_camera_id: dict[int, object],
+    support_fallback_enabled: bool = True,
+) -> dict[str, object]:
+    """Re-anchor optical children to full-resolution immutable RGB evidence.
+
+    Copying a broad parent's optimized DC colour into every child preserves
+    the very low-pass appearance that subdivision is meant to remove.  For
+    exact-owner leaf rows, project each new child into its calibrated source
+    camera.  For a canonical child, robustly pool the calibrated observations
+    whose measured depth is consistent with the child's current projection.
+    Both paths sample the immutable native target with pixel-centre bilinear
+    coordinates; no camera-plane appearance grid participates.
+    """
+    owner_camera_ids = torch.as_tensor(
+        owner_camera_ids,
+        device=foliage.xyz.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    child_start = int(child_start)
+    if not len(owner_camera_ids):
+        return {
+            "contract": (
+                "full_resolution_depth_consistent_exact_dynamic_owner_"
+                "plus_depth_consistent_multiview_canonical_pixel_centres"
+            ),
+            "candidate_children": 0,
+            "refreshed_children": 0,
+            "dynamic_candidate_children": 0,
+            "dynamic_refreshed_children": 0,
+            "dynamic_depth_candidate_children": 0,
+            "canonical_candidate_children": 0,
+            "canonical_refreshed_children": 0,
+            "canonical_depth_candidate_children": 0,
+            "canonical_support_fallback_children": 0,
+            "owner_camera_count": 0,
+            "skipped_without_scene_lookup": 0,
+        }
+    child_indices = torch.arange(
+        child_start,
+        child_start + len(owner_camera_ids),
+        device=foliage.xyz.device,
+        dtype=torch.long,
+    )
+    if int(child_indices[-1]) >= len(foliage):
+        raise RuntimeError("Split child colour metadata exceeds new topology")
+    child_roles = foliage.layer_role[child_indices]
+    dynamic_child = child_roles == LAYER_DYNAMIC_LEAF
+    canonical_child = child_roles == LAYER_CANONICAL_CROWN
+    refreshed_mask = torch.zeros(
+        len(child_indices), dtype=torch.bool, device=foliage.xyz.device
+    )
+    refreshed_cameras: set[int] = set()
+    missing_scene_camera_children = 0
+    dynamic_depth_candidate = torch.zeros_like(dynamic_child)
+
+    def sample_projected_rgb(
+        camera_id: int,
+        local_child_indices: torch.Tensor,
+        *,
+        measured_depth: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return valid local rows and their exact-raster RGB samples."""
+        nonlocal missing_scene_camera_children
+        view = view_by_camera_id.get(camera_id)
+        if view is None:
+            if not view_by_camera_id:
+                missing_scene_camera_children += int(
+                    len(local_child_indices)
+                )
+                return local_child_indices[:0], foliage.xyz.new_empty((0, 3))
+            raise RuntimeError(
+                f"Split child evidence camera {camera_id} is absent from "
+                "scene"
+            )
+        indices = child_indices[local_child_indices]
+        xyz = foliage.xyz.detach()[indices]
+        homogeneous = torch.cat(
+            [xyz, torch.ones_like(xyz[:, :1])], dim=1
+        )
+        camera_xyz = homogeneous @ view.world_view_transform
+        depth = camera_xyz[:, 2]
+        pixel_x = (
+            float(view.focal_x) * camera_xyz[:, 0]
+            / depth.clamp_min(1e-5)
+            + float(view.cx)
+        )
+        pixel_y = (
+            float(view.focal_y) * camera_xyz[:, 1]
+            / depth.clamp_min(1e-5)
+            + float(view.cy)
+        )
+        normalized_uv = torch.stack(
+            [
+                (pixel_x + 0.5) / float(view.image_width),
+                (pixel_y + 0.5) / float(view.image_height),
+            ],
+            dim=1,
+        )
+        valid = (
+            torch.isfinite(normalized_uv).all(dim=1)
+            & torch.isfinite(depth)
+            & (depth > 0.05)
+            & (normalized_uv[:, 0] >= 0)
+            & (normalized_uv[:, 0] <= 1)
+            & (normalized_uv[:, 1] >= 0)
+            & (normalized_uv[:, 1] <= 1)
+        )
+        if measured_depth is not None:
+            measured_depth = measured_depth.to(
+                device=depth.device, dtype=depth.dtype
+            )
+            # A child is offset inside its parent's physical footprint.  The
+            # accepted interval therefore follows that child's current scale
+            # but never grows into a broad, view-independent colour lookup.
+            depth_tolerance = torch.maximum(
+                2.5 * foliage.scales.detach()[indices].amax(dim=1),
+                depth.new_full(depth.shape, 0.03),
+            )
+            valid &= (
+                torch.isfinite(measured_depth)
+                & (measured_depth > 0.05)
+                & ((depth - measured_depth).abs() <= depth_tolerance)
+            )
+        if not bool(valid.any()):
+            return local_child_indices[:0], foliage.xyz.new_empty((0, 3))
+        target = view.original_image.to(
+            device=foliage.xyz.device, non_blocking=True
+        )[None]
+        grid = (2.0 * normalized_uv[valid] - 1.0).reshape(1, -1, 1, 2)
+        colors = F.grid_sample(
+            target,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )[0, :, :, 0].T.clamp(0, 1)
+        refreshed_cameras.add(camera_id)
+        return local_child_indices[valid], colors
+
+    # An exact observation owns the dynamic child's base colour.
+    for camera_id_tensor in torch.unique(owner_camera_ids[dynamic_child]):
+        camera_id = int(camera_id_tensor)
+        if camera_id < 0:
+            continue
+        local = torch.nonzero(
+            dynamic_child & (owner_camera_ids == camera_id),
+            as_tuple=False,
+        ).flatten()
+        measured_depth = None
+        # Exact dynamic ownership includes a calibrated hit depth.  A split
+        # child displaced outside that posterior must retain the parent's
+        # colour, not sample whichever sky/facade pixel happens to lie under
+        # its new projection.  That missing check created the bright leaf
+        # flecks visible after otherwise correct full-resolution refresh.
+        if foliage.observation_camera_ids.shape[1]:
+            child_rows = child_indices[local]
+            observation_cameras = foliage.observation_camera_ids[
+                child_rows
+            ].long()
+            matches = observation_cameras == camera_id
+            has_depth_owner = matches.any(dim=1)
+            local = local[has_depth_owner]
+            if not len(local):
+                continue
+            child_rows = child_indices[local]
+            matches = foliage.observation_camera_ids[
+                child_rows
+            ].long() == camera_id
+            depth_slot = matches.to(torch.int64).argmax(dim=1)
+            measured_depth = foliage.observation_depth[
+                child_rows
+            ].gather(1, depth_slot[:, None])[:, 0]
+            dynamic_depth_candidate[local] = True
+        valid_local, colors = sample_projected_rgb(
+            camera_id, local, measured_depth=measured_depth
+        )
+        valid_indices = child_indices[valid_local]
+        foliage.features[valid_indices, 0] = (
+            colors - 0.5
+        ) / 0.28209479177387814
+        refreshed_mask[valid_local] = True
+
+    # Canonical children have no single appearance owner.  Pool only their
+    # persisted, depth-consistent multi-view observations so transient leaves
+    # and background pixels cannot recolour a shared static child.
+    canonical_local = torch.nonzero(canonical_child, as_tuple=False).flatten()
+    canonical_candidate = torch.zeros_like(canonical_child)
+    canonical_depth_candidate = torch.zeros_like(canonical_child)
+    canonical_support_fallback = torch.zeros_like(canonical_child)
+    color_sum = foliage.xyz.new_zeros((len(child_indices), 3))
+    color_count = foliage.xyz.new_zeros(len(child_indices))
+    if len(canonical_local) and foliage.observation_camera_ids.shape[1]:
+        observation_cameras = foliage.observation_camera_ids[
+            child_indices[canonical_local]
+        ].long()
+        observation_depths = foliage.observation_depth[
+            child_indices[canonical_local]
+        ]
+        for slot in range(observation_cameras.shape[1]):
+            slot_camera = observation_cameras[:, slot]
+            slot_depth = observation_depths[:, slot]
+            valid_slot = slot_camera >= 0
+            if not bool(valid_slot.any()):
+                continue
+            slot_local = canonical_local[valid_slot]
+            slot_camera = slot_camera[valid_slot]
+            slot_depth = slot_depth[valid_slot]
+            canonical_candidate[slot_local] = True
+            canonical_depth_candidate[slot_local] = True
+            for camera_id_tensor in torch.unique(slot_camera):
+                camera_id = int(camera_id_tensor)
+                camera_choice = slot_camera == camera_id
+                selected_local = slot_local[camera_choice]
+                selected_depth = slot_depth[camera_choice]
+                valid_local, colors = sample_projected_rgb(
+                    camera_id,
+                    selected_local,
+                    measured_depth=selected_depth,
+                )
+                if not len(valid_local):
+                    continue
+                color_sum.index_add_(0, valid_local, colors)
+                color_count.index_add_(
+                    0,
+                    valid_local,
+                    torch.ones_like(valid_local, dtype=color_count.dtype),
+                )
+    # Visual-hull canonical rows carry the calibrated cameras that jointly
+    # supported their cross-sequence intersection, but older evidence stores
+    # do not duplicate a depth scalar per support view.  Those are still much
+    # stronger colour witnesses than copying a broad parent.  Use a bounded
+    # number only when no explicit observation table exists and the row has
+    # independent sequence support; pooling across views suppresses transient
+    # leaves and exposure outliers without creating camera-owned primitives.
+    if (
+        support_fallback_enabled
+        and len(canonical_local)
+        and foliage.support_camera_ids.shape[1]
+    ):
+        child_rows = child_indices[canonical_local]
+        retained_support_count = (
+            foliage.support_camera_ids[child_rows] >= 0
+        ).sum(dim=1)
+        fallback_local_mask = (
+            ~canonical_depth_candidate[canonical_local]
+            & (retained_support_count >= 2)
+        )
+        fallback_local = canonical_local[fallback_local_mask]
+        if len(fallback_local):
+            support_cameras = foliage.support_camera_ids[
+                child_indices[fallback_local]
+            ].long()
+            maximum_support_views = min(support_cameras.shape[1], 8)
+            for slot in range(maximum_support_views):
+                slot_camera = support_cameras[:, slot]
+                valid_slot = slot_camera >= 0
+                if not bool(valid_slot.any()):
+                    continue
+                slot_local = fallback_local[valid_slot]
+                slot_camera = slot_camera[valid_slot]
+                canonical_candidate[slot_local] = True
+                canonical_support_fallback[slot_local] = True
+                for camera_id_tensor in torch.unique(slot_camera):
+                    camera_id = int(camera_id_tensor)
+                    selected_local = slot_local[
+                        slot_camera == camera_id
+                    ]
+                    valid_local, colors = sample_projected_rgb(
+                        camera_id, selected_local
+                    )
+                    if not len(valid_local):
+                        continue
+                    color_sum.index_add_(0, valid_local, colors)
+                    color_count.index_add_(
+                        0,
+                        valid_local,
+                        torch.ones_like(
+                            valid_local, dtype=color_count.dtype
+                        ),
+                    )
+    valid_canonical = canonical_child & (color_count > 0)
+    if bool(valid_canonical.any()):
+        colors = color_sum[valid_canonical] / color_count[
+            valid_canonical, None
+        ]
+        valid_indices = child_indices[valid_canonical]
+        foliage.features[valid_indices, 0] = (
+            colors - 0.5
+        ) / 0.28209479177387814
+        refreshed_mask[valid_canonical] = True
+    return {
+        "contract": (
+            "full_resolution_depth_consistent_exact_dynamic_owner_plus_"
+            "depth_consistent_multiview_canonical_pixel_centres"
+        ),
+        "candidate_children": int(
+            (
+                (dynamic_child & (owner_camera_ids >= 0))
+                | canonical_candidate
+            ).sum()
+        ),
+        "refreshed_children": int(refreshed_mask.sum()),
+        "dynamic_candidate_children": int(
+            (dynamic_child & (owner_camera_ids >= 0)).sum()
+        ),
+        "dynamic_refreshed_children": int(
+            (refreshed_mask & dynamic_child).sum()
+        ),
+        "dynamic_depth_candidate_children": int(
+            dynamic_depth_candidate.sum()
+        ),
+        "canonical_candidate_children": int(canonical_candidate.sum()),
+        "canonical_refreshed_children": int(
+            (refreshed_mask & canonical_child).sum()
+        ),
+        "canonical_depth_candidate_children": int(
+            canonical_depth_candidate.sum()
+        ),
+        "canonical_support_fallback_children": int(
+            canonical_support_fallback.sum()
+        ),
+        "owner_camera_count": len(refreshed_cameras),
+        "skipped_without_scene_lookup": missing_scene_camera_children,
+    }
+
+
+@torch.no_grad()
 def _adapt_volume(
     args,
     foliage,
@@ -4899,6 +5624,7 @@ def _adapt_volume(
     phase: str | None = None,
     split_capacity_scale: float = 1.0,
     camera_forward_lookup: torch.Tensor | None = None,
+    view_by_camera_id: dict[int, object] | None = None,
 ):
     """Prune contradictions first, then split residuals in one mutation.
 
@@ -5088,6 +5814,14 @@ def _adapt_volume(
         - int(contradiction_remove.sum()),
         0,
     )
+    saturated_budget_settle = old_count >= int(effective_budget)
+    if saturated_budget_settle:
+        # A full budget is a topology-settle boundary, not permission to
+        # replace a fixed fraction of the whole model forever.  Generic
+        # residual-driven splits may use genuinely free capacity, and strong
+        # contradiction pruning may create such capacity, but they cannot
+        # manufacture it by retiring ~20k healthy descendants every event.
+        retirement_requested = 0
     # Capacity allocation and retirement must obey the same physical-role
     # demand.  The former implementation selected retirements globally by
     # utility: at v82/8k it retired 11,900 dynamic rows while the subsequent
@@ -5774,6 +6508,10 @@ def _adapt_volume(
             allow_static_skeleton=True,
             split_plane_normals=split_plane_normals,
         )
+        split_child_start = int(split_event.pop("_child_start"))
+        split_child_owner_camera_ids = conditioned_context_id[
+            selected
+        ].repeat_interleave(selected_child_counts)
         camera_plane_parent_count = int(
             split_event.get("camera_plane_parents", 0)
         )
@@ -5835,7 +6573,20 @@ def _adapt_volume(
             ),
             allow_static_skeleton=True,
         )
+        split_child_start = int(prune_event.pop("_child_start"))
+        split_child_owner_camera_ids = torch.empty(
+            0, dtype=torch.long, device=foliage.xyz.device
+        )
         final_to_old = prune_event["_new_to_old"]
+    owner_color_refresh = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=split_child_start,
+        owner_camera_ids=split_child_owner_camera_ids,
+        view_by_camera_id=(view_by_camera_id or {}),
+        support_fallback_enabled=bool(
+            getattr(args, "canonical_child_support_color_refresh", True)
+        ),
+    )
     mutated = pruned > 0 or split_parents > 0
     return {
         "old_count": old_count,
@@ -5873,8 +6624,10 @@ def _adapt_volume(
         },
         "reallocated_pruned": int(reallocation_remove.sum()),
         "capacity_reallocation": reallocation_audit,
+        "saturated_budget_settle": saturated_budget_settle,
         "capacity_reallocation_contract": VOLUME_REALLOCATION_CONTRACT,
         "topology_mutation_contract": VOLUME_TOPOLOGY_MUTATION_CONTRACT,
+        "split_child_owner_color_refresh": owner_color_refresh,
         "integrated_split_demand": float(integrated_demand),
         "requested_splits": int(requested_splits),
         "configured_split_limit": int(args.maximum_volume_splits),
@@ -5989,6 +6742,102 @@ def _apply_volume_role_gradients(
             # the conditioned branch is actually active.
             if not dynamic_active:
                 parameter.grad[dynamic] = 0
+
+
+def _apply_volume_opacity_settle_policy(
+    foliage,
+    volume_optimizer,
+    step: int,
+    args,
+) -> dict[str, object]:
+    """Stop late RGB residuals from rebuilding an opaque low-pass canopy.
+
+    By the settle point the exact owner/depth stage has already calibrated
+    optical existence.  Geometry, covariance and SH colour still need many
+    refinement steps, but unconstrained Adam opacity updates can cheaply lower
+    RGB loss by increasing projected optical thickness everywhere.  That
+    destroys parallax and edge bandwidth even when topology is held fixed.
+
+    ``freeze`` skips both base and temporal opacity parameters.  The less
+    restrictive ``retirement_only`` policy keeps positive base-logit
+    gradients (Adam decreases opacity) but removes gradients and Adam momentum
+    that would increase it, only through the configured bounded retirement
+    window; it automatically becomes ``freeze`` afterwards.  Temporal opacity
+    is frozen in both policies because its parameter group also owns
+    deformation/colour bases and cannot be safely controlled by changing the
+    shared group learning rate.
+    """
+
+    policy = str(args.volume_opacity_settle_policy)
+    iteration = int(step) + 1
+    start = int(args.volume_opacity_settle_start_iteration)
+    retirement_end = int(
+        args.volume_opacity_retirement_until_iteration
+    )
+    effective_policy = (
+        "freeze"
+        if policy == "retirement_only" and iteration > retirement_end
+        else policy
+    )
+    audit: dict[str, object] = {
+        "contract": VOLUME_OPACITY_SETTLE_CONTRACT,
+        "policy": policy,
+        "effective_policy": effective_policy,
+        "start_iteration": start,
+        "retirement_until_iteration": retirement_end,
+        "active": bool(policy != "none" and iteration > start),
+        "base_rows_frozen": 0,
+        "base_growth_rows_suppressed": 0,
+        "base_growth_gradient_suppressed": 0.0,
+        "base_growth_momentum_entries_suppressed": 0,
+        "temporal_rows_frozen": 0,
+    }
+    if not audit["active"]:
+        return audit
+
+    base_gradient = foliage.opacity_logits.grad
+    temporal_gradient = foliage.dynamic_opacity_basis.grad
+    if effective_policy == "freeze":
+        if base_gradient is not None:
+            audit["base_rows_frozen"] = int(
+                (base_gradient.flatten(1).abs().sum(dim=1) > 0).sum()
+            )
+            foliage.opacity_logits.grad = None
+    elif effective_policy == "retirement_only":
+        if base_gradient is not None:
+            increasing = base_gradient < 0
+            audit["base_growth_rows_suppressed"] = int(
+                increasing.flatten(1).any(dim=1).sum()
+            )
+            audit["base_growth_gradient_suppressed"] = float(
+                (-base_gradient[increasing]).sum()
+            )
+            base_gradient.clamp_(min=0)
+        # A non-negative current gradient is insufficient with Adam: a
+        # negative first moment still increases the logit.  Constrain that
+        # stored growth direction as part of the same optical contract.
+        state = volume_optimizer.state.get(foliage.opacity_logits, {})
+        first_moment = state.get("exp_avg")
+        if torch.is_tensor(first_moment):
+            increasing_momentum = first_moment < 0
+            audit["base_growth_momentum_entries_suppressed"] = int(
+                increasing_momentum.sum()
+            )
+            first_moment.clamp_(min=0)
+    else:
+        raise ValueError(
+            f"Unknown volume opacity settle policy {effective_policy!r}"
+        )
+
+    if temporal_gradient is not None:
+        audit["temporal_rows_frozen"] = int(
+            (temporal_gradient.flatten(1).abs().sum(dim=1) > 0).sum()
+        )
+        # ``grad=None`` makes Adam skip this parameter entirely, including
+        # its retained moments, while deformation and feature bases in the
+        # same named group continue to update.
+        foliage.dynamic_opacity_basis.grad = None
+    return audit
 
 
 def _apply_mature_surface_gradient_policy(
@@ -6745,6 +7594,7 @@ def _evaluate(
     output: Path,
     *,
     conditioned_enabled: bool,
+    optical_replacement_policy: str = "view_depth_local",
 ) -> list[dict]:
     from PIL import Image as PILImage
 
@@ -6787,6 +7637,7 @@ def _evaluate(
                     camera_sequence_lookup,
                     camera_frame_lookup,
                 ),
+                optical_replacement_policy=optical_replacement_policy,
             )
             conditioned = appearance(
                 composite_white_background(
@@ -7219,6 +8070,14 @@ def main():
         per_camera_rows=per_camera_unvisited_ray_rows,
         available_factor_calls=available_ray_factor_calls,
     )
+    effective_ray_posterior_maximum_rays = (
+        _prefix_stable_resume_ray_batch(
+            effective_ray_posterior_maximum_rays,
+            resume,
+            per_camera_unvisited_ray_rows,
+            capacity_ray_factor_calls,
+        )
+    )
     clean_epoch_aggregate_minimum_batch = int(
         np.ceil(
             1.05
@@ -7267,6 +8126,22 @@ def main():
         seed=args.seed + 19,
         maximum_tangent_scale=args.maximum_surface_scale,
     ).cuda()
+    chart_runtime_audit = chart_surface.audit()
+    required_chart_contract = {
+        "continuous_learnable_inverse_depth_atlas": True,
+        "uv_domain_quadtree_densification": True,
+        "renderer_binding": "native_2d_surfel_geometry_override",
+    }
+    chart_contract_mismatch = {
+        key: (chart_runtime_audit.get(key), expected)
+        for key, expected in required_chart_contract.items()
+        if chart_runtime_audit.get(key) != expected
+    }
+    if chart_contract_mismatch:
+        raise RuntimeError(
+            "Runtime Chart atlas contradicts the declared mainline: "
+            f"{chart_contract_mismatch}"
+        )
     # The provider changes only the native 2D surfel geometry tensors passed
     # to the mixed rasterizer. It does not alter the renderer API or create a
     # second compositing pass.
@@ -7622,6 +8497,28 @@ def main():
             "exact_owner_plus_treewise_continuous_temporal_fallback_"
             "max035_decay"
         ),
+        "foliage_sampling_policy": (
+            "per_camera_instance_dephased_deterministic_blue_noise_"
+            "coverage_plus_full_resolution_rgb_detail"
+        ),
+        "appearance_grid_policy": "disabled_no_camera_plane_grid",
+        "optical_replacement_policy": args.optical_replacement_policy,
+        "chart_surface_policy": (
+            "continuous_learnable_inverse_depth_atlas_uv_quadtree_"
+            "live_native_2dgs_binding"
+        ),
+        "dynamic_policy": (
+            "training_evidence_only_exact_owner__canonical_static_map_export"
+        ),
+        "deployment_static_contract": {
+            "render_mode": "canonical",
+            "include_dynamic_leaf_rows": False,
+            "include_temporal_code": False,
+            "include_camera_plane_spatial_appearance": False,
+            "conditioned_render_role": (
+                "database_fit_training_diagnostic_only"
+            ),
+        },
         "dynamic_optical_mass_contract": (
             "exact_owner_support_unknown_free_space_initial_optical_mass_"
             "separate_from_occupancy_depth_geometry_floor__spatial_"
@@ -7716,6 +8613,19 @@ def main():
         ),
         "volume_split_radius": float(args.volume_split_radius),
         "volume_opacity_lr": float(args.volume_opacity_lr),
+        "volume_opacity_settle": {
+            "contract": VOLUME_OPACITY_SETTLE_CONTRACT,
+            "policy": str(args.volume_opacity_settle_policy),
+            "start_iteration": int(
+                args.volume_opacity_settle_start_iteration
+            ),
+            "retirement_until_iteration": int(
+                args.volume_opacity_retirement_until_iteration
+            ),
+            "trainable_after_settle": (
+                "geometry_scale_rotation_sh_and_dynamic_deformation_feature"
+            ),
+        },
         "volume_topology_ramp_iterations": int(
             args.volume_topology_ramp_iterations
         ),
@@ -7879,6 +8789,15 @@ def main():
     }
     implementation_hashes = {
         "trainer": _file_sha256(Path(__file__)),
+        "role_aware_initialization": _file_sha256(
+            REPO_ROOT / "outdoor/role_aware_initialization.py"
+        ),
+        "foliage_geometry": _file_sha256(
+            REPO_ROOT / "outdoor/foliage_geometry.py"
+        ),
+        "hybrid_teacher_api": _file_sha256(
+            REPO_ROOT / "outdoor/hybrid_teacher_api.py"
+        ),
         "appearance_uncertainty": _file_sha256(
             REPO_ROOT / "outdoor/appearance_uncertainty.py"
         ),
@@ -7919,12 +8838,27 @@ def main():
             / "submodules/diff-surfel-rasterization/"
             "cuda_rasterizer/mixed_backward.cu"
         ),
+        "mixed_cuda_config": _file_sha256(
+            SURFEL_ROOT
+            / "submodules/diff-surfel-rasterization/"
+            "cuda_rasterizer/config.h"
+        ),
+        "mixed_rasterizer_impl_cuda": _file_sha256(
+            SURFEL_ROOT
+            / "submodules/diff-surfel-rasterization/"
+            "cuda_rasterizer/rasterizer_impl.cu"
+        ),
     }
     runtime_provenance = collect_runtime_provenance(
         REPO_ROOT,
         python_modules=(
             "scripts.train_unified_outdoor_teacher",
             "outdoor.hybrid_gaussian_renderer",
+            "outdoor.foliage_geometry",
+            "outdoor.role_aware_initialization",
+            "outdoor.appearance_uncertainty",
+            "outdoor.chart_surface_model",
+            "outdoor.hybrid_teacher_api",
             "scene.gaussian_model",
             "diff_surfel_rasterization",
         ),
@@ -7932,6 +8866,26 @@ def main():
             SURFEL_ROOT / "submodules/diff-surfel-rasterization",
             SURFEL_ROOT / "submodules/simple-knn",
         ),
+    )
+    print(
+        json.dumps(
+            {
+                "runtime_provenance": runtime_provenance,
+                "implementation_hashes": implementation_hashes,
+                "policies": {
+                    key: training_contract[key]
+                    for key in (
+                        "foliage_sampling_policy",
+                        "appearance_grid_policy",
+                        "optical_replacement_policy",
+                        "chart_surface_policy",
+                        "dynamic_policy",
+                    )
+                },
+            },
+            indent=2,
+        ),
+        flush=True,
     )
     if resume is not None:
         resume_hashes = resume.get("implementation_hashes", {})
@@ -8082,6 +9036,12 @@ def main():
             ),
             allow_volume_capacity_repair_migration=bool(
                 args.allow_volume_capacity_repair_resume
+            ),
+            allow_volume_topology_settle_migration=bool(
+                args.allow_volume_topology_settle_resume
+            ),
+            allow_volume_opacity_settle_migration=bool(
+                args.allow_volume_opacity_settle_resume
             ),
             allow_surface_ownership_repair_migration=bool(
                 args.allow_surface_ownership_repair_resume
@@ -8945,6 +9905,9 @@ def main():
                 volume_dynamic_opacity_gradient_gate=(
                     temporal_residual_gradient_gate
                 ),
+                optical_replacement_policy=(
+                    args.optical_replacement_policy
+                ),
                 structural_trainable_start=None,
                 audit_fields=torch.stack(
                     [
@@ -9148,7 +10111,7 @@ def main():
             )
             torch.autograd.backward(
                 conditioned_loss,
-                inputs=tuple(appearance.parameters()),
+                inputs=_trainable_parameters(appearance),
             )
             dynamic_gate_audit.update(
                 {
@@ -9696,6 +10659,14 @@ def main():
         _apply_volume_role_gradients(
             foliage, phase, dynamic_active=dynamic_active
         )
+        volume_opacity_settle_audit = (
+            _apply_volume_opacity_settle_policy(
+                foliage,
+                volume_optimizer,
+                step,
+                args,
+            )
+        )
         surface_spatial_confidence_audit = (
             _apply_surface_spatial_confidence_gradients(surface)
         )
@@ -9946,6 +10917,7 @@ def main():
                     step, args
                 ),
                 camera_forward_lookup=camera_forward_lookup,
+                view_by_camera_id=view_by_camera_id,
             )
             new_to_old = event.pop("_new_to_old", None)
             if new_to_old is not None:
@@ -10065,6 +11037,7 @@ def main():
                 "foliage_ray_consumption": foliage_rays.audit(),
                 "geometry": geometry_values,
                 "gradient_norms": gradient_audit,
+                "volume_opacity_settle": volume_opacity_settle_audit,
                 "surface_spatial_confidence": (
                     surface_spatial_confidence_audit
                 ),
@@ -10513,6 +11486,7 @@ def main():
         conditioned_enabled=(
             args.training_profile != "hybrid_rigid_stage1"
         ),
+        optical_replacement_policy=args.optical_replacement_policy,
     )
     scene.close()
     result = {
@@ -10537,6 +11511,7 @@ def main():
         "teacher_state": str(teacher_state),
         "teacher_state_sha256": _file_sha256(teacher_state),
         "authoritative_final_model": "native_hybrid_teacher",
+        "deployment_render_mode": "canonical_static",
         "standard_student_trained": False,
         "surface_ply": str(
             output
@@ -10585,8 +11560,11 @@ def main():
         "final_surface_health": final_surface_health,
         "surface_spatial_confidence": surface_spatial_confidence_audit,
         "foliage_ray_evidence_audit": foliage_rays.audit(),
+        "volume_opacity_settle": volume_opacity_settle_audit,
         "targeted_evaluation": evaluation,
         "evaluation_contract": {
+            "deployment_mode": "canonical",
+            "conditioned_role": "database_fit_training_diagnostic_only",
             "valid_render_modes": (
                 ["canonical"]
                 if args.training_profile == "hybrid_rigid_stage1"
@@ -10622,6 +11600,8 @@ def main():
             "include_canonical_volume": (
                 args.training_profile != "hybrid_rigid_stage1"
             ),
+            "deployment_authoritative": True,
+            "uses_temporal_or_image_conditioning": False,
         },
         "conditioned_render": {
             "available": (
@@ -10632,6 +11612,8 @@ def main():
             ),
             "temporal_code": "known database image name",
             "appearance_conditioning": True,
+            "deployment_authoritative": False,
+            "role": "database_fit_training_diagnostic_only",
         },
         "mixed_kernel": (
             "native perspective-correct 2D surfel and 3D EWA in one "

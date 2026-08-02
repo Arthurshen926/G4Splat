@@ -943,6 +943,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-static-foliage-render-repair",
+        action="store_true",
+        help=(
+            "Explicitly reinterpret the exact v131/v40 checkpoint with the "
+            "v41 no-screen-grid appearance and view/depth-local optical "
+            "handoff. Intended only for labelled zero-training diagnosis."
+        ),
+    )
+    parser.add_argument(
         "--exact-ray-render-aspect-limit",
         type=float,
         default=4.0,
@@ -950,6 +959,15 @@ def main() -> None:
             "Render-only maximum depth/tangent scale ratio for a visible "
             "single-observation exact-ray leaf. Metric position covariance, "
             "tangent footprint, colour and opacity are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--optical-replacement-policy",
+        choices=("view_depth_local", "group_projected", "disabled"),
+        default="view_depth_local",
+        help=(
+            "Envelope-to-detail handoff. view_depth_local additionally "
+            "requires active-camera projection and depth-interval overlap."
         ),
     )
     parser.add_argument(
@@ -995,6 +1013,9 @@ def main() -> None:
         sh_degree=dataset.sh_degree,
         allow_projected_optical_footprint_repair=(
             args.allow_projected_optical_footprint_repair
+        ),
+        allow_static_foliage_render_repair=(
+            args.allow_static_foliage_render_repair
         ),
     )
     evaluation_rgb_source, rgb_source_contract_match = (
@@ -1152,6 +1173,9 @@ def main() -> None:
                 exact_ray_render_aspect_limit=(
                     args.exact_ray_render_aspect_limit
                 ),
+                optical_replacement_policy=(
+                    args.optical_replacement_policy
+                ),
             )
             conditioned = (
                 teacher.render(
@@ -1164,6 +1188,9 @@ def main() -> None:
                     conditioned=True,
                     exact_ray_render_aspect_limit=(
                         args.exact_ray_render_aspect_limit
+                    ),
+                    optical_replacement_policy=(
+                        args.optical_replacement_policy
                     ),
                 )
                 if evaluation_mode == "hybrid"

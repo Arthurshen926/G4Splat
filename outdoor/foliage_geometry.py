@@ -8,6 +8,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
+
+from outdoor.blue_noise_sampling import (
+    deterministic_blue_noise_rows,
+    stable_sampling_seed,
+)
 
 try:
     from numba import njit
@@ -26,6 +32,26 @@ CAMERA_MODELS = {
     0: ("SIMPLE_PINHOLE", 3),
     1: ("PINHOLE", 4),
 }
+
+
+def _bilinear_rgb_sample(
+    image: np.ndarray, x: np.ndarray, y: np.ndarray
+) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    x = np.clip(np.asarray(x, dtype=np.float64), 0, image.shape[1] - 1)
+    y = np.clip(np.asarray(y, dtype=np.float64), 0, image.shape[0] - 1)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.minimum(x0 + 1, image.shape[1] - 1)
+    y1 = np.minimum(y0 + 1, image.shape[0] - 1)
+    wx = (x - x0)[:, None]
+    wy = (y - y0)[:, None]
+    return (
+        image[y0, x0] * (1 - wx) * (1 - wy)
+        + image[y0, x1] * wx * (1 - wy)
+        + image[y1, x0] * (1 - wx) * wy
+        + image[y1, x1] * wx * wy
+    )
 
 
 def evidence_conditioned_leaf_optical_mass(
@@ -1114,85 +1140,14 @@ def _spatially_stratified_coverage_rows(
     sample_v: np.ndarray,
     count: int,
 ) -> np.ndarray:
-    """Choose deterministic 2D coverage witnesses from raster-ordered rows.
-
-    Dense ray rows are stored in raster order. Applying ``linspace`` to their
-    one-dimensional indices therefore traces scanlines/diagonals rather than
-    covering the two-dimensional crown, and the resulting exact-RGB splats
-    remain visible as coherent bands after training. This routine places a
-    lattice over the observed image-space extent and assigns one distinct
-    nearest row to each lattice site. The result is invariant to input row
-    order and preserves the requested finite renderer-basis size exactly.
-    """
-    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
-    count = min(max(int(count), 0), len(rows))
-    if count == 0:
-        return np.empty(0, dtype=np.int64)
-    if count == len(rows):
-        return np.sort(rows)
-    rows = np.sort(rows)
-    u = np.asarray(sample_u, dtype=np.float64)[rows]
-    v = np.asarray(sample_v, dtype=np.float64)[rows]
-    u_min, u_max = float(u.min()), float(u.max())
-    v_min, v_max = float(v.min()), float(v.max())
-    u_span = max(u_max - u_min, 1.0)
-    v_span = max(v_max - v_min, 1.0)
-    aspect = np.clip(u_span / v_span, 1.0 / count, float(count))
-    columns = max(1, int(np.ceil(np.sqrt(count * aspect))))
-    row_count = max(1, int(np.ceil(count / columns)))
-    normalized = np.column_stack(
-        [(u - u_min) / u_span, (v - v_min) / v_span]
+    """Compatibility wrapper for the camera-dephased blue-noise sampler."""
+    return deterministic_blue_noise_rows(
+        rows,
+        sample_u,
+        sample_v,
+        count,
+        seed=stable_sampling_seed("coverage-wrapper", int(count)),
     )
-    # A dense posterior may contain hundreds of thousands of valid pixels in
-    # one camera.  Per-target nearest-neighbour scans are quadratic, while a
-    # KD-tree per camera still spends most initialization time rebuilding the
-    # same regular image-space index.  Assign candidates to the target lattice
-    # in one vectorized pass, select the closest row to every occupied cell,
-    # then distribute any refill across the remaining cells.  This is linear
-    # apart from one deterministic sort and preserves exact cardinality.
-    cell_x = np.minimum(
-        np.floor(normalized[:, 0] * columns).astype(np.int64),
-        columns - 1,
-    )
-    cell_y = np.minimum(
-        np.floor(normalized[:, 1] * row_count).astype(np.int64),
-        row_count - 1,
-    )
-    cell = cell_y * columns + cell_x
-    cell_center_x = (cell_x.astype(np.float64) + 0.5) / columns
-    cell_center_y = (cell_y.astype(np.float64) + 0.5) / row_count
-    center_distance = (
-        (normalized[:, 0] - cell_center_x) ** 2
-        + (normalized[:, 1] - cell_center_y) ** 2
-    )
-    order = np.lexsort((rows, center_distance, cell))
-    ordered_cell = cell[order]
-    first = np.concatenate(
-        [
-            np.asarray([True]),
-            ordered_cell[1:] != ordered_cell[:-1],
-        ]
-    )
-    selected_local = order[first]
-    if len(selected_local) > count:
-        selected_local = selected_local[
-            np.linspace(
-                0, len(selected_local) - 1, count, dtype=np.int64
-            )
-        ]
-    elif len(selected_local) < count:
-        remaining_local = order[~first]
-        required = count - len(selected_local)
-        refill = remaining_local[
-            np.linspace(
-                0,
-                len(remaining_local) - 1,
-                required,
-                dtype=np.int64,
-            )
-        ]
-        selected_local = np.concatenate([selected_local, refill])
-    return np.sort(rows[selected_local])
 
 
 def _bounded_candidate_ray_rows(
@@ -1274,59 +1229,24 @@ def _bounded_candidate_ray_rows(
         remaining -= int(addition.sum())
 
     selected = []
-    for candidates, quota in zip(class_rows, quotas):
+    for class_value, candidates, quota in zip(
+        class_order, class_rows, quotas
+    ):
         quota = int(quota)
         if quota <= 0:
             continue
         if len(candidates) <= quota:
             selected.append(candidates)
             continue
-        u = pixel_u[candidates]
-        v = pixel_v[candidates]
-        grid_side = max(1, int(np.ceil(np.sqrt(quota))))
-        u_span = max(float(u.max() - u.min()), 1.0)
-        v_span = max(float(v.max() - v.min()), 1.0)
-        cell_x = np.minimum(
-            np.floor(
-                (u - float(u.min())) / u_span * grid_side
-            ).astype(np.int64),
-            grid_side - 1,
+        winners = deterministic_blue_noise_rows(
+            candidates,
+            pixel_u,
+            pixel_v,
+            quota,
+            seed=stable_sampling_seed(
+                "bounded-ray-factor", int(class_value), int(maximum_rows)
+            ),
         )
-        cell_y = np.minimum(
-            np.floor(
-                (v - float(v.min())) / v_span * grid_side
-            ).astype(np.int64),
-            grid_side - 1,
-        )
-        cell = cell_y * grid_side + cell_x
-        order = np.lexsort((candidates, u, v, cell))
-        ordered_cells = cell[order]
-        first_in_cell = np.concatenate(
-            [
-                np.asarray([True]),
-                ordered_cells[1:] != ordered_cells[:-1],
-            ]
-        )
-        winners = candidates[order[first_in_cell]]
-        if len(winners) > quota:
-            winners = winners[
-                np.linspace(
-                    0, len(winners) - 1, quota, dtype=np.int64
-                )
-            ]
-        if len(winners) < quota:
-            unselected = candidates[
-                ~np.isin(candidates, winners, assume_unique=False)
-            ]
-            refill = unselected[
-                np.linspace(
-                    0,
-                    len(unselected) - 1,
-                    quota - len(winners),
-                    dtype=np.int64,
-                )
-            ]
-            winners = np.concatenate([winners, refill])
         selected.append(winners)
     if not selected:
         return np.empty(0, dtype=np.int64)
@@ -1680,11 +1600,14 @@ def _dense_component_ray_posterior(
         # exact-view Gaussians then make those bands visible in RGB even when
         # all later ownership and depth contracts are correct.  Select the
         # fixed evidence budget directly in image space instead.
-        indices = _spatially_stratified_coverage_rows(
+        indices = deterministic_blue_noise_rows(
             indices,
             sample_u,
             sample_v,
             int(maximum_rays),
+            seed=stable_sampling_seed(
+                "dense-ray-posterior", int(view["image_id"])
+            ),
         )
     confidence = np.exp(
         -0.5
@@ -1845,11 +1768,16 @@ def _dense_component_ray_posterior(
             # in weak-continuous crowns that receive the largest budget.
             quota = min(int(quota), len(instance_rows))
             uniform_count = max(1, (quota + 1) // 2)
-            uniform = _spatially_stratified_coverage_rows(
+            uniform = deterministic_blue_noise_rows(
                 instance_rows,
                 sample_u,
                 sample_v,
                 uniform_count,
+                seed=stable_sampling_seed(
+                    "dense-ray-coverage",
+                    int(view["image_id"]),
+                    int(instance),
+                ),
             )
             residual_count = quota - len(uniform)
             remaining_rows = instance_rows[
@@ -1862,66 +1790,18 @@ def _dense_component_ray_posterior(
                 # of detail cells merely to select the complete remainder.
                 detail = remaining_rows
             elif residual_count > 0 and len(remaining_rows):
-                grid_side = max(
-                    1, int(np.ceil(np.sqrt(2 * residual_count)))
+                detail = deterministic_blue_noise_rows(
+                    remaining_rows,
+                    sample_u,
+                    sample_v,
+                    residual_count,
+                    seed=stable_sampling_seed(
+                        "dense-ray-detail",
+                        int(view["image_id"]),
+                        int(instance),
+                    ),
+                    score=high_frequency_score,
                 )
-                u = sample_u[remaining_rows]
-                v = sample_v[remaining_rows]
-                u_span = max(float(u.max() - u.min()), 1.0)
-                v_span = max(float(v.max() - v.min()), 1.0)
-                cell_x = np.minimum(
-                    np.floor(
-                        (u - float(u.min())) / u_span * grid_side
-                    ).astype(np.int64),
-                    grid_side - 1,
-                )
-                cell_y = np.minimum(
-                    np.floor(
-                        (v - float(v.min())) / v_span * grid_side
-                    ).astype(np.int64),
-                    grid_side - 1,
-                )
-                cell = cell_y * grid_side + cell_x
-                cell_winners = []
-                for cell_id in np.unique(cell):
-                    rows = remaining_rows[cell == cell_id]
-                    order = np.lexsort(
-                        (rows, -high_frequency_score[rows])
-                    )
-                    cell_winners.append(rows[order[0]])
-                cell_winners = np.asarray(
-                    cell_winners, dtype=np.int64
-                )
-                winner_order = np.lexsort(
-                    (
-                        cell_winners,
-                        -high_frequency_score[cell_winners],
-                    )
-                )
-                detail = cell_winners[
-                    winner_order[:residual_count]
-                ]
-                if len(detail) < residual_count:
-                    refill = remaining_rows[
-                        ~np.isin(
-                            remaining_rows,
-                            detail,
-                            assume_unique=False,
-                        )
-                    ]
-                    refill_order = np.lexsort(
-                        (refill, -high_frequency_score[refill])
-                    )
-                    detail = np.concatenate(
-                        [
-                            detail,
-                            refill[
-                                refill_order[
-                                    : residual_count - len(detail)
-                                ]
-                            ],
-                        ]
-                    )
             selected_dynamic_rows.append(
                 np.concatenate([uniform, detail])
             )
@@ -2020,32 +1900,40 @@ def _dense_component_ray_posterior(
     # proposals below, but it removes leaf-scale frequencies and can be badly
     # wrong across an occlusion boundary.
     if target_rgb is not None:
-        target_rows = np.clip(
-            np.floor(
-                sample_v[dynamic_rows]
-                / float(view["height"])
-                * target_rgb.shape[0]
-            ).astype(np.int64),
-            0,
-            target_rgb.shape[0] - 1,
+        target_x = (
+            sample_u[dynamic_rows]
+            * target_rgb.shape[1]
+            / float(view["width"])
+            - 0.5
         )
-        target_columns = np.clip(
-            np.floor(
-                sample_u[dynamic_rows]
-                / float(view["width"])
-                * target_rgb.shape[1]
-            ).astype(np.int64),
-            0,
-            target_rgb.shape[1] - 1,
+        target_y = (
+            sample_v[dynamic_rows]
+            * target_rgb.shape[0]
+            / float(view["height"])
+            - 0.5
         )
-        dynamic_rgb = target_rgb[target_rows, target_columns]
-        dynamic_rgb_source = "exact_training_target_raster"
+        dynamic_rgb = _bilinear_rgb_sample(target_rgb, target_x, target_y)
+        dynamic_rgb_source = (
+            "exact_training_target_raster_pixel_center_bilinear"
+        )
     else:
         # Kept only for direct synthetic/unit callers. Role-aware production
         # initialization always attaches the contracted target RGB path.
         dynamic_rgb = posterior_color[dynamic_rows]
         dynamic_rgb_source = "sparse_anchor_interpolation_fallback"
     dynamic_proposals = []
+    camera_frame_xyzw = Rotation.from_matrix(
+        np.asarray(view["rotation"], dtype=np.float64).T
+    ).as_quat()
+    camera_frame_wxyz = np.asarray(
+        [
+            camera_frame_xyzw[3],
+            camera_frame_xyzw[0],
+            camera_frame_xyzw[1],
+            camera_frame_xyzw[2],
+        ],
+        dtype=np.float32,
+    )
     for local, row in enumerate(dynamic_rows):
         dynamic_proposals.append(
             {
@@ -2077,8 +1965,8 @@ def _dense_component_ray_posterior(
                 "observation_uv": np.asarray(
                     [
                         [
-                            sample_u[row] / float(view["width"]),
-                            sample_v[row] / float(view["height"]),
+                            (sample_u[row] + 0.5) / float(view["width"]),
+                            (sample_v[row] + 0.5) / float(view["height"]),
                         ]
                     ],
                     dtype=np.float32,
@@ -2104,6 +1992,24 @@ def _dense_component_ray_posterior(
                 "ray_footprint_scale": float(
                     dynamic_footprint[local]
                 ),
+                "ray_tangent_scale_u": float(dynamic_footprint[local]),
+                "ray_tangent_scale_v": float(dynamic_footprint[local]),
+                "ray_render_depth_scale": float(
+                    np.clip(
+                        min(
+                            posterior_sigma[row],
+                            dynamic_footprint[local]
+                            * (
+                                1.0
+                                if bool(dynamic_is_detail[local])
+                                else 2.0
+                            ),
+                        ),
+                        0.004,
+                        0.24,
+                    )
+                ),
+                "ray_frame_quaternion": camera_frame_wxyz.copy(),
                 "_tree_instance_id": int(sample_instance[row]),
                 "_dense_ray_dynamic_birth": True,
                 "_dense_ray_rgb_source": dynamic_rgb_source,
@@ -2119,14 +2025,16 @@ def _dense_component_ray_posterior(
         return record, [], dynamic_proposals
     proposal_rows = indices
     if len(proposal_rows) > int(maximum_proposals):
-        proposal_rows = proposal_rows[
-            np.linspace(
-                0,
-                len(proposal_rows) - 1,
-                int(maximum_proposals),
-                dtype=np.int64,
-            )
-        ]
+        proposal_rows = deterministic_blue_noise_rows(
+            proposal_rows,
+            sample_u,
+            sample_v,
+            int(maximum_proposals),
+            seed=stable_sampling_seed(
+                "canonical-ray-proposal", int(view["image_id"])
+            ),
+            score=confidence_by_row,
+        )
     z = posterior_depth[proposal_rows]
     camera_xyz = np.column_stack(
         [

@@ -17,7 +17,10 @@ from outdoor.directional_sky import CanonicalDirectionalSky, _eval_sh
 from outdoor.foliage_view_graph import sequence_id
 
 
-APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v3"
+APPEARANCE_VERSION = "outdoor_global_sequence_appearance_uncertainty_v4"
+SPATIAL_APPEARANCE_VERSION = (
+    "outdoor_spatial_sequence_appearance_uncertainty_v3"
+)
 LEGACY_APPEARANCE_VERSION = "outdoor_spatial_sequence_appearance_uncertainty_v2"
 
 
@@ -86,8 +89,12 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 device=device,
             )
         )
-        # Low-resolution spatial fields decoded from the same sequence/time
-        # code.  They are shared bases, not unconstrained per-image pixels.
+        # Compatibility tensors for v2/v3 checkpoints.  They are deliberately
+        # frozen and ignored by v4: a fixed camera-plane lattice imprints its
+        # cell frequency on foliage RGB and uncertainty (24 columns at the
+        # Cambridge training resolution produced the measured 26.7 px bands).
+        # Keeping the tensors lets an old checkpoint load losslessly while the
+        # runtime image-formation policy is explicit and artifact-free.
         self.local_canopy_basis = nn.Parameter(
             torch.zeros(
                 self.rank,
@@ -95,7 +102,8 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 self.spatial_grid_size,
                 self.spatial_grid_size,
                 device=device,
-            )
+            ),
+            requires_grad=False,
         )
         self.spatial_uncertainty_basis = nn.Parameter(
             torch.zeros(
@@ -104,7 +112,8 @@ class OutdoorAppearanceUncertainty(nn.Module):
                 self.spatial_grid_size,
                 self.spatial_grid_size,
                 device=device,
-            )
+            ),
+            requires_grad=False,
         )
         self.uncertainty_base = nn.Parameter(
             torch.full((2,), -3.0, device=device)
@@ -166,23 +175,11 @@ class OutdoorAppearanceUncertainty(nn.Module):
         image_name: str,
         shape: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        foliage_code = self.foliage_code(image_name)
-        uncertainty_code = self.uncertainty_code(image_name)
-        local_rgb = torch.einsum(
-            "r,rchw->chw", foliage_code, self.local_canopy_basis
-        )
-        log_sigma = self.uncertainty_base[:, None, None] + torch.einsum(
-            "r,rchw->chw",
-            uncertainty_code,
-            self.spatial_uncertainty_basis,
-        )
         size = tuple(map(int, shape))
-        local_rgb = torch.nn.functional.interpolate(
-            local_rgb[None], size=size, mode="bilinear", align_corners=False
-        )[0]
-        log_sigma = torch.nn.functional.interpolate(
-            log_sigma[None], size=size, mode="bilinear", align_corners=False
-        )[0]
+        local_rgb = self.uncertainty_base.new_zeros((3, *size))
+        # Two learned scene-wide robust scales (canopy and sky) retain the
+        # useful heteroscedastic calibration without a camera-plane field.
+        log_sigma = self.uncertainty_base[:, None, None].expand(-1, *size)
         return (
             self.maximum_rgb_residual * torch.tanh(local_rgb),
             # Smooth bounded parameterization preserves a recovery gradient
@@ -305,8 +302,6 @@ class OutdoorAppearanceUncertainty(nn.Module):
         )
         value = value + self.canopy_decoder.square().mean()
         value = value + self.sky_basis.square().mean()
-        value = value + self.local_canopy_basis.square().mean()
-        value = value + self.spatial_uncertainty_basis.square().mean()
         value = value + 0.05 * (
             self.uncertainty_base + 3.0
         ).square().mean()
@@ -322,7 +317,11 @@ class OutdoorAppearanceUncertainty(nn.Module):
     def restore(self, payload):
         """Restore v3 or migrate the former shared-code v2 checkpoint."""
         version = payload.get("version", LEGACY_APPEARANCE_VERSION)
-        if version not in {APPEARANCE_VERSION, LEGACY_APPEARANCE_VERSION}:
+        if version not in {
+            APPEARANCE_VERSION,
+            SPATIAL_APPEARANCE_VERSION,
+            LEGACY_APPEARANCE_VERSION,
+        }:
             raise RuntimeError(f"Unsupported appearance state {version!r}")
         state = dict(payload["state_dict"])
         shared = state.get("codes")
@@ -359,13 +358,12 @@ class OutdoorAppearanceUncertainty(nn.Module):
             "image_count": len(self.image_names),
             "canonical_render_available": True,
             "query_fallback": "canonical_only",
-            "canopy_model": "shared_low_rank_affine_plus_spatial_residual",
+            "canopy_model": "shared_low_rank_global_affine",
             "sky_model": "low_rank_directional_SH_temporal_residual",
-            "uncertainty_regions": ["spatial_canopy", "spatial_sky"],
-            "uncertainty_grid": [
-                self.spatial_grid_size,
-                self.spatial_grid_size,
-            ],
+            "spatial_canopy_rgb_residual": "disabled",
+            "appearance_grid_policy": "no_camera_plane_grid",
+            "uncertainty_regions": ["global_canopy", "global_sky"],
+            "uncertainty_grid": None,
             "temporal_regularization": "within_sequence_only",
             "temporal_code_parameterization": "fixed_norm_direction",
             "temporal_code_branches": [

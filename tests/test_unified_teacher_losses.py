@@ -11,6 +11,7 @@ from scripts.train_unified_outdoor_teacher import (
     DYNAMIC_LIFECYCLE_REPAIR_TARGET,
     SURFACE_OWNERSHIP_REPAIR_TARGET,
     TRAINING_PROFILES,
+    VOLUME_OPACITY_SETTLE_CONTRACT,
     _adapt_volume,
     _activation_iteration,
     _accumulate_volume_stats,
@@ -44,10 +45,13 @@ from scripts.train_unified_outdoor_teacher import (
     _masked_clamp_max_,
     _masked_ssim_loss,
     _apply_volume_role_gradients,
+    _apply_volume_opacity_settle_policy,
     _apply_mature_surface_gradient_policy,
     _phase,
+    _prefix_stable_resume_ray_batch,
     _resolved_phase_schedule,
     _resume_conditioned_visit_counts,
+    _refresh_split_child_owner_colors,
     _retain_checkpoint_snapshot,
     _rigid_completion_seed_indices,
     _rigid_residual_patch_loss,
@@ -105,6 +109,162 @@ def test_ray_epoch_batch_capacity_uses_final_horizon_not_prefix():
     assert _complete_evidence_epoch_batch_size(
         512, 1_773_981, 12_000, 4
     ) == (batch, minimum, calls)
+
+
+def _ray_epoch_capacity_audit(*, prior, remaining):
+    scheduled = 3000
+    available = scheduled - prior
+    required = available - 2
+    return {
+        "batch_boundary_contract": (
+            "short_tail_never_wraps_into_next_camera_epoch"
+        ),
+        "capacity_contract": (
+            "sum_per_camera_ceil_rows_over_batch_lte_scheduled_calls"
+        ),
+        "capacity_scope": (
+            "clean_epoch_start"
+            if prior == 0
+            else "resume_remaining_unvisited_rows"
+        ),
+        "scheduled_factor_calls": scheduled,
+        "prior_factor_calls": prior,
+        "available_factor_calls": available,
+        "camera_table_count": 750,
+        "full_effective_row_count": 3_079_774,
+        "remaining_unvisited_row_count": remaining,
+        "clean_epoch_aggregate_minimum_batch_with_five_percent_margin": 1078,
+        "clean_epoch_minimum_batch_for_complete_per_camera_epoch": 1173,
+        "clean_epoch_effective_batch": 1173,
+        "runtime_aggregate_minimum_batch_with_five_percent_margin": 1078,
+        "minimum_batch_for_runtime_completion": 1173,
+        "required_factor_calls": required,
+        "unused_factor_calls": 2,
+        "complete_epoch_capacity": True,
+    }
+
+
+def test_resume_ray_capacity_compares_fixed_epoch_not_runtime_cursor():
+    saved = {
+        "ray_posterior_maximum_rays": 1173,
+        "ray_evidence_epoch_capacity": _ray_epoch_capacity_audit(
+            prior=0, remaining=3_079_774
+        ),
+    }
+    current = {
+        "ray_posterior_maximum_rays": 1173,
+        "ray_evidence_epoch_capacity": _ray_epoch_capacity_audit(
+            prior=125, remaining=2_933_149
+        ),
+    }
+    assert not _resume_training_contract_differences(saved, current)
+
+    changed_evidence = {
+        **current,
+        "ray_evidence_epoch_capacity": {
+            **current["ray_evidence_epoch_capacity"],
+            "full_effective_row_count": 3_079_775,
+        },
+    }
+    assert _resume_training_contract_differences(
+        saved, changed_evidence
+    ) == {"ray_evidence_epoch_capacity"}
+
+
+def test_resume_allows_only_exact_6k_volume_topology_settle():
+    saved = {
+        "schedule_horizon": 12_000,
+        "volume_densify_until_iteration": 12_000,
+    }
+    settled = {
+        "schedule_horizon": 12_000,
+        "volume_densify_until_iteration": 6_000,
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        settled,
+        allow_volume_topology_settle_migration=True,
+    )
+    with pytest.raises(RuntimeError, match="12k->6k"):
+        _resume_training_contract_differences(
+            saved,
+            {**settled, "volume_densify_until_iteration": 7_000},
+            allow_volume_topology_settle_migration=True,
+        )
+
+
+def test_resume_allows_only_exact_6k_volume_opacity_settle():
+    saved = {
+        "schedule_horizon": 12_000,
+        "volume_densify_until_iteration": 12_000,
+    }
+    settle = {
+        "contract": VOLUME_OPACITY_SETTLE_CONTRACT,
+        "policy": "retirement_only",
+        "start_iteration": 6_000,
+        "trainable_after_settle": (
+            "geometry_scale_rotation_sh_and_dynamic_deformation_feature"
+        ),
+    }
+    current = {**saved, "volume_opacity_settle": settle}
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_volume_opacity_settle_migration=True,
+    )
+    freeze = {
+        **current,
+        "volume_opacity_settle": {**settle, "policy": "freeze"},
+    }
+    assert not _resume_training_contract_differences(
+        current,
+        freeze,
+        allow_volume_opacity_settle_migration=True,
+    )
+    with pytest.raises(RuntimeError, match="audited 6k settle point"):
+        _resume_training_contract_differences(
+            saved,
+            {
+                **current,
+                "volume_opacity_settle": {
+                    **settle,
+                    "start_iteration": 7_000,
+                },
+            },
+            allow_volume_opacity_settle_migration=True,
+        )
+
+
+def test_resume_ray_capacity_rejects_inconsistent_runtime_audit():
+    saved = {
+        "ray_evidence_epoch_capacity": _ray_epoch_capacity_audit(
+            prior=0, remaining=3_079_774
+        )
+    }
+    corrupt = {
+        "ray_evidence_epoch_capacity": {
+            **_ray_epoch_capacity_audit(
+                prior=125, remaining=2_933_149
+            ),
+            "available_factor_calls": 1,
+        }
+    }
+    with pytest.raises(RuntimeError, match="internally inconsistent"):
+        _resume_training_contract_differences(saved, corrupt)
+
+
+def test_resume_ray_batch_keeps_checkpoint_value_when_still_feasible():
+    resume = {
+        "training_contract": {"ray_posterior_maximum_rays": 1173}
+    }
+    rows = (2_345, 1_172, 1)
+    assert _prefix_stable_resume_ray_batch(
+        1172, resume, rows, available_factor_calls=4
+    ) == 1173
+    with pytest.raises(RuntimeError, match="cannot complete"):
+        _prefix_stable_resume_ray_batch(
+            1172, resume, rows, available_factor_calls=3
+        )
 
 
 def test_ray_epoch_batch_capacity_accounts_for_per_camera_tail_calls():
@@ -1088,6 +1248,94 @@ def test_conditioned_bases_keep_gradients_during_topology_settle():
         assert torch.all(parameter.grad[~foliage.dynamic_leaf_mask] == 0)
 
 
+def test_volume_opacity_freeze_keeps_geometry_and_colour_trainable():
+    foliage = SimpleNamespace(
+        opacity_logits=torch.nn.Parameter(torch.zeros(3, 1)),
+        dynamic_opacity_basis=torch.nn.Parameter(torch.zeros(3, 2)),
+        xyz=torch.nn.Parameter(torch.zeros(3, 3)),
+        features=torch.nn.Parameter(torch.zeros(3, 3)),
+    )
+    for parameter in (
+        foliage.opacity_logits,
+        foliage.dynamic_opacity_basis,
+        foliage.xyz,
+        foliage.features,
+    ):
+        parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.Adam(
+        [
+            foliage.opacity_logits,
+            foliage.dynamic_opacity_basis,
+            foliage.xyz,
+            foliage.features,
+        ],
+        lr=1e-3,
+    )
+    args = SimpleNamespace(
+        volume_opacity_settle_policy="freeze",
+        volume_opacity_settle_start_iteration=6_000,
+        volume_opacity_retirement_until_iteration=6_000,
+    )
+    before = _apply_volume_opacity_settle_policy(
+        foliage, optimizer, 5_999, args
+    )
+    assert not before["active"]
+    assert foliage.opacity_logits.grad is not None
+
+    audit = _apply_volume_opacity_settle_policy(
+        foliage, optimizer, 6_000, args
+    )
+    assert audit["active"]
+    assert audit["base_rows_frozen"] == 3
+    assert audit["temporal_rows_frozen"] == 3
+    assert foliage.opacity_logits.grad is None
+    assert foliage.dynamic_opacity_basis.grad is None
+    assert foliage.xyz.grad is not None
+    assert foliage.features.grad is not None
+
+
+def test_volume_opacity_retirement_only_removes_growth_gradient_and_momentum():
+    opacity = torch.nn.Parameter(torch.zeros(3, 1))
+    temporal = torch.nn.Parameter(torch.zeros(3, 2))
+    foliage = SimpleNamespace(
+        opacity_logits=opacity,
+        dynamic_opacity_basis=temporal,
+    )
+    opacity.grad = torch.tensor([[-2.0], [1.0], [-0.5]])
+    temporal.grad = torch.ones_like(temporal)
+    optimizer = torch.optim.Adam([opacity, temporal], lr=1e-3)
+    optimizer.state[opacity]["exp_avg"] = torch.tensor(
+        [[-0.25], [0.50], [-0.10]]
+    )
+    args = SimpleNamespace(
+        volume_opacity_settle_policy="retirement_only",
+        volume_opacity_settle_start_iteration=6_000,
+        volume_opacity_retirement_until_iteration=9_000,
+    )
+    audit = _apply_volume_opacity_settle_policy(
+        foliage, optimizer, 6_000, args
+    )
+    torch.testing.assert_close(
+        opacity.grad, torch.tensor([[0.0], [1.0], [0.0]])
+    )
+    torch.testing.assert_close(
+        optimizer.state[opacity]["exp_avg"],
+        torch.tensor([[0.0], [0.50], [0.0]]),
+    )
+    assert audit["base_growth_rows_suppressed"] == 2
+    assert audit["base_growth_momentum_entries_suppressed"] == 2
+    assert temporal.grad is None
+
+    opacity.grad = torch.ones_like(opacity)
+    temporal.grad = torch.ones_like(temporal)
+    after_window = _apply_volume_opacity_settle_policy(
+        foliage, optimizer, 9_000, args
+    )
+    assert after_window["effective_policy"] == "freeze"
+    assert opacity.grad is None
+    assert temporal.grad is None
+
+
 def test_known_invalid_free_space_initialization_cannot_train():
     with np.testing.assert_raises_regex(
         RuntimeError, "invalid free-space contradiction metadata"
@@ -1518,6 +1766,46 @@ def test_strong_contradiction_retires_observed_dynamic_identity():
     prune = event["contradiction_prune_evidence"]
     assert prune["strong_contradiction_candidates"] == 1
     assert prune["observed_unverified_rows_prunable"] == 1
+
+
+def test_full_volume_budget_settles_without_reallocation_churn():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.4),
+        "opacities": torch.full((2, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2),
+        "layer_role": torch.tensor([0, 0], dtype=torch.int8),
+        "support_view_count": torch.tensor([4, 4], dtype=torch.int16),
+        "support_sequence_count": torch.tensor([2, 2], dtype=torch.int16),
+        "occupancy_probability": torch.tensor([0.9, 0.9]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    stats = _volume_stats(foliage)
+    stats["radius"].fill_(10.0)
+    stats["contribution"].fill_(1.0)
+    stats["residual"].fill_(1.0)
+    stats["gradient"].fill_(1.0)
+    stats["gradient_count"].fill_(1.0)
+
+    event = _adapt_volume(
+        SimpleNamespace(
+            volume_split_radius=3.0,
+            maximum_volume_gaussians=2,
+            maximum_volume_splits=2,
+        ),
+        foliage,
+        stats,
+        volume_budget=2,
+    )
+
+    assert len(foliage) == 2
+    assert event["requested_splits"] == 2
+    assert event["split_parents"] == 0
+    assert event["capacity_reallocation"]["selected"] == 0
+    assert event["saturated_budget_settle"] is True
 
 
 def test_weak_conflict_keeps_independent_cross_sequence_positive_support():
@@ -2461,6 +2749,158 @@ def _interval_dynamic_foliage(z, *, support_camera_id=7):
     model = VolumetricFoliageModel(1, device="cpu")
     model.initialize_from_volume_state(payload)
     return model
+
+
+def _solid_refresh_camera(camera_id, color):
+    return SimpleNamespace(
+        colmap_id=camera_id,
+        world_view_transform=torch.eye(4),
+        focal_x=2.0,
+        focal_y=2.0,
+        cx=1.0,
+        cy=1.0,
+        image_width=4,
+        image_height=4,
+        original_image=torch.as_tensor(color, dtype=torch.float32)[
+            :, None, None
+        ].expand(3, 4, 4),
+    )
+
+
+def test_split_child_color_refresh_uses_owner_and_static_multiview_rgb():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]] * 2),
+        "scales": torch.full((2, 3), 0.05),
+        "colors": torch.full((2, 3), 0.25),
+        "opacities": torch.full((2, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2),
+        "layer_role": torch.tensor([LAYER_DYNAMIC_LEAF, 0], dtype=torch.int8),
+        "observation_camera_ids": torch.tensor(
+            [[7, -1], [7, 8]], dtype=torch.int32
+        ),
+        "observation_uv": torch.full((2, 2, 2), 0.5),
+        "observation_depth": torch.tensor([[2.0, 0.0], [2.0, 2.0]]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    cameras = {
+        7: _solid_refresh_camera(7, [1.0, 0.0, 0.0]),
+        8: _solid_refresh_camera(8, [0.0, 0.0, 1.0]),
+    }
+
+    audit = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=0,
+        owner_camera_ids=torch.tensor([7, -1]),
+        view_by_camera_id=cameras,
+    )
+
+    dc_rgb = foliage.features[:, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb[0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(dc_rgb[1], torch.tensor([0.5, 0.0, 0.5]))
+    assert audit["dynamic_refreshed_children"] == 1
+    assert audit["canonical_refreshed_children"] == 1
+
+
+def test_static_child_color_refresh_rejects_depth_inconsistent_view():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([0], dtype=torch.int8),
+        "observation_camera_ids": torch.tensor([[7, 8]], dtype=torch.int32),
+        "observation_uv": torch.full((1, 2, 2), 0.5),
+        "observation_depth": torch.tensor([[2.0, 4.0]]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+
+    audit = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=0,
+        owner_camera_ids=torch.tensor([-1]),
+        view_by_camera_id={
+            7: _solid_refresh_camera(7, [0.0, 1.0, 0.0]),
+            8: _solid_refresh_camera(8, [1.0, 0.0, 0.0]),
+        },
+    )
+
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.tensor([0.0, 1.0, 0.0]))
+    assert audit["canonical_refreshed_children"] == 1
+
+
+def test_dynamic_child_color_refresh_rejects_owner_depth_mismatch():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 4.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor(
+            [LAYER_DYNAMIC_LEAF], dtype=torch.int8
+        ),
+        "observation_camera_ids": torch.tensor(
+            [[7]], dtype=torch.int32
+        ),
+        "observation_uv": torch.full((1, 1, 2), 0.5),
+        "observation_depth": torch.tensor([[2.0]]),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+
+    audit = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=0,
+        owner_camera_ids=torch.tensor([7]),
+        view_by_camera_id={
+            7: _solid_refresh_camera(7, [1.0, 1.0, 1.0])
+        },
+    )
+
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.full((3,), 0.25))
+    assert audit["dynamic_depth_candidate_children"] == 1
+    assert audit["dynamic_refreshed_children"] == 0
+
+
+def test_visual_hull_static_child_refresh_uses_cross_sequence_support():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([0], dtype=torch.int8),
+        "support_camera_ids": torch.tensor([[7, 8]], dtype=torch.int32),
+        # Split-time evidence accounting may conservatively reduce this
+        # scalar even though the immutable support-camera identity set is
+        # retained. The fallback must use the latter.
+        "support_sequence_count": torch.tensor([1], dtype=torch.int16),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+
+    audit = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=0,
+        owner_camera_ids=torch.tensor([-1]),
+        view_by_camera_id={
+            7: _solid_refresh_camera(7, [0.2, 0.4, 0.6]),
+            8: _solid_refresh_camera(8, [0.6, 0.4, 0.2]),
+        },
+    )
+
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.tensor([0.4, 0.4, 0.4]))
+    assert audit["canonical_support_fallback_children"] == 1
+    assert audit["canonical_refreshed_children"] == 1
 
 
 def _interval_camera():

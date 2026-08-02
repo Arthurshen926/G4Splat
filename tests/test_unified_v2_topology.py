@@ -267,7 +267,7 @@ def test_teacher_dynamic_phase_keeps_canonical_and_dynamic_topology_adaptive():
     assert event["eligible_count_by_role"]["canonical_crown"] == 2
 
 
-def test_teacher_reallocates_full_volume_budget_without_losing_lineage():
+def test_teacher_settles_full_volume_budget_without_losing_lineage():
     model = _model(2)
     args = SimpleNamespace(
         maximum_volume_splits=2,
@@ -284,13 +284,14 @@ def test_teacher_reallocates_full_volume_budget_without_losing_lineage():
 
     assert second["old_count"] == 4
     assert second["new_count"] == 4
-    assert second["reallocated_pruned"] == 2
-    assert second["split_parents"] == 2
+    assert second["reallocated_pruned"] == 0
+    assert second["split_parents"] == 0
     assert second["capacity_reallocation"]["shortfall"] == 0
+    assert second["saturated_budget_settle"] is True
     assert len(torch.unique(model.track_id)) == 2
 
 
-def test_full_budget_reallocation_preserves_physical_role_capacity():
+def test_full_budget_settle_preserves_physical_role_capacity():
     model = _model(4)
     model.layer_role.copy_(
         torch.tensor([0, 0, 2, 2], dtype=torch.int8)
@@ -308,8 +309,9 @@ def test_full_budget_reallocation_preserves_physical_role_capacity():
     }
 
     stats = _exact_conditioned_stats(8)
-    # Global low-utility retirement used to delete dynamic siblings almost
-    # exclusively, even though subsequent split quotas were role-balanced.
+    # A saturated model must not delete either role merely to fund another
+    # generic residual-driven split. Strong contradiction pruning remains a
+    # separate path and can create real free capacity.
     stats["contribution"][model.canonical_crown_mask] = 10.0
     stats["contribution"][model.dynamic_leaf_mask] = 0.01
     second = _adapt_volume(args, model, stats)
@@ -317,14 +319,12 @@ def test_full_budget_reallocation_preserves_physical_role_capacity():
     assert second["new_count"] == 8
     assert second["capacity_reallocation"]["selected_by_role"] == {
         "static_skeleton": 0,
-        "canonical_crown": 2,
-        "dynamic_leaf": 2,
+        "canonical_crown": 0,
+        "dynamic_leaf": 0,
     }
     assert int(model.canonical_crown_mask.sum()) == before["canonical"]
     assert int(model.dynamic_leaf_mask.sum()) == before["dynamic"]
-    assert second["capacity_reallocation_contract"].startswith(
-        "role_matched"
-    )
+    assert second["saturated_budget_settle"] is True
 
 
 def test_student_density_control_protects_sky_and_splits_crown():

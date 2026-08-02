@@ -66,6 +66,9 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v38_resume_aware_ray_epoch_topology_settle",
     "cambridge_native_hybrid_teacher_v39_conditioned_topology_settle",
     "cambridge_native_hybrid_teacher_v40_projected_optical_footprint",
+    "cambridge_native_hybrid_teacher_v41_blue_noise_static_optical_handoff",
+    "cambridge_native_hybrid_teacher_v42_blue_noise_static_optical_handoff_"
+    "owner_color_refresh",
     "unified_outdoor_mixed_teacher_v1",
 }
 
@@ -230,12 +233,22 @@ PROJECTED_OPTICAL_FOOTPRINT_REPAIR_PREDECESSOR = {
         "5b210eeb406502d30b0c0d83c2361221677a17e68417aee228386382303f6876"
     ),
 }
+STATIC_FOLIAGE_RENDER_REPAIR_PREDECESSOR = {
+    "protocol": "cambridge_native_hybrid_teacher_v40_projected_optical_footprint",
+    "appearance_uncertainty": (
+        "9e0591affdaea7ebe286d3c95985926b1b027255679211328645ba5e585090bf"
+    ),
+    "hybrid_renderer": (
+        "73d425a03926f65a494c6ba6b81aa72f19e44b006024918e4bda061203fb8251"
+    ),
+}
 
 
 def _validate_render_implementation(
     state: dict,
     *,
     allow_projected_optical_footprint_repair: bool = False,
+    allow_static_foliage_render_repair: bool = False,
 ) -> dict:
     """Reject silently reinterpreting a state with different render code."""
     expected = state.get("implementation_hashes")
@@ -280,6 +293,33 @@ def _validate_render_implementation(
             }
     causal_repair = None
     if (
+        allow_static_foliage_render_repair
+        and set(changed) == {"appearance_uncertainty", "hybrid_renderer"}
+        and state.get("protocol")
+        == STATIC_FOLIAGE_RENDER_REPAIR_PREDECESSOR["protocol"]
+        and all(
+            expected.get(name)
+            == STATIC_FOLIAGE_RENDER_REPAIR_PREDECESSOR[name]
+            for name in ("appearance_uncertainty", "hybrid_renderer")
+        )
+    ):
+        causal_repair = {
+            "state_hashes": {
+                name: expected[name]
+                for name in ("appearance_uncertainty", "hybrid_renderer")
+            },
+            "runtime_hashes": {
+                name: actual_hashes[name]
+                for name in ("appearance_uncertainty", "hybrid_renderer")
+            },
+            "reason": (
+                "explicit v40->v41 diagnostic: camera-plane canopy RGB and "
+                "uncertainty grids are bypassed and group replacement is "
+                "localized by active-view projection and depth interval"
+            ),
+        }
+        changed.clear()
+    if (
         allow_projected_optical_footprint_repair
         and changed == ["hybrid_renderer"]
         and state.get("protocol")
@@ -306,7 +346,11 @@ def _validate_render_implementation(
         )
     return {
         "status": (
-            "projected_optical_footprint_causal_repair"
+            "static_foliage_render_causal_repair"
+            if causal_repair is not None
+            and state.get("protocol")
+            == STATIC_FOLIAGE_RENDER_REPAIR_PREDECESSOR["protocol"]
+            else "projected_optical_footprint_causal_repair"
             if causal_repair is not None
             else (
                 "render_equivalent_migration"
@@ -461,6 +505,7 @@ class HybridTeacher:
         surface_only: bool = False,
         background: torch.Tensor | None = None,
         exact_ray_render_aspect_limit: float = 4.0,
+        optical_replacement_policy: str = "view_depth_local",
     ) -> dict[str, torch.Tensor]:
         """Render the mixed teacher or its native structural counterfactual.
 
@@ -525,6 +570,7 @@ class HybridTeacher:
             exact_ray_render_aspect_limit=(
                 exact_ray_render_aspect_limit
             ),
+            optical_replacement_policy=optical_replacement_policy,
         )
         rgb = composite_white_background(
             package.render, package.alpha, self.sky(camera)
@@ -618,6 +664,7 @@ def load_hybrid_teacher(
     *,
     sh_degree: int,
     allow_projected_optical_footprint_repair: bool = False,
+    allow_static_foliage_render_repair: bool = False,
 ) -> HybridTeacher:
     """Load a Teacher state. No student conversion or COLMAP geometry is used."""
     try:
@@ -633,6 +680,9 @@ def load_hybrid_teacher(
         state,
         allow_projected_optical_footprint_repair=(
             allow_projected_optical_footprint_repair
+        ),
+        allow_static_foliage_render_repair=(
+            allow_static_foliage_render_repair
         ),
     )
     state["_render_implementation_validation"] = implementation_validation

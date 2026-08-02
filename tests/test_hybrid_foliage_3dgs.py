@@ -11,7 +11,57 @@ from outdoor.hybrid_gaussian_renderer import (
     _identity_with_gradient_gate,
     _restore_sparse_volume_rows,
     dynamic_visibility_gate,
+    view_depth_local_optical_replacement,
 )
+
+
+def test_view_depth_local_replacement_only_retires_overlapping_envelope():
+    roles = torch.tensor(
+        [
+            LAYER_CANONICAL_CROWN,
+            LAYER_CANONICAL_CROWN,
+            LAYER_CANONICAL_CROWN,
+            LAYER_DYNAMIC_LEAF,
+        ],
+        dtype=torch.int8,
+    )
+    suppression = view_depth_local_optical_replacement(
+        roles,
+        torch.zeros(4, dtype=torch.int64),
+        torch.full((4,), 0.2),
+        torch.full((4, 3), 0.05),
+        torch.tensor(
+            [[10.0, 10.0], [110.0, 10.0], [10.0, 10.0], [10.0, 10.0]]
+        ),
+        torch.tensor([5.0, 5.0, 8.0, 5.0]),
+        focal_x=100.0,
+        focal_y=100.0,
+        cross_section=torch.full((4,), 0.01),
+    )
+    assert suppression[0] > 0.1
+    assert suppression[1] < 1.0e-3
+    assert suppression[2] < 1.0e-3
+    assert suppression[3] == 0
+
+
+def test_view_depth_local_replacement_uses_projected_depth_covariance():
+    roles = torch.tensor(
+        [LAYER_CANONICAL_CROWN, LAYER_DYNAMIC_LEAF], dtype=torch.int8
+    )
+    suppression = view_depth_local_optical_replacement(
+        roles,
+        torch.zeros(2, dtype=torch.int64),
+        torch.full((2,), 0.2),
+        # Broad image-plane support must not be mistaken for depth support.
+        torch.tensor([[2.0, 2.0, 0.01], [2.0, 2.0, 0.01]]),
+        torch.tensor([[10.0, 10.0], [10.0, 10.0]]),
+        torch.tensor([5.0, 6.0]),
+        focal_x=100.0,
+        focal_y=100.0,
+        cross_section=torch.full((2,), 0.01),
+        depth_radius=torch.full((2,), 0.01),
+    )
+    assert suppression[0] < 1.0e-6
 
 
 def test_dynamic_leaf_inherits_shared_canonical_group_displacement():

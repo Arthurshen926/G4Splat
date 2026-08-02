@@ -413,6 +413,146 @@ def local_optical_mass_replacement(
     ).clamp(0.0, 1.0)
 
 
+def view_depth_local_optical_replacement(
+    layer_role: torch.Tensor,
+    replacement_group: torch.Tensor,
+    opacities: torch.Tensor,
+    scales: torch.Tensor,
+    projected_xy: torch.Tensor,
+    camera_depth: torch.Tensor,
+    *,
+    focal_x: float,
+    focal_y: float,
+    cross_section: torch.Tensor,
+    depth_radius: torch.Tensor | None = None,
+    epsilon: float = 1.0e-8,
+) -> torch.Tensor:
+    """Return per-primitive envelope retreat in the active camera.
+
+    Replacement groups express persistent 3D locality, but a group-wide
+    scalar still lets a detail observation suppress unrelated pixels and
+    depths.  This fallback to a full per-ray ownership kernel adds the missing
+    active-view and depth-interval terms: dynamic optical mass supplies a
+    projected centroid/radius/depth for each local cell, and each canonical
+    descendant retreats only in proportion to its actual overlap.  The exact
+    owner visibility gate is applied before this function, so another camera
+    cannot change the hand-off.
+    """
+    roles = layer_role.reshape(-1)
+    groups = replacement_group.reshape(-1).long()
+    alpha = opacities.reshape(-1)
+    xy = torch.as_tensor(
+        projected_xy, device=alpha.device, dtype=alpha.dtype
+    ).reshape(-1, 2)
+    depth = torch.as_tensor(
+        camera_depth, device=alpha.device, dtype=alpha.dtype
+    ).reshape(-1)
+    area = torch.as_tensor(
+        cross_section, device=alpha.device, dtype=alpha.dtype
+    ).reshape(-1)
+    if not (
+        len(roles)
+        == len(groups)
+        == len(alpha)
+        == len(scales)
+        == len(xy)
+        == len(depth)
+        == len(area)
+    ):
+        raise ValueError("view-local replacement arrays must have equal length")
+    valid_group = groups >= 0
+    if not bool(valid_group.any()):
+        return alpha.new_zeros(len(alpha))
+    group_count = int(groups[valid_group].max().item()) + 1
+    canonical = valid_group & (roles == LAYER_CANONICAL_CROWN)
+    dynamic = (
+        valid_group
+        & (roles == LAYER_DYNAMIC_LEAF)
+        & (alpha > 0)
+        & torch.isfinite(depth)
+        & (depth > 0)
+        & torch.isfinite(xy).all(dim=1)
+    )
+    if not bool(canonical.any()) or not bool(dynamic.any()):
+        return alpha.new_zeros(len(alpha))
+
+    optical_depth = -torch.log1p(-alpha.clamp(0.0, 1.0 - epsilon))
+    mass = optical_depth * area.clamp_min(0)
+    canonical_mass = alpha.new_zeros(group_count)
+    dynamic_mass = alpha.new_zeros(group_count)
+    canonical_mass.scatter_add_(0, groups[canonical], mass[canonical])
+    dynamic_mass.scatter_add_(0, groups[dynamic], mass[dynamic])
+    ratio = (dynamic_mass / canonical_mass.clamp_min(epsilon)).clamp(0, 1)
+
+    dynamic_weight = mass[dynamic]
+    dynamic_groups = groups[dynamic]
+    denominator = dynamic_mass.clamp_min(epsilon)
+
+    def weighted_group(values: torch.Tensor) -> torch.Tensor:
+        output = alpha.new_zeros((group_count,) + values.shape[1:])
+        index = dynamic_groups.reshape(
+            (-1,) + (1,) * (values.ndim - 1)
+        ).expand_as(values)
+        output.scatter_add_(
+            0,
+            index,
+            values
+            * dynamic_weight.reshape(
+                (-1,) + (1,) * (values.ndim - 1)
+            ),
+        )
+        return output / denominator.reshape(
+            (-1,) + (1,) * (values.ndim - 1)
+        )
+
+    dynamic_xy = weighted_group(xy[dynamic])
+    dynamic_depth = weighted_group(depth[dynamic, None])[:, 0]
+    focal = float(max((float(focal_x) * float(focal_y)) ** 0.5, 1.0e-6))
+    projected_radius = torch.sqrt(area.clamp_min(epsilon)) * focal
+    dynamic_radius = weighted_group(projected_radius[dynamic, None])[:, 0]
+    if depth_radius is None:
+        depth_radius_value = scales.max(dim=1).values
+    else:
+        depth_radius_value = torch.as_tensor(
+            depth_radius, device=alpha.device, dtype=alpha.dtype
+        ).reshape(-1)
+        if len(depth_radius_value) != len(alpha):
+            raise ValueError("depth_radius must have one value per Gaussian")
+    dynamic_depth_radius = weighted_group(
+        depth_radius_value[dynamic, None]
+    )[:, 0]
+
+    rows = torch.nonzero(canonical, as_tuple=False).flatten()
+    row_groups = groups[rows]
+    pixel_sigma = (
+        projected_radius[rows] + dynamic_radius[row_groups]
+    ).clamp_min(1.0)
+    pixel_distance2 = (
+        (xy[rows] - dynamic_xy[row_groups]).square().sum(dim=1)
+        / pixel_sigma.square()
+    )
+    depth_sigma = (
+        depth_radius_value[rows] + dynamic_depth_radius[row_groups]
+    ).clamp_min(0.01)
+    depth_distance2 = (
+        (depth[rows] - dynamic_depth[row_groups]).square()
+        / (2.5 * depth_sigma).square()
+    )
+    overlap = torch.exp(-0.5 * (pixel_distance2 + depth_distance2))
+    valid_projection = (
+        torch.isfinite(depth[rows])
+        & (depth[rows] > 0)
+        & torch.isfinite(xy[rows]).all(dim=1)
+    )
+    suppression = alpha.new_zeros(len(alpha))
+    suppression[rows] = torch.where(
+        valid_projection,
+        ratio[row_groups] * overlap,
+        torch.zeros_like(overlap),
+    )
+    return suppression.clamp(0.0, 1.0)
+
+
 def conserve_local_temporal_fallback_mass(
     layer_role: torch.Tensor,
     replacement_group: torch.Tensor,
@@ -1369,6 +1509,7 @@ class VolumetricFoliageModel(nn.Module):
                 "camera_plane_parents": 0,
                 "pruned": pruned,
                 "_new_to_old": kept,
+                "_child_start": int(len(kept)),
             }
         keep = ~remove
         keep[indices] = False
@@ -1650,6 +1791,10 @@ class VolumetricFoliageModel(nn.Module):
             "camera_plane_parents": int(optical_plane_parent.sum()),
             "pruned": int(remove.sum()),
             "_new_to_old": new_to_old,
+            # Private mutation metadata lets the trainer initialize newly
+            # created optical children from their immutable owner raster.
+            # It is consumed before the JSON event is recorded.
+            "_child_start": child_start,
         }
 
     @torch.no_grad()
@@ -1830,6 +1975,7 @@ def render_hybrid(
     exact_ray_render_aspect_limit: float = (
         EXACT_RAY_RENDER_MAX_DEPTH_TO_TANGENT_RATIO
     ),
+    optical_replacement_policy: str = "view_depth_local",
     compact_zero_volume: bool = True,
     structural_trainable_start: int | None = None,
 ) -> HybridRenderOutput:
@@ -1846,6 +1992,15 @@ def render_hybrid(
     ownership without making sequence interpolation read-only.
     """
     del structural_thickness_ratio, radius_clip
+    if optical_replacement_policy not in {
+        "view_depth_local",
+        "group_projected",
+        "disabled",
+    }:
+        raise ValueError(
+            "optical_replacement_policy must be view_depth_local, "
+            "group_projected or disabled"
+        )
     from diff_surfel_rasterization import (
         GaussianRasterizationSettings,
         MixedGaussianRasterizer,
@@ -2062,6 +2217,35 @@ def render_hybrid(
                     volume_view_vectors[optical_indices],
                 )
             )
+            # Project each anisotropic covariance onto the active camera's
+            # optical axis. ``max(scale)`` is not a depth interval: for a
+            # tangent-wide but depth-thin leaf it falsely overlaps geometry
+            # behind the crown and suppresses neighbouring building detail.
+            optical_depth_radius = volume_scales.new_zeros(
+                len(volume_scales)
+            )
+            camera_depth_axis = camera.world_view_transform[:3, 2].to(
+                device=volume_scales.device,
+                dtype=volume_scales.dtype,
+            )
+            camera_depth_axis = camera_depth_axis / (
+                camera_depth_axis.norm().clamp_min(1.0e-8)
+            )
+            optical_rotation = _rotation_matrices_from_quaternions(
+                volume_rotations[optical_indices]
+            )
+            local_depth_axis = torch.bmm(
+                optical_rotation.transpose(1, 2),
+                camera_depth_axis.expand(len(optical_indices), -1)[
+                    :, :, None
+                ],
+            ).squeeze(-1)
+            optical_depth_radius[optical_indices] = torch.sqrt(
+                (
+                    local_depth_axis.square()
+                    * volume_scales[optical_indices].square()
+                ).sum(dim=1).clamp_min(1.0e-12)
+            )
             volume_opacities = conserve_local_temporal_fallback_mass(
                 foliage.layer_role,
                 groups,
@@ -2078,29 +2262,83 @@ def render_hybrid(
             # maximum opacity ignored both footprint and accumulated dynamic
             # descendants, so exact ray/RGB births remained hidden behind a
             # much larger canonical crown.
-            replacement = local_optical_mass_replacement(
-                foliage.layer_role,
-                groups,
-                volume_opacities,
-                volume_scales,
-                rotations=volume_rotations,
-                view_vectors=volume_view_vectors,
-                cross_section=optical_cross_section,
-            ).detach()
+            if optical_replacement_policy == "view_depth_local":
+                homogeneous = torch.cat(
+                    [
+                        volume_means,
+                        torch.ones_like(volume_means[:, :1]),
+                    ],
+                    dim=1,
+                )
+                camera_points = homogeneous @ camera.world_view_transform.to(
+                    device=volume_means.device,
+                    dtype=volume_means.dtype,
+                )
+                camera_depth = camera_points[:, 2]
+                inverse_depth = camera_depth.clamp_min(1.0e-8).reciprocal()
+                projected_xy = torch.stack(
+                    [
+                        float(camera.focal_x)
+                        * camera_points[:, 0]
+                        * inverse_depth
+                        + float(camera.cx),
+                        float(camera.focal_y)
+                        * camera_points[:, 1]
+                        * inverse_depth
+                        + float(camera.cy),
+                    ],
+                    dim=1,
+                )
+                replacement_per_row = view_depth_local_optical_replacement(
+                    foliage.layer_role,
+                    groups,
+                    volume_opacities,
+                    volume_scales,
+                    projected_xy,
+                    camera_depth,
+                    focal_x=float(camera.focal_x),
+                    focal_y=float(camera.focal_y),
+                    cross_section=optical_cross_section,
+                    depth_radius=optical_depth_radius,
+                ).detach()
+                replacement = None
+            elif optical_replacement_policy == "group_projected":
+                replacement = local_optical_mass_replacement(
+                    foliage.layer_role,
+                    groups,
+                    volume_opacities,
+                    volume_scales,
+                    rotations=volume_rotations,
+                    view_vectors=volume_view_vectors,
+                    cross_section=optical_cross_section,
+                ).detach()
+                replacement_per_row = None
+            else:
+                replacement = None
+                replacement_per_row = volume_opacities.new_zeros(
+                    len(volume_opacities)
+                )
             # Replacement is a measured optical-mass state transition, not an
             # escape gradient. Letting gradients pass through the ratio made
             # either branch improve its loss by manipulating the ownership
             # denominator rather than its rendered colour or geometry. Dynamic
             # mass still changes the next forward hand-off after an owner-camera
             # photometric update.
-            group_count = len(replacement)
-            valid_canonical = canonical & (groups >= 0) & (
-                groups < group_count
+            group_count = (
+                len(replacement)
+                if replacement is not None
+                else int(groups.max().item()) + 1
             )
+            valid_canonical = canonical & (groups >= 0) & (groups < group_count)
             volume_opacities = volume_opacities.clone()
-            volume_opacities[valid_canonical] *= (
-                1.0 - replacement[groups[valid_canonical]]
-            )
+            if replacement_per_row is not None:
+                volume_opacities[valid_canonical] *= (
+                    1.0 - replacement_per_row[valid_canonical]
+                )
+            else:
+                volume_opacities[valid_canonical] *= (
+                    1.0 - replacement[groups[valid_canonical]]
+                )
     active_volume_indices = torch.nonzero(
         volume_active, as_tuple=False
     ).flatten()

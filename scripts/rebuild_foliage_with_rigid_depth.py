@@ -20,6 +20,9 @@ from outdoor.role_aware_initialization import (  # noqa: E402
     RIGID_CALIBRATED_INITIALIZATION_VERSION,
     build_foliage_seed,
 )
+from outdoor.runtime_provenance import (  # noqa: E402
+    collect_runtime_provenance,
+)
 from outdoor.scene_contract import sha256_file  # noqa: E402
 
 
@@ -87,6 +90,21 @@ def _link_or_copy(source: Path, target: Path) -> None:
 
 def main() -> None:
     args = _parse_args()
+    runtime_provenance = collect_runtime_provenance(
+        REPO_ROOT,
+        python_modules=(
+            "scripts.rebuild_foliage_with_rigid_depth",
+            "outdoor.role_aware_initialization",
+            "outdoor.foliage_geometry",
+            "outdoor.blue_noise_sampling",
+        ),
+    )
+    print(
+        json.dumps(
+            {"runtime_provenance": runtime_provenance}, indent=2
+        ),
+        flush=True,
+    )
     base = args.base_initialization.expanduser().resolve()
     base_manifest_path = base / "initialization_manifest.json"
     if not base_manifest_path.is_file():
@@ -255,6 +273,7 @@ def main() -> None:
             "foliage_rebuilt": True,
             **rigid_contract,
         },
+        "runtime_provenance": runtime_provenance,
     }
     manifest_path = output / "initialization_manifest.json"
     manifest_path.write_text(
