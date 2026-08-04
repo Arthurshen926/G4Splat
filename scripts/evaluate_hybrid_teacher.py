@@ -20,6 +20,7 @@ sys.path[:0] = [str(REPO_ROOT), str(SURFEL_ROOT)]
 from arguments import ModelParams  # noqa: E402
 from outdoor.hybrid_teacher_api import (  # noqa: E402
     load_hybrid_teacher,
+    resolve_deployment_optical_contract,
     teacher_branch_validity,
 )
 from outdoor.evidence_store import sha256_file  # noqa: E402
@@ -859,6 +860,41 @@ def _assert_localization_query_contract(
     }
 
 
+def _resolve_evaluation_mode(
+    requested: str,
+    *,
+    localization_query: bool,
+    branch_validity: dict[str, bool | str],
+) -> str:
+    """Resolve ``auto`` from every valid static/conditioned branch.
+
+    A static production Teacher deliberately has no conditioned branch.  It
+    still owns a trained canonical canopy, so treating every unconditioned
+    checkpoint as rigid-only silently removed the complete 3D foliage model
+    during evaluation.
+    """
+    if requested != "auto":
+        return requested
+    if localization_query:
+        return "canonical"
+    if bool(branch_validity["conditioned"]):
+        return "hybrid"
+    if bool(branch_validity["canonical_canopy"]):
+        return "canonical"
+    return "rigid"
+
+
+def _evaluation_render_modes(evaluation_mode: str) -> tuple[str, tuple[str, ...]]:
+    """Return the truthful row label and aggregate modes for one render."""
+    if evaluation_mode == "hybrid":
+        return "canonical", ("canonical", "conditioned")
+    if evaluation_mode == "canonical":
+        return "canonical", ("canonical",)
+    if evaluation_mode == "rigid":
+        return "rigid", ("rigid",)
+    raise ValueError(f"Unsupported evaluation mode {evaluation_mode!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     model = ModelParams(parser)
@@ -952,6 +988,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-static-optical-handoff-repair",
+        action="store_true",
+        help=(
+            "Explicitly reinterpret an exact v51 static checkpoint with "
+            "the split-invariant, optical-depth-conserving local hand-off. "
+            "This is a labelled zero-training causal diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--exact-ray-render-aspect-limit",
         type=float,
         default=4.0,
@@ -963,11 +1008,34 @@ def main() -> None:
     )
     parser.add_argument(
         "--optical-replacement-policy",
-        choices=("view_depth_local", "group_projected", "disabled"),
-        default="view_depth_local",
+        choices=(
+            "view_depth_local",
+            "group_projected",
+            "disabled",
+            "ray_normalized_two_pass",
+            "ray_normalized_surface_evidence_three_pass",
+        ),
+        default=None,
         help=(
-            "Envelope-to-detail handoff. view_depth_local additionally "
-            "requires active-camera projection and depth-interval overlap."
+            "Optional labelled override of the checkpoint deployment "
+            "compositor. By default the evaluator uses the immutable policy "
+            "recorded in the Teacher. view_depth_local additionally "
+            "requires active-camera projection and depth-interval overlap; "
+            "ray_normalized_two_pass treats envelope/detail as mutually "
+            "exclusive static per-ray explanations; the three-pass variant "
+            "also restores strong foreground rigid-surface evidence without "
+            "using a semantic mask."
+        ),
+    )
+    parser.add_argument(
+        "--optical-responsibility-prior",
+        type=float,
+        default=None,
+        help=(
+            "Optional labelled override of the checkpoint optical prior. "
+            "The symmetric optical-depth pseudo-count is used only by "
+            "ray_normalized_two_pass when both static canopy explanations "
+            "are visible. Zero is the unregularized causal diagnostic."
         ),
     )
     parser.add_argument(
@@ -1017,6 +1085,20 @@ def main() -> None:
         allow_static_foliage_render_repair=(
             args.allow_static_foliage_render_repair
         ),
+        allow_static_optical_handoff_repair=(
+            args.allow_static_optical_handoff_repair
+        ),
+    )
+    optical_compositing_contract = resolve_deployment_optical_contract(
+        teacher.state,
+        requested_policy=args.optical_replacement_policy,
+        requested_prior=args.optical_responsibility_prior,
+    )
+    optical_replacement_policy = str(
+        optical_compositing_contract["policy"]
+    )
+    optical_responsibility_prior = float(
+        optical_compositing_contract["optical_responsibility_prior"]
     )
     evaluation_rgb_source, rgb_source_contract_match = (
         _assert_rgb_source_contract(
@@ -1066,14 +1148,11 @@ def main() -> None:
     )
     training_profile = str(teacher.state.get("training_profile", "unknown"))
     branch_validity = teacher_branch_validity(teacher.state)
-    evaluation_mode = args.evaluation_mode
-    if evaluation_mode == "auto":
-        if localization_query:
-            evaluation_mode = "canonical"
-        else:
-            evaluation_mode = (
-                "hybrid" if branch_validity["conditioned"] else "rigid"
-            )
+    evaluation_mode = _resolve_evaluation_mode(
+        args.evaluation_mode,
+        localization_query=localization_query,
+        branch_validity=branch_validity,
+    )
     query_representation_contract = _query_representation_contract(
         localization_query=localization_query,
         evaluation_mode=evaluation_mode,
@@ -1084,11 +1163,7 @@ def main() -> None:
             f"branch is not trained ({branch_validity['reason']}). Use "
             "--evaluation-mode auto/rigid or evaluate a later checkpoint."
         )
-    modes = (
-        ("canonical", "conditioned")
-        if evaluation_mode == "hybrid"
-        else ("canonical",)
-    )
+    primary_mode, modes = _evaluation_render_modes(evaluation_mode)
     if evaluation_mode == "hybrid":
         conditioned_visit_counts, conditioned_sampling_coverage = (
             _conditioned_visit_counts(teacher.state, len(views))
@@ -1174,7 +1249,10 @@ def main() -> None:
                     args.exact_ray_render_aspect_limit
                 ),
                 optical_replacement_policy=(
-                    args.optical_replacement_policy
+                    optical_replacement_policy
+                ),
+                optical_responsibility_prior=(
+                    optical_responsibility_prior
                 ),
             )
             conditioned = (
@@ -1190,7 +1268,10 @@ def main() -> None:
                         args.exact_ray_render_aspect_limit
                     ),
                     optical_replacement_policy=(
-                        args.optical_replacement_policy
+                        optical_replacement_policy
+                    ),
+                    optical_responsibility_prior=(
+                        optical_responsibility_prior
                     ),
                 )
                 if evaluation_mode == "hybrid"
@@ -1204,7 +1285,7 @@ def main() -> None:
                 ),
                 "tree_boundary_radius_pixels": tree_boundary_radius,
             }
-            render_by_mode = {"canonical": canonical}
+            render_by_mode = {primary_mode: canonical}
             if conditioned is not None:
                 render_by_mode["conditioned"] = conditioned
             for name, render in render_by_mode.items():
@@ -1352,7 +1433,7 @@ def main() -> None:
             if not args.render_only or not args.all:
                 images = {
                     "gt": target,
-                    "canonical": canonical["rgb"],
+                    primary_mode: canonical["rgb"],
                     "error_x4": (
                         (
                             conditioned["rgb"]
@@ -1369,6 +1450,14 @@ def main() -> None:
                         "volume_alpha"
                     ].expand(3, -1, -1),
                 }
+                if canonical.get("optical_detail_responsibility") is not None:
+                    images["optical_detail_responsibility"] = canonical[
+                        "optical_detail_responsibility"
+                    ].expand(3, -1, -1)
+                if canonical.get("optical_surface_responsibility") is not None:
+                    images["optical_surface_responsibility"] = canonical[
+                        "optical_surface_responsibility"
+                    ].expand(3, -1, -1)
                 if conditioned is not None:
                     images["conditioned"] = conditioned["rgb"]
                     images["volume_alpha"] = conditioned[
@@ -1579,6 +1668,37 @@ def main() -> None:
         "canopy_quality_valid": bool(
             branch_validity["canonical_canopy"]
         ),
+        "optical_compositing_protocol": {
+            **optical_compositing_contract,
+            "requested_deployment_policy": optical_replacement_policy,
+            "policy": (
+                "surface_only_no_volume"
+                if evaluation_mode == "rigid"
+                else optical_replacement_policy
+            ),
+            "applied_to_evaluation": evaluation_mode != "rigid",
+            "static_only": bool(
+                evaluation_mode != "rigid"
+                and optical_replacement_policy
+                in {
+                    "ray_normalized_two_pass",
+                    "ray_normalized_surface_evidence_three_pass",
+                }
+            ),
+            "ground_truth_routing": False,
+            "sequence_conditioning": False,
+            "native_passes": (
+                1
+                if evaluation_mode == "rigid"
+                else {
+                    "ray_normalized_two_pass": 2,
+                    "ray_normalized_surface_evidence_three_pass": 3,
+                }.get(optical_replacement_policy, 1)
+            ),
+            "symmetric_optical_responsibility_prior": (
+                optical_responsibility_prior
+            ),
+        },
         "view_count": len(rows),
         "aggregate": aggregate,
         "aggregate_semantics": {
@@ -1635,14 +1755,14 @@ def main() -> None:
             "name": "cambridge_rgb_metrics_v3_tree_gpu_adaptermask",
             "evaluator_sha256": sha256_file(Path(__file__).resolve()),
             "primary_comparison_field": (
-                "protocol_aggregate.canonical.non_tree_static"
+                f"protocol_aggregate.{primary_mode}.non_tree_static"
                 if localization_query
                 else (
                     "historical_uint8_protocol_aggregate.canonical."
                     "static_valid"
                     if evaluation_mode in {"hybrid", "canonical"}
                     else (
-                        "historical_uint8_protocol_aggregate.canonical."
+                        "historical_uint8_protocol_aggregate.rigid."
                         "non_tree_static"
                     )
                 )

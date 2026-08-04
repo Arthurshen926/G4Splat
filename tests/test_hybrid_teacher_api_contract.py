@@ -7,9 +7,201 @@ import torch
 import outdoor.hybrid_teacher_api as api
 from outdoor.hybrid_teacher_api import (
     HybridTeacher,
+    STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
     SUPPORTED_TEACHER_PROTOCOLS,
+    _static_ray_normalized_optical_mixture,
+    _static_surface_evidence_mixture,
+    resolve_deployment_optical_contract,
     teacher_branch_validity,
 )
+from outdoor.hybrid_gaussian_renderer import HybridRenderOutput
+
+
+def _optical_test_output(
+    rgb: float, volume_alpha: float
+) -> HybridRenderOutput:
+    image = torch.full((3, 2, 3), float(rgb))
+    alpha = torch.full((1, 2, 3), float(volume_alpha))
+    rows = torch.tensor([1.0, 0.0])
+    return HybridRenderOutput(
+        render=image,
+        alpha=alpha,
+        depth=torch.ones(1, 2, 3),
+        normal_world=image,
+        median_depth=torch.ones(1, 2, 3),
+        distortion=torch.zeros(1, 2, 3),
+        radii=rows,
+        means2d=None,
+        structural_count=1,
+        responsibility=rows,
+        gate_responsibility=rows,
+        surface_alpha=torch.zeros(1, 2, 3),
+        volume_alpha=alpha,
+        surface_depth=torch.ones(1, 2, 3),
+        volume_depth=torch.ones(1, 2, 3),
+        surface_means2d=None,
+        volume_means2d=None,
+        volume_replacement=rows,
+    )
+
+
+def test_static_ray_normalized_optical_mixture_uses_optical_responsibility():
+    envelope = _optical_test_output(0.0, 0.2)
+    detail = _optical_test_output(1.0, 0.2)
+    mixed, detail_weight = _static_ray_normalized_optical_mixture(
+        envelope, detail
+    )
+    torch.testing.assert_close(detail_weight, torch.full_like(detail_weight, 0.5))
+    torch.testing.assert_close(mixed.render, torch.full_like(mixed.render, 0.5))
+
+
+def test_static_ray_normalized_optical_mixture_preserves_single_owner():
+    envelope = _optical_test_output(0.25, 0.35)
+    detail = _optical_test_output(0.9, 0.0)
+    mixed, detail_weight = _static_ray_normalized_optical_mixture(
+        envelope, detail
+    )
+    torch.testing.assert_close(detail_weight, torch.zeros_like(detail_weight))
+    torch.testing.assert_close(mixed.render, envelope.render)
+
+
+def test_static_ray_normalized_optical_mixture_is_split_mass_invariant():
+    # Two alpha=0.2 contributors have combined optical depth
+    # -log((1-.2)^2), hence combined alpha 1-(1-.2)^2.
+    split_invariant_alpha = 1.0 - (1.0 - 0.2) ** 2
+    envelope = _optical_test_output(0.1, split_invariant_alpha)
+    detail = _optical_test_output(0.8, 0.2)
+    _, detail_weight = _static_ray_normalized_optical_mixture(
+        envelope, detail
+    )
+    expected = 1.0 / 3.0
+    torch.testing.assert_close(
+        detail_weight, torch.full_like(detail_weight, expected)
+    )
+
+
+def test_static_optical_prior_regularizes_only_two_owner_rays():
+    envelope = _optical_test_output(0.1, 0.05)
+    detail = _optical_test_output(0.8, 0.8)
+    _, raw_weight = _static_ray_normalized_optical_mixture(
+        envelope, detail
+    )
+    _, regularized_weight = _static_ray_normalized_optical_mixture(
+        envelope, detail, symmetric_optical_prior=0.25
+    )
+    assert bool((regularized_weight < raw_weight).all())
+    assert bool((regularized_weight > 0.5).all())
+
+    absent_detail = _optical_test_output(0.8, 0.0)
+    _, single_owner_weight = _static_ray_normalized_optical_mixture(
+        envelope,
+        absent_detail,
+        symmetric_optical_prior=0.25,
+    )
+    torch.testing.assert_close(
+        single_owner_weight, torch.zeros_like(single_owner_weight)
+    )
+
+
+def test_static_deployment_contract_defaults_to_retained_two_pass_policy():
+    state = {
+        "training_contract": {
+            "reconstruction_target": "static",
+            "deployment_static_contract": {
+                "optical_replacement_policy": (
+                    STATIC_RAY_NORMALIZED_OPTICAL_POLICY
+                ),
+                "optical_responsibility_prior": 0.25,
+            },
+        }
+    }
+    resolved = resolve_deployment_optical_contract(state)
+    assert resolved["policy"] == STATIC_RAY_NORMALIZED_OPTICAL_POLICY
+    assert resolved["optical_responsibility_prior"] == pytest.approx(0.25)
+    assert resolved["source"] == "checkpoint_deployment_contract"
+    assert not resolved["explicit_override"]
+
+    overridden = resolve_deployment_optical_contract(
+        state, requested_policy="view_depth_local"
+    )
+    assert overridden["policy"] == "view_depth_local"
+    assert overridden["optical_responsibility_prior"] == 0.0
+    assert overridden["source"] == "explicit_override"
+
+
+def test_static_api_uses_checkpoint_deployment_compositor_by_default(
+    monkeypatch,
+):
+    policies = []
+
+    def fake_render(*_args, **kwargs):
+        policies.append(kwargs["optical_replacement_policy"])
+        return _optical_test_output(0.5, 0.2)
+
+    monkeypatch.setattr(api, "render_hybrid", fake_render)
+    monkeypatch.setattr(
+        api,
+        "composite_white_background",
+        lambda image, _alpha, _sky: image,
+    )
+    teacher = HybridTeacher(
+        surface=SimpleNamespace(get_xyz=torch.zeros(1, 3)),
+        foliage=SimpleNamespace(
+            layer_role=torch.zeros(3, dtype=torch.int8),
+            static_skeleton_mask=torch.tensor([True, False, False]),
+            persistent_envelope_mask=torch.tensor([False, True, False]),
+            static_leaf_mask=torch.tensor([False, False, True]),
+        ),
+        sky=lambda _camera: torch.ones(3, 2, 3),
+        appearance=object(),
+        state={
+            "iteration": 2,
+            "training_contract": {
+                "reconstruction_target": "static",
+                "branch_activation": {"foliage_iteration": 1},
+                "deployment_static_contract": {
+                    "optical_replacement_policy": (
+                        STATIC_RAY_NORMALIZED_OPTICAL_POLICY
+                    ),
+                    "optical_responsibility_prior": 0.25,
+                },
+            },
+        },
+    )
+    rendered = teacher.render(SimpleNamespace(), conditioned=False)
+    assert policies == ["disabled", "disabled"]
+    assert (
+        rendered["optical_compositing_policy"]
+        == STATIC_RAY_NORMALIZED_OPTICAL_POLICY
+    )
+    assert rendered["optical_responsibility_prior"] == pytest.approx(0.25)
+    assert not rendered["optical_compositing_contract"]["explicit_override"]
+
+
+def test_static_surface_evidence_is_soft_and_depth_ordered():
+    canopy = _optical_test_output(0.0, 0.5)
+    canopy.volume_depth.fill_(2.0)
+    surface = _optical_test_output(1.0, 0.0)
+    surface.alpha.fill_(0.8)
+    surface.surface_alpha.fill_(0.8)
+    surface.depth.fill_(1.0)
+    mixed, weight = _static_surface_evidence_mixture(canopy, surface)
+    assert bool((weight > 0.5).all())
+    torch.testing.assert_close(mixed.render, weight.expand_as(mixed.render))
+
+    surface.depth.fill_(4.0)
+    _, behind_weight = _static_surface_evidence_mixture(canopy, surface)
+    assert bool((behind_weight < 0.01).all())
+
+
+def test_static_surface_evidence_preserves_unopposed_surface():
+    canopy = _optical_test_output(0.0, 0.0)
+    surface = _optical_test_output(0.75, 0.0)
+    surface.alpha.fill_(0.8)
+    surface.surface_alpha.fill_(0.8)
+    mixed, weight = _static_surface_evidence_mixture(canopy, surface)
+    torch.testing.assert_close(weight, torch.ones_like(weight))
+    torch.testing.assert_close(mixed.render, surface.render)
 
 
 def test_causal_repair_teacher_protocol_is_publicly_loadable():
@@ -147,6 +339,40 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
     )
     assert (
         "cambridge_native_hybrid_teacher_v40_projected_optical_footprint"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v46_static_detail_isolated_"
+        "ownership_topology"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v47_static_staged_detail_"
+        "ownership_topology"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v48_static_scene_snapshot_"
+        "detail_ownership"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v49_static_scene_snapshot_"
+        "canonical_detail_ownership"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v50_static_scene_snapshot_"
+        "canonical_detail_schedule"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v51_static_scene_snapshot_"
+        "visible_canonical_detail_schedule"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v52_static_ray_local_optical_handoff"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
 

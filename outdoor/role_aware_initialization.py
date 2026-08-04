@@ -50,9 +50,12 @@ from outdoor.scene_contract import sha256_file
 from scripts.augment_foliage_seed_with_sfm_tracks import _track_frames
 
 
+SINGLE_SEQUENCE_POINTMAP_PRECISION = 0.03
+
+
 INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v61-camera-complete-strict-depth-"
-    "posterior"
+    "outdoor-role-aware-initialization-v62-immutable-cross-sequence-"
+    "pointmap-posterior"
 )
 RIGID_CALIBRATED_INITIALIZATION_VERSION = (
     "outdoor-role-aware-initialization-v77-native-rigid-depth-continuous-"
@@ -1472,6 +1475,20 @@ def _uniform_confidence_samples(
     )
 
 
+def _apply_missing_pointmap_posterior_fallback(
+    posterior_available: np.ndarray,
+    precision: np.ndarray,
+    supported: np.ndarray,
+    distance: np.ndarray,
+) -> int:
+    """Keep missing posterior rows weak without manufacturing consensus."""
+    fallback = ~np.asarray(posterior_available, dtype=bool)
+    precision[fallback] = SINGLE_SEQUENCE_POINTMAP_PRECISION
+    supported[fallback] = False
+    distance[fallback] = np.inf
+    return int(fallback.sum())
+
+
 def _sample_dense_mast3r_rigid_seeds(
     store: dict,
     *,
@@ -1717,19 +1734,17 @@ def _sample_dense_mast3r_rigid_seeds(
     posterior_precision = np.concatenate(posterior_precision_parts)
     cross_supported = np.concatenate(posterior_supported_parts)
     cross_distance = np.concatenate(posterior_distance_parts)
-    if not bool(posterior_available.all()):
-        fallback_distance = _different_sequence_nearest_distance(
-            xyz, sequence
-        )
-        fallback_rows = ~posterior_available
-        cross_distance[fallback_rows] = fallback_distance[fallback_rows]
-        cross_supported[fallback_rows] = (
-            fallback_distance[fallback_rows]
-            <= float(cross_sequence_radius)
-        )
-        posterior_precision[fallback_rows] = np.where(
-            cross_supported[fallback_rows], 1.0, 0.30
-        )
+    # Posterior construction is a separate immutable evidence stage.  A
+    # runtime nearest-neighbour recomputation changes its reference set after
+    # per-view sampling and previously promoted missing artifacts to
+    # full-trust geometry. Preserve absent rows only as weak source-view
+    # coverage; they are never labelled cross-sequence supported.
+    _apply_missing_pointmap_posterior_fallback(
+        posterior_available,
+        posterior_precision,
+        cross_supported,
+        cross_distance,
+    )
     posterior_precision = np.clip(
         posterior_precision, 0.0, 1.0
     ).astype(np.float32)

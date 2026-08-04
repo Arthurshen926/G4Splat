@@ -34,6 +34,7 @@ from outdoor.evidence_store import (  # noqa: E402
 )
 from outdoor.foliage_view_graph import sequence_id  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
+    SINGLE_SEQUENCE_POINTMAP_PRECISION,
     _load_mast3r_pointmap_geometry,
     _native_pointmap_shape,
     _pointmap_fixed_camera_validity,
@@ -164,7 +165,9 @@ def main() -> None:
         "--supported-minimum-precision", type=float, default=0.20
     )
     parser.add_argument(
-        "--unsupported-precision-floor", type=float, default=0.03
+        "--unsupported-precision-floor",
+        type=float,
+        default=SINGLE_SEQUENCE_POINTMAP_PRECISION,
     )
     args = parser.parse_args()
 
@@ -382,6 +385,13 @@ def main() -> None:
 
     manifest = dict(base)
     manifest.pop("evidence_hash", None)
+    manifest["derived_from_evidence_hash"] = base["evidence_hash"]
+    manifest["pointmap_cross_sequence_posterior_contract"] = {
+        "schema_version": POSTERIOR_VERSION,
+        "unsupported_precision_floor": unsupported_floor,
+        "support_is_explicit_boolean_not_precision_threshold": True,
+        "single_sequence_observations_remain_low_precision": True,
+    }
     manifest["colmap_points_or_tracks_used"] = False
     manifest.setdefault("historical_gaussian_initialization_used", False)
     artifacts = [dict(row) for row in manifest["artifacts"]]

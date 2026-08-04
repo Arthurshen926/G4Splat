@@ -151,3 +151,40 @@ def test_ray_table_grouping_preserves_source_row_order_per_camera():
     assert evidence.camera_id_values.tolist() == [3, 7]
     assert evidence.camera_rows[3].tolist() == [1, 3]
     assert evidence.camera_rows[7].tolist() == [0, 2, 4]
+
+
+def test_current_projection_query_selects_nearby_depth_consistent_hit():
+    evidence = FoliageRayEvidence(
+        {
+            "camera_ids": torch.tensor([7, 7, 7], dtype=torch.int32),
+            "pixels": torch.tensor(
+                [[40.0, 40.0], [42.0, 40.0], [90.0, 90.0]]
+            ),
+            "source_image_sizes": torch.tensor(
+                [[100, 100]] * 3, dtype=torch.int32
+            ),
+            "free_end_depth": torch.tensor([2.0, 4.0, 2.0]),
+            "hit_start_depth": torch.tensor([2.0, 4.0, 2.0]),
+            "hit_end_depth": torch.tensor([2.2, 4.2, 2.2]),
+            "observation_type": torch.ones(3, dtype=torch.int8),
+            "confidence": torch.tensor([0.7, 0.9, 0.8]),
+            "depth_coordinate": "camera_z",
+        }
+    )
+
+    query = evidence.sample_hit_depth_posterior(
+        7,
+        # The first query is closer to the z=2 ray.  The second is closer to
+        # that same image ray but must select the nearby z=4 layer instead.
+        torch.tensor([[20.1, 20.0], [20.1, 20.0], [5.0, 5.0]]),
+        render_width=50,
+        render_height=50,
+        camera_z_depth=torch.tensor([2.1, 4.1, 2.1]),
+        depth_tolerance=torch.full((3,), 0.05),
+        maximum_source_pixel_distance=5.0,
+    )
+
+    assert query["spatial_candidate"].tolist() == [True, True, False]
+    assert query["depth_consistent"].tolist() == [True, True, False]
+    assert query["hit_start_depth"][:2].tolist() == pytest.approx([2.0, 4.0])
+    assert query["confidence"][:2].tolist() == pytest.approx([0.7, 0.9])

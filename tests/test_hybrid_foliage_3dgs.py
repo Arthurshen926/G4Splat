@@ -15,7 +15,7 @@ from outdoor.hybrid_gaussian_renderer import (
 )
 
 
-def test_view_depth_local_replacement_only_retires_overlapping_envelope():
+def test_view_depth_local_replacement_retires_same_ray_occluded_envelope():
     roles = torch.tensor(
         [
             LAYER_CANONICAL_CROWN,
@@ -40,7 +40,9 @@ def test_view_depth_local_replacement_only_retires_overlapping_envelope():
     )
     assert suppression[0] > 0.1
     assert suppression[1] < 1.0e-3
-    assert suppression[2] < 1.0e-3
+    # The exact detail first hit at z=5 owns transmittance behind it; keeping
+    # the same-ray visual-hull sample at z=8 would double that optical mass.
+    assert suppression[2] > 0.1
     assert suppression[3] == 0
 
 

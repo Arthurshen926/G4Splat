@@ -10,6 +10,8 @@ import shutil
 import sys
 from types import SimpleNamespace
 
+import torch
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SURFEL_ROOT = REPO_ROOT / "2d-gaussian-splatting"
@@ -200,6 +202,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rigid-stage-placeholder-foliage",
+        action="store_true",
+        help=(
+            "Write one inert, explicitly non-deployable foliage row for a "
+            "hybrid_rigid_stage1 run. That profile disables the volume "
+            "renderer and all foliage losses, so building the expensive "
+            "visual hull would not affect its surface optimization. Mixed "
+            "training must use a normal initialization without this flag."
+        ),
+    )
+    parser.add_argument(
         "--resume-existing-surface",
         action="store_true",
         help=(
@@ -277,12 +290,70 @@ def _validated_reused_foliage(
     return foliage_path, foliage, provenance
 
 
+def _write_rigid_stage_placeholder_foliage(
+    output_path: Path, *, evidence_hash: str
+) -> dict:
+    """Write a schema-valid but optically inert rigid-stage placeholder.
+
+    The placeholder exists only because the unified checkpoint schema always
+    carries both branches.  Its provenance deliberately fails the normal
+    foliage-quality contract and must never be reused by a mixed trainer.
+    """
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.zeros((1, 3), dtype=torch.float32),
+        "scales": torch.full((1, 3), 1.0e-3, dtype=torch.float32),
+        "quaternions": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32
+        ),
+        "colors": torch.zeros((1, 3), dtype=torch.float32),
+        "opacities": torch.full((1, 1), 1.0e-6, dtype=torch.float32),
+        "primitive_role": torch.zeros(1, dtype=torch.int8),
+        "layer_role": torch.zeros(1, dtype=torch.int8),
+        "tree_instance_id": torch.full((1,), -1, dtype=torch.int32),
+        "support_camera_ids": torch.full((1, 0), -1, dtype=torch.int32),
+        "replacement_group": torch.zeros(1, dtype=torch.int64),
+        "ray_evidence": {"depth_coordinate": "camera_z"},
+        "audit": {
+            "protocol": INITIALIZATION_VERSION,
+            "evidence_hash": evidence_hash,
+            "geometry_source": "none_inert_rigid_stage_placeholder",
+            "selected_views": [],
+            "rigid_stage_only": True,
+            "mixed_training_eligible": False,
+            "deployment_eligible": False,
+        },
+    }
+    torch.save(payload, output_path)
+    return {
+        "version": "rigid-stage-inert-foliage-placeholder-v1",
+        "evidence_hash": evidence_hash,
+        "geometry_source": "none_inert_rigid_stage_placeholder",
+        "historical_trained_ply_used": False,
+        "all_real_rgb_initialization_used": False,
+        "colmap_points_or_tracks_used": False,
+        "seed_count": 1,
+        "optical_opacity": 1.0e-6,
+        "rigid_stage_only": True,
+        "mixed_training_eligible": False,
+        "deployment_eligible": False,
+    }
+
+
 def main() -> None:
     args = _parse_args()
     output = args.output.expanduser().resolve()
     if args.resume_existing_surface and args.replace:
         raise ValueError(
             "--resume-existing-surface and --replace are mutually exclusive"
+        )
+    if (
+        args.rigid_stage_placeholder_foliage
+        and args.reuse_foliage_initialization is not None
+    ):
+        raise ValueError(
+            "--rigid-stage-placeholder-foliage and "
+            "--reuse-foliage-initialization are mutually exclusive"
         )
     if output.exists() and not args.resume_existing_surface:
         if not args.replace:
@@ -369,7 +440,17 @@ def main() -> None:
             seed=args.seed,
         )
     foliage_reuse = None
-    if args.reuse_foliage_initialization is None:
+    if args.rigid_stage_placeholder_foliage:
+        foliage_path = output / "foliage_seed_gaussians.pth"
+        foliage = _write_rigid_stage_placeholder_foliage(
+            foliage_path, evidence_hash=store["evidence_hash"]
+        )
+        foliage_reuse = {
+            "policy": "inert_rigid_stage_schema_placeholder",
+            "foliage_seed_sha256": sha256_file(foliage_path),
+            "mixed_training_eligible": False,
+        }
+    elif args.reuse_foliage_initialization is None:
         foliage_path = output / "foliage_seed_gaussians.pth"
         foliage = build_foliage_seed(
             args.evidence_store,
@@ -502,6 +583,9 @@ def main() -> None:
             ),
             "seed": int(args.seed),
             "foliage_reuse": foliage_reuse,
+            "rigid_stage_placeholder_foliage": bool(
+                args.rigid_stage_placeholder_foliage
+            ),
         },
         "surface_seed": str(surface_path),
         "foliage_seed": str(foliage_path),

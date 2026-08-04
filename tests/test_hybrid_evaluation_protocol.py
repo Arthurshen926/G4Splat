@@ -15,16 +15,57 @@ from scripts.evaluate_hybrid_teacher import (
     _conditioned_visit_counts,
     _database_view_set_contract,
     _evaluation_indices,
+    _evaluation_render_modes,
     _historical_uint8_raster,
     _high_frequency_metrics,
     _historical_static_comparison_is_valid,
     _protocol_metrics,
     _projected_radius_diagnostics,
     _query_representation_contract,
+    _resolve_evaluation_mode,
     _route_evaluation_scene_artifacts,
     _tree_boundary_masks,
 )
 from scripts.evaluate_render_dir import metrics as historical_metrics
+
+
+def test_auto_evaluation_keeps_static_canonical_canopy():
+    validity = {
+        "canonical_surface": True,
+        "canonical_canopy": True,
+        "conditioned": False,
+        "reason": "single_static_localization_map",
+    }
+    assert _resolve_evaluation_mode(
+        "auto", localization_query=False, branch_validity=validity
+    ) == "canonical"
+    assert _resolve_evaluation_mode(
+        "auto", localization_query=True, branch_validity=validity
+    ) == "canonical"
+
+
+def test_auto_evaluation_uses_rigid_only_when_canopy_is_untrained():
+    validity = {
+        "canonical_surface": True,
+        "canonical_canopy": False,
+        "conditioned": False,
+        "reason": "rigid_stage_profile",
+    }
+    assert _resolve_evaluation_mode(
+        "auto", localization_query=False, branch_validity=validity
+    ) == "rigid"
+
+
+def test_rigid_evaluation_is_not_reported_as_canonical():
+    assert _evaluation_render_modes("rigid") == ("rigid", ("rigid",))
+    assert _evaluation_render_modes("canonical") == (
+        "canonical",
+        ("canonical",),
+    )
+    assert _evaluation_render_modes("hybrid") == (
+        "canonical",
+        ("canonical", "conditioned"),
+    )
 
 
 @pytest.mark.parametrize("masked", [False, True])

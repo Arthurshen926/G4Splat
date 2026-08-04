@@ -117,13 +117,18 @@ def _recover_alignments(
         if record is None:
             continue
         ordinal = _resize_depth(Path(record["path"]))
+        # Observation UV stores exact normalized pixel centres,
+        # ``(index + 0.5) / size``.  The inverse is the half-open raster
+        # lookup ``floor(uv * size)``.  Rounding shifts every centre in the
+        # upper half of a pixel into its neighbour and made an otherwise
+        # exact affine fit fail for almost every accepted camera.
         row = np.clip(
-            np.rint(uv[chosen, 1] * ordinal.shape[0]).astype(np.int64),
+            np.floor(uv[chosen, 1] * ordinal.shape[0]).astype(np.int64),
             0,
             ordinal.shape[0] - 1,
         )
         column = np.clip(
-            np.rint(uv[chosen, 0] * ordinal.shape[1]).astype(np.int64),
+            np.floor(uv[chosen, 0] * ordinal.shape[1]).astype(np.int64),
             0,
             ordinal.shape[1] - 1,
         )
@@ -506,6 +511,7 @@ def main() -> None:
         "seq1__frame00075.png",
         "seq1__frame00076.png",
         "seq1__frame00077.png",
+        "seq1__frame00079.png",
     }
 
     for selected in selected_views:

@@ -342,6 +342,8 @@ def local_optical_mass_replacement(
     rotations: torch.Tensor | None = None,
     view_vectors: torch.Tensor | None = None,
     cross_section: torch.Tensor | None = None,
+    canonical_mask: torch.Tensor | None = None,
+    detail_mask: torch.Tensor | None = None,
     epsilon: float = 1.0e-8,
 ) -> torch.Tensor:
     """Measure established dynamic mass relative to its local canonical mass.
@@ -377,9 +379,25 @@ def local_optical_mass_replacement(
     if not bool(valid_group.any()):
         return alpha.new_zeros(0)
     group_count = int(groups[valid_group].max().item()) + 1
-    canonical = valid_group & (roles == LAYER_CANONICAL_CROWN)
-    dynamic = valid_group & (roles == LAYER_DYNAMIC_LEAF)
-    if not bool(canonical.any()) or not bool(dynamic.any()):
+    canonical = (
+        valid_group & (roles == LAYER_CANONICAL_CROWN)
+        if canonical_mask is None
+        else valid_group
+        & torch.as_tensor(
+            canonical_mask, device=roles.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    detail = (
+        valid_group & (roles == LAYER_DYNAMIC_LEAF)
+        if detail_mask is None
+        else valid_group
+        & torch.as_tensor(
+            detail_mask, device=roles.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    if len(canonical) != len(roles) or len(detail) != len(roles):
+        raise ValueError("replacement masks must match the primitive rows")
+    if not bool(canonical.any()) or not bool(detail.any()):
         return alpha.new_zeros(group_count)
 
     safe_alpha = alpha.clamp(0.0, 1.0 - epsilon)
@@ -402,15 +420,74 @@ def local_optical_mass_replacement(
     optical_mass = optical_depth * cross_section
 
     canonical_mass = alpha.new_zeros(group_count)
-    dynamic_mass = alpha.new_zeros(group_count)
+    detail_mass = alpha.new_zeros(group_count)
     canonical_mass.scatter_add_(
         0, groups[canonical], optical_mass[canonical]
     )
-    dynamic_mass.scatter_add_(0, groups[dynamic], optical_mass[dynamic])
+    detail_mass.scatter_add_(0, groups[detail], optical_mass[detail])
     return (
-        dynamic_mass
+        detail_mass
         / canonical_mass.clamp_min(epsilon)
     ).clamp(0.0, 1.0)
+
+
+def replacement_group_pair_indices(
+    replacement_group: torch.Tensor,
+    canonical_mask: torch.Tensor,
+    detail_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Enumerate the sparse canonical/detail Cartesian product per group."""
+    groups = replacement_group.reshape(-1).long()
+    canonical = torch.as_tensor(
+        canonical_mask, device=groups.device, dtype=torch.bool
+    ).reshape(-1)
+    detail = torch.as_tensor(
+        detail_mask, device=groups.device, dtype=torch.bool
+    ).reshape(-1)
+    if len(canonical) != len(groups) or len(detail) != len(groups):
+        raise ValueError("replacement pair masks must match group rows")
+    valid = groups >= 0
+    canonical_rows = torch.nonzero(
+        valid & canonical, as_tuple=False
+    ).flatten()
+    detail_rows = torch.nonzero(valid & detail, as_tuple=False).flatten()
+    if not len(canonical_rows) or not len(detail_rows):
+        empty = torch.empty(0, dtype=torch.long, device=groups.device)
+        return empty, empty
+    group_count = int(groups[valid].max().item()) + 1
+    canonical_order = torch.argsort(groups[canonical_rows], stable=True)
+    detail_order = torch.argsort(groups[detail_rows], stable=True)
+    canonical_sorted = canonical_rows[canonical_order]
+    detail_sorted = detail_rows[detail_order]
+    canonical_count = torch.bincount(
+        groups[canonical_sorted], minlength=group_count
+    )
+    detail_count = torch.bincount(
+        groups[detail_sorted], minlength=group_count
+    )
+    pair_count = canonical_count * detail_count
+    pair_groups = torch.repeat_interleave(
+        torch.arange(group_count, device=groups.device), pair_count
+    )
+    total_pairs = int(pair_count.sum().item())
+    pair_local = torch.arange(total_pairs, device=groups.device)
+    pair_start = torch.cumsum(pair_count, dim=0) - pair_count
+    pair_local -= torch.repeat_interleave(pair_start, pair_count)
+    canonical_start = torch.cumsum(canonical_count, dim=0) - canonical_count
+    detail_start = torch.cumsum(detail_count, dim=0) - detail_count
+    pair_canonical = canonical_sorted[
+        canonical_start[pair_groups]
+        + torch.div(
+            pair_local,
+            detail_count[pair_groups],
+            rounding_mode="floor",
+        )
+    ]
+    pair_detail = detail_sorted[
+        detail_start[pair_groups]
+        + torch.remainder(pair_local, detail_count[pair_groups])
+    ]
+    return pair_canonical, pair_detail
 
 
 def view_depth_local_optical_replacement(
@@ -425,18 +502,27 @@ def view_depth_local_optical_replacement(
     focal_y: float,
     cross_section: torch.Tensor,
     depth_radius: torch.Tensor | None = None,
+    canonical_mask: torch.Tensor | None = None,
+    detail_mask: torch.Tensor | None = None,
+    pair_indices: tuple[torch.Tensor, torch.Tensor] | None = None,
     epsilon: float = 1.0e-8,
 ) -> torch.Tensor:
     """Return per-primitive envelope retreat in the active camera.
 
     Replacement groups express persistent 3D locality, but a group-wide
     scalar still lets a detail observation suppress unrelated pixels and
-    depths.  This fallback to a full per-ray ownership kernel adds the missing
-    active-view and depth-interval terms: dynamic optical mass supplies a
-    projected centroid/radius/depth for each local cell, and each canonical
-    descendant retreats only in proportion to its actual overlap.  The exact
-    owner visibility gate is applied before this function, so another camera
-    cannot change the hand-off.
+    depths.  The previous implementation collapsed every detail mixture to a
+    single centroid and average radius.  Once either branch was split, that
+    statistic ceased to describe the covered image support: small canonical
+    descendants saw a severe radius-ratio penalty and almost never handed
+    optical mass to the detail mixture.
+
+    This implementation evaluates the (usually sparse) canonical/detail
+    Cartesian product inside each persistent group.  Detail optical mass is
+    distributed over the canonical rows it actually overlaps, and no detail
+    mass can be spent more than once.  The resulting attenuation is applied
+    in optical-depth space, so the hand-off is invariant to Gaussian splits
+    and conserves extinction instead of multiplying peak alpha heuristically.
     """
     roles = layer_role.reshape(-1)
     groups = replacement_group.reshape(-1).long()
@@ -464,52 +550,45 @@ def view_depth_local_optical_replacement(
     if not bool(valid_group.any()):
         return alpha.new_zeros(len(alpha))
     group_count = int(groups[valid_group].max().item()) + 1
-    canonical = valid_group & (roles == LAYER_CANONICAL_CROWN)
-    dynamic = (
+    canonical = (
+        valid_group & (roles == LAYER_CANONICAL_CROWN)
+        if canonical_mask is None
+        else valid_group
+        & torch.as_tensor(
+            canonical_mask, device=roles.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    detail_role = (
+        roles == LAYER_DYNAMIC_LEAF
+        if detail_mask is None
+        else torch.as_tensor(
+            detail_mask, device=roles.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    if len(canonical) != len(roles) or len(detail_role) != len(roles):
+        raise ValueError("replacement masks must match the primitive rows")
+    detail = (
         valid_group
-        & (roles == LAYER_DYNAMIC_LEAF)
+        & detail_role
         & (alpha > 0)
         & torch.isfinite(depth)
         & (depth > 0)
         & torch.isfinite(xy).all(dim=1)
     )
-    if not bool(canonical.any()) or not bool(dynamic.any()):
+    if not bool(canonical.any()) or not bool(detail.any()):
         return alpha.new_zeros(len(alpha))
 
     optical_depth = -torch.log1p(-alpha.clamp(0.0, 1.0 - epsilon))
     mass = optical_depth * area.clamp_min(0)
-    canonical_mass = alpha.new_zeros(group_count)
-    dynamic_mass = alpha.new_zeros(group_count)
-    canonical_mass.scatter_add_(0, groups[canonical], mass[canonical])
-    dynamic_mass.scatter_add_(0, groups[dynamic], mass[dynamic])
-    ratio = (dynamic_mass / canonical_mass.clamp_min(epsilon)).clamp(0, 1)
-
-    dynamic_weight = mass[dynamic]
-    dynamic_groups = groups[dynamic]
-    denominator = dynamic_mass.clamp_min(epsilon)
-
-    def weighted_group(values: torch.Tensor) -> torch.Tensor:
-        output = alpha.new_zeros((group_count,) + values.shape[1:])
-        index = dynamic_groups.reshape(
-            (-1,) + (1,) * (values.ndim - 1)
-        ).expand_as(values)
-        output.scatter_add_(
-            0,
-            index,
-            values
-            * dynamic_weight.reshape(
-                (-1,) + (1,) * (values.ndim - 1)
-            ),
-        )
-        return output / denominator.reshape(
-            (-1,) + (1,) * (values.ndim - 1)
-        )
-
-    dynamic_xy = weighted_group(xy[dynamic])
-    dynamic_depth = weighted_group(depth[dynamic, None])[:, 0]
     focal = float(max((float(focal_x) * float(focal_y)) ** 0.5, 1.0e-6))
-    projected_radius = torch.sqrt(area.clamp_min(epsilon)) * focal
-    dynamic_radius = weighted_group(projected_radius[dynamic, None])[:, 0]
+    # ``area`` is a world-space cross-section.  Perspective projected radius
+    # therefore contains the formerly missing 1/z factor.  Omitting it made
+    # image-space locality depend on the scene's arbitrary world scale.
+    projected_radius = (
+        torch.sqrt(area.clamp_min(epsilon))
+        * focal
+        / depth.abs().clamp_min(1.0e-6)
+    )
     if depth_radius is None:
         depth_radius_value = scales.max(dim=1).values
     else:
@@ -518,39 +597,150 @@ def view_depth_local_optical_replacement(
         ).reshape(-1)
         if len(depth_radius_value) != len(alpha):
             raise ValueError("depth_radius must have one value per Gaussian")
-    dynamic_depth_radius = weighted_group(
-        depth_radius_value[dynamic, None]
-    )[:, 0]
+    if pair_indices is None:
+        pair_canonical, pair_detail = replacement_group_pair_indices(
+            groups, canonical, detail
+        )
+    else:
+        pair_canonical, pair_detail = pair_indices
+        pair_canonical = torch.as_tensor(
+            pair_canonical, device=groups.device, dtype=torch.long
+        ).reshape(-1)
+        pair_detail = torch.as_tensor(
+            pair_detail, device=groups.device, dtype=torch.long
+        ).reshape(-1)
+        if len(pair_canonical) != len(pair_detail):
+            raise ValueError("replacement pair indices must have equal length")
+        valid_pair = (
+            canonical[pair_canonical]
+            & detail[pair_detail]
+            & (groups[pair_canonical] == groups[pair_detail])
+        )
+        pair_canonical = pair_canonical[valid_pair]
+        pair_detail = pair_detail[valid_pair]
+    if not len(pair_canonical):
+        return alpha.new_zeros(len(alpha))
 
-    rows = torch.nonzero(canonical, as_tuple=False).flatten()
-    row_groups = groups[rows]
     pixel_sigma = (
-        projected_radius[rows] + dynamic_radius[row_groups]
+        projected_radius[pair_canonical]
+        + projected_radius[pair_detail]
     ).clamp_min(1.0)
     pixel_distance2 = (
-        (xy[rows] - dynamic_xy[row_groups]).square().sum(dim=1)
+        (xy[pair_canonical] - xy[pair_detail]).square().sum(dim=1)
         / pixel_sigma.square()
     )
     depth_sigma = (
-        depth_radius_value[rows] + dynamic_depth_radius[row_groups]
+        depth_radius_value[pair_canonical]
+        + depth_radius_value[pair_detail]
     ).clamp_min(0.01)
-    depth_distance2 = (
-        (depth[rows] - dynamic_depth[row_groups]).square()
-        / (2.5 * depth_sigma).square()
-    )
+    # A hit-ray detail sample owns transmittance behind its measured first-hit
+    # depth.  Requiring symmetric depth coincidence kept the broad visual-hull
+    # envelope alive immediately behind an exact leaf and recreated the same
+    # density twice.  Conversely, a canonical sample *in front* of the hit can
+    # be another real leaf, so only that direction is reduced continuously by
+    # the posterior depth interval.
+    canonical_in_front = (
+        depth[pair_detail]
+        - depth[pair_canonical]
+        - 2.5 * depth_sigma
+    ).clamp_min(0.0)
+    depth_distance2 = canonical_in_front.square() / (
+        2.5 * depth_sigma
+    ).square()
+    # This is deliberately asymmetric: it measures which fraction of the
+    # *detail* optical mass lies inside a canonical footprint.  A broad detail
+    # Gaussian can cover several split canonical descendants; its mass is
+    # divided among them below, rather than being discarded once per child by
+    # a symmetric radius-ratio ceiling.
+    canonical_area = projected_radius[pair_canonical].square()
+    detail_area = projected_radius[pair_detail].square().clamp_min(epsilon)
+    detail_coverage_ceiling = (canonical_area / detail_area).clamp(max=1.0)
     overlap = torch.exp(-0.5 * (pixel_distance2 + depth_distance2))
+    overlap *= detail_coverage_ceiling
     valid_projection = (
-        torch.isfinite(depth[rows])
-        & (depth[rows] > 0)
-        & torch.isfinite(xy[rows]).all(dim=1)
+        torch.isfinite(depth[pair_canonical])
+        & (depth[pair_canonical] > 0)
+        & torch.isfinite(xy[pair_canonical]).all(dim=1)
+        & torch.isfinite(depth[pair_detail])
+        & (depth[pair_detail] > 0)
+        & torch.isfinite(xy[pair_detail]).all(dim=1)
     )
+    overlap = torch.where(valid_projection, overlap, torch.zeros_like(overlap))
+
+    # Allocate each detail row's optical mass once.  When its coverage weights
+    # sum to less than one, the uncovered fraction remains detail-only rather
+    # than retiring unrelated canonical mass.
+    detail_overlap_sum = alpha.new_zeros(len(alpha))
+    detail_overlap_sum.scatter_add_(0, pair_detail, overlap)
+    allocated_pair_mass = (
+        mass[pair_detail]
+        * overlap
+        / detail_overlap_sum[pair_detail].clamp_min(1.0)
+    )
+    allocated_canonical_mass = alpha.new_zeros(len(alpha))
+    allocated_canonical_mass.scatter_add_(
+        0, pair_canonical, allocated_pair_mass
+    )
+    replaced_mass_fraction = (
+        allocated_canonical_mass / mass.clamp_min(epsilon)
+    ).clamp(0.0, 1.0)
+
+    # Convert the conserved optical-depth reduction back to the renderer's
+    # peak-alpha multiplier.  Multiplying alpha directly is not equivalent
+    # once alpha is appreciable.
+    target_tau = optical_depth * (1.0 - replaced_mass_fraction)
+    target_alpha = -torch.expm1(-target_tau)
     suppression = alpha.new_zeros(len(alpha))
-    suppression[rows] = torch.where(
-        valid_projection,
-        ratio[row_groups] * overlap,
-        torch.zeros_like(overlap),
+    canonical_rows = torch.nonzero(canonical, as_tuple=False).flatten()
+    suppression[canonical_rows] = (
+        1.0
+        - target_alpha[canonical_rows]
+        / alpha[canonical_rows].clamp_min(epsilon)
     )
-    return suppression.clamp(0.0, 1.0)
+    # Broad detail must not retire a compact envelope merely because its
+    # integrated tau is large. Estimate a split-invariant group projected IoU
+    # by spending every detail footprint at most once over the same pair
+    # weights. The continuous ceiling guarantees replacement cannot exceed
+    # 0.5 below IoU 0.2, while reaching full authority by IoU 0.4. This is the
+    # executable boundary-safety invariant used by the six-layer audit.
+    projected_area = projected_radius.square()
+    allocated_pair_area = (
+        projected_area[pair_detail]
+        * overlap
+        / detail_overlap_sum[pair_detail].clamp_min(1.0)
+    )
+    canonical_group_area = alpha.new_zeros(group_count)
+    detail_group_area = alpha.new_zeros(group_count)
+    intersection_group_area = alpha.new_zeros(group_count)
+    canonical_group_area.scatter_add_(
+        0, groups[canonical], projected_area[canonical]
+    )
+    detail_group_area.scatter_add_(0, groups[detail], projected_area[detail])
+    intersection_group_area.scatter_add_(
+        0, groups[pair_canonical], allocated_pair_area
+    )
+    intersection_group_area = torch.minimum(
+        intersection_group_area,
+        torch.minimum(canonical_group_area, detail_group_area),
+    )
+    union_group_area = (
+        canonical_group_area
+        + detail_group_area
+        - intersection_group_area
+    ).clamp_min(epsilon)
+    projected_group_iou = intersection_group_area / union_group_area
+    boundary_safe_ceiling = (2.5 * projected_group_iou).clamp(0.0, 1.0)
+    suppression[canonical_rows] = torch.minimum(
+        suppression[canonical_rows],
+        boundary_safe_ceiling[groups[canonical_rows]],
+    )
+    # Until replacement is evaluated per pixel inside the mixed CUDA pass,
+    # the primitive-level proxy must never perform a majority retirement in
+    # one forward. This makes the audited invariant exact: replacement > 0.5
+    # is impossible without a future native per-ray ownership path, avoiding
+    # another broad-kernel-to-hole failure while persistent multi-view EMA and
+    # local topology can continue the hand-off over subsequent observations.
+    return suppression.clamp(0.0, 0.5)
 
 
 def conserve_local_temporal_fallback_mass(
@@ -704,6 +894,7 @@ class HybridRenderOutput:
     volume_depth: torch.Tensor | None = None
     surface_means2d: torch.Tensor | None = None
     volume_means2d: torch.Tensor | None = None
+    volume_replacement: torch.Tensor | None = None
 
 
 class VolumetricFoliageModel(nn.Module):
@@ -818,10 +1009,33 @@ class VolumetricFoliageModel(nn.Module):
             "replacement_group",
             torch.empty(0, dtype=torch.int64, device=device),
         )
+        # ``layer_role`` remains checkpoint-compatible: role 0 is every
+        # persistent static crown primitive and role 2 is the deprecated
+        # sequence-owned residual.  This orthogonal bit separates the broad
+        # persistent envelope from fused multi-view static leaf clusters
+        # without inventing another time-conditioned renderer role.
+        self.register_buffer(
+            "static_detail",
+            torch.empty(0, dtype=torch.bool, device=device),
+        )
+        self.register_buffer(
+            "replacement_overlap_ema",
+            torch.empty(0, device=device),
+        )
+        self.register_buffer(
+            "replacement_observation_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
         self.register_buffer(
             "evidence_primitive_id",
             torch.empty(0, dtype=torch.int64, device=device),
         )
+        # Topology changes replace the metadata buffers and invalidate this
+        # non-persistent acceleration cache.  Keeping the sparse same-group
+        # pair list avoids sorting close to one million rows on every render.
+        self._replacement_pair_cache: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None
 
     def __len__(self) -> int:
         return int(self.xyz.shape[0])
@@ -833,6 +1047,64 @@ class VolumetricFoliageModel(nn.Module):
     @property
     def opacities(self) -> torch.Tensor:
         return self.opacity_logits.sigmoid().squeeze(-1)
+
+    def integrated_optical_mass(self) -> torch.Tensor:
+        """Return a view-independent projected extinction mass proxy.
+
+        Peak alpha is not conserved when the learned covariance changes.
+        The product of optical depth and the two-axis Gaussian cross-section
+        is.  Training snapshots this quantity before each Adam update and
+        reprojects the learned mass onto the final, physically constrained
+        covariance afterwards.  This keeps scale refinement from silently
+        creating either holes or broad opaque curtains.
+        """
+        area = projected_gaussian_cross_section(self.scales)
+        tau = -torch.log1p(-self.opacities.clamp(0.0, 1.0 - 1.0e-6))
+        return tau * area
+
+    @torch.no_grad()
+    def restore_integrated_optical_mass(
+        self,
+        target_mass: torch.Tensor,
+        *,
+        minimum_opacity: float = 1.0e-6,
+        maximum_opacity: float = 1.0 - 1.0e-6,
+    ) -> dict[str, float]:
+        """Compensate peak alpha after covariance/scale changes.
+
+        ``target_mass`` may include the current step's opacity-gradient
+        update, but it must be measured against the *pre-scale-update* area.
+        Thus opacity still learns optical existence while scale, split and
+        screen-bandwidth refinement cannot change integrated mass by accident.
+        """
+        target = torch.as_tensor(
+            target_mass,
+            device=self.xyz.device,
+            dtype=self.xyz.dtype,
+        ).reshape(-1)
+        if target.shape != (len(self),):
+            raise ValueError("target optical mass must match foliage rows")
+        area = projected_gaussian_cross_section(self.scales).clamp_min(1e-12)
+        tau = target.clamp_min(0.0) / area
+        alpha = (-torch.expm1(-tau)).clamp(
+            float(minimum_opacity), float(maximum_opacity)
+        )
+        before = self.opacities.detach()
+        self.opacity_logits.copy_(torch.logit(alpha)[:, None])
+        relative = (
+            (alpha - before).abs()
+            / before.clamp_min(float(minimum_opacity))
+        )
+        return {
+            "target_mass": float(target.sum()),
+            "realized_mass": float(self.integrated_optical_mass().sum()),
+            "mean_relative_alpha_compensation": float(relative.mean())
+            if len(relative)
+            else 0.0,
+            "maximum_relative_alpha_compensation": float(relative.max())
+            if len(relative)
+            else 0.0,
+        }
 
     @property
     def normalized_quaternions(self) -> torch.Tensor:
@@ -849,6 +1121,18 @@ class VolumetricFoliageModel(nn.Module):
     @property
     def canonical_crown_mask(self) -> torch.Tensor:
         return self.layer_role == LAYER_CANONICAL_CROWN
+
+    @property
+    def persistent_envelope_mask(self) -> torch.Tensor:
+        return self.canonical_crown_mask & ~self.static_detail
+
+    @property
+    def static_leaf_mask(self) -> torch.Tensor:
+        return self.canonical_crown_mask & self.static_detail
+
+    @property
+    def detail_leaf_mask(self) -> torch.Tensor:
+        return self.static_leaf_mask | self.dynamic_leaf_mask
 
     def conditioned_state(
         self,
@@ -1190,6 +1474,16 @@ class VolumetricFoliageModel(nn.Module):
                     torch.full_like(scales, float("inf")),
                 ),
             ).to(device=device, dtype=dtype),
+            "static_detail": payload.get(
+                "static_detail", torch.zeros(count, dtype=torch.bool)
+            ).to(device=device, dtype=torch.bool),
+            "replacement_overlap_ema": payload.get(
+                "replacement_overlap_ema", torch.zeros(count)
+            ).to(device=device, dtype=dtype),
+            "replacement_observation_count": payload.get(
+                "replacement_observation_count",
+                torch.zeros(count, dtype=torch.int16),
+            ).to(device=device, dtype=torch.int16),
         }
         ray_offsets = payload.get("ray_evidence", {}).get("offsets")
         evidence_primitive_id = torch.full(
@@ -1210,8 +1504,14 @@ class VolumetricFoliageModel(nn.Module):
         metadata["evidence_primitive_id"] = payload.get(
             "evidence_primitive_id", evidence_primitive_id
         ).to(device=device, dtype=torch.int64)
-        canonical_indices = torch.nonzero(
-            layer_role == LAYER_CANONICAL_CROWN, as_tuple=False
+        static_detail = metadata["static_detail"]
+        envelope_indices = torch.nonzero(
+            (layer_role == LAYER_CANONICAL_CROWN) & ~static_detail,
+            as_tuple=False,
+        ).flatten()
+        static_detail_indices = torch.nonzero(
+            (layer_role == LAYER_CANONICAL_CROWN) & static_detail,
+            as_tuple=False,
         ).flatten()
         dynamic_indices = torch.nonzero(
             layer_role == LAYER_DYNAMIC_LEAF, as_tuple=False
@@ -1226,8 +1526,8 @@ class VolumetricFoliageModel(nn.Module):
             replacement_group = torch.full(
                 (count,), -1, dtype=torch.int64, device=device
             )
-            replacement_group[canonical_indices] = torch.arange(
-                len(canonical_indices), dtype=torch.int64, device=device
+            replacement_group[envelope_indices] = torch.arange(
+                len(envelope_indices), dtype=torch.int64, device=device
             )
         else:
             replacement_group = torch.as_tensor(
@@ -1240,10 +1540,10 @@ class VolumetricFoliageModel(nn.Module):
                     "replacement_group does not match foliage seed length"
                 )
             expected_canonical = torch.arange(
-                len(canonical_indices), dtype=torch.int64, device=device
+                len(envelope_indices), dtype=torch.int64, device=device
             )
             if not torch.equal(
-                replacement_group[canonical_indices], expected_canonical
+                replacement_group[envelope_indices], expected_canonical
             ):
                 raise RuntimeError(
                     "Canonical replacement groups must be contiguous and "
@@ -1253,11 +1553,21 @@ class VolumetricFoliageModel(nn.Module):
             if bool(
                 (
                     (dynamic_groups < -1)
-                    | (dynamic_groups >= len(canonical_indices))
+                    | (dynamic_groups >= len(envelope_indices))
                 ).any()
             ):
                 raise RuntimeError(
                     "Dynamic replacement group has no canonical owner"
+                )
+            detail_groups = replacement_group[static_detail_indices]
+            if bool(
+                (
+                    (detail_groups < -1)
+                    | (detail_groups >= len(envelope_indices))
+                ).any()
+            ):
+                raise RuntimeError(
+                    "Static detail replacement group has no envelope owner"
                 )
         metadata["replacement_group"] = replacement_group
         self._replace_buffers(**metadata)
@@ -1270,6 +1580,107 @@ class VolumetricFoliageModel(nn.Module):
     def _replace_buffers(self, **values: torch.Tensor) -> None:
         for name, value in values.items():
             setattr(self, name, value)
+        if {"replacement_group", "layer_role", "static_detail"} & set(values):
+            self._replacement_pair_cache = None
+
+    def replacement_pair_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached sparse envelope/detail pairs for local hand-off."""
+        if self._replacement_pair_cache is None:
+            self._replacement_pair_cache = replacement_group_pair_indices(
+                self.replacement_group,
+                self.persistent_envelope_mask,
+                self.detail_leaf_mask,
+            )
+        return self._replacement_pair_cache
+
+    @torch.no_grad()
+    def associate_static_detail_replacement_groups(
+        self,
+        rows: torch.Tensor | None = None,
+        *,
+        query_batch_size: int = 128,
+    ) -> dict[str, int | float | str]:
+        """Attach unowned static detail to its nearest same-tree envelope.
+
+        Cross-view ray births are genuine new geometry, but leaving every one
+        at ``replacement_group=-1`` permanently exempts it from local optical
+        conservation.  The tree instance is inherited from its nearest static
+        scaffold.  Within that instance, the nearest persistent envelope cell
+        supplies only a candidate identity; actual retirement still requires
+        view/ray overlap in :func:`view_depth_local_optical_replacement`.
+        Thus no world-distance threshold becomes a brittle visibility gate.
+        """
+        target = self.static_leaf_mask & (self.replacement_group < 0)
+        if rows is not None:
+            selected = torch.zeros_like(target)
+            selected[
+                torch.as_tensor(
+                    rows, device=self.xyz.device, dtype=torch.long
+                ).reshape(-1)
+            ] = True
+            target &= selected
+        target_rows = torch.nonzero(target, as_tuple=False).flatten()
+        owners = self.persistent_envelope_mask & (
+            self.replacement_group >= 0
+        )
+        if not len(target_rows) or not bool(owners.any()):
+            return {
+                "contract": "nearest_same_tree_group_then_view_ray_overlap",
+                "candidates": int(len(target_rows)),
+                "assigned": 0,
+                "unassigned_without_tree_owner": int(len(target_rows)),
+                "mean_world_distance": 0.0,
+                "maximum_world_distance": 0.0,
+            }
+        assigned_rows = []
+        assigned_groups = []
+        assigned_distances = []
+        target_trees = self.tree_instance_id[target_rows].long()
+        for tree_id in torch.unique(target_trees).tolist():
+            if int(tree_id) < 0:
+                continue
+            local_targets = target_rows[target_trees == int(tree_id)]
+            local_owners = torch.nonzero(
+                owners & (self.tree_instance_id == int(tree_id)),
+                as_tuple=False,
+            ).flatten()
+            if not len(local_owners):
+                continue
+            for begin in range(0, len(local_targets), int(query_batch_size)):
+                batch = local_targets[begin : begin + int(query_batch_size)]
+                distance = torch.cdist(
+                    self.xyz.detach()[batch], self.xyz.detach()[local_owners]
+                )
+                nearest_distance, nearest = distance.min(dim=1)
+                owner_rows = local_owners[nearest]
+                assigned_rows.append(batch)
+                assigned_groups.append(self.replacement_group[owner_rows])
+                assigned_distances.append(nearest_distance)
+        if assigned_rows:
+            assigned_rows_tensor = torch.cat(assigned_rows)
+            assigned_groups_tensor = torch.cat(assigned_groups)
+            distances = torch.cat(assigned_distances)
+            self.replacement_group[assigned_rows_tensor] = (
+                assigned_groups_tensor
+            )
+            self._replacement_pair_cache = None
+            assigned_count = int(len(assigned_rows_tensor))
+            mean_distance = float(distances.mean())
+            maximum_distance = float(distances.max())
+        else:
+            assigned_count = 0
+            mean_distance = 0.0
+            maximum_distance = 0.0
+        return {
+            "contract": "nearest_same_tree_group_then_view_ray_overlap",
+            "candidates": int(len(target_rows)),
+            "assigned": assigned_count,
+            "unassigned_without_tree_owner": int(
+                len(target_rows) - assigned_count
+            ),
+            "mean_world_distance": mean_distance,
+            "maximum_world_distance": maximum_distance,
+        }
 
     @property
     def metadata_names(self) -> tuple[str, ...]:
@@ -1297,6 +1708,9 @@ class VolumetricFoliageModel(nn.Module):
             "initialization_center",
             "scale_ceiling",
             "replacement_group",
+            "static_detail",
+            "replacement_overlap_ema",
+            "replacement_observation_count",
             "evidence_primitive_id",
         )
 
@@ -1346,6 +1760,13 @@ class VolumetricFoliageModel(nn.Module):
                 clone.fill_(LAYER_DYNAMIC_LEAF)
             elif name == "scale_ceiling":
                 clone *= float(scale_factor)
+            elif name == "static_detail":
+                clone.fill_(False)
+            elif name in {
+                "replacement_overlap_ema",
+                "replacement_observation_count",
+            }:
+                clone.zero_()
             elif name == "evidence_primitive_id":
                 # Ray/depth intervals describe the canonical evidence cell.
                 # A sequence-conditioned residual must not claim that same
@@ -1355,6 +1776,183 @@ class VolumetricFoliageModel(nn.Module):
         self._replace(**parameter_values)
         self._replace_buffers(**metadata)
         return int(indices.numel())
+
+    @torch.no_grad()
+    def append_static_ray_births(
+        self,
+        centers: torch.Tensor,
+        *,
+        colors: torch.Tensor | None = None,
+        support_camera_ids: torch.Tensor | None = None,
+        support_sequence_count: torch.Tensor | None = None,
+        initial_scale: float = 0.04,
+        initial_opacity: float = 0.02,
+    ) -> dict[str, torch.Tensor | int]:
+        """Append cross-sequence uncovered-hit consensus as static leaves."""
+        centers = torch.as_tensor(
+            centers, device=self.xyz.device, dtype=self.xyz.dtype
+        ).reshape(-1, 3)
+        if not len(centers):
+            return {
+                "appended": 0,
+                "_new_to_old": torch.arange(
+                    len(self), device=self.xyz.device
+                ),
+                "_new_start": len(self),
+            }
+        if not len(self):
+            raise RuntimeError("Static ray births require a foliage scaffold")
+        if initial_scale <= 0 or not 0 < initial_opacity < 1:
+            raise ValueError("Static ray birth scale/opacity is invalid")
+        if colors is not None:
+            colors = torch.as_tensor(
+                colors, device=self.xyz.device, dtype=self.xyz.dtype
+            ).reshape(-1, 3)
+            if len(colors) != len(centers):
+                raise ValueError("Static ray-birth colors must align with centers")
+        if support_camera_ids is not None:
+            support_camera_ids = torch.as_tensor(
+                support_camera_ids,
+                device=self.xyz.device,
+                dtype=torch.int32,
+            ).reshape(len(centers), -1)
+        if support_sequence_count is not None:
+            support_sequence_count = torch.as_tensor(
+                support_sequence_count,
+                device=self.xyz.device,
+                dtype=torch.int16,
+            ).reshape(-1)
+            if len(support_sequence_count) != len(centers):
+                raise ValueError(
+                    "Static ray-birth sequence support must align with centers"
+                )
+        reference_pool = torch.nonzero(
+            ~self.dynamic_leaf_mask, as_tuple=False
+        ).flatten()
+        best_distance = torch.full(
+            (len(centers),), float("inf"), device=self.xyz.device
+        )
+        parent = torch.zeros(
+            len(centers), dtype=torch.long, device=self.xyz.device
+        )
+        for begin in range(0, len(reference_pool), 65_536):
+            rows = reference_pool[begin : begin + 65_536]
+            distance = torch.cdist(centers, self.xyz.detach()[rows])
+            local_distance, local_index = distance.min(dim=1)
+            better = local_distance < best_distance
+            best_distance[better] = local_distance[better]
+            parent[better] = rows[local_index[better]]
+        old_count = len(self)
+        parameter_values = {}
+        for name in (
+            "xyz",
+            "log_scales",
+            "quaternions",
+            "opacity_logits",
+            "features",
+            "deformation_basis",
+            "dynamic_feature_basis",
+            "dynamic_opacity_basis",
+        ):
+            value = getattr(self, name).detach()
+            child = value[parent].clone()
+            if name == "xyz":
+                child = centers.clone()
+            elif name == "log_scales":
+                child.fill_(math.log(float(initial_scale)))
+            elif name == "opacity_logits":
+                child.fill_(torch.logit(value.new_tensor(initial_opacity)))
+            elif name == "features":
+                child[:, 1:] = 0
+                if colors is not None:
+                    valid_color = torch.isfinite(colors).all(dim=1)
+                    child[valid_color, 0] = (
+                        colors[valid_color].clamp(0.0, 1.0) - 0.5
+                    ) / 0.28209479177387814
+            elif name in {
+                "deformation_basis",
+                "dynamic_feature_basis",
+                "dynamic_opacity_basis",
+            }:
+                child.zero_()
+            parameter_values[name] = torch.cat([value, child], dim=0)
+        metadata = {}
+        for name in self.metadata_names:
+            value = getattr(self, name)
+            child = value[parent].clone()
+            if name == "layer_role":
+                child.fill_(LAYER_CANONICAL_CROWN)
+            elif name == "static_detail":
+                child.fill_(True)
+            elif name in {
+                "replacement_group",
+                "track_id",
+                "evidence_primitive_id",
+            }:
+                child.fill_(-1)
+            elif name == "initialization_source":
+                child.fill_(6)
+            elif name == "initialization_center":
+                child = centers.clone()
+            elif name == "scale_ceiling":
+                child.fill_(float(initial_scale) * 2.0)
+            elif name == "position_covariance":
+                child = torch.eye(
+                    3, device=self.xyz.device, dtype=self.xyz.dtype
+                )[None].repeat(len(centers), 1, 1)
+                child *= float(initial_scale) ** 2
+            elif name == "support_view_count":
+                if support_camera_ids is None:
+                    child.fill_(2)
+                else:
+                    child.copy_((support_camera_ids >= 0).sum(dim=1))
+            elif name == "support_sequence_count":
+                if support_sequence_count is None:
+                    child.fill_(2)
+                else:
+                    child.copy_(support_sequence_count)
+            elif name in {
+                "split_generation",
+                "free_space_violation_count",
+                "unknown_view_count",
+                "replacement_observation_count",
+            }:
+                child.zero_()
+            elif name in {
+                "track_linearity",
+                "static_skeleton_confidence",
+                "reprojection_error",
+                "ray_depth_nll",
+                "replacement_overlap_ema",
+            }:
+                child.zero_()
+            elif name == "support_camera_ids":
+                child.fill_(-1)
+                if support_camera_ids is not None:
+                    width = min(child.shape[1], support_camera_ids.shape[1])
+                    child[:, :width] = support_camera_ids[:, :width]
+            elif name == "observation_camera_ids":
+                child.fill_(-1)
+            elif name in {"observation_uv", "observation_depth"}:
+                child.fill_(float("nan"))
+            metadata[name] = torch.cat([value, child], dim=0)
+        new_to_old = torch.cat(
+            [
+                torch.arange(old_count, device=self.xyz.device),
+                parent,
+            ]
+        )
+        self._replace(**parameter_values)
+        self._replace_buffers(**metadata)
+        association = self.associate_static_detail_replacement_groups(
+            torch.arange(old_count, len(self), device=self.xyz.device)
+        )
+        return {
+            "appended": int(len(centers)),
+            "replacement_group_association": association,
+            "_new_to_old": new_to_old,
+            "_new_start": old_count,
+        }
 
     @torch.no_grad()
     def split(
@@ -1755,6 +2353,7 @@ class VolumetricFoliageModel(nn.Module):
             "support_sequence_count",
             "free_space_violation_count",
             "unknown_view_count",
+            "replacement_observation_count",
         ):
             value = metadata[name][child_start:]
             metadata[name][child_start:] = torch.div(
@@ -1933,6 +2532,11 @@ class VolumetricFoliageModel(nn.Module):
             "replacement_group": torch.full(
                 (count,), -1, dtype=torch.int64
             ),
+            "static_detail": torch.zeros(count, dtype=torch.bool),
+            "replacement_overlap_ema": torch.zeros(count),
+            "replacement_observation_count": torch.zeros(
+                count, dtype=torch.int16
+            ),
             "evidence_primitive_id": torch.full(
                 (count,), -1, dtype=torch.int64
             ),
@@ -1964,6 +2568,7 @@ def render_hybrid(
     include_dynamic: bool = False,
     volume_means_override: torch.Tensor | None = None,
     volume_opacity_scale: float | torch.Tensor = 1.0,
+    volume_role_mask: torch.Tensor | None = None,
     volume_gate: torch.Tensor | None = None,
     volume_gradient_gate: torch.Tensor | None = None,
     volume_geometry_gradient_gate: torch.Tensor | None = None,
@@ -2148,6 +2753,19 @@ def render_hybrid(
         dtype=torch.bool,
         device=volume_opacities.device,
     )
+    if volume_role_mask is not None:
+        volume_role_mask = torch.as_tensor(
+            volume_role_mask,
+            device=volume_opacities.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if volume_role_mask.shape != (len(volume_opacities),):
+            raise ValueError("volume_role_mask must match foliage rows")
+        volume_opacities = volume_opacities * volume_role_mask.to(
+            volume_opacities.dtype
+        )
+        if compact_zero_volume:
+            volume_active &= volume_role_mask
     if compact_zero_volume and isinstance(
         volume_opacity_scale, (int, float)
     ) and float(volume_opacity_scale) == 0.0:
@@ -2187,12 +2805,19 @@ def render_hybrid(
     volume_view_vectors = (
         volume_means - camera.camera_center.reshape(1, 3)
     )
-    if include_dynamic and volume_gate is not None and len(volume_opacities):
-        dynamic = foliage.dynamic_leaf_mask
-        canonical = foliage.canonical_crown_mask
+    replacement_per_row_full = volume_opacities.new_zeros(
+        len(volume_opacities)
+    )
+    replacement_detail = foliage.detail_leaf_mask
+    replacement_envelope = foliage.persistent_envelope_mask
+    replacement_active = (
+        bool(foliage.static_leaf_mask.any())
+        or (include_dynamic and volume_gate is not None)
+    )
+    if replacement_active and len(volume_opacities):
         groups = foliage.replacement_group
-        valid_dynamic = dynamic & (groups >= 0)
-        if bool(valid_dynamic.any()) and bool(canonical.any()):
+        valid_detail = replacement_detail & (groups >= 0)
+        if bool(valid_detail.any()) and bool(replacement_envelope.any()):
             # Projected optical mass is needed only for persistent canonical
             # rows and dynamic rows visible in the current camera.  Computing
             # quaternion matrices for every sequence-local leaf (and doing it
@@ -2201,8 +2826,15 @@ def render_hybrid(
             # active render.  Build the exact same cross-section once on the
             # sparse ownership set and share it between both consumers.
             optical_rows = (
-                (canonical & (groups >= 0))
-                | (valid_dynamic & (volume_gate > 0))
+                (replacement_envelope & (groups >= 0))
+                | (
+                    valid_detail
+                    & (
+                        torch.ones_like(valid_detail)
+                        if volume_gate is None
+                        else volume_gate > 0
+                    )
+                )
             )
             optical_indices = torch.nonzero(
                 optical_rows, as_tuple=False
@@ -2246,16 +2878,17 @@ def render_hybrid(
                     * volume_scales[optical_indices].square()
                 ).sum(dim=1).clamp_min(1.0e-12)
             )
-            volume_opacities = conserve_local_temporal_fallback_mass(
-                foliage.layer_role,
-                groups,
-                volume_opacities,
-                volume_scales,
-                volume_gate,
-                rotations=volume_rotations,
-                view_vectors=volume_view_vectors,
-                cross_section=optical_cross_section,
-            )
+            if include_dynamic and volume_gate is not None:
+                volume_opacities = conserve_local_temporal_fallback_mass(
+                    foliage.layer_role,
+                    groups,
+                    volume_opacities,
+                    volume_scales,
+                    volume_gate,
+                    rotations=volume_rotations,
+                    view_vectors=volume_view_vectors,
+                    cross_section=optical_cross_section,
+                )
             if compact_zero_volume:
                 volume_active &= volume_opacities.reshape(-1) > 0
             # Use a split-invariant local optical-mass ratio. A single
@@ -2300,7 +2933,11 @@ def render_hybrid(
                     focal_y=float(camera.focal_y),
                     cross_section=optical_cross_section,
                     depth_radius=optical_depth_radius,
+                    canonical_mask=replacement_envelope,
+                    detail_mask=replacement_detail,
+                    pair_indices=foliage.replacement_pair_indices(),
                 ).detach()
+                replacement_per_row_full = replacement_per_row
                 replacement = None
             elif optical_replacement_policy == "group_projected":
                 replacement = local_optical_mass_replacement(
@@ -2311,6 +2948,8 @@ def render_hybrid(
                     rotations=volume_rotations,
                     view_vectors=volume_view_vectors,
                     cross_section=optical_cross_section,
+                    canonical_mask=replacement_envelope,
+                    detail_mask=replacement_detail,
                 ).detach()
                 replacement_per_row = None
             else:
@@ -2329,7 +2968,11 @@ def render_hybrid(
                 if replacement is not None
                 else int(groups.max().item()) + 1
             )
-            valid_canonical = canonical & (groups >= 0) & (groups < group_count)
+            valid_canonical = (
+                replacement_envelope
+                & (groups >= 0)
+                & (groups < group_count)
+            )
             volume_opacities = volume_opacities.clone()
             if replacement_per_row is not None:
                 volume_opacities[valid_canonical] *= (
@@ -2339,6 +2982,9 @@ def render_hybrid(
                 volume_opacities[valid_canonical] *= (
                     1.0 - replacement[groups[valid_canonical]]
                 )
+                replacement_per_row_full[valid_canonical] = replacement[
+                    groups[valid_canonical]
+                ]
     active_volume_indices = torch.nonzero(
         volume_active, as_tuple=False
     ).flatten()
@@ -2487,4 +3133,5 @@ def render_hybrid(
         volume_depth=volume_depth,
         surface_means2d=surface_means2D,
         volume_means2d=volume_means2D,
+        volume_replacement=replacement_per_row_full,
     )

@@ -15,6 +15,7 @@ from outdoor.evidence_store import artifact_path, load_evidence_store
 from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION
 from outdoor.mast3r_track_graph import TRACK_GRAPH_VERSION
 from outdoor.role_aware_initialization import (
+    SINGLE_SEQUENCE_POINTMAP_PRECISION,
     _load_mast3r_pointmap_geometry,
     _native_pointmap_shape,
 )
@@ -302,6 +303,7 @@ class FoliageRayEvidence:
             sorted=True,
         )
         self.camera_rows = {}
+        self.camera_hit_rows = {}
         self.camera_samplers = {}
         # Group the table once. Scanning all N rows separately for every
         # camera is O(N*C) (about 1.6 billion comparisons for Cambridge v64)
@@ -336,6 +338,9 @@ class FoliageRayEvidence:
             rows = grouped_rows[offset : offset + int(camera_count)]
             offset += int(camera_count)
             self.camera_rows[int(camera_id)] = rows
+            self.camera_hit_rows[int(camera_id)] = rows[
+                self.observation_type[rows] > 0
+            ]
             self.camera_samplers[int(camera_id)] = EvidenceEpochSampler(
                 len(rows), seed=7_919 + int(camera_id) * 104_729
             )
@@ -377,6 +382,146 @@ class FoliageRayEvidence:
         self.ownerless_missing_supported_hit_rows = 0
         self.verified_ownerless_hit_rows = 0
         self.excluded_ownerless_hit_rows = 0
+        self._latest_uncovered_hit_proposals = None
+
+    @torch.no_grad()
+    def sample_hit_depth_posterior(
+        self,
+        camera_id: int,
+        render_pixels: torch.Tensor,
+        *,
+        render_width: int,
+        render_height: int,
+        camera_z_depth: torch.Tensor,
+        depth_tolerance: torch.Tensor,
+        maximum_source_pixel_distance: float = 12.0,
+        nearest_candidates: int = 8,
+    ) -> dict[str, torch.Tensor]:
+        """Query immutable hit intervals at current candidate projections.
+
+        The persisted observation table is deliberately independent of the
+        live Gaussian topology.  This lookup therefore answers the question
+        needed after a split: does a *real calibrated ray near the child's
+        current image projection* contain that child in its hit interval?
+        It does not consume the epoch sampler and cannot promote ownership.
+
+        Ray pixels are stored in their native source raster while topology
+        adaptation may run at a resized training resolution.  The query is
+        converted back to the declared source raster before the spatial and
+        camera-z interval tests.  A small K-nearest set is considered so the
+        closest image-space ray cannot hide another nearby layer whose depth
+        interval actually contains the child.
+        """
+        render_pixels = torch.as_tensor(render_pixels)
+        device = render_pixels.device
+        dtype = render_pixels.dtype
+        query_count = int(len(render_pixels))
+        empty_bool = torch.zeros(query_count, dtype=torch.bool, device=device)
+        empty_float = torch.full(
+            (query_count,), float("nan"), dtype=dtype, device=device
+        )
+        result = {
+            "spatial_candidate": empty_bool.clone(),
+            "depth_consistent": empty_bool.clone(),
+            "hit_start_depth": empty_float.clone(),
+            "hit_end_depth": empty_float.clone(),
+            "confidence": empty_float.clone(),
+            "source_pixel_distance": empty_float.clone(),
+        }
+        if not query_count:
+            return result
+        rows = self.camera_hit_rows.get(int(camera_id))
+        if rows is None or not len(rows):
+            return result
+        if int(render_width) <= 0 or int(render_height) <= 0:
+            raise ValueError("Render raster dimensions must be positive")
+        source_sizes = self.source_image_sizes[rows]
+        source_size = source_sizes[0]
+        if not bool((source_sizes == source_size).all()):
+            raise RuntimeError(
+                "One foliage-ray camera contains multiple source rasters"
+            )
+        source_width = float(source_size[0])
+        source_height = float(source_size[1])
+        query_source = render_pixels.to(dtype=dtype).clone()
+        query_source[:, 0] *= source_width / float(render_width)
+        query_source[:, 1] *= source_height / float(render_height)
+        evidence_pixels = self.pixels[rows].to(device=device, dtype=dtype)
+        hit_start = self.hit_start[rows].to(device=device, dtype=dtype)
+        hit_end = self.hit_end[rows].to(device=device, dtype=dtype)
+        confidence = self.confidence[rows].to(device=device, dtype=dtype)
+        camera_z_depth = torch.as_tensor(
+            camera_z_depth, device=device, dtype=dtype
+        ).reshape(-1)
+        depth_tolerance = torch.as_tensor(
+            depth_tolerance, device=device, dtype=dtype
+        ).reshape(-1)
+        if len(camera_z_depth) != query_count or len(depth_tolerance) != query_count:
+            raise ValueError("Ray-posterior query tensors must share one row count")
+        k = min(max(int(nearest_candidates), 1), int(len(rows)))
+        maximum_distance = float(maximum_source_pixel_distance)
+        # Bound the temporary QxN distance matrix.  At Cambridge scale each
+        # camera has roughly 3--6k hit rays, so 1,024 queries stay comfortably
+        # below the memory of one renderer frame while avoiding Python
+        # per-candidate searches.
+        for begin in range(0, query_count, 1024):
+            end = min(begin + 1024, query_count)
+            distances = torch.cdist(
+                query_source[begin:end], evidence_pixels
+            )
+            nearest_distance, nearest_index = torch.topk(
+                distances, k, dim=1, largest=False, sorted=True
+            )
+            spatial = nearest_distance <= maximum_distance
+            local_depth = camera_z_depth[begin:end, None]
+            local_tolerance = depth_tolerance[begin:end, None]
+            local_start = hit_start[nearest_index]
+            local_end = hit_end[nearest_index]
+            depth_ok = (
+                torch.isfinite(local_depth)
+                & (local_depth > 0.05)
+                & (local_depth >= local_start - local_tolerance)
+                & (local_depth <= local_end + local_tolerance)
+            )
+            accepted = spatial & depth_ok
+            result["spatial_candidate"][begin:end] = spatial.any(dim=1)
+            accepted_any = accepted.any(dim=1)
+            result["depth_consistent"][begin:end] = accepted_any
+            # Invalid candidates receive +inf so argmin selects the nearest
+            # depth-consistent observation rather than merely the nearest ray.
+            selected_slot = torch.where(
+                accepted,
+                nearest_distance,
+                nearest_distance.new_full(nearest_distance.shape, float("inf")),
+            ).argmin(dim=1)
+            selected_row = nearest_index.gather(
+                1, selected_slot[:, None]
+            )[:, 0]
+            local_rows = torch.arange(end - begin, device=device)
+            selected_distance = nearest_distance[
+                local_rows, selected_slot
+            ]
+            for name, values in (
+                ("hit_start_depth", hit_start),
+                ("hit_end_depth", hit_end),
+                ("confidence", confidence),
+            ):
+                selected = values[selected_row]
+                result[name][begin:end] = torch.where(
+                    accepted_any, selected, result[name][begin:end]
+                )
+            result["source_pixel_distance"][begin:end] = torch.where(
+                accepted_any,
+                selected_distance,
+                result["source_pixel_distance"][begin:end],
+            )
+        return result
+
+    def pop_uncovered_hit_proposals(self) -> dict | None:
+        """Return and clear static birth proposals from the latest ray batch."""
+        proposals = self._latest_uncovered_hit_proposals
+        self._latest_uncovered_hit_proposals = None
+        return proposals
 
     def audit(self) -> dict:
         kind = self.observation_type
@@ -814,6 +959,8 @@ class FoliageRayEvidence:
         maximum_rays: int = 256,
         maximum_candidates_per_ray: int = 96,
         sample_update: int = 0,
+        canonical_candidate_mask: torch.Tensor | None = None,
+        canonical_hit_candidate_mask: torch.Tensor | None = None,
     ):
         """Evaluate all nearby canonical Gaussians on each measured ray.
 
@@ -831,16 +978,23 @@ class FoliageRayEvidence:
             tau_before - log(1 - exp(-tau_inside)),
 
         while a confirmed-free observation penalizes only ``tau_before``.
-        Cross-sequence seed-bound hits use canonical mass. Dense
-        observation-space hits use the sum of (a) canonical lineages that
-        were independently established before this observation and (b)
-        sequence-local residual leaves whose immutable support table names
-        the exact scheduled camera. The dense ray can optimize an existing
-        canonical lineage, but can never promote a new one or alter its
-        support metadata. Confirmed-free rays constrain both branches visible
-        in that camera.
+        ``canonical_candidate_mask`` grants globally valid free-space
+        participation. ``canonical_hit_candidate_mask`` is the narrower
+        positive-hit permission; when omitted it defaults to the former for
+        exact backwards compatibility. Cross-sequence seed-bound hits use
+        canonical mass. Dense observation-space hits use the sum of (a)
+        canonical lineages that were independently established before this
+        observation, (b) sequence-local residual leaves whose immutable
+        support table names the exact scheduled camera, and (c) fused static
+        detail whose cross-sequence consensus table names that camera.  The
+        last route preserves exact ray ownership when static deployment
+        removes the dynamic row. The dense ray can optimize an existing
+        verified lineage, but can never promote a new one or alter its
+        support metadata. Confirmed-free rays constrain every static branch
+        visible in that camera.
         """
         self.interval_factor_calls += 1
+        self._latest_uncovered_hit_proposals = None
         zero = foliage.xyz.new_zeros(())
         selected = self._next_camera_rows(
             int(view.colmap_id), int(maximum_rays)
@@ -849,6 +1003,10 @@ class FoliageRayEvidence:
             return zero, {
                 "rays": 0,
                 "candidate_evaluations": 0,
+                "canonical_candidate_evaluations": 0,
+                "canonical_hit_candidate_evaluations": 0,
+                "exact_dynamic_candidate_evaluations": 0,
+                "exact_static_candidate_evaluations": 0,
                 "confirmed_free_rays": 0,
                 "hit_rays": 0,
                 "unknown_rays": 0,
@@ -912,6 +1070,42 @@ class FoliageRayEvidence:
             )
 
         dynamic_mask = foliage.dynamic_leaf_mask
+        if canonical_candidate_mask is None:
+            canonical_candidate_mask = torch.ones_like(
+                dynamic_mask, dtype=torch.bool
+            )
+        else:
+            canonical_candidate_mask = torch.as_tensor(
+                canonical_candidate_mask,
+                device=device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            if len(canonical_candidate_mask) != len(foliage):
+                raise ValueError(
+                    "canonical candidate mask must align with foliage"
+                )
+        if canonical_hit_candidate_mask is None:
+            canonical_hit_candidate_mask = canonical_candidate_mask
+        else:
+            canonical_hit_candidate_mask = torch.as_tensor(
+                canonical_hit_candidate_mask,
+                device=device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            if len(canonical_hit_candidate_mask) != len(foliage):
+                raise ValueError(
+                    "canonical hit candidate mask must align with foliage"
+                )
+            if bool(
+                (
+                    canonical_hit_candidate_mask
+                    & ~canonical_candidate_mask
+                ).any()
+            ):
+                raise ValueError(
+                    "canonical hit candidates must be a subset of free-space "
+                    "candidates"
+                )
         support_camera_ids = foliage.support_camera_ids
         if support_camera_ids.ndim != 2 or len(support_camera_ids) != len(
             foliage
@@ -922,26 +1116,42 @@ class FoliageRayEvidence:
             )
         # Cross-sequence seed-bound rays supervise the canonical crown.  A
         # dense observation-space ray instead owns the exact sequence-local
-        # birth created from this calibrated camera.  Include only those
-        # dynamic rows whose immutable support table names the scheduled
-        # camera; neighbouring-frame fallback is rendering interpolation,
+        # birth created from this calibrated camera. Static deployment turns
+        # independently confirmed dynamic rows into unconditional detail but
+        # preserves their contributing-camera table. That table remains
+        # positive-ray ownership; neighbouring-frame rendering fallback is
         # not ray-posterior evidence.
         exact_dynamic = dynamic_mask & (
             support_camera_ids == int(view.colmap_id)
         ).any(dim=1)
+        static_detail_mask = getattr(
+            foliage,
+            "static_leaf_mask",
+            torch.zeros_like(dynamic_mask),
+        )
+        exact_static = static_detail_mask & (
+            support_camera_ids == int(view.colmap_id)
+        ).any(dim=1) & canonical_candidate_mask
         verified_canonical = (
             ~dynamic_mask
+            & ~exact_static
+            & canonical_hit_candidate_mask
             & (
                 (foliage.support_sequence_count >= 2)
                 | (foliage.split_generation > 0)
             )
         )
         candidate_pool = torch.nonzero(
-            (~dynamic_mask) | exact_dynamic, as_tuple=False
+            ((~dynamic_mask) & canonical_candidate_mask)
+            | exact_dynamic
+            | exact_static,
+            as_tuple=False,
         ).flatten()
         candidate_evaluations = 0
         canonical_candidate_evaluations = 0
+        canonical_hit_candidate_evaluations = 0
         exact_dynamic_candidate_evaluations = 0
+        exact_static_candidate_evaluations = 0
         rays_with_candidates = 0
         canonical_free_tau_chunks = []
         canonical_hit_tau_chunks = []
@@ -954,6 +1164,17 @@ class FoliageRayEvidence:
         dynamic_hit_tau_chunks = []
         dynamic_hit_optical_tau_chunks = []
         dynamic_behind_tau_chunks = []
+        static_hit_tau_chunks = []
+        static_hit_optical_tau_chunks = []
+        static_behind_tau_chunks = []
+        observation_kind = self.observation_type[selected].to(device=device)
+        split_candidate_permissions = bool(
+            (
+                canonical_candidate_mask
+                & ~canonical_hit_candidate_mask
+                & ~dynamic_mask
+            ).any()
+        )
         # Candidate lookup is intentionally detached.  It is a sparse
         # acceleration structure, not part of the objective; the selected
         # Gaussian parameters below remain fully differentiable.
@@ -970,6 +1191,12 @@ class FoliageRayEvidence:
                     .clamp_min(1e-4)
                     .square()
                 )
+                hit_pool_local = torch.nonzero(
+                    exact_dynamic[candidate_pool]
+                    | exact_static[candidate_pool]
+                    | canonical_hit_candidate_mask[candidate_pool],
+                    as_tuple=False,
+                ).flatten()
         for begin in range(0, len(selected), lookup_chunk):
             end = min(begin + lookup_chunk, len(selected))
             ray_count = end - begin
@@ -988,6 +1215,9 @@ class FoliageRayEvidence:
                 dynamic_hit_tau_chunks.append(empty)
                 dynamic_hit_optical_tau_chunks.append(empty)
                 dynamic_behind_tau_chunks.append(empty)
+                static_hit_tau_chunks.append(empty)
+                static_hit_optical_tau_chunks.append(empty)
+                static_behind_tau_chunks.append(empty)
                 continue
             with torch.no_grad():
                 ray_direction = direction_world[begin:end]
@@ -1019,9 +1249,53 @@ class FoliageRayEvidence:
                 local_ray, slot = torch.nonzero(
                     supported, as_tuple=True
                 )
-                candidate_rows = candidate_pool[
-                    local_rows[local_ray, slot]
-                ]
+                selected_pool_rows = local_rows[local_ray, slot]
+                # A global free-space pool can be much denser than the
+                # canonical-support positive-hit pool.  Reserve an
+                # independent top-k for the latter on hit rays, then union
+                # both sets. Otherwise nearby non-owned leaves could consume
+                # the whole lookup budget and silently erase the very hit
+                # permission this API is meant to preserve.
+                if (
+                    split_candidate_permissions
+                    and len(hit_pool_local)
+                    and bool((observation_kind[begin:end] > 0).any())
+                ):
+                    hit_limit = min(
+                        max(int(maximum_candidates_per_ray), 1),
+                        len(hit_pool_local),
+                    )
+                    hit_score, hit_local_rows = torch.topk(
+                        lookup_score[:, hit_pool_local],
+                        hit_limit,
+                        dim=1,
+                        largest=False,
+                        sorted=False,
+                    )
+                    hit_supported = (
+                        torch.isfinite(hit_score)
+                        & (hit_score <= 36.0)
+                        & (observation_kind[begin:end] > 0)[:, None]
+                    )
+                    hit_local_ray, hit_slot = torch.nonzero(
+                        hit_supported, as_tuple=True
+                    )
+                    hit_selected_pool_rows = hit_pool_local[
+                        hit_local_rows[hit_local_ray, hit_slot]
+                    ]
+                    pool_count = int(len(candidate_pool))
+                    encoded = torch.cat(
+                        [
+                            local_ray * pool_count + selected_pool_rows,
+                            hit_local_ray * pool_count
+                            + hit_selected_pool_rows,
+                        ]
+                    ).unique()
+                    local_ray = torch.div(
+                        encoded, pool_count, rounding_mode="floor"
+                    )
+                    selected_pool_rows = encoded.remainder(pool_count)
+                candidate_rows = candidate_pool[selected_pool_rows]
             if not len(candidate_rows):
                 empty = torch.zeros(
                     ray_count, device=device, dtype=dtype
@@ -1037,14 +1311,27 @@ class FoliageRayEvidence:
                 dynamic_hit_tau_chunks.append(empty)
                 dynamic_hit_optical_tau_chunks.append(empty)
                 dynamic_behind_tau_chunks.append(empty)
+                static_hit_tau_chunks.append(empty)
+                static_hit_optical_tau_chunks.append(empty)
+                static_behind_tau_chunks.append(empty)
                 continue
             candidate_evaluations += int(len(candidate_rows))
             candidate_dynamic = dynamic_mask[candidate_rows]
+            candidate_static = exact_static[candidate_rows]
             exact_dynamic_candidate_evaluations += int(
                 candidate_dynamic.sum()
             )
+            exact_static_candidate_evaluations += int(
+                candidate_static.sum()
+            )
             canonical_candidate_evaluations += int(
                 (~candidate_dynamic).sum()
+            )
+            canonical_hit_candidate_evaluations += int(
+                (
+                    (~candidate_dynamic)
+                    & canonical_hit_candidate_mask[candidate_rows]
+                ).sum()
             )
             rays_with_candidates += int(torch.unique(local_ray).numel())
             direction = direction_world[begin:end][local_ray]
@@ -1147,10 +1434,15 @@ class FoliageRayEvidence:
                 neginf=0.0,
             ).clamp(0, 1)
             canonical_weight = (~candidate_dynamic).to(local_tau)
+            canonical_hit_weight = (
+                (~candidate_dynamic)
+                & canonical_hit_candidate_mask[candidate_rows]
+            ).to(local_tau)
             verified_canonical_weight = verified_canonical[
                 candidate_rows
             ].to(local_tau)
             dynamic_weight = candidate_dynamic.to(local_tau)
+            static_weight = candidate_static.to(local_tau)
 
             def accumulate(value, branch_weight):
                 return torch.zeros(
@@ -1163,16 +1455,18 @@ class FoliageRayEvidence:
                 accumulate(local_tau * free_fraction, canonical_weight)
             )
             canonical_hit_tau_chunks.append(
-                accumulate(local_tau * hit_fraction, canonical_weight)
+                accumulate(local_tau * hit_fraction, canonical_hit_weight)
             )
             canonical_hit_optical_tau_chunks.append(
                 accumulate(
                     local_tau_optical * hit_fraction.detach(),
-                    canonical_weight,
+                    canonical_hit_weight,
                 )
             )
             canonical_behind_tau_chunks.append(
-                accumulate(local_tau * behind_fraction, canonical_weight)
+                accumulate(
+                    local_tau * behind_fraction, canonical_hit_weight
+                )
             )
             verified_canonical_free_tau_chunks.append(
                 accumulate(
@@ -1207,6 +1501,18 @@ class FoliageRayEvidence:
             dynamic_behind_tau_chunks.append(
                 accumulate(local_tau * behind_fraction, dynamic_weight)
             )
+            static_hit_tau_chunks.append(
+                accumulate(local_tau * hit_fraction, static_weight)
+            )
+            static_hit_optical_tau_chunks.append(
+                accumulate(
+                    local_tau_optical * hit_fraction.detach(),
+                    static_weight,
+                )
+            )
+            static_behind_tau_chunks.append(
+                accumulate(local_tau * behind_fraction, static_weight)
+            )
         canonical_free_tau = torch.cat(canonical_free_tau_chunks)
         canonical_hit_tau = torch.cat(canonical_hit_tau_chunks)
         canonical_hit_optical_tau = torch.cat(
@@ -1228,7 +1534,12 @@ class FoliageRayEvidence:
             dynamic_hit_optical_tau_chunks
         )
         dynamic_behind_tau = torch.cat(dynamic_behind_tau_chunks)
-        kind = self.observation_type[selected].to(device=device)
+        static_hit_tau = torch.cat(static_hit_tau_chunks)
+        static_hit_optical_tau = torch.cat(
+            static_hit_optical_tau_chunks
+        )
+        static_behind_tau = torch.cat(static_behind_tau_chunks)
+        kind = observation_kind
         weight = self.confidence[selected].to(
             device=device, dtype=dtype
         ).clamp(0.05, 1.0)
@@ -1241,27 +1552,99 @@ class FoliageRayEvidence:
         ownerless_canonical_hit = ownerless_hit & (
             verified_canonical_hit_tau.detach() > 0
         )
-        verified_ownerless = ownerless_canonical_hit
         ownerless_dynamic_hit = ownerless_hit & (
             dynamic_hit_tau.detach() > 0
         )
+        ownerless_static_hit = ownerless_hit & (
+            static_hit_tau.detach() > 0
+        )
+        verified_ownerless = ownerless_canonical_hit | ownerless_static_hit
         ownerless_missing_dynamic_hit = (
             ownerless_hit & ~ownerless_dynamic_hit
         )
         ownerless_supported_hit = (
-            ownerless_canonical_hit | ownerless_dynamic_hit
+            ownerless_canonical_hit
+            | ownerless_dynamic_hit
+            | ownerless_static_hit
         )
         ownerless_missing_supported_hit = (
             ownerless_hit & ~ownerless_supported_hit
         )
+        if bool(ownerless_missing_supported_hit.any()):
+            proposal_rows = torch.nonzero(
+                ownerless_missing_supported_hit, as_tuple=False
+            ).flatten()
+            midpoint = 0.5 * (
+                hit_start[proposal_rows] + hit_end[proposal_rows]
+            )
+            proposal_centers = (
+                origin[None]
+                + direction_world[proposal_rows] * midpoint[:, None]
+            )
+            proposal_grid = torch.stack(
+                [
+                    2.0
+                    * (render_x[proposal_rows] + 0.5)
+                    / float(view.image_width)
+                    - 1.0,
+                    2.0
+                    * (render_y[proposal_rows] + 0.5)
+                    / float(view.image_height)
+                    - 1.0,
+                ],
+                dim=-1,
+            ).reshape(1, -1, 1, 2)
+            proposal_image = getattr(view, "original_image", None)
+            proposal_colors = None
+            if proposal_image is not None:
+                proposal_image = proposal_image.to(
+                    device=device, dtype=dtype
+                )
+                proposal_colors = F.grid_sample(
+                    proposal_image[None],
+                    proposal_grid,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False,
+                ).reshape(3, -1).T
+            self._latest_uncovered_hit_proposals = {
+                "centers": proposal_centers.detach().cpu(),
+                "confidence": weight[proposal_rows].detach().cpu(),
+                "camera_id": int(view.colmap_id),
+                # Retain the complete calibrated hit interval. Static birth
+                # consensus must intersect cross-sequence posterior segments;
+                # requiring their arbitrary midpoints to coincide rejects
+                # persistent crown volume whenever leaves move or the depth
+                # posterior is broad.
+                "origins": origin[None]
+                .expand(len(proposal_rows), -1)
+                .detach()
+                .cpu(),
+                "directions": direction_world[proposal_rows].detach().cpu(),
+                "hit_start": hit_start[proposal_rows].detach().cpu(),
+                "hit_end": hit_end[proposal_rows].detach().cpu(),
+            }
+            if proposal_colors is not None:
+                self._latest_uncovered_hit_proposals["colors"] = (
+                    proposal_colors.detach().cpu()
+                )
         ownerless_free_tau = (
-            verified_canonical_free_tau + dynamic_free_tau
+            (
+                canonical_free_tau
+                if split_candidate_permissions
+                else verified_canonical_free_tau
+            )
+            + dynamic_free_tau
         )
         ownerless_hit_tau = (
-            verified_canonical_hit_tau + dynamic_hit_tau
+            verified_canonical_hit_tau
+            + dynamic_hit_tau
+            + static_hit_tau
         )
         ownerless_behind_tau = (
-            verified_canonical_behind_tau + dynamic_behind_tau
+            verified_canonical_behind_tau
+            + dynamic_behind_tau
+            + static_behind_tau
         )
         selected_free_tau = torch.where(
             seed_bound, canonical_free_tau, ownerless_free_tau
@@ -1276,7 +1659,7 @@ class FoliageRayEvidence:
         selected_hit_optical_tau = torch.where(
             seed_bound,
             canonical_hit_optical_tau,
-            dynamic_hit_optical_tau,
+            dynamic_hit_optical_tau + static_hit_optical_tau,
         )
         selected_behind_tau = torch.where(
             seed_bound, canonical_behind_tau, ownerless_behind_tau
@@ -1391,8 +1774,14 @@ class FoliageRayEvidence:
             "canonical_candidate_evaluations": (
                 canonical_candidate_evaluations
             ),
+            "canonical_hit_candidate_evaluations": (
+                canonical_hit_candidate_evaluations
+            ),
             "exact_dynamic_candidate_evaluations": (
                 exact_dynamic_candidate_evaluations
+            ),
+            "exact_static_candidate_evaluations": (
+                exact_static_candidate_evaluations
             ),
             "rays_with_candidates": rays_with_candidates,
             "confirmed_free_rays": int(
@@ -1406,6 +1795,9 @@ class FoliageRayEvidence:
             ),
             "ownerless_dynamic_hit_rays": int(
                 ownerless_dynamic_hit.sum()
+            ),
+            "ownerless_static_hit_rays": int(
+                ownerless_static_hit.sum()
             ),
             "ownerless_missing_dynamic_hit_rays": int(
                 ownerless_missing_dynamic_hit.sum()
@@ -1446,10 +1838,14 @@ class FoliageRayEvidence:
             "behind_mass": float(behind_mass.detach()),
             "ownerless_hit_contract": (
                 "existing_cross_sequence_canonical_lineage_plus_exact_"
-                "camera_dynamic_residual__never_canonical_promotion"
+                "camera_dynamic_or_fused_static_detail__never_canonical_"
+                "promotion"
             ),
             "confirmed_free_contract": (
-                "canonical_plus_exact_camera_dynamic"
+                "global_canonical_free_plus_exact_camera_dynamic__positive_"
+                "canonical_hit_permission_is_independent"
+                if split_candidate_permissions
+                else "canonical_plus_exact_camera_dynamic"
             ),
             "depth_coordinate": "camera_z_converted_to_unit_ray_distance",
         }
@@ -1604,11 +2000,17 @@ class OutdoorGeometryEvidence:
         self._pointmap_cache: dict[
             str, tuple[np.ndarray, np.ndarray]
         ] = {}
-        self._pointmap_posterior_cache: dict[str, np.ndarray] = {}
+        self._pointmap_posterior_cache: dict[
+            str, tuple[np.ndarray, np.ndarray]
+        ] = {}
         self._pointmap_posterior_stats = {
             "factor_calls": 0,
+            "posterior_factor_calls": 0,
+            "single_sequence_fallback_factor_calls": 0,
             "pixels": 0,
             "cross_sequence_supported_pixels": 0,
+            "single_sequence_low_precision_pixels": 0,
+            "missing_posterior_fallback_pixels": 0,
             "precision_sum": 0.0,
         }
         if chart_path is not None and chart_camera_path is not None:
@@ -2163,12 +2565,17 @@ class OutdoorGeometryEvidence:
         )[:, 2].reshape(native_shape)
         confidence_np = confidence_flat.reshape(native_shape)
         posterior_record = record.get("cross_sequence_posterior")
-        precision_np = np.ones(native_shape, dtype=np.float32)
+        precision_np = np.full(
+            native_shape,
+            SINGLE_SEQUENCE_POINTMAP_PRECISION,
+            dtype=np.float32,
+        )
+        cross_sequence_supported_np = np.zeros(native_shape, dtype=bool)
         if posterior_record is not None:
-            precision_np = getattr(
+            cached_posterior = getattr(
                 self, "_pointmap_posterior_cache", {}
             ).get(stem)
-            if precision_np is None:
+            if cached_posterior is None:
                 posterior_path = Path(posterior_record["path"])
                 digest = hashlib.sha256()
                 with posterior_path.open("rb") as handle:
@@ -2192,16 +2599,35 @@ class OutdoorGeometryEvidence:
                             "Unsupported MASt3R pointmap posterior: "
                             f"{schema!r}"
                         )
-                    precision_np = posterior["precision"].astype(
-                        np.float32
-                    )
-                if tuple(precision_np.shape) != tuple(native_shape):
+                    precision_np = posterior["precision"].astype(np.float32)
+                    cross_sequence_supported_np = posterior[
+                        "cross_sequence_supported"
+                    ].astype(bool)
+                if (
+                    tuple(precision_np.shape) != tuple(native_shape)
+                    or tuple(cross_sequence_supported_np.shape)
+                    != tuple(native_shape)
+                ):
                     raise RuntimeError(
-                        "MASt3R pointmap posterior shape does not match "
-                        f"native raster: {precision_np.shape} != "
+                        "MASt3R pointmap posterior arrays do not match "
+                        "native raster: "
+                        f"precision={precision_np.shape}, support="
+                        f"{cross_sequence_supported_np.shape}, expected="
                         f"{native_shape}"
                     )
-                self._pointmap_posterior_cache[stem] = precision_np
+                precision_np = np.nan_to_num(
+                    precision_np,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).clip(0.0, 1.0)
+                cross_sequence_supported_np &= precision_np > 0
+                self._pointmap_posterior_cache[stem] = (
+                    precision_np,
+                    cross_sequence_supported_np,
+                )
+            else:
+                precision_np, cross_sequence_supported_np = cached_posterior
         valid_np = (
             np.isfinite(target_np)
             & (target_np > 0)
@@ -2231,6 +2657,11 @@ class OutdoorGeometryEvidence:
         ).to(device=device, dtype=dtype)
         valid_target = torch.from_numpy(
             np.array(valid_np, copy=True, order="C")
+        ).to(device=device)
+        cross_sequence_supported = torch.from_numpy(
+            np.array(
+                cross_sequence_supported_np, copy=True, order="C"
+            )
         ).to(device=device)
         native_rigid = F.interpolate(
             rigid.clamp(0, 1)[None, None],
@@ -2320,14 +2751,36 @@ class OutdoorGeometryEvidence:
         ].mean().clamp(0.0, 1.0)
         stats = getattr(self, "_pointmap_posterior_stats", None)
         if stats is not None:
+            for name, initial in (
+                ("factor_calls", 0),
+                ("posterior_factor_calls", 0),
+                ("single_sequence_fallback_factor_calls", 0),
+                ("pixels", 0),
+                ("cross_sequence_supported_pixels", 0),
+                ("single_sequence_low_precision_pixels", 0),
+                ("missing_posterior_fallback_pixels", 0),
+                ("precision_sum", 0.0),
+            ):
+                stats.setdefault(name, initial)
             stats["factor_calls"] += 1
+            if posterior_record is None:
+                stats["single_sequence_fallback_factor_calls"] += 1
+            else:
+                stats["posterior_factor_calls"] += 1
             stats["pixels"] += int(supervision_valid.sum())
             stats["cross_sequence_supported_pixels"] += int(
-                (
-                    supervision_valid
-                    & (precision >= 0.20)
-                ).sum()
+                (supervision_valid & cross_sequence_supported).sum()
             )
+            unsupported_pixels = int(
+                (supervision_valid & ~cross_sequence_supported).sum()
+            )
+            stats["single_sequence_low_precision_pixels"] += (
+                unsupported_pixels
+            )
+            if posterior_record is None:
+                stats["missing_posterior_fallback_pixels"] += (
+                    unsupported_pixels
+                )
             stats["precision_sum"] += float(
                 precision[supervision_valid].sum().detach()
             )
@@ -2341,11 +2794,17 @@ class OutdoorGeometryEvidence:
             "hit": float(hit_loss.detach()),
             "absolute_precision": float(absolute_precision.detach()),
             "cross_sequence_supported_pixels": int(
-                (
-                    supervision_valid
-                    & (precision >= 0.20)
-                ).sum()
+                (supervision_valid & cross_sequence_supported).sum()
             ),
+            "single_sequence_low_precision_pixels": int(
+                (supervision_valid & ~cross_sequence_supported).sum()
+            ),
+            "missing_posterior_fallback_pixels": (
+                int((supervision_valid & ~cross_sequence_supported).sum())
+                if posterior_record is None
+                else 0
+            ),
+            "posterior_available": posterior_record is not None,
         }
 
     def track_observation_factor(
@@ -2996,19 +3455,44 @@ class OutdoorGeometryEvidence:
             "source_consumption_count": dict(self.consumed),
             "source_losses_are_mutually_exclusive": True,
             "pointmap_cross_sequence_posterior": {
+                "pointmap_camera_count": len(self.pointmap_records),
                 "available_camera_count": int(
                     sum(
                         "cross_sequence_posterior" in record
                         for record in self.pointmap_records.values()
                     )
                 ),
+                "missing_camera_count": int(
+                    sum(
+                        "cross_sequence_posterior" not in record
+                        for record in self.pointmap_records.values()
+                    )
+                ),
                 "factor_calls": int(
                     pointmap_posterior.get("factor_calls", 0)
+                ),
+                "posterior_factor_calls": int(
+                    pointmap_posterior.get("posterior_factor_calls", 0)
+                ),
+                "single_sequence_fallback_factor_calls": int(
+                    pointmap_posterior.get(
+                        "single_sequence_fallback_factor_calls", 0
+                    )
                 ),
                 "pixels": posterior_pixels,
                 "supported_pixels": int(
                     pointmap_posterior.get(
                         "cross_sequence_supported_pixels", 0
+                    )
+                ),
+                "single_sequence_low_precision_pixels": int(
+                    pointmap_posterior.get(
+                        "single_sequence_low_precision_pixels", 0
+                    )
+                ),
+                "missing_posterior_fallback_pixels": int(
+                    pointmap_posterior.get(
+                        "missing_posterior_fallback_pixels", 0
                     )
                 ),
                 "mean_precision": (
@@ -3019,7 +3503,13 @@ class OutdoorGeometryEvidence:
                     if posterior_pixels
                     else 0.0
                 ),
+                "single_sequence_precision": (
+                    SINGLE_SEQUENCE_POINTMAP_PRECISION
+                ),
                 "single_sequence_is_low_precision_not_deleted": True,
+                "support_is_read_from_posterior_not_precision_threshold": (
+                    True
+                ),
             },
             "inverse_depth_is_cache_not_replacement": True,
             "chart_to_cambridge_world_scale": float(

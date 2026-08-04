@@ -9,9 +9,25 @@ from scripts.run_cambridge_hybrid_teacher import (
     PROFILES,
     _evaluation_is_current,
     _teacher_command,
+    _teacher_evaluation_mode,
     _teacher_result_is_current,
     _trainer_implementation_hashes,
 )
+
+
+def test_static_runner_evaluates_complete_canonical_map_not_empty_hybrid_branch():
+    assert _teacher_evaluation_mode(
+        training_profile="hybrid_handoff_quality",
+        reconstruction_target="static",
+    ) == "canonical"
+    assert _teacher_evaluation_mode(
+        training_profile="hybrid_rigid_stage1",
+        reconstruction_target="static",
+    ) == "rigid"
+    assert _teacher_evaluation_mode(
+        training_profile="hybrid_quality",
+        reconstruction_target="sequence_conditioned_legacy",
+    ) == "hybrid"
 
 
 def test_scene_contract_entrypoint_imports_repo_from_any_working_directory(
@@ -53,7 +69,10 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
         profile["dynamic_birth_target_source_pixels_per_basis"]
         == 192.0
     )
-    assert profile["use_temporal_dav2_witnesses"] is False
+    assert profile["use_temporal_dav2_witnesses"] is True
+    assert profile["temporal_dav2_maximum_gap"] == 12
+    assert profile["temporal_dav2_maximum_rays_per_view"] == 2_048
+    assert profile["temporal_dav2_maximum_births_per_view"] == 2_048
     assert profile["use_rigid_depth_calibrated_foliage"] is True
     assert profile["rigid_calibration_resolution_scale"] == 0.125
     assert profile["foliage_voxel_size"] == 0.12
@@ -69,7 +88,7 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
     assert profile["dav2_rigid_selected_views"] == 512
     assert profile["dav2_rigid_seeds_per_view"] == 384
     assert profile["dav2_rigid_cross_sequence_radius"] == 0.25
-    assert profile["training_profile"] == "hybrid_handoff_quality"
+    assert profile["training_profile"] == "static_handoff_quality"
     assert profile["rigid_pretrain_iterations"] == 32_000
     assert profile["rigid_pretrain_surface_gaussians"] == 800_000
     assert profile["rigid_pretrain_surface_growth_per_event"] == 5_000
@@ -93,6 +112,7 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
         / "scripts/run_cambridge_hybrid_teacher.py"
     ).read_text(encoding="utf-8")
     assert "initialization_temporal_dav2" in runner
+    assert "initialization_rigid_depth_calibrated_temporal_dav2" in runner
     assert "augment_temporal_dav2_foliage.py" in runner
     assert "TEMPORAL_DAV2_AUGMENTATION_VERSION" in runner
     assert "rebuild_foliage_with_rigid_depth.py" in runner
@@ -114,6 +134,10 @@ def test_fast_profile_shortens_training_without_halving_foliage_evidence():
         == quality["maximum_dense_rays_total"]
         == 1_572_864
     )
+    assert fast["training_profile"] == "static_handoff_fast"
+    assert fast["use_temporal_dav2_witnesses"] is True
+    assert fast["temporal_dav2_maximum_rays_per_view"] == 1_024
+    assert fast["temporal_dav2_maximum_births_per_view"] == 1_024
     assert (
         fast["foliage_voxel_size"]
         == quality["foliage_voxel_size"]
@@ -148,6 +172,7 @@ def test_staged_teacher_command_closes_scale_and_rigid_lr_contract(tmp_path):
         == "24"
     )
     assert command[command.index("--position_lr_init") + 1] == "1.6e-5"
+    assert command[command.index("--reconstruction-target") + 1] == "static"
     assert (
         command[command.index("--geometry-gradient-ratio") + 1]
         == "0.25"

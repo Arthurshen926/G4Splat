@@ -12,6 +12,7 @@ from outdoor.chart_surface_model import (
 from outdoor.evidence_store import ROLE_CANOPY, ROLE_RIGID
 from outdoor.role_aware_initialization import (
     _align_tracks_to_local_hull_instances,
+    _apply_missing_pointmap_posterior_fallback,
     _balanced_single_camera_sample_cap,
     _balanced_pointmap_seed_cap,
     _chart_hypothesis_authority,
@@ -42,7 +43,46 @@ from outdoor.role_aware_initialization import (
 from scripts.initialize_unified_outdoor_scene import (
     _validated_reused_foliage,
 )
+from scripts.augment_temporal_dav2_foliage import _recover_alignments
 from scene.gaussian_model import GaussianModel
+
+
+def test_temporal_dav2_alignment_recovers_half_open_pixel_centres(tmp_path):
+    rows = np.asarray([3, 9, 17, 28, 41, 56, 73, 91, 108, 126])
+    columns = np.asarray([5, 19, 34, 52, 77, 103, 131, 164, 199, 231])
+    grid_y, grid_x = np.indices((135, 240))
+    ordinal = (1.0 + 0.002 * grid_x + 0.003 * grid_y).astype(np.float32)
+    depth_path = tmp_path / "frame.npy"
+    np.save(depth_path, ordinal)
+    alpha, beta = 0.025, 0.075
+    depth = 1.0 / (alpha + beta / ordinal[rows, columns])
+    payload = {
+        "initialization_source": torch.full((len(rows),), 3, dtype=torch.int8),
+        "observation_camera_ids": torch.ones((len(rows), 1), dtype=torch.int32),
+        "observation_uv": torch.from_numpy(
+            np.column_stack(
+                [
+                    (columns.astype(np.float32) + 0.5) / 240.0,
+                    (rows.astype(np.float32) + 0.5) / 135.0,
+                ]
+            )[:, None]
+        ),
+        "observation_depth": torch.from_numpy(depth.astype(np.float32))[:, None],
+        "reprojection_error": torch.full((len(rows),), 0.05),
+    }
+    recovered = _recover_alignments(
+        payload,
+        [{"image_id": 1, "image_name": "seq1__frame00010.png"}],
+        {"seq1__frame00010": {"path": str(depth_path)}},
+    )
+
+    assert set(recovered) == {"seq1__frame00010.png"}
+    assert recovered["seq1__frame00010.png"]["alpha"] == pytest.approx(
+        alpha, abs=2e-6
+    )
+    assert recovered["seq1__frame00010.png"]["beta"] == pytest.approx(
+        beta, abs=2e-6
+    )
 
 
 def test_zero_foliage_view_limit_reaches_all_fixed_camera_selection_layer():
@@ -798,6 +838,22 @@ def test_pointmap_initialization_loads_native_cross_sequence_posterior(
     np.testing.assert_allclose(loaded["precision"], precision)
     assert loaded["supported"].tolist() == supported.tolist()
     assert np.isinf(loaded["distance"][1]).all()
+
+
+def test_missing_pointmap_posterior_cannot_manufacture_cross_sequence_support():
+    available = np.asarray([True, False, False])
+    precision = np.asarray([0.8, 1.0, 0.3], dtype=np.float32)
+    supported = np.asarray([True, True, True])
+    distance = np.asarray([0.02, 0.01, 0.10], dtype=np.float32)
+
+    fallback_count = _apply_missing_pointmap_posterior_fallback(
+        available, precision, supported, distance
+    )
+
+    assert fallback_count == 2
+    assert precision.tolist() == pytest.approx([0.8, 0.03, 0.03])
+    assert supported.tolist() == [True, False, False]
+    assert np.isinf(distance[1:]).all()
 
 
 def test_pointmap_seed_cap_balances_views_before_score_fill():

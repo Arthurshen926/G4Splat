@@ -40,9 +40,9 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v37-native-rigid-depth-"
-    "calibrated-continuous-all-camera-posterior-adaptive-optical-bandwidth-"
-    "atomic-volume-replace-split"
+    "cambridge-native-hybrid-teacher-mainline-v45-native-rigid-depth-"
+    "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
+    "and-static-deployment-contract-closed"
 )
 STAGES = (
     "prepare_cameras",
@@ -61,7 +61,7 @@ PROFILES = {
         # coverage to emerge simultaneously and repeatedly wrote foliage
         # residuals into the facade scaffold.
         "iterations": 30_000,
-        "training_profile": "hybrid_handoff_quality",
+        "training_profile": "static_handoff_quality",
         # The no-COLMAP v74 scaffold reached 400k at 13.2k and then retained
         # 25k--35k eligible coverage candidates per event until 20.4k.  The
         # old cap therefore froze a demonstrably under-covered rigid map and
@@ -129,11 +129,16 @@ PROFILES = {
         # basis row per 21 training pixels.  This closes large accepted-view
         # silhouette holes continuously without increasing small-view caps.
         "dynamic_birth_target_source_pixels_per_basis": 192.0,
-        # A rejected per-view DAV2 affine fit is missing metric evidence, not
-        # permission to manufacture it by interpolating frame numbers.
-        # Sequence/time conditioning still handles those database views, but
-        # no interpolated depth is promoted to a 3D witness.
-        "use_temporal_dav2_witnesses": False,
+        # A tree-dominant frame can contain too few visible rigid pixels to
+        # fit the DAV2 affine map independently.  This is not an absence of
+        # depth evidence.  Recover the continuous same-sequence posterior
+        # only between two accepted neighbours, keep it sequence-local in
+        # the immutable evidence archive, and fuse repeated observations into
+        # the one static deployment map before optimization.
+        "use_temporal_dav2_witnesses": True,
+        "temporal_dav2_maximum_gap": 12,
+        "temporal_dav2_maximum_rays_per_view": 2_048,
+        "temporal_dav2_maximum_births_per_view": 2_048,
         "use_rigid_depth_calibrated_foliage": True,
         "rigid_calibration_resolution_scale": 0.125,
         "foliage_voxel_size": 0.12,
@@ -161,7 +166,7 @@ PROFILES = {
     },
     "fast": {
         "iterations": 12_000,
-        "training_profile": "hybrid_handoff_quality",
+        "training_profile": "static_handoff_fast",
         "rigid_pretrain_iterations": 12_000,
         "rigid_pretrain_surface_gaussians": 600_000,
         "rigid_pretrain_surface_growth_per_event": 5000,
@@ -190,7 +195,10 @@ PROFILES = {
         "maximum_dynamic_births_per_foliage_view": 384,
         "maximum_weak_continuous_dynamic_births_per_foliage_view": 2_048,
         "dynamic_birth_target_source_pixels_per_basis": 192.0,
-        "use_temporal_dav2_witnesses": False,
+        "use_temporal_dav2_witnesses": True,
+        "temporal_dav2_maximum_gap": 12,
+        "temporal_dav2_maximum_rays_per_view": 1_024,
+        "temporal_dav2_maximum_births_per_view": 1_024,
         "use_rigid_depth_calibrated_foliage": True,
         "rigid_calibration_resolution_scale": 0.125,
         "foliage_voxel_size": 0.12,
@@ -258,6 +266,8 @@ def _trainer_implementation_hashes() -> dict[str, str]:
         "mask_lookup": REPO_ROOT / "matcha/cambridge_masks.py",
         "training_evidence": REPO_ROOT
         / "outdoor/training_evidence.py",
+        "hybrid_teacher_api": REPO_ROOT
+        / "outdoor/hybrid_teacher_api.py",
         "hybrid_renderer": REPO_ROOT
         / "outdoor/hybrid_gaussian_renderer.py",
         "mixed_forward_cuda": surfel_root
@@ -722,6 +732,8 @@ def _teacher_command(
         str(int(iterations)),
         "--training-profile",
         str(training_profile),
+        "--reconstruction-target",
+        "static",
         "--geometry-gradient-ratio",
         str(float(geometry_gradient_ratio)),
         "--maximum-surface-gaussians",
@@ -800,6 +812,20 @@ def _teacher_command(
             ]
         )
     return command
+
+
+def _teacher_evaluation_mode(
+    *, training_profile: str, reconstruction_target: str
+) -> str:
+    if training_profile == "hybrid_rigid_stage1":
+        return "rigid"
+    if reconstruction_target == "static":
+        return "canonical"
+    if reconstruction_target == "sequence_conditioned_legacy":
+        return "hybrid"
+    raise ValueError(
+        f"Unsupported reconstruction target {reconstruction_target!r}"
+    )
 
 
 def _find_frontend(args: argparse.Namespace) -> Path:
@@ -1142,7 +1168,10 @@ def main() -> None:
         }
         _write_manifest(manifest_path, manifest)
 
-    evidence = run / "evidence"
+    # The base Evidence Store is immutable. Independent-traversal pointmap
+    # posteriors form a derived, content-addressed store so a missing artifact
+    # can never silently regain full metric authority during training.
+    base_evidence = run / "evidence"
     if "build_evidence" in selected:
         dav2_root = (
             args.dav2_root.expanduser().resolve()
@@ -1178,11 +1207,11 @@ def main() -> None:
                     dry_run=args.dry_run,
                 )
         rebuild_evidence = not (
-            evidence / "evidence_manifest.json"
+            base_evidence / "evidence_manifest.json"
         ).is_file()
         if not rebuild_evidence:
             try:
-                current_store = load_evidence_store(evidence)
+                current_store = load_evidence_store(base_evidence)
                 if (
                     current_store.get("schema_version")
                     != EVIDENCE_STORE_VERSION
@@ -1243,9 +1272,9 @@ def main() -> None:
                 "--chart-consensus",
                 str(chart_consensus),
                 "--output",
-                str(evidence),
+                str(base_evidence),
             ]
-            if evidence.exists():
+            if base_evidence.exists():
                 command.append("--replace")
             if dav2_root is not None:
                 command.extend(["--dav2-root", str(dav2_root)])
@@ -1257,21 +1286,82 @@ def main() -> None:
             )
         if args.dry_run:
             return
+        base_store = load_evidence_store(base_evidence)
+        evidence = run / (
+            "evidence_cross_sequence_posterior_"
+            f"{base_store['evidence_hash'][:12]}"
+        )
+        if not (evidence / "evidence_manifest.json").is_file():
+            _run(
+                [
+                    python,
+                    str(
+                        REPO_ROOT
+                        / "scripts/"
+                        "build_mast3r_pointmap_cross_sequence_posterior.py"
+                    ),
+                    "--base-evidence-store",
+                    str(base_evidence),
+                    "--output-evidence-store",
+                    str(evidence),
+                ],
+                env=env,
+                log=run / "logs/build_pointmap_posterior.log",
+                dry_run=False,
+            )
         store = load_evidence_store(evidence)
+        if store.get("derived_from_evidence_hash") != base_store[
+            "evidence_hash"
+        ]:
+            raise RuntimeError(
+                "Pointmap posterior store was derived from a different "
+                "base Evidence Store"
+            )
         manifest["stages"]["build_evidence"] = {
             "status": "complete",
             "evidence_hash": store["evidence_hash"],
+            "base_evidence_hash": base_store["evidence_hash"],
+            "pointmap_cross_sequence_posterior": True,
             "colmap_tracks": False,
         }
         _write_manifest(manifest_path, manifest)
+    else:
+        base_store = load_evidence_store(base_evidence)
+        evidence = run / (
+            "evidence_cross_sequence_posterior_"
+            f"{base_store['evidence_hash'][:12]}"
+        )
+        if not (evidence / "evidence_manifest.json").is_file():
+            raise FileNotFoundError(
+                "The cross-sequence pointmap posterior Evidence Store is "
+                f"missing: {evidence}. Run --stage build_evidence first."
+            )
+        store = load_evidence_store(evidence)
+        if store.get("derived_from_evidence_hash") != base_store[
+            "evidence_hash"
+        ]:
+            raise RuntimeError(
+                "Pointmap posterior store/base evidence hash mismatch"
+            )
 
     base_initialization = run / "initialization"
     use_temporal_dav2_witnesses = bool(
         profile.get("use_temporal_dav2_witnesses", False)
     )
+    # Quality/fast rebuild foliage after native rigid pretraining. Applying
+    # temporal witnesses before that rebuild only feeds the foliage-disabled
+    # rigid stage and is then silently discarded. Defer augmentation until
+    # the final rigid-calibrated foliage archive exists.
+    defer_temporal_until_rigid_calibration = bool(
+        use_temporal_dav2_witnesses
+        and profile.get("use_rigid_depth_calibrated_foliage", False)
+    )
     initialization = (
         run / "initialization_temporal_dav2"
-        if use_temporal_dav2_witnesses
+        if (
+            use_temporal_dav2_witnesses
+            and not defer_temporal_until_rigid_calibration
+        )
         else base_initialization
     )
     if "initialize_teacher" in selected:
@@ -1472,9 +1562,21 @@ def main() -> None:
             )
         if args.dry_run:
             return
-        if use_temporal_dav2_witnesses:
+        if (
+            use_temporal_dav2_witnesses
+            and not defer_temporal_until_rigid_calibration
+        ):
             base_foliage = (
                 base_initialization / "foliage_seed_gaussians.pth"
+            )
+            temporal_maximum_gap = int(
+                profile["temporal_dav2_maximum_gap"]
+            )
+            temporal_maximum_rays = int(
+                profile["temporal_dav2_maximum_rays_per_view"]
+            )
+            temporal_maximum_births = int(
+                profile["temporal_dav2_maximum_births_per_view"]
             )
             augmentation_contract = {
                 "protocol": TEMPORAL_DAV2_AUGMENTATION_VERSION,
@@ -1484,9 +1586,9 @@ def main() -> None:
                     / "scripts/augment_temporal_dav2_foliage.py"
                 ),
                 "same_sequence_two_sided_only": True,
-                "maximum_temporal_gap": 12,
-                "maximum_rays_per_view": 512,
-                "maximum_births_per_view": 512,
+                "maximum_temporal_gap": temporal_maximum_gap,
+                "maximum_rays_per_view": temporal_maximum_rays,
+                "maximum_births_per_view": temporal_maximum_births,
                 "every_added_ray_has_exact_birth": True,
                 "maximum_canonical_distance": 3.0,
                 "canonical_birth_count": 0,
@@ -1530,11 +1632,11 @@ def main() -> None:
                     "--output",
                     str(initialization),
                     "--maximum-temporal-gap",
-                    "12",
+                    str(temporal_maximum_gap),
                     "--maximum-rays-per-view",
-                    "512",
+                    str(temporal_maximum_rays),
                     "--maximum-births-per-view",
-                    "512",
+                    str(temporal_maximum_births),
                     "--maximum-canonical-distance",
                     "3.0",
                 ]
@@ -1824,6 +1926,116 @@ def main() -> None:
             }
             _write_manifest(manifest_path, manifest)
 
+            if use_temporal_dav2_witnesses:
+                temporal_maximum_gap = int(
+                    profile["temporal_dav2_maximum_gap"]
+                )
+                temporal_maximum_rays = int(
+                    profile[
+                        "temporal_dav2_maximum_rays_per_view"
+                    ]
+                )
+                temporal_maximum_births = int(
+                    profile[
+                        "temporal_dav2_maximum_births_per_view"
+                    ]
+                )
+                augmented_initialization = (
+                    run
+                    / "initialization_rigid_depth_calibrated_temporal_dav2"
+                )
+                calibrated_foliage = (
+                    calibrated_initialization
+                    / "foliage_seed_gaussians.pth"
+                )
+                augmentation_contract = {
+                    "protocol": TEMPORAL_DAV2_AUGMENTATION_VERSION,
+                    "source_foliage_sha256": sha256_file(
+                        calibrated_foliage
+                    ),
+                    "producer_implementation_sha256": sha256_file(
+                        REPO_ROOT
+                        / "scripts/augment_temporal_dav2_foliage.py"
+                    ),
+                    "same_sequence_two_sided_only": True,
+                    "maximum_temporal_gap": temporal_maximum_gap,
+                    "maximum_rays_per_view": temporal_maximum_rays,
+                    "maximum_births_per_view": temporal_maximum_births,
+                    "every_added_ray_has_exact_birth": True,
+                    "maximum_canonical_distance": 3.0,
+                    "canonical_birth_count": 0,
+                    "localization_landmark_count": 0,
+                }
+                augmented_manifest_path = (
+                    augmented_initialization
+                    / "initialization_manifest.json"
+                )
+                augmented_current = False
+                if augmented_manifest_path.is_file():
+                    try:
+                        augmented_payload = json.loads(
+                            augmented_manifest_path.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        augmented_audit = augmented_payload["foliage"][
+                            "temporal_dav2_augmentation"
+                        ]
+                        augmented_current = bool(
+                            augmented_payload.get("version")
+                            == TEMPORAL_DAV2_AUGMENTATION_VERSION
+                            and all(
+                                augmented_audit.get(key) == value
+                                for key, value in augmentation_contract.items()
+                            )
+                        )
+                    except (KeyError, OSError, ValueError):
+                        augmented_current = False
+                if not augmented_current:
+                    augmentation_command = [
+                        python,
+                        str(
+                            REPO_ROOT
+                            / "scripts/augment_temporal_dav2_foliage.py"
+                        ),
+                        "--source-initialization",
+                        str(calibrated_initialization),
+                        "--evidence-store",
+                        str(evidence),
+                        "--output",
+                        str(augmented_initialization),
+                        "--maximum-temporal-gap",
+                        str(temporal_maximum_gap),
+                        "--maximum-rays-per-view",
+                        str(temporal_maximum_rays),
+                        "--maximum-births-per-view",
+                        str(temporal_maximum_births),
+                        "--maximum-canonical-distance",
+                        "3.0",
+                    ]
+                    if augmented_initialization.exists():
+                        augmentation_command.append("--replace")
+                    _run(
+                        augmentation_command,
+                        env=train_env,
+                        log=run
+                        / "logs/augment_rigid_calibrated_temporal_dav2.log",
+                        dry_run=args.dry_run,
+                    )
+                initialization = augmented_initialization
+                manifest["stages"][
+                    "rigid_calibrated_temporal_dav2"
+                ] = {
+                    "status": "complete",
+                    "initialization": str(initialization),
+                    "protocol": TEMPORAL_DAV2_AUGMENTATION_VERSION,
+                    "source_initialization": str(
+                        calibrated_initialization
+                    ),
+                    "static_training_fusion": True,
+                }
+                _write_manifest(manifest_path, manifest)
+
         result = teacher / "result.json"
         # This value is part of the reproducibility contract even when a
         # mature non-joint handoff disables all surface topology.  In joint
@@ -1973,11 +2185,11 @@ def main() -> None:
         eval_env["CUDA_VISIBLE_DEVICES"] = physical_gpu
         trained = json.loads((teacher / "result.json").read_text())
         teacher_state = Path(trained["teacher_state"]).resolve()
-        evaluation_mode = (
-            "rigid"
-            if profile["training_profile"]
-            == "hybrid_rigid_stage1"
-            else "hybrid"
+        evaluation_mode = _teacher_evaluation_mode(
+            training_profile=profile["training_profile"],
+            reconstruction_target=trained["training_contract"].get(
+                "reconstruction_target", "sequence_conditioned_legacy"
+            ),
         )
         evaluation_store = load_evidence_store(evidence)
         semantic_contract = Path(
