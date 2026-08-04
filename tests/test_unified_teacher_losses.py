@@ -54,6 +54,9 @@ from scripts.train_unified_outdoor_teacher import (
     _apply_volume_role_gradients,
     _apply_volume_opacity_settle_policy,
     _apply_static_optical_policy,
+    _apply_static_ray_local_mass_handoff,
+    _accumulate_static_replacement_evidence,
+    _update_static_child_verification_from_render,
     _apply_mature_surface_gradient_policy,
     _phase,
     _public_phase_name,
@@ -90,6 +93,8 @@ from scripts.train_unified_outdoor_teacher import (
 )
 from outdoor.hybrid_gaussian_renderer import (
     LAYER_DYNAMIC_LEAF,
+    VERIFICATION_UNVERIFIED,
+    VERIFICATION_VERIFIED,
     VolumetricFoliageModel,
 )
 from outdoor.training_evidence import (
@@ -157,6 +162,207 @@ def test_local_static_replacement_attenuates_only_authorized_growth():
     )
     assert torch.allclose(
         moment, torch.tensor([[-4.0], [-5.0]]) * expected_multiplier
+    )
+
+
+def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
+    foliage, optimizer, moment = _static_optical_policy_fixture(1.0)
+    foliage.verification_state = torch.tensor(
+        [VERIFICATION_UNVERIFIED, VERIFICATION_VERIFIED],
+        dtype=torch.int8,
+    )
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "ownership_cleanup"
+    )
+    readiness = 1.0 - torch.exp(torch.tensor(-1.0))
+    assert foliage.opacity_logits.grad[0].item() == -2.0
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad[1],
+        torch.tensor([-3.0 * (1.0 - readiness)]),
+    )
+    assert audit["opacity_growth_removed_by_policy"][
+        "unverified_child"
+    ] == 0.0
+    assert moment[0].item() == -4.0
+
+
+def test_real_ray_handoff_is_bounded_and_reversible():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    initial = foliage.integrated_optical_mass().clone()
+    foliage.replacement_overlap_ema.fill_(1.0)
+    foliage.replacement_observation_count.fill_(3)
+    optimizer = SimpleNamespace(state={})
+    retired = _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.02
+    )
+    assert retired["changed_rows"] == 1
+    assert torch.allclose(
+        foliage.integrated_optical_mass(), initial * 0.98, rtol=1e-5
+    )
+    foliage.replacement_overlap_ema.zero_()
+    restored = _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.02
+    )
+    assert restored["restored_mass"] > 0
+    assert torch.allclose(
+        foliage.integrated_optical_mass(), initial, rtol=1e-5
+    )
+
+
+def test_unverified_envelope_is_ineligible_for_mass_handoff():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    initial = foliage.integrated_optical_mass().clone()
+    foliage.verification_state.fill_(VERIFICATION_UNVERIFIED)
+    foliage.replacement_overlap_ema.fill_(1.0)
+    foliage.replacement_observation_count.fill_(3)
+    audit = _apply_static_ray_local_mass_handoff(
+        foliage,
+        SimpleNamespace(state={}),
+        maximum_fraction_per_event=0.02,
+    )
+    assert audit["changed_rows"] == 0
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass(), initial
+    )
+    # A legacy/broken checkpoint may already contain retirement state on a
+    # row that is subsequently recognized as unverified.  The next handoff
+    # event must restore that mass instead of leaving a hidden hole.
+    foliage.verification_state.fill_(VERIFICATION_VERIFIED)
+    _apply_static_ray_local_mass_handoff(
+        foliage,
+        SimpleNamespace(state={}),
+        maximum_fraction_per_event=0.02,
+    )
+    assert foliage.integrated_optical_mass().item() < initial.item()
+    foliage.verification_state.fill_(VERIFICATION_UNVERIFIED)
+    repaired = _apply_static_ray_local_mass_handoff(
+        foliage,
+        SimpleNamespace(state={}),
+        maximum_fraction_per_event=0.02,
+    )
+    assert repaired["repaired_ineligible_rows"] == 1
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass(), initial, rtol=1e-5, atol=1e-7
+    )
+
+
+def test_replacement_readiness_counts_distinct_cameras_only():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    value = torch.ones(1)
+    visible = torch.ones(1, dtype=torch.bool)
+    _accumulate_static_replacement_evidence(
+        foliage, value, visible, camera_id=7, decay=0.0
+    )
+    _accumulate_static_replacement_evidence(
+        foliage, value, visible, camera_id=7, decay=0.0
+    )
+    assert foliage.replacement_observation_count.item() == 1
+    _accumulate_static_replacement_evidence(
+        foliage, value, visible, camera_id=8, decay=0.0
+    )
+    assert foliage.replacement_observation_count.item() == 2
+
+
+def test_static_child_reverification_refreshes_dc_from_distinct_real_views():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.9),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+            "support_camera_ids": torch.tensor(
+                [[7, 8]], dtype=torch.int32
+            ),
+            "support_sequence_count": torch.tensor(
+                [2], dtype=torch.int16
+            ),
+            "evidence_primitive_id": torch.tensor(
+                [11], dtype=torch.int64
+            ),
+        }
+    )
+    foliage.split(torch.tensor([0]), birth_iteration=20)
+    foliage.support_sequence_count.fill_(2)
+    optimizer = SimpleNamespace(state={})
+    sequence_lookup = torch.full((9,), -1, dtype=torch.int16)
+    sequence_lookup[7] = 0
+    sequence_lookup[8] = 1
+
+    def package(rgb):
+        responsibility = torch.zeros(len(foliage), 7)
+        responsibility[0, 0] = 1.0
+        responsibility[0, 1] = 1.0
+        responsibility[0, 4:7] = torch.tensor(rgb)
+        return SimpleNamespace(
+            responsibility=responsibility, structural_count=0
+        )
+
+    first = _update_static_child_verification_from_render(
+        foliage,
+        package([0.2, 0.4, 0.6]),
+        camera_id=7,
+        camera_sequence_lookup=sequence_lookup,
+        volume_optimizer=optimizer,
+    )
+    assert first["new_color_witnesses"] == 1
+    assert foliage.verification_state[0].item() == 0
+    torch.testing.assert_close(
+        foliage.features[0, 0] * 0.28209479177387814 + 0.5,
+        torch.tensor([0.2, 0.4, 0.6]),
+    )
+
+    second = _update_static_child_verification_from_render(
+        foliage,
+        package([0.4, 0.4, 0.4]),
+        camera_id=8,
+        camera_sequence_lookup=sequence_lookup,
+        volume_optimizer=optimizer,
+    )
+    assert second["newly_verified"] == 1
+    assert foliage.verified_camera_count[0].item() == 2
+    assert foliage.verified_sequence_count[0].item() == 2
+    assert foliage.evidence_primitive_id[0].item() == 11
+    assert foliage.candidate_evidence_primitive_id[0].item() == -1
+    torch.testing.assert_close(
+        foliage.features[0, 0] * 0.28209479177387814 + 0.5,
+        torch.tensor([0.3, 0.4, 0.5]),
     )
 
 
@@ -4013,7 +4219,10 @@ def test_candidate_interval_descendant_index_rebuilds_after_split():
 
     assert before["candidate_evaluations"] == 1
     assert after["candidate_evaluations"] == 2
-    assert foliage.evidence_primitive_id.tolist() == [0, 0]
+    # The parent evidence row is a re-verification candidate, not proof at
+    # either displaced child centre.
+    assert foliage.evidence_primitive_id.tolist() == [-1, -1]
+    assert foliage.candidate_evidence_primitive_id.tolist() == [0, 0]
 
 
 def test_interval_factor_uses_all_gaussians_on_same_ray_not_only_lineage():

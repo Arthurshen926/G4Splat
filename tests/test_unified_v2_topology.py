@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import torch
 
-from outdoor.hybrid_gaussian_renderer import VolumetricFoliageModel
+from outdoor.hybrid_gaussian_renderer import (
+    VERIFICATION_VERIFIED,
+    VolumetricFoliageModel,
+)
 from outdoor.standard_3dgs import (
     STUDENT_ROLE_CROWN,
     STUDENT_ROLE_RIGID,
@@ -215,10 +218,12 @@ def test_teacher_canonical_descendants_can_split_recursively():
     first = _adapt_volume(args, model, _stats(2))
     assert first["split_parents"] == 2
     assert bool((model.split_generation == 1).all())
-    # Split metadata intentionally halves the two-view evidence count.  That
-    # must not turn an already-proven canonical lineage into a one-generation
-    # topology dead end.
+    # Split metadata intentionally halves the candidate evidence count, but a
+    # displaced child cannot recurse until real owner rays verify its centre.
     assert bool((model.support_sequence_count == 1).all())
+    blocked = _adapt_volume(args, model, _stats(len(model)))
+    assert blocked["split_parents"] == 0
+    model.verification_state.fill_(VERIFICATION_VERIFIED)
     second = _adapt_volume(args, model, _stats(len(model)))
     assert second["split_parents"] == 2
     assert int((model.split_generation == 2).sum()) == 4

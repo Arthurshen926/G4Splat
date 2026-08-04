@@ -96,6 +96,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v57_static_ray_prefit_closed",
     "cambridge_native_hybrid_teacher_v58_static_sh_ownership_decoupled",
     "cambridge_native_hybrid_teacher_v59_static_rgb_appearance_coverage_closed",
+    "cambridge_native_hybrid_teacher_v60_ray_local_optical_lifecycle_closed",
     "unified_outdoor_mixed_teacher_v1",
 }
 
@@ -275,9 +276,10 @@ def _static_ray_normalized_optical_mixture(
         ),
         radii=primitive_union(envelope.radii, detail.radii),
         # Screen-space gradients from two independent raster passes cannot be
-        # represented by one tensor.  This compositor is currently an
-        # inference/deployment policy; training keeps using the single native
-        # pass and its unambiguous densification statistics.
+        # represented by one tensor. Training therefore keeps its single
+        # native image-formation pass for optimization/topology, while a
+        # scheduled no-grad two-pass audit uses these exact alpha/depth fields
+        # to drive persistent integrated-mass hand-off.
         means2d=None,
         structural_count=envelope.structural_count,
         responsibility=primitive_union(
@@ -302,6 +304,10 @@ def _static_ray_normalized_optical_mixture(
         volume_means2d=None,
         volume_replacement=primitive_union(
             envelope.volume_replacement, detail.volume_replacement
+        ),
+        volume_replacement_candidate=primitive_union(
+            envelope.volume_replacement_candidate,
+            detail.volume_replacement_candidate,
         ),
     )
     return mixed, detail_weight
@@ -393,6 +399,10 @@ def _static_surface_evidence_mixture(
         volume_means2d=None,
         volume_replacement=rows(
             canopy.volume_replacement, surface.volume_replacement
+        ),
+        volume_replacement_candidate=rows(
+            canopy.volume_replacement_candidate,
+            surface.volume_replacement_candidate,
         ),
     )
     return mixed, surface_weight
@@ -627,6 +637,36 @@ def _validate_render_implementation(
                 "reason": migration,
             }
     causal_repair = None
+    deployment_static = state.get("training_contract", {}).get(
+        "deployment_static_contract", {}
+    )
+    if (
+        changed == ["hybrid_renderer"]
+        and state.get("protocol")
+        == "cambridge_native_hybrid_teacher_v59_static_rgb_appearance_coverage_closed"
+        and expected.get("hybrid_renderer")
+        == "da392232d3186c6cab145d72b537474cf5a8175607758f47ed25b33e66be768e"
+        and deployment_static.get("optical_replacement_policy")
+        in {
+            STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
+            STATIC_RAY_SURFACE_EVIDENCE_POLICY,
+        }
+    ):
+        # v60 changes only the *training* single-pass static hand-off: the
+        # centre proxy becomes candidate-only and persistent mass is updated
+        # by scheduled real-ray evidence. v59 deployment already used the
+        # separate two/three-pass ray-normalized compositor, whose inputs and
+        # pixel equations are unchanged. This exact predecessor/policy pair is
+        # therefore safe to load for a zero-training CUDA compatibility audit.
+        equivalent["hybrid_renderer"] = {
+            "state_hash": expected["hybrid_renderer"],
+            "runtime_hash": actual_hashes["hybrid_renderer"],
+            "reason": (
+                "v59 ray-normalized deployment is unchanged; v60 modifies "
+                "only future training evidence/lifecycle and adds metadata"
+            ),
+        }
+        changed.clear()
     if (
         allow_static_optical_handoff_repair
         and changed == ["hybrid_renderer"]
@@ -1119,6 +1159,9 @@ class HybridTeacher:
             "volume_means2d": getattr(package, "volume_means2d", None),
             "volume_replacement": getattr(
                 package, "volume_replacement", None
+            ),
+            "volume_replacement_candidate": getattr(
+                package, "volume_replacement_candidate", None
             ),
             "optical_detail_responsibility": (
                 optical_detail_responsibility

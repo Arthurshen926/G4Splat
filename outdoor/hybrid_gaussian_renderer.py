@@ -20,6 +20,9 @@ PRIMITIVE_SFM_TRACK = 1
 LAYER_CANONICAL_CROWN = 0
 LAYER_STATIC_SKELETON = 1
 LAYER_DYNAMIC_LEAF = 2
+VERIFICATION_UNVERIFIED = 0
+VERIFICATION_VERIFIED = 1
+VERIFICATION_REJECTED = 2
 DYNAMIC_TEMPORAL_FALLBACK_MAX = 0.35
 EXACT_RAY_RENDER_MAX_DEPTH_TO_TANGENT_RATIO = 4.0
 
@@ -895,6 +898,11 @@ class HybridRenderOutput:
     surface_means2d: torch.Tensor | None = None
     volume_means2d: torch.Tensor | None = None
     volume_replacement: torch.Tensor | None = None
+    # ``volume_replacement_candidate`` is deliberately distinct from the
+    # applied state.  It is only a cheap same-tree/projected-depth candidate
+    # used to focus the scheduled per-ray audit; it may never retire optical
+    # mass by itself.
+    volume_replacement_candidate: torch.Tensor | None = None
 
 
 class VolumetricFoliageModel(nn.Module):
@@ -1027,7 +1035,55 @@ class VolumetricFoliageModel(nn.Module):
             torch.empty(0, dtype=torch.int16, device=device),
         )
         self.register_buffer(
+            "replacement_camera_signature",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        # A local optical hand-off is a persistent, reversible mass state,
+        # not a renderer-only alpha multiplier.  The reference mass follows
+        # legitimate hit/opacity learning; ``handoff_retired_fraction`` says
+        # which part is currently supplied by verified static detail.
+        self.register_buffer(
+            "handoff_reference_mass", torch.empty(0, device=device)
+        )
+        self.register_buffer(
+            "handoff_retired_fraction", torch.empty(0, device=device)
+        )
+        # Topology provenance and child verification are independent from
+        # inherited support-camera *candidates*.  A displaced child cannot
+        # claim the parent's UV/depth/evidence row as fresh proof.
+        self.register_buffer(
+            "lineage_id", torch.empty(0, dtype=torch.int64, device=device)
+        )
+        self.register_buffer(
+            "parent_lineage_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "birth_iteration",
+            torch.empty(0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "verification_state",
+            torch.empty(0, dtype=torch.int8, device=device),
+        )
+        self.register_buffer(
+            "verified_camera_ids",
+            torch.empty(0, 0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "verified_camera_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "verified_sequence_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
             "evidence_primitive_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "candidate_evidence_primitive_id",
             torch.empty(0, dtype=torch.int64, device=device),
         )
         # Topology changes replace the metadata buffers and invalidate this
@@ -1484,6 +1540,53 @@ class VolumetricFoliageModel(nn.Module):
                 "replacement_observation_count",
                 torch.zeros(count, dtype=torch.int16),
             ).to(device=device, dtype=torch.int16),
+            "replacement_camera_signature": payload.get(
+                "replacement_camera_signature",
+                torch.zeros(count, dtype=torch.int64),
+            ).to(device=device, dtype=torch.int64),
+            "handoff_reference_mass": payload.get(
+                "handoff_reference_mass",
+                -torch.log1p(
+                    -opacity.reshape(-1).to(device=device, dtype=dtype)
+                    .clamp(0.0, 1.0 - 1.0e-6)
+                )
+                * projected_gaussian_cross_section(scales),
+            ).to(device=device, dtype=dtype),
+            "handoff_retired_fraction": payload.get(
+                "handoff_retired_fraction", torch.zeros(count)
+            ).to(device=device, dtype=dtype),
+            "lineage_id": payload.get(
+                "lineage_id", torch.arange(count, dtype=torch.int64)
+            ).to(device=device, dtype=torch.int64),
+            "parent_lineage_id": payload.get(
+                "parent_lineage_id",
+                torch.full((count,), -1, dtype=torch.int64),
+            ).to(device=device, dtype=torch.int64),
+            "birth_iteration": payload.get(
+                "birth_iteration", torch.full((count,), -1, dtype=torch.int32)
+            ).to(device=device, dtype=torch.int32),
+            # Seed rows and legacy checkpoints were verified before topology
+            # mutation.  Only newly created rows enter the unverified state.
+            "verification_state": payload.get(
+                "verification_state",
+                torch.full(
+                    (count,), VERIFICATION_VERIFIED, dtype=torch.int8
+                ),
+            ).to(device=device, dtype=torch.int8),
+            "verified_camera_ids": payload.get(
+                "verified_camera_ids", observation_camera_ids
+            ).to(device=device, dtype=torch.int32),
+            "verified_camera_count": payload.get(
+                "verified_camera_count",
+                (observation_camera_ids >= 0).sum(dim=1).to(torch.int16),
+            ).to(device=device, dtype=torch.int16),
+            "verified_sequence_count": payload.get(
+                "verified_sequence_count",
+                payload.get(
+                    "support_sequence_count",
+                    torch.zeros(count, dtype=torch.int16),
+                ),
+            ).to(device=device, dtype=torch.int16),
         }
         ray_offsets = payload.get("ray_evidence", {}).get("offsets")
         evidence_primitive_id = torch.full(
@@ -1503,6 +1606,10 @@ class VolumetricFoliageModel(nn.Module):
             )
         metadata["evidence_primitive_id"] = payload.get(
             "evidence_primitive_id", evidence_primitive_id
+        ).to(device=device, dtype=torch.int64)
+        metadata["candidate_evidence_primitive_id"] = payload.get(
+            "candidate_evidence_primitive_id",
+            metadata["evidence_primitive_id"],
         ).to(device=device, dtype=torch.int64)
         static_detail = metadata["static_detail"]
         envelope_indices = torch.nonzero(
@@ -1711,7 +1818,18 @@ class VolumetricFoliageModel(nn.Module):
             "static_detail",
             "replacement_overlap_ema",
             "replacement_observation_count",
+            "replacement_camera_signature",
+            "handoff_reference_mass",
+            "handoff_retired_fraction",
+            "lineage_id",
+            "parent_lineage_id",
+            "birth_iteration",
+            "verification_state",
+            "verified_camera_ids",
+            "verified_camera_count",
+            "verified_sequence_count",
             "evidence_primitive_id",
+            "candidate_evidence_primitive_id",
         )
 
     @torch.no_grad()
@@ -1765,9 +1883,13 @@ class VolumetricFoliageModel(nn.Module):
             elif name in {
                 "replacement_overlap_ema",
                 "replacement_observation_count",
+                "replacement_camera_signature",
             }:
                 clone.zero_()
-            elif name == "evidence_primitive_id":
+            elif name in {
+                "evidence_primitive_id",
+                "candidate_evidence_primitive_id",
+            }:
                 # Ray/depth intervals describe the canonical evidence cell.
                 # A sequence-conditioned residual must not claim that same
                 # independent existence observation.
@@ -1787,6 +1909,7 @@ class VolumetricFoliageModel(nn.Module):
         support_sequence_count: torch.Tensor | None = None,
         initial_scale: float = 0.04,
         initial_opacity: float = 0.02,
+        birth_iteration: int = -1,
     ) -> dict[str, torch.Tensor | int]:
         """Append cross-sequence uncovered-hit consensus as static leaves."""
         centers = torch.as_tensor(
@@ -1888,8 +2011,40 @@ class VolumetricFoliageModel(nn.Module):
                 "replacement_group",
                 "track_id",
                 "evidence_primitive_id",
+                "candidate_evidence_primitive_id",
             }:
                 child.fill_(-1)
+            elif name == "lineage_id":
+                next_lineage = (
+                    int(self.lineage_id.max()) + 1
+                    if len(self.lineage_id)
+                    else 0
+                )
+                child = torch.arange(
+                    next_lineage,
+                    next_lineage + len(centers),
+                    device=self.xyz.device,
+                    dtype=torch.int64,
+                )
+            elif name == "parent_lineage_id":
+                child = self.lineage_id[parent].clone()
+            elif name == "birth_iteration":
+                child.fill_(int(birth_iteration))
+            elif name == "verification_state":
+                child.fill_(VERIFICATION_UNVERIFIED)
+            elif name in {
+                "verified_camera_count",
+                "verified_sequence_count",
+            }:
+                child.zero_()
+            elif name == "verified_camera_ids":
+                child.fill_(-1)
+            elif name == "handoff_reference_mass":
+                birth_scale = centers.new_full((len(centers), 3), initial_scale)
+                birth_tau = -math.log1p(-float(initial_opacity))
+                child = projected_gaussian_cross_section(birth_scale) * birth_tau
+            elif name == "handoff_retired_fraction":
+                child.zero_()
             elif name == "initialization_source":
                 child.fill_(6)
             elif name == "initialization_center":
@@ -1916,6 +2071,7 @@ class VolumetricFoliageModel(nn.Module):
                 "free_space_violation_count",
                 "unknown_view_count",
                 "replacement_observation_count",
+                "replacement_camera_signature",
             }:
                 child.zero_()
             elif name in {
@@ -1961,6 +2117,7 @@ class VolumetricFoliageModel(nn.Module):
         *,
         shrink: float = math.sqrt(2.0),
         allow_static_skeleton: bool = False,
+        birth_iteration: int = -1,
     ) -> dict[str, int]:
         """Replace selected volumes with two role-preserving children."""
         indices = torch.as_tensor(
@@ -1971,6 +2128,7 @@ class VolumetricFoliageModel(nn.Module):
             torch.full_like(indices, 2),
             shrink_override=float(shrink),
             allow_static_skeleton=allow_static_skeleton,
+            birth_iteration=birth_iteration,
         )
 
     @torch.no_grad()
@@ -1982,6 +2140,7 @@ class VolumetricFoliageModel(nn.Module):
         shrink_override: float | None = None,
         allow_static_skeleton: bool = False,
         split_plane_normals: torch.Tensor | None = None,
+        birth_iteration: int = -1,
     ) -> dict[str, int]:
         """Replace selected volumes with adaptive role-preserving children."""
         remove = torch.zeros(
@@ -1994,6 +2153,7 @@ class VolumetricFoliageModel(nn.Module):
             shrink_override=shrink_override,
             allow_static_skeleton=allow_static_skeleton,
             split_plane_normals=split_plane_normals,
+            birth_iteration=birth_iteration,
         )
 
     @torch.no_grad()
@@ -2006,6 +2166,7 @@ class VolumetricFoliageModel(nn.Module):
         shrink_override: float | None = None,
         allow_static_skeleton: bool = False,
         split_plane_normals: torch.Tensor | None = None,
+        birth_iteration: int = -1,
     ) -> dict[str, int]:
         """Replace broad volumes with two or four oriented children.
 
@@ -2344,10 +2505,59 @@ class VolumetricFoliageModel(nn.Module):
             child_shrink[geometric_child].square()[:, None, None]
         )
         metadata["scale_ceiling"][child_start:] /= child_axis_shrink
-        # Children inherit the semantic/tree identity, but not the full
-        # confidence of a ray posterior evaluated at the deleted parent
-        # centre.  Halving discrete evidence prevents duplicated support from
-        # making freshly split children look independently verified.
+        # The support/observation tables below are retained only as candidate
+        # owner rays for re-verification.  They are not proof at the displaced
+        # child centre: the explicit state/counts are reset, the immutable
+        # parent evidence id is dropped, and higher-order SH is removed.
+        child_rows = slice(child_start, None)
+        parent_lineage = self.lineage_id[indices].repeat_interleave(
+            child_counts
+        )
+        next_lineage = (
+            int(self.lineage_id.max()) + 1 if len(self.lineage_id) else 0
+        )
+        child_total = int(child_counts.sum())
+        metadata["parent_lineage_id"][child_rows] = parent_lineage
+        metadata["lineage_id"][child_rows] = torch.arange(
+            next_lineage,
+            next_lineage + child_total,
+            device=self.xyz.device,
+            dtype=torch.int64,
+        )
+        metadata["birth_iteration"][child_rows] = int(birth_iteration)
+        metadata["verification_state"][child_rows] = (
+            VERIFICATION_UNVERIFIED
+        )
+        metadata["verified_camera_ids"][child_rows] = -1
+        metadata["verified_camera_count"][child_rows] = 0
+        metadata["verified_sequence_count"][child_rows] = 0
+        inherited_evidence = self.evidence_primitive_id[indices]
+        inherited_candidate = self.candidate_evidence_primitive_id[indices]
+        metadata["candidate_evidence_primitive_id"][child_rows] = torch.where(
+            inherited_evidence >= 0,
+            inherited_evidence,
+            inherited_candidate,
+        ).repeat_interleave(child_counts)
+        metadata["evidence_primitive_id"][child_rows] = -1
+        metadata["replacement_camera_signature"][child_rows] = 0
+        metadata["replacement_overlap_ema"][child_rows] = 0
+        metadata["replacement_observation_count"][child_rows] = 0
+        parameter_values["features"][child_rows, 1:] = 0
+        # Reference mass follows the actual conserved child mass rather than
+        # duplicating the parent's scalar once per child.
+        child_alpha = parameter_values["opacity_logits"][child_rows].sigmoid()
+        child_mass = -torch.log1p(
+            -child_alpha.squeeze(-1).clamp(0.0, 1.0 - 1.0e-6)
+        ) * projected_gaussian_cross_section(
+            parameter_values["log_scales"][child_rows].exp()
+        )
+        retained_fraction = (
+            1.0 - metadata["handoff_retired_fraction"][child_rows]
+        ).clamp_min(1.0e-4)
+        metadata["handoff_reference_mass"][child_rows] = (
+            child_mass / retained_fraction
+        )
+        # Discrete support remains a candidate-count prior, not verification.
         for name in (
             "support_view_count",
             "support_sequence_count",
@@ -2537,8 +2747,50 @@ class VolumetricFoliageModel(nn.Module):
             "replacement_observation_count": torch.zeros(
                 count, dtype=torch.int16
             ),
+            "replacement_camera_signature": torch.zeros(
+                count, dtype=torch.int64
+            ),
+            "handoff_reference_mass": (
+                -torch.log1p(
+                    -payload["opacity_logits"].sigmoid().reshape(-1)
+                    .clamp(0.0, 1.0 - 1.0e-6)
+                )
+                * projected_gaussian_cross_section(
+                    payload["log_scales"].exp()
+                )
+            ),
+            "handoff_retired_fraction": torch.zeros(count),
+            "lineage_id": torch.arange(count, dtype=torch.int64),
+            "parent_lineage_id": torch.full(
+                (count,), -1, dtype=torch.int64
+            ),
+            "birth_iteration": torch.full(
+                (count,), -1, dtype=torch.int32
+            ),
+            "verification_state": torch.full(
+                (count,), VERIFICATION_VERIFIED, dtype=torch.int8
+            ),
+            "verified_camera_ids": payload.get(
+                "observation_camera_ids",
+                torch.empty(count, 0, dtype=torch.int32),
+            ),
+            "verified_camera_count": (
+                payload.get(
+                    "observation_camera_ids",
+                    torch.empty(count, 0, dtype=torch.int32),
+                )
+                >= 0
+            ).sum(dim=1).to(torch.int16),
+            "verified_sequence_count": payload.get(
+                "support_sequence_count",
+                torch.zeros(count, dtype=torch.int16),
+            ),
             "evidence_primitive_id": torch.full(
                 (count,), -1, dtype=torch.int64
+            ),
+            "candidate_evidence_primitive_id": payload.get(
+                "evidence_primitive_id",
+                torch.full((count,), -1, dtype=torch.int64),
             ),
         }
         self._replace_buffers(
@@ -2808,6 +3060,9 @@ def render_hybrid(
     replacement_per_row_full = volume_opacities.new_zeros(
         len(volume_opacities)
     )
+    replacement_per_row_candidate_full = volume_opacities.new_zeros(
+        len(volume_opacities)
+    )
     replacement_detail = foliage.detail_leaf_mask
     replacement_envelope = foliage.persistent_envelope_mask
     replacement_active = (
@@ -2937,7 +3192,7 @@ def render_hybrid(
                     detail_mask=replacement_detail,
                     pair_indices=foliage.replacement_pair_indices(),
                 ).detach()
-                replacement_per_row_full = replacement_per_row
+                replacement_per_row_candidate_full = replacement_per_row
                 replacement = None
             elif optical_replacement_policy == "group_projected":
                 replacement = local_optical_mass_replacement(
@@ -2975,9 +3230,17 @@ def render_hybrid(
             )
             volume_opacities = volume_opacities.clone()
             if replacement_per_row is not None:
-                volume_opacities[valid_canonical] *= (
-                    1.0 - replacement_per_row[valid_canonical]
-                )
+                # Static production uses a persistent mass state updated only
+                # from the scheduled per-pixel T_before*alpha audit.  The
+                # primitive-centre proxy is merely a same-tree candidate and
+                # must never dig a transient hole in the training render.
+                if include_dynamic or not bool(
+                    foliage.static_leaf_mask.any()
+                ):
+                    replacement_per_row_full = replacement_per_row
+                    volume_opacities[valid_canonical] *= (
+                        1.0 - replacement_per_row[valid_canonical]
+                    )
             else:
                 volume_opacities[valid_canonical] *= (
                     1.0 - replacement[groups[valid_canonical]]
@@ -2985,6 +3248,9 @@ def render_hybrid(
                 replacement_per_row_full[valid_canonical] = replacement[
                     groups[valid_canonical]
                 ]
+                replacement_per_row_candidate_full[valid_canonical] = (
+                    replacement[groups[valid_canonical]]
+                )
     active_volume_indices = torch.nonzero(
         volume_active, as_tuple=False
     ).flatten()
@@ -3134,4 +3400,7 @@ def render_hybrid(
         surface_means2d=surface_means2D,
         volume_means2d=volume_means2D,
         volume_replacement=replacement_per_row_full,
+        volume_replacement_candidate=(
+            replacement_per_row_candidate_full
+        ),
     )

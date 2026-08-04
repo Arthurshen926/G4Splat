@@ -45,6 +45,8 @@ from outdoor.foliage_view_graph import sequence_id  # noqa: E402
 from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
+    VERIFICATION_UNVERIFIED,
+    VERIFICATION_VERIFIED,
     VolumetricFoliageModel,
     dynamic_visibility_gate,
     projected_gaussian_cross_section,
@@ -76,7 +78,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v59_static_rgb_appearance_coverage_closed"
+    "cambridge_native_hybrid_teacher_v60_ray_local_optical_lifecycle_closed"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -151,10 +153,12 @@ VOLUME_OPACITY_SETTLE_CONTRACT = (
 )
 STATIC_OPTICAL_POLICY_CONTRACT = (
     "single_static_map__envelope_growth_continuously_attenuated_only_by_"
-    "persistent_multiview_view_ray_local_overlap__same_group_gaussian_"
-    "mixture_allocates_each_detail_optical_mass_once__occluded_envelope_"
-    "retires_in_optical_depth_space__static_detail_and_skeleton_mass_remain_"
+    "persistent_multiview_native_t_before_alpha_ray_local_overlap__same_"
+    "group_primitive_proxy_is_candidate_only__occluded_envelope_retires_"
+    "reversibly_in_integrated_optical_mass_space__static_detail_and_"
+    "skeleton_mass_remain_"
     "trainable__hidden_detail_consumes_exact_ray_posterior_during_topology__"
+    "newborn_dc_uses_distinct_view_native_responsibility_rgb__"
     "xyz_scale_rotation_and_mass_freeze_together_in_canonical_"
     "polish__scale_updates_preserve_integrated_optical_mass"
 )
@@ -684,6 +688,33 @@ def _parse_args():
         help=(
             "EMA decay for active-view, depth-overlap leaf-to-envelope "
             "replacement evidence."
+        ),
+    )
+    parser.add_argument(
+        "--static-replacement-evidence-every",
+        type=int,
+        default=50,
+        help=(
+            "Cadence for envelope-only/detail-only real-pixel replacement "
+            "responsibility audits. Zero disables hand-off evidence."
+        ),
+    )
+    parser.add_argument(
+        "--static-replacement-mass-fraction-per-event",
+        type=float,
+        default=0.02,
+        help=(
+            "Maximum reversible envelope optical-mass fraction transferred "
+            "per real-pixel audit event."
+        ),
+    )
+    parser.add_argument(
+        "--child-verification-grace-iterations",
+        type=int,
+        default=500,
+        help=(
+            "Iterations during which an unverified split/ray child may grow "
+            "but cannot be ordinarily pruned or split again."
         ),
     )
     parser.add_argument(
@@ -1468,6 +1499,14 @@ def _parse_args():
         )
     if not 0.0 <= args.static_replacement_ema_decay < 1.0:
         parser.error("--static-replacement-ema-decay must lie in [0,1)")
+    if args.static_replacement_evidence_every < 0:
+        parser.error("--static-replacement-evidence-every must be >= 0")
+    if not 0.0 <= args.static_replacement_mass_fraction_per_event <= 0.10:
+        parser.error(
+            "--static-replacement-mass-fraction-per-event must lie in [0,0.1]"
+        )
+    if args.child_verification_grace_iterations < 0:
+        parser.error("--child-verification-grace-iterations must be >= 0")
     if args.training_profile.startswith("static_") and (
         args.reconstruction_target != "static"
     ):
@@ -6106,11 +6145,29 @@ def _select_volume_reallocation_retirements(
     evidence_id = foliage.evidence_primitive_id.to(torch.int64)
     track_id = foliage.track_id.to(torch.int64)
     uses_evidence_id = evidence_id >= 0
-    lineage_id = torch.where(uses_evidence_id, evidence_id, track_id)
+    legacy_lineage_id = torch.where(uses_evidence_id, evidence_id, track_id)
+    parent_lineage_id = getattr(
+        foliage,
+        "parent_lineage_id",
+        torch.full_like(legacy_lineage_id, -1),
+    ).to(torch.int64)
+    lineage_id = torch.where(
+        parent_lineage_id >= 0, parent_lineage_id, legacy_lineage_id
+    )
     candidates = (
         (foliage.split_generation > 0)
         & (lineage_id != -1)
         & ~foliage.static_skeleton_mask
+        & (
+            getattr(
+                foliage,
+                "verification_state",
+                torch.full_like(
+                    foliage.layer_role, VERIFICATION_VERIFIED
+                ),
+            )
+            == VERIFICATION_VERIFIED
+        )
         & ~excluded
     )
     rows = torch.nonzero(candidates, as_tuple=False).flatten()
@@ -6929,6 +6986,7 @@ def _adapt_volume(
     view_by_camera_id: dict[int, object] | None = None,
     geometry_evidence=None,
     foliage_ray_evidence: FoliageRayEvidence | None = None,
+    current_iteration: int = -1,
 ):
     """Prune contradictions first, then split residuals in one mutation.
 
@@ -6998,6 +7056,32 @@ def _adapt_volume(
     )
     weak_remove = weak_free_remove | weak_occupancy_remove
     remove = strong_contradiction | weak_remove
+    verification_state = getattr(
+        foliage,
+        "verification_state",
+        torch.full_like(foliage.layer_role, VERIFICATION_VERIFIED),
+    )
+    birth_iteration = getattr(
+        foliage,
+        "birth_iteration",
+        torch.full_like(foliage.layer_role, -1, dtype=torch.int32),
+    )
+    verification_grace = (
+        (verification_state == VERIFICATION_UNVERIFIED)
+        & (birth_iteration >= 0)
+            & (
+                int(current_iteration) - birth_iteration
+                < int(
+                    getattr(
+                        args, "child_verification_grace_iterations", 500
+                    )
+                )
+            )
+    )
+    # During the grace interval positive hit/RGB evidence may grow a child,
+    # while ordinary opacity/utility cleanup cannot erase it before its
+    # candidate owner cameras are revisited.
+    remove &= ~verification_grace
     observation_count = stats.get(
         "observation_count", torch.zeros_like(stats["contribution"])
     )
@@ -7163,6 +7247,7 @@ def _adapt_volume(
             >= float(args.volume_split_radius)
         )
         & pre_canonical_lineage_supported
+        & (verification_state == VERIFICATION_VERIFIED)
     )
     if static_detail_exclusive_topology:
         pre_canonical_eligible &= foliage.static_leaf_mask
@@ -7410,6 +7495,7 @@ def _adapt_volume(
         & foliage.canonical_crown_mask
         & (working_stats["radius"] >= args.volume_split_radius)
         & canonical_lineage_supported
+        & (verification_state == VERIFICATION_VERIFIED)
     )
     if static_detail_exclusive_topology:
         canonical_eligible &= foliage.static_leaf_mask
@@ -7820,6 +7906,7 @@ def _adapt_volume(
             selected_child_counts,
             allow_static_skeleton=True,
             split_plane_normals=split_plane_normals,
+            birth_iteration=int(current_iteration),
         )
         split_child_start = int(split_event.pop("_child_start"))
         split_child_owner_camera_ids = conditioned_context_id[
@@ -7885,6 +7972,7 @@ def _adapt_volume(
                 0, dtype=torch.long, device=foliage.xyz.device
             ),
             allow_static_skeleton=True,
+            birth_iteration=int(current_iteration),
         )
         split_child_start = int(prune_event.pop("_child_start"))
         split_child_owner_camera_ids = torch.empty(
@@ -8006,6 +8094,20 @@ def _adapt_volume(
             capacity > 0 and net_growth == capacity
         ),
         "selection_audit": selection_audit,
+        "child_verification_lifecycle": {
+            "grace_protected_from_prune": int(verification_grace.sum()),
+            "unverified_before_mutation": int(
+                (verification_state == VERIFICATION_UNVERIFIED).sum()
+            ),
+            "unverified_after_mutation": int(
+                (
+                    foliage.verification_state
+                    == VERIFICATION_UNVERIFIED
+                ).sum()
+            ),
+            "new_children_are_unverified": True,
+            "unverified_split_eligible": 0,
+        },
         "selection_contract": (
             "continuous_screen_demand_then_lineage_safe_replace_retire_then_"
             "posterior_authority_weighted_observable_population_normalized_"
@@ -8161,56 +8263,445 @@ def _apply_volume_opacity_settle_policy(
 
 
 @torch.no_grad()
+def _measure_static_ray_local_replacement(
+    view,
+    surface,
+    foliage,
+    background: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    candidate_package,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int | str]]:
+    """Measure detail takeover from real per-pixel mixed-kernel weights.
+
+    Two role-isolated native mixed renders establish the actual alpha/depth
+    explanations.  A third envelope render asks the existing CUDA audit path
+    to integrate ``T_before * alpha * q(pixel)`` per primitive.  The old
+    centre proxy is used only as a same-tree/local-cell candidate; its scalar
+    magnitude has no authority to remove mass.
+    """
+    envelope_mask = foliage.persistent_envelope_mask
+    detail_mask = foliage.static_leaf_mask
+    verified_envelope_mask = envelope_mask & (
+        foliage.verification_state == VERIFICATION_VERIFIED
+    )
+    empty = foliage.xyz.new_zeros(len(foliage))
+    if not bool(envelope_mask.any()) or not bool(detail_mask.any()):
+        return empty, envelope_mask & False, {
+            "contract": "native_t_before_alpha_ray_local_replacement",
+            "scheduled": True,
+            "supported_pixels": 0,
+            "observed_envelope_rows": 0,
+            "mean_pixel_authority": 0.0,
+        }
+
+    def role_render(mask, audit_fields=None):
+        return render_hybrid(
+            view,
+            surface,
+            foliage,
+            background=background,
+            include_dynamic=False,
+            volume_role_mask=mask,
+            optical_replacement_policy="disabled",
+            structural_trainable_start=None,
+            audit_fields=audit_fields,
+        )
+
+    envelope = role_render(envelope_mask)
+    detail = role_render(detail_mask)
+    epsilon = 1.0e-6
+    envelope_alpha = envelope.volume_alpha.clamp(0.0, 1.0 - epsilon)
+    detail_alpha = detail.volume_alpha.clamp(0.0, 1.0 - epsilon)
+    envelope_tau = -torch.log1p(-envelope_alpha)
+    detail_tau = -torch.log1p(-detail_alpha)
+    coverage = (detail_tau / envelope_tau.clamp_min(epsilon)).clamp(0.0, 1.0)
+    both = (envelope_tau > epsilon) & (detail_tau > epsilon)
+    depth_scale = torch.maximum(
+        0.04
+        * torch.minimum(envelope.volume_depth, detail.volume_depth).abs(),
+        envelope_tau.new_full(envelope_tau.shape, 0.04),
+    )
+    depth_residual = (
+        envelope.volume_depth - detail.volume_depth
+    ).abs() / depth_scale.clamp_min(epsilon)
+    depth_compatibility = torch.exp(-0.5 * depth_residual.square())
+    depth_compatibility = torch.where(
+        both
+        & torch.isfinite(envelope.volume_depth)
+        & torch.isfinite(detail.volume_depth),
+        depth_compatibility,
+        torch.zeros_like(depth_compatibility),
+    )
+    canopy_core = task["p_canopy_core"].clamp(0.0, 1.0)
+    rigid_probability = task["p_rigid"].clamp(0.0, 1.0)
+    if canopy_core.ndim == 2:
+        canopy_core = canopy_core.unsqueeze(0)
+    if rigid_probability.ndim == 2:
+        rigid_probability = rigid_probability.unsqueeze(0)
+    rigid_safe = canopy_core * (1.0 - rigid_probability)
+    pixel_authority = (
+        coverage * depth_compatibility * rigid_safe
+    ).clamp(0.0, 1.0)
+    audit_fields = torch.cat(
+        [pixel_authority, coverage, depth_compatibility, rigid_safe], dim=0
+    ).contiguous()
+    audited = role_render(envelope_mask, audit_fields=audit_fields)
+    responsibility = audited.responsibility[
+        audited.structural_count :
+    ]
+    total = responsibility[:, 0].clamp_min(epsilon)
+    authority = (responsibility[:, 1] / total).clamp(0.0, 1.0)
+    candidate = getattr(
+        candidate_package, "volume_replacement_candidate", None
+    )
+    if candidate is None or len(candidate) != len(foliage):
+        candidate_mask = torch.zeros_like(envelope_mask)
+    else:
+        candidate_mask = torch.as_tensor(
+            candidate, device=authority.device, dtype=authority.dtype
+        ).reshape(-1) > 0
+    visible = verified_envelope_mask & (
+        responsibility[:, 0] > epsilon
+    )
+    # The primitive proxy supplies only group/tree locality.  Real coverage,
+    # depth, transmittance and rigid safety all come from pixel contributions.
+    authority = torch.where(
+        visible & candidate_mask, authority, torch.zeros_like(authority)
+    )
+    supported = pixel_authority > 0.05
+    audit = {
+        "contract": "native_t_before_alpha_ray_local_replacement",
+        "scheduled": True,
+        "supported_pixels": int(supported.sum()),
+        "observed_envelope_rows": int(visible.sum()),
+        "same_tree_candidate_rows": int((visible & candidate_mask).sum()),
+        "positive_authority_rows": int((authority > 0).sum()),
+        "mean_pixel_authority": float(pixel_authority[supported].mean())
+        if bool(supported.any())
+        else 0.0,
+        "mean_row_authority": float(authority[visible].mean())
+        if bool(visible.any())
+        else 0.0,
+        "tree_alpha_coverage": float(
+            (detail_alpha > 0.01).float()[canopy_core > 0.5].mean()
+        )
+        if bool((canopy_core > 0.5).any())
+        else 0.0,
+    }
+    del envelope, detail, audited, responsibility
+    return authority, visible, audit
+
+
+@torch.no_grad()
 def _accumulate_static_replacement_evidence(
     foliage,
-    package,
+    authority_observation: torch.Tensor,
+    visible: torch.Tensor,
     *,
+    camera_id: int,
     decay: float,
 ) -> dict[str, float | int | str]:
-    """Persist active-view/depth overlap instead of a transient group ratio."""
-    replacement = getattr(package, "volume_replacement", None)
-    if replacement is None or len(replacement) != len(foliage):
-        return {
-            "contract": "persistent_view_depth_local_replacement_ema",
-            "observed_envelope_rows": 0,
-            "overlapping_envelope_rows": 0,
-            "mean_authority": 0.0,
-        }
-    volume_radii = package.radii[package.structural_count :]
-    envelope = foliage.persistent_envelope_mask
-    visible = envelope & (volume_radii > 0)
+    """Persist distinct-view real-ray replacement evidence."""
     value = torch.as_tensor(
-        replacement,
+        authority_observation,
         device=foliage.xyz.device,
         dtype=foliage.xyz.dtype,
     ).reshape(-1).clamp(0.0, 1.0)
+    visible = torch.as_tensor(
+        visible, device=foliage.xyz.device, dtype=torch.bool
+    ).reshape(-1) & foliage.persistent_envelope_mask & (
+        foliage.verification_state == VERIFICATION_VERIFIED
+    )
+    if len(value) != len(foliage) or len(visible) != len(foliage):
+        raise ValueError("replacement evidence must align with foliage rows")
     if bool(visible.any()):
         foliage.replacement_overlap_ema[visible] = (
             float(decay) * foliage.replacement_overlap_ema[visible]
             + (1.0 - float(decay)) * value[visible]
         )
-        count = foliage.replacement_observation_count[visible].to(
-            torch.int32
-        )
+        bit = int(1) << (int(camera_id) % 62)
+        old_signature = foliage.replacement_camera_signature[visible]
+        new_camera = (old_signature & bit) == 0
+        foliage.replacement_camera_signature[visible] = old_signature | bit
+        count = foliage.replacement_observation_count[visible].to(torch.int32)
         foliage.replacement_observation_count[visible] = (
-            count.add(1).clamp_max(torch.iinfo(torch.int16).max).to(
-                torch.int16
-            )
+            count.add(new_camera.to(torch.int32))
+            .clamp_max(torch.iinfo(torch.int16).max)
+            .to(torch.int16)
         )
     readiness = 1.0 - torch.exp(
         -foliage.replacement_observation_count.float() / 3.0
     )
     authority = foliage.replacement_overlap_ema * readiness
+    envelope = foliage.persistent_envelope_mask & (
+        foliage.verification_state == VERIFICATION_VERIFIED
+    )
     return {
-        "contract": "persistent_view_depth_local_replacement_ema",
+        "contract": "persistent_distinct_view_real_ray_replacement_ema",
         "observed_envelope_rows": int(visible.sum()),
         "overlapping_envelope_rows": int((visible & (value > 0)).sum()),
+        "mean_distinct_views": float(
+            foliage.replacement_observation_count[envelope].float().mean()
+        )
+        if bool(envelope.any())
+        else 0.0,
         "mean_authority": float(authority[envelope].mean())
         if bool(envelope.any())
         else 0.0,
         "maximum_authority": float(authority[envelope].max())
         if bool(envelope.any())
         else 0.0,
+    }
+
+
+@torch.no_grad()
+def _apply_static_ray_local_mass_handoff(
+    foliage,
+    volume_optimizer,
+    *,
+    maximum_fraction_per_event: float,
+) -> dict[str, float | int | str]:
+    """Move envelope mass only after persistent real-ray takeover evidence.
+
+    The transition is reversible: if later calibrated views lose detail
+    coverage, the reference envelope mass is restored gradually.  This is
+    what prevents both duplicate fog and one-way transparent holes.
+    """
+    all_envelope = foliage.persistent_envelope_mask
+    envelope = all_envelope & (
+        foliage.verification_state == VERIFICATION_VERIFIED
+    )
+    previous = foliage.handoff_retired_fraction.clamp(0.0, 0.95)
+    illegally_retired = all_envelope & ~envelope & (previous > 0)
+    if (
+        not bool(envelope.any())
+        and not bool(illegally_retired.any())
+    ) or maximum_fraction_per_event < 0:
+        return {
+            "contract": "reversible_integrated_optical_mass_handoff",
+            "changed_rows": 0,
+            "repaired_ineligible_rows": 0,
+            "removed_mass": 0.0,
+            "restored_mass": 0.0,
+        }
+    readiness = 1.0 - torch.exp(
+        -foliage.replacement_observation_count.float() / 3.0
+    )
+    desired = (
+        foliage.replacement_overlap_ema * readiness * 0.95
+    ).clamp(0.0, 0.95)
+    delta = (desired - previous).clamp(
+        -float(maximum_fraction_per_event),
+        float(maximum_fraction_per_event),
+    )
+    updated = torch.where(envelope, previous + delta, previous).clone()
+    # No unverified child is allowed to carry retirement state.  This branch
+    # is normally a no-op; it also repairs a checkpoint produced before the
+    # verification owner was added to the handoff contract.
+    updated[illegally_retired] = 0
+    changed = (envelope & (delta.abs() > 1.0e-7)) | illegally_retired
+    current_mass = foliage.integrated_optical_mass()
+    reference = foliage.handoff_reference_mass.clamp_min(0.0)
+    invalid_reference = all_envelope & (
+        ~torch.isfinite(reference) | (reference <= 0)
+    )
+    reference[invalid_reference] = (
+        current_mass[invalid_reference]
+        / (1.0 - previous[invalid_reference]).clamp_min(1.0e-4)
+    )
+    target = current_mass.clone()
+    target[changed] = reference[changed] * (1.0 - updated[changed])
+    removed = (current_mass - target).clamp_min(0.0)
+    restored = (target - current_mass).clamp_min(0.0)
+    foliage.restore_integrated_optical_mass(target)
+    foliage.handoff_retired_fraction.copy_(updated)
+    state = volume_optimizer.state.get(foliage.opacity_logits, {})
+    for value in state.values():
+        if torch.is_tensor(value) and value.shape == foliage.opacity_logits.shape:
+            value[changed] = 0
+    return {
+        "contract": "reversible_integrated_optical_mass_handoff",
+        "changed_rows": int(changed.sum()),
+        "repaired_ineligible_rows": int(illegally_retired.sum()),
+        "removed_mass": float(removed.sum()),
+        "restored_mass": float(restored.sum()),
+        "mean_retired_fraction": float(updated[envelope].mean())
+        if bool(envelope.any())
+        else 0.0,
+        "maximum_retired_fraction": float(updated[envelope].max())
+        if bool(envelope.any())
+        else 0.0,
+    }
+
+
+@torch.no_grad()
+def _update_static_child_verification_from_render(
+    foliage,
+    package,
+    *,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+    volume_optimizer=None,
+) -> dict[str, int | str]:
+    """Re-verify topology children from native real-ray contribution.
+
+    Parent camera tables remain candidate rays only.  A candidate camera is
+    recorded once when the displaced child really contributes to a canopy
+    pixel and does not predominantly explain rigid content.  Verification
+    then requires two cameras and every independent sequence available to the
+    parent (up to two); no repeated visit can manufacture multiview support.
+    """
+    unverified = (
+        foliage.verification_state == VERIFICATION_UNVERIFIED
+    ) & ~foliage.dynamic_leaf_mask
+    if not bool(unverified.any()) or package.responsibility is None:
+        return {
+            "contract": "real_ray_child_reverification",
+            "candidate_rows": int(unverified.sum()),
+            "new_camera_witnesses": 0,
+            "new_color_witnesses": 0,
+            "newly_verified": 0,
+        }
+    volume = package.responsibility[package.structural_count :]
+    if len(volume) != len(foliage) or volume.shape[1] < 3:
+        raise RuntimeError("Child verification responsibility is incomplete")
+    total = volume[:, 0].clamp_min(1.0e-8)
+    canopy_fraction = volume[:, 1] / total
+    rigid_fraction = volume[:, 2] / total
+    candidate_camera = (foliage.support_camera_ids == int(camera_id)).any(
+        dim=1
+    ) if foliage.support_camera_ids.shape[1] else torch.zeros_like(unverified)
+    witnessed = (
+        unverified
+        & candidate_camera
+        & (volume[:, 0] > 1.0e-5)
+        & (canopy_fraction > rigid_fraction)
+    )
+    rows = torch.nonzero(witnessed, as_tuple=False).flatten()
+    added = 0
+    color_witnesses = 0
+    if len(rows) and foliage.verified_camera_ids.shape[1]:
+        table = foliage.verified_camera_ids[rows]
+        already = (table == int(camera_id)).any(dim=1)
+        free = table < 0
+        has_free = free.any(dim=1)
+        insert_local = (~already) & has_free
+        if bool(insert_local.any()):
+            insert_rows = rows[insert_local]
+            insert_slots = free[insert_local].to(torch.int8).argmax(dim=1)
+            previous_count = foliage.verified_camera_count[
+                insert_rows
+            ].float()
+            foliage.verified_camera_ids[
+                insert_rows, insert_slots
+            ] = int(camera_id)
+            added = int(len(insert_rows))
+            # The main native render appends the observed full-resolution RGB
+            # as audit fields 3:6.  Its per-primitive responsibility is
+            # exactly sum(T_before * alpha * RGB), so division by the ordinary
+            # responsibility yields a geometrically visible colour witness.
+            # Use a clipped online mean: the first witness replaces the stale
+            # parent DC; later independent views refine it without allowing a
+            # single highlight or exposure outlier to create a bright speck.
+            if volume.shape[1] >= 7:
+                observed_rgb = (
+                    volume[insert_rows, 4:7]
+                    / total[insert_rows, None]
+                ).clamp(0.0, 1.0)
+                dc_constant = 0.28209479177387814
+                current_rgb = (
+                    foliage.features[insert_rows, 0] * dc_constant + 0.5
+                ).clamp(0.0, 1.0)
+                first = previous_count <= 0
+                robust_delta = (observed_rgb - current_rgb).clamp(
+                    -0.20, 0.20
+                )
+                updated_rgb = current_rgb + robust_delta / (
+                    previous_count[:, None] + 1.0
+                )
+                updated_rgb[first] = observed_rgb[first]
+                foliage.features[insert_rows, 0] = (
+                    updated_rgb - 0.5
+                ) / dc_constant
+                # This step's gradient was computed at the copied parent
+                # colour.  Do not let it or inherited Adam state immediately
+                # undo the verified full-resolution observation.
+                if foliage.features.grad is not None:
+                    foliage.features.grad[insert_rows] = 0
+                if volume_optimizer is not None:
+                    feature_state = volume_optimizer.state.get(
+                        foliage.features, {}
+                    )
+                    for state_value in feature_state.values():
+                        if (
+                            torch.is_tensor(state_value)
+                            and state_value.shape
+                            == foliage.features.shape
+                        ):
+                            state_value[insert_rows] = 0
+                color_witnesses = int(len(insert_rows))
+    valid_verified = foliage.verified_camera_ids >= 0
+    foliage.verified_camera_count.copy_(
+        valid_verified.sum(dim=1).clamp_max(
+            torch.iinfo(torch.int16).max
+        ).to(torch.int16)
+    )
+    if (
+        camera_sequence_lookup is not None
+        and foliage.verified_camera_ids.shape[1]
+        and len(camera_sequence_lookup)
+    ):
+        safe = foliage.verified_camera_ids.clamp(
+            0, len(camera_sequence_lookup) - 1
+        ).long()
+        sequence = camera_sequence_lookup[safe]
+        valid = valid_verified & (sequence >= 0)
+        # Support tables are narrow (normally <=8); an explicit per-slot
+        # comparison is cheaper and exact compared with a global unique.
+        sequence_count = torch.zeros(
+            len(foliage), dtype=torch.int16, device=foliage.xyz.device
+        )
+        for slot in range(sequence.shape[1]):
+            # ``valid[:, slot]`` is a view.  Mutating it in-place corrupts the
+            # persisted validity table and makes the count depend on slot
+            # order, so every uniqueness accumulator must work on a clone.
+            first = valid[:, slot].clone()
+            for previous_slot in range(slot):
+                first &= ~(
+                    valid[:, previous_slot]
+                    & (sequence[:, previous_slot] == sequence[:, slot])
+                )
+            sequence_count += first.to(torch.int16)
+        foliage.verified_sequence_count.copy_(sequence_count)
+    required_sequences = torch.minimum(
+        foliage.support_sequence_count.clamp_min(1),
+        torch.full_like(foliage.support_sequence_count, 2),
+    )
+    verified = (
+        unverified
+        & (foliage.verified_camera_count >= 2)
+        & (foliage.verified_sequence_count >= required_sequences)
+    )
+    foliage.verification_state[verified] = VERIFICATION_VERIFIED
+    # The parent evidence row was only a candidate after displacement.  Once
+    # two real owner cameras (and the required independent sequences) have
+    # witnessed the child at its new position, promote that candidate into
+    # the child's updated ray-posterior identity.
+    promotable = verified & (foliage.candidate_evidence_primitive_id >= 0)
+    foliage.evidence_primitive_id[promotable] = (
+        foliage.candidate_evidence_primitive_id[promotable]
+    )
+    foliage.candidate_evidence_primitive_id[promotable] = -1
+    return {
+        "contract": "real_ray_child_reverification",
+        "candidate_rows": int(unverified.sum()),
+        "real_contributing_candidates": int(witnessed.sum()),
+        "new_camera_witnesses": int(added),
+        "new_color_witnesses": int(color_witnesses),
+        "newly_verified": int(verified.sum()),
+        "remaining_unverified": int(
+            (foliage.verification_state == VERIFICATION_UNVERIFIED).sum()
+        ),
     }
 
 
@@ -8327,6 +8818,8 @@ def _apply_static_optical_policy(
         "static_detail_mass_trainable": _static_detail_stage_trainable(phase),
         "static_detail_ray_trainable": _static_detail_ray_trainable(phase),
         "skeleton_mass_trainable": phase != "canonical_polish",
+        "opacity_growth_before_policy": {},
+        "opacity_growth_removed_by_policy": {},
     }
     if phase == "canonical_polish":
         for parameter in (
@@ -8357,20 +8850,69 @@ def _apply_static_optical_policy(
             if torch.is_tensor(first_moment):
                 first_moment[detail] = 0
 
+    verification_state = getattr(foliage, "verification_state", None)
+    if verification_state is not None:
+        unverified = verification_state == VERIFICATION_UNVERIFIED
+        # DC and optical mass are allowed to settle on true owner rays, but a
+        # child cannot invent view-dependent colour before multiview proof.
+        if foliage.features.grad is not None and foliage.features.shape[1] > 1:
+            foliage.features.grad[unverified, 1:] = 0
+        feature_state = volume_optimizer.state.get(foliage.features, {})
+        feature_moment = feature_state.get("exp_avg")
+        if (
+            torch.is_tensor(feature_moment)
+            and feature_moment.ndim == 3
+            and feature_moment.shape[1] > 1
+        ):
+            feature_moment[unverified, 1:] = 0
+
     envelope = foliage.persistent_envelope_mask
+    retirement_envelope = envelope
+    if verification_state is not None:
+        retirement_envelope = envelope & (
+            verification_state == VERIFICATION_VERIFIED
+        )
     readiness = 1.0 - torch.exp(
         -foliage.replacement_observation_count.float() / 3.0
     )
     authority = (
-        foliage.replacement_overlap_ema * readiness * envelope.float()
+        foliage.replacement_overlap_ema
+        * readiness
+        * retirement_envelope.float()
     ).detach().clamp(0.0, 1.0)
-    if bool(envelope.any()):
+    if bool(retirement_envelope.any()):
         audit["mean_envelope_replacement_authority"] = float(
-            authority[envelope].mean()
+            authority[retirement_envelope].mean()
         )
     gradient = foliage.opacity_logits.grad
     if gradient is not None:
-        growth = envelope[:, None] & (gradient < 0)
+        skeleton = getattr(
+            foliage,
+            "static_skeleton_mask",
+            torch.zeros_like(envelope),
+        )
+        detail = foliage.static_leaf_mask
+        role_masks = {
+            "skeleton": skeleton,
+            "persistent_envelope": envelope,
+            "static_detail": detail,
+        }
+        if verification_state is not None:
+            role_masks["unverified_child"] = unverified
+        for name, mask in role_masks.items():
+            growth_values = (-gradient[mask]).clamp_min(0.0)
+            audit["opacity_growth_before_policy"][name] = {
+                "rows": int((growth_values > 0).flatten(1).any(dim=1).sum())
+                if len(growth_values)
+                else 0,
+                "magnitude": float(growth_values.sum()),
+            }
+        gradient_before = gradient.detach().clone()
+        # Newborn children must be able to establish optical existence before
+        # they can participate in envelope retirement.  Even genuine detail
+        # overlap is only a replacement *candidate* until the displaced child
+        # has independent real-ray verification.
+        growth = retirement_envelope[:, None] & (gradient < 0)
         attenuated_growth = growth & (authority[:, None] > 0)
         audit["envelope_growth_rows_attenuated"] = int(
             attenuated_growth.flatten(1).any(dim=1).sum()
@@ -8378,12 +8920,19 @@ def _apply_static_optical_policy(
         gradient[growth] *= (
             1.0 - authority[:, None].expand_as(gradient)[growth]
         )
+        removed = (gradient - gradient_before).clamp_min(0.0)
+        for name, mask in role_masks.items():
+            audit["opacity_growth_removed_by_policy"][name] = float(
+                removed[mask].sum()
+            )
     # Apply the same continuous authority to Adam's retained growth moment;
     # otherwise a zero current gradient can still increase envelope mass.
     state = volume_optimizer.state.get(foliage.opacity_logits, {})
     first_moment = state.get("exp_avg")
     if torch.is_tensor(first_moment):
-        growth_momentum = envelope[:, None] & (first_moment < 0)
+        growth_momentum = retirement_envelope[:, None] & (
+            first_moment < 0
+        )
         first_moment[growth_momentum] *= (
             1.0
             - authority[:, None].expand_as(first_moment)[growth_momentum]
@@ -10243,6 +10792,40 @@ def main():
             if args.reconstruction_target == "static"
             else None
         ),
+        "static_ray_local_mass_handoff": {
+            "evidence_every": int(args.static_replacement_evidence_every),
+            "ema_decay": float(args.static_replacement_ema_decay),
+            "maximum_fraction_per_event": float(
+                args.static_replacement_mass_fraction_per_event
+            ),
+            "candidate_contract": (
+                "primitive_center_same_tree_only__no_retirement_authority"
+            ),
+            "authority_contract": (
+                "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
+                "distinct_view_persistent"
+            ),
+            "transition_contract": (
+                "reversible_integrated_optical_mass_reference"
+            ),
+        },
+        "child_verification_lifecycle": {
+            "grace_iterations": int(
+                args.child_verification_grace_iterations
+            ),
+            "new_child_state": "unverified",
+            "parent_observations": "candidates_not_proof",
+            "verification": (
+                "native_real_ray_contribution_plus_candidate_camera_"
+                "multiview_sequence"
+            ),
+            "unverified_permissions": {
+                "dc_and_mass_growth": True,
+                "higher_order_sh": False,
+                "split": False,
+                "ordinary_prune_during_grace": False,
+            },
+        },
         "static_training_stages": (
             {
                 "rigid_stage": "validated_native_2dgs_handoff",
@@ -11505,6 +12088,18 @@ def main():
         "resume_iteration": int(start_step),
         "requested_stop_iteration": int(args.iterations),
     }
+    static_replacement_audit = {
+        "contract": "persistent_distinct_view_real_ray_replacement_ema",
+        "scheduled": False,
+    }
+    static_mass_handoff_audit = {
+        "contract": "reversible_integrated_optical_mass_handoff",
+        "changed_rows": 0,
+    }
+    static_child_verification_audit = {
+        "contract": "real_ray_child_reverification",
+        "candidate_rows": 0,
+    }
     progress = tqdm(
         range(start_step, args.iterations),
         initial=start_step,
@@ -11706,6 +12301,14 @@ def main():
             ) = _static_detail_isolated_gradient_gates(
                 static_detail_gradient_gate
             )
+        static_replacement_candidate_scheduled = bool(
+            args.reconstruction_target == "static"
+            and foliage_active
+            and static_detail_active
+            and args.optical_replacement_policy != "disabled"
+            and args.static_replacement_evidence_every > 0
+            and (step + 1) % args.static_replacement_evidence_every == 0
+        )
         package = render_hybrid(
             view,
             surface,
@@ -11727,12 +12330,23 @@ def main():
             volume_opacity_gradient_gate=canonical_volume_opacity_gate,
             volume_opacity_scale=1.0 if foliage_active else 0.0,
             structural_trainable_start=0,
-            audit_fields=torch.stack(
+            optical_replacement_policy=(
+                args.optical_replacement_policy
+                if static_replacement_candidate_scheduled
+                else "disabled"
+            ),
+            audit_fields=torch.cat(
                 [
-                    task["p_canopy_core"],
-                    task["p_rigid"],
-                    canopy_topology_signal,
-                ]
+                    torch.stack(
+                        [
+                            task["p_canopy_core"],
+                            task["p_rigid"],
+                            canopy_topology_signal,
+                        ]
+                    ),
+                    target.detach(),
+                ],
+                dim=0,
             ),
         )
         # The mixed image is the authoritative image-formation model, but it
@@ -12535,29 +13149,61 @@ def main():
                 ),
             )
             del static_detail_isolated_package
-        static_replacement_audit = (
-            _accumulate_static_replacement_evidence(
+        static_child_verification_audit = (
+            _update_static_child_verification_from_render(
                 foliage,
                 package,
-                decay=args.static_replacement_ema_decay,
+                camera_id=int(view.colmap_id),
+                camera_sequence_lookup=camera_sequence_lookup,
+                volume_optimizer=volume_optimizer,
             )
-            if (
-                args.reconstruction_target == "static"
-                and foliage_active
-                and static_detail_active
-                and args.optical_replacement_policy != "disabled"
-            )
+            if args.reconstruction_target == "static" and foliage_active
             else {
+                "contract": "real_ray_child_reverification",
+                "candidate_rows": 0,
+                "new_camera_witnesses": 0,
+                "new_color_witnesses": 0,
+                "newly_verified": 0,
+            }
+        )
+        static_replacement_scheduled = (
+            static_replacement_candidate_scheduled
+        )
+        if static_replacement_scheduled:
+            (
+                ray_local_authority,
+                ray_local_visible,
+                ray_local_measurement,
+            ) = _measure_static_ray_local_replacement(
+                view,
+                surface,
+                foliage,
+                background,
+                task,
+                package,
+            )
+            static_replacement_audit = {
+                **ray_local_measurement,
+                **_accumulate_static_replacement_evidence(
+                    foliage,
+                    ray_local_authority,
+                    ray_local_visible,
+                    camera_id=int(view.colmap_id),
+                    decay=args.static_replacement_ema_decay,
+                ),
+            }
+        else:
+            static_replacement_audit = {
                 "contract": (
-                    "persistent_view_depth_local_replacement_ema"
+                    "persistent_distinct_view_real_ray_replacement_ema"
                     if args.optical_replacement_policy != "disabled"
                     else "replacement_disabled_no_evidence_or_mass_handoff"
                 ),
+                "scheduled": False,
                 "observed_envelope_rows": 0,
                 "overlapping_envelope_rows": 0,
                 "mean_authority": 0.0,
             }
-        )
 
         conditioned_loss = canonical_loss.new_zeros(())
         conditioned_counterfactual_transparency = canonical_loss.new_zeros(())
@@ -13438,6 +14084,22 @@ def main():
                 args,
             )
         )
+        static_mass_handoff_audit = (
+            _apply_static_ray_local_mass_handoff(
+                foliage,
+                volume_optimizer,
+                maximum_fraction_per_event=(
+                    args.static_replacement_mass_fraction_per_event
+                ),
+            )
+            if static_replacement_scheduled
+            else {
+                "contract": "reversible_integrated_optical_mass_handoff",
+                "changed_rows": 0,
+                "removed_mass": 0.0,
+                "restored_mass": 0.0,
+            }
+        )
         surface_spatial_confidence_audit = (
             _apply_surface_spatial_confidence_gradients(surface)
         )
@@ -13636,6 +14298,17 @@ def main():
                     foliage.dynamic_leaf_mask,
                     dynamic_opacity_ceiling,
                 )
+            # Keep the unretired reference synchronized with legitimate hit
+            # and opacity learning.  The next scheduled hand-off can then
+            # remove or restore only the replacement-owned fraction without
+            # erasing new optical existence evidence.
+            realized_mass = foliage.integrated_optical_mass()
+            retained_fraction = (
+                1.0 - foliage.handoff_retired_fraction
+            ).clamp_min(1.0e-4)
+            foliage.handoff_reference_mass.copy_(
+                realized_mass / retained_fraction
+            )
 
         topology_event = None
         if (
@@ -13740,6 +14413,7 @@ def main():
                 view_by_camera_id=view_by_camera_id,
                 geometry_evidence=geometry,
                 foliage_ray_evidence=foliage_rays,
+                current_iteration=step + 1,
             )
             new_to_old = event.pop("_new_to_old", None)
             if new_to_old is not None:
@@ -13773,6 +14447,7 @@ def main():
                         support_sequence_count=(
                             birth_support_sequence_count
                         ),
+                        birth_iteration=step + 1,
                     )
                     birth_mapping = birth_event.pop("_new_to_old")
                     birth_start = int(birth_event.pop("_new_start"))
@@ -13989,6 +14664,10 @@ def main():
                 ),
                 "volume_opacity_settle": volume_opacity_settle_audit,
                 "static_local_replacement": static_replacement_audit,
+                "static_optical_mass_handoff": static_mass_handoff_audit,
+                "static_child_verification": (
+                    static_child_verification_audit
+                ),
                 "integrated_optical_mass_compensation": (
                     optical_mass_compensation_audit
                 ),
@@ -14574,6 +15253,9 @@ def main():
         "surface_spatial_confidence": surface_spatial_confidence_audit,
         "foliage_ray_evidence_audit": foliage_rays.audit(),
         "volume_opacity_settle": volume_opacity_settle_audit,
+        "static_local_replacement": static_replacement_audit,
+        "static_optical_mass_handoff": static_mass_handoff_audit,
+        "static_child_verification": static_child_verification_audit,
         "targeted_evaluation": evaluation,
         "evaluation_contract": {
             "deployment_mode": "canonical",

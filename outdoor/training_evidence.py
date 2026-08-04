@@ -900,10 +900,20 @@ class FoliageRayEvidence:
         return selected
 
     def _descendants_for_sources(self, foliage, source_ids):
-        current_ids = foliage.evidence_primitive_id
+        # A split child cannot claim its parent's evidence row as already
+        # verified at the displaced centre.  It may nevertheless use that row
+        # as a candidate for the differentiable ray-interval recheck.
+        verified_ids = foliage.evidence_primitive_id
+        candidate_ids = getattr(
+            foliage, "candidate_evidence_primitive_id", verified_ids
+        )
+        current_ids = torch.where(
+            verified_ids >= 0, verified_ids, candidate_ids
+        )
         signature = (
             str(current_ids.device),
-            int(current_ids.data_ptr()),
+            int(verified_ids.data_ptr()),
+            int(candidate_ids.data_ptr()),
             int(current_ids.numel()),
         )
         if signature != self._descendant_cache_signature:

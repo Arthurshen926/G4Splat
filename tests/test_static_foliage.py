@@ -4,6 +4,7 @@ from outdoor.hybrid_gaussian_renderer import (
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     LAYER_STATIC_SKELETON,
+    VERIFICATION_UNVERIFIED,
     VolumetricFoliageModel,
     view_depth_local_optical_replacement,
 )
@@ -161,6 +162,33 @@ def test_integrated_mass_survives_scale_refinement():
         foliage.restore_integrated_optical_mass(mass)
     assert torch.allclose(
         foliage.integrated_optical_mass(), mass, rtol=2e-5, atol=2e-7
+    )
+
+
+def test_split_children_drop_parent_proof_and_keep_mass_and_lineage():
+    payload, _ = fuse_sequence_evidence_into_static_leaves(_payload())
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    parent = torch.nonzero(
+        foliage.persistent_envelope_mask, as_tuple=False
+    ).flatten()[:1]
+    foliage.features.data[parent, 1:] = 2.0
+    mass_before = foliage.integrated_optical_mass().sum()
+    parent_lineage = int(foliage.lineage_id[parent])
+    foliage.split(parent, birth_iteration=17)
+    children = foliage.parent_lineage_id == parent_lineage
+    assert int(children.sum()) == 2
+    assert torch.all(
+        foliage.verification_state[children] == VERIFICATION_UNVERIFIED
+    )
+    assert torch.all(foliage.birth_iteration[children] == 17)
+    assert torch.all(foliage.evidence_primitive_id[children] == -1)
+    assert torch.all(foliage.features[children, 1:] == 0)
+    assert torch.allclose(
+        foliage.integrated_optical_mass().sum(),
+        mass_before,
+        rtol=2e-5,
+        atol=2e-7,
     )
 
 

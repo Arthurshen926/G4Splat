@@ -536,12 +536,14 @@ def test_ray_evidence_identity_survives_split_but_not_dynamic_clone():
 
     assert model.evidence_primitive_id.tolist() == [0, 1]
     model.split(torch.tensor([0]))
-    # The unsplit second primitive remains first, followed by both children
-    # of evidence primitive zero.
-    assert model.evidence_primitive_id.tolist() == [1, 0, 0]
+    # The unsplit row keeps verified evidence. Displaced children keep source
+    # zero only as a ray re-verification candidate, never as inherited proof.
+    assert model.evidence_primitive_id.tolist() == [1, -1, -1]
+    assert model.candidate_evidence_primitive_id.tolist() == [1, 0, 0]
 
     model.append_dynamic_leaves(torch.tensor([1]))
-    assert model.evidence_primitive_id.tolist() == [1, 0, 0, -1]
+    assert model.evidence_primitive_id.tolist() == [1, -1, -1, -1]
+    assert model.candidate_evidence_primitive_id.tolist() == [1, 0, 0, -1]
     assert model.dynamic_leaf_mask.tolist() == [False, False, False, True]
 
 
