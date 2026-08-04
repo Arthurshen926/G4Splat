@@ -36,7 +36,11 @@ from outdoor.directional_sky import (  # noqa: E402
     CanonicalDirectionalSky,
     composite_white_background,
 )
-from outdoor.evidence_store import load_evidence_store  # noqa: E402
+from outdoor.evidence_store import (  # noqa: E402
+    load_evidence_store,
+    mast3r_is_geometry_authority,
+    sfm_coverage_tracks_enabled,
+)
 from outdoor.foliage_geometry import (  # noqa: E402
     evidence_conditioned_dynamic_opacity_ceiling,
     evidence_conditioned_leaf_optical_mass,
@@ -4714,7 +4718,7 @@ def _validate_surface_warmstart(
     surface_ply: Path,
     handoff_manifest: Path,
 ) -> dict:
-    """Validate a no-COLMAP, no-historical rigid surface provenance chain."""
+    """Validate a no-history, explicitly scoped rigid-surface provenance."""
     surface_ply = surface_ply.expanduser().resolve()
     handoff_manifest = handoff_manifest.expanduser().resolve()
     if not surface_ply.is_file():
@@ -4760,9 +4764,15 @@ def _validate_surface_warmstart(
         payload["chart_surface_state_sha256"] = actual_chart_sha256
     if bool(payload.get("historical_gaussian_input_used", True)):
         raise RuntimeError("Historical Gaussian warm-starts are forbidden")
-    if bool(payload.get("colmap_points_or_tracks_used", True)):
+    colmap_used = bool(payload.get("colmap_points_or_tracks_used", True))
+    coverage_only = (
+        payload.get("sfm_track_usage_mode") == "coverage_only"
+        and payload.get("geometry_authority") == "mast3r_matcha_primary"
+    )
+    if colmap_used and not coverage_only:
         raise RuntimeError(
-            "Rigid surface handoff used forbidden COLMAP point/track geometry"
+            "Rigid surface handoff used COLMAP geometry without the explicit "
+            "MASt3R-primary coverage-only contract"
         )
     if (
         payload.get("surface_ownership_contract")
@@ -4959,16 +4969,24 @@ def _write_rigid_stage_surface_handoff(
         evidence_store
     )
     rejection_reasons = []
-    if evidence_store.get("geometry_source") != "mast3r_only":
-        rejection_reasons.append("geometry source is not MASt3R-only")
-    if evidence_colmap_geometry_used:
-        rejection_reasons.append("Evidence Store used COLMAP point/track geometry")
+    sfm_coverage = sfm_coverage_tracks_enabled(evidence_store)
+    if not mast3r_is_geometry_authority(evidence_store):
+        rejection_reasons.append("geometry source is not MASt3R/MAtCha-primary")
+    if evidence_colmap_geometry_used and not sfm_coverage:
+        rejection_reasons.append(
+            "Evidence Store used COLMAP geometry outside coverage-only mode"
+        )
     if bool(initialization.get("historical_model_initialization", True)):
         rejection_reasons.append("historical Gaussian initialization was used")
     if bool(surface_audit.get("historical_trained_ply_used", True)):
         rejection_reasons.append("surface seed used a historical trained PLY")
-    if bool(surface_audit.get("colmap_points_or_tracks_used", True)):
-        rejection_reasons.append("surface seed used COLMAP point/track geometry")
+    if (
+        bool(surface_audit.get("colmap_points_or_tracks_used", True))
+        and not sfm_coverage
+    ):
+        rejection_reasons.append(
+            "surface seed used COLMAP geometry outside coverage-only mode"
+        )
     if int(surface_audit.get("canopy_surface_seed_count", -1)) != 0:
         rejection_reasons.append("surface seed contains canopy-owned primitives")
     if int(surface_point_count) <= 0:
@@ -5036,6 +5054,14 @@ def _write_rigid_stage_surface_handoff(
         "colmap_points_or_tracks_used": bool(
             evidence_colmap_geometry_used
             or surface_audit.get("colmap_points_or_tracks_used", True)
+        ),
+        "sfm_track_usage_mode": (
+            "coverage_only" if sfm_coverage else "disabled"
+        ),
+        "geometry_authority": (
+            "mast3r_matcha_primary"
+            if mast3r_is_geometry_authority(evidence_store)
+            else "unsupported"
         ),
         "all_real_rgb_from_iteration_one": True,
         "surface_ownership_contract": (
@@ -9974,9 +10000,9 @@ def main():
     )
     output = Path(dataset.model_path).resolve()
     evidence_store = load_evidence_store(args.evidence_store)
-    if evidence_store.get("geometry_source") != "mast3r_only":
+    if not mast3r_is_geometry_authority(evidence_store):
         raise RuntimeError(
-            "Native hybrid Teacher v2 requires geometry_source=mast3r_only"
+            "Native hybrid Teacher requires MASt3R/MAtCha-primary geometry"
         )
     if evidence_store.get("final_model") != "hybrid_teacher":
         raise RuntimeError(
@@ -10065,7 +10091,7 @@ def main():
         str(row["sequence_id"])
         for row in foliage_initialization_audit.get("selected_views", [])
     }
-    if evidence_store.get("geometry_source") == "mast3r_only":
+    if mast3r_is_geometry_authority(evidence_store):
         gate_failures = []
         if not foliage_initialization_audit.get(
             "cross_sequence_visual_hull", False
@@ -15282,7 +15308,12 @@ def main():
             ),
         },
         "historical_parent_ply_used": False,
-        "colmap_points_or_tracks_used": False,
+        "colmap_points_or_tracks_used": bool(
+            evidence_store.get("colmap_points_or_tracks_used", False)
+        ),
+        "sfm_track_usage_mode": evidence_store.get(
+            "sfm_track_usage_mode", "disabled"
+        ),
         "all_real_rgb_from_iteration_one": True,
         "canopy_surface_topology_gradient": False,
         "canopy_volume_topology_gradient": True,

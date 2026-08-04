@@ -23,6 +23,8 @@ from outdoor.evidence_store import (
     ROLE_TRANSIENT,
     artifact_path,
     load_evidence_store,
+    mast3r_is_geometry_authority,
+    sfm_coverage_tracks_enabled,
 )
 from outdoor.blue_noise_sampling import (
     deterministic_blue_noise_rows,
@@ -2423,6 +2425,8 @@ def build_surface_seed(
     dav2_rigid_selected_views: int = 0,
     dav2_rigid_seeds_per_view: int = 256,
     dav2_rigid_cross_sequence_radius: float = 0.25,
+    maximum_sfm_rigid_coverage_seeds: int = 160_000,
+    sfm_rigid_coverage_radius: float = 0.025,
     seed: int = 991,
 ) -> dict[str, Any]:
     store = load_evidence_store(evidence_store)
@@ -2436,7 +2440,8 @@ def build_surface_seed(
         raise FileNotFoundError(
             f"Surface target RGB root does not exist: {rgb_root}"
         )
-    mast3r_only = store.get("geometry_source") == "mast3r_only"
+    mast3r_primary = mast3r_is_geometry_authority(store)
+    sfm_coverage = sfm_coverage_tracks_enabled(store)
     xyz_parts: list[np.ndarray] = []
     rgb_parts: list[np.ndarray] = []
     sigma_parts: list[np.ndarray] = []
@@ -2453,8 +2458,13 @@ def build_surface_seed(
     source_counts: dict[str, int] = {}
     dense_pointmap = None
     dav2_rigid = None
+    sfm_envelope_audit = {
+        "reference_radius": 0.0,
+        "maximum_radius": 0.0,
+        "rejected": 0,
+    }
 
-    if not mast3r_only:
+    if not mast3r_primary:
         colmap = _load_tracks(artifact_path(store, "colmap_tracks"))
         colmap_keep = _selection_mask(
             colmap,
@@ -2513,10 +2523,10 @@ def build_surface_seed(
             maximum_canopy_probability=maximum_canopy_probability,
             # The new mainline requires genuine ragged multi-view tracks.
             # A one-camera MASt3R sparse export cannot pass this selection.
-            minimum_observations=2 if mast3r_only else 1,
-            maximum_reprojection_error=2.0 if mast3r_only else 2.5,
+            minimum_observations=2 if mast3r_primary else 1,
+            maximum_reprojection_error=2.0 if mast3r_primary else 2.5,
         )
-        if mast3r_only:
+        if mast3r_primary:
             # A same-sequence source-star is not a stable building landmark.
             # Surface initialization uses only tracks independently observed
             # across Cambridge traversals; sequence-local canopy evidence is
@@ -2532,7 +2542,7 @@ def build_surface_seed(
             if xyz_parts
             else np.empty((0, 3), dtype=np.float32)
         )
-        if not mast3r_only and len(candidate) and len(reference):
+        if not mast3r_primary and len(candidate) and len(reference):
             distance = cKDTree(reference).query(candidate, k=1)[0]
             candidate_support = distance <= min(
                 float(consensus_radius), 0.05
@@ -2654,7 +2664,7 @@ def build_surface_seed(
         source_counts["mast3r_dense_single_sequence"] = int(
             (~dense_pointmap["cross_sequence_supported"]).sum()
         )
-    if mast3r_only and not sum(map(len, xyz_parts)):
+    if mast3r_primary and not sum(map(len, xyz_parts)):
         raise RuntimeError(
             "MASt3R-only initialization has no valid rigid observations"
         )
@@ -2669,7 +2679,7 @@ def build_surface_seed(
         store, "chart_crossview_consensus", required=False
     )
     if chart_path is not None and chart_cameras is not None:
-        if mast3r_only and chart_consensus is None:
+        if mast3r_primary and chart_consensus is None:
             raise RuntimeError(
                 "MASt3R-only initialization requires pixelwise Chart "
                 "cross-view consensus"
@@ -2782,6 +2792,124 @@ def build_surface_seed(
         )
         source_counts["chart_unsupported_bootstrap"] = int(
             (~chart["consensus_confirmed"]).sum()
+        )
+
+    if sfm_coverage:
+        # SfM is admitted only after every MASt3R/MAtCha renderer witness has
+        # been assembled. This ordering is the authority contract: raw tracks
+        # may fill a measured spatial hole, but can neither reject nor
+        # de-duplicate a primary geometry observation.
+        colmap = _load_tracks(artifact_path(store, "colmap_tracks"))
+        candidate_mask = _selection_mask(
+            colmap,
+            minimum_rigid_probability=max(
+                float(minimum_rigid_probability), 0.80
+            ),
+            maximum_canopy_probability=min(
+                float(maximum_canopy_probability), 0.10
+            ),
+            minimum_observations=3,
+            maximum_reprojection_error=1.5,
+        )
+        if "sequence_count" in colmap:
+            candidate_mask &= colmap["sequence_count"] >= 2
+        candidate_indices = np.flatnonzero(candidate_mask)
+        primary_reference = np.concatenate(xyz_parts).astype(np.float32)
+        candidate_xyz = colmap["xyz"][candidate_indices].astype(np.float32)
+        envelope_keep, sfm_envelope_audit = _rigid_scene_envelope_mask(
+            candidate_xyz, primary_reference
+        )
+        candidate_indices = candidate_indices[envelope_keep]
+        candidate_xyz = candidate_xyz[envelope_keep]
+        if len(candidate_xyz) and len(primary_reference):
+            distance_to_primary = cKDTree(primary_reference).query(
+                candidate_xyz, k=1, workers=-1
+            )[0]
+            coverage_hole = distance_to_primary > max(
+                float(sfm_rigid_coverage_radius),
+                1.5 * float(dedup_radius),
+            )
+            candidate_indices = candidate_indices[coverage_hole]
+            candidate_xyz = candidate_xyz[coverage_hole]
+        # Keep one best measured track per local 3-D coverage cell. This is a
+        # capacity bound, not a geometry-quality threshold; the strict
+        # reprojection/role contract above already establishes validity.
+        if len(candidate_indices):
+            quality = (
+                colmap["role_probabilities"][candidate_indices, ROLE_RIGID]
+                * np.sqrt(
+                    np.maximum(
+                        colmap["valid_observation_count"][candidate_indices],
+                        1,
+                    )
+                )
+                / np.maximum(
+                    colmap["reprojection_error"][candidate_indices] + 0.25,
+                    0.25,
+                )
+            )
+            cells = np.floor(
+                candidate_xyz
+                / max(float(sfm_rigid_coverage_radius), 1.0e-4)
+            ).astype(np.int64)
+            order = np.lexsort((candidate_indices, -quality))
+            _, first = np.unique(cells[order], axis=0, return_index=True)
+            candidate_indices = candidate_indices[order[np.sort(first)]]
+            quality = quality[order[np.sort(first)]]
+            maximum_coverage = max(
+                int(maximum_sfm_rigid_coverage_seeds), 0
+            )
+            if len(candidate_indices) > maximum_coverage:
+                keep = np.lexsort((candidate_indices, -quality))[
+                    :maximum_coverage
+                ]
+                candidate_indices = candidate_indices[keep]
+        count = int(len(candidate_indices))
+        if count:
+            xyz_parts.append(colmap["xyz"][candidate_indices])
+            rgb_parts.append(
+                colmap["rgb"][candidate_indices].astype(np.float32) / 255.0
+            )
+            sigma_parts.append(
+                np.sqrt(
+                    colmap["position_covariance_diag"][
+                        candidate_indices
+                    ].mean(axis=1)
+                )
+            )
+            confidence_parts.append(
+                colmap["role_probabilities"][candidate_indices, ROLE_RIGID]
+            )
+            track_parts.append(colmap["track_id"][candidate_indices])
+            source_parts.append(
+                np.full(count, SOURCE_COLMAP, dtype=np.int8)
+            )
+            chart_id_parts.append(np.full(count, -1, dtype=np.int32))
+            chart_uv_parts.append(
+                np.full((count, 2), np.nan, dtype=np.float32)
+            )
+            pointmap_view_parts.append(
+                np.full(count, -1, dtype=np.int32)
+            )
+            pointmap_cross_sequence_parts.append(
+                np.zeros(count, dtype=bool)
+            )
+            # Valid raw tracks are persistent renderer witnesses. Their
+            # covariance remains source-specific and no COLMAP centre is
+            # copied into a MASt3R/Chart observation factor.
+            persistent_geometry_parts.append(np.ones(count, dtype=bool))
+            chart_independent_support_parts.append(
+                np.zeros(count, dtype=bool)
+            )
+        source_counts["sfm_rigid_coverage_candidates"] = int(
+            candidate_mask.sum()
+        )
+        source_counts["sfm_rigid_scene_envelope_rejected"] = int(
+            sfm_envelope_audit["rejected"]
+        )
+        source_counts["sfm_rigid_coverage_admitted"] = count
+        source_counts["sfm_rigid_coverage_primary_reference"] = int(
+            len(primary_reference)
         )
 
     if (
@@ -2900,7 +3028,9 @@ def build_surface_seed(
     # not form an opaque displaced sheet before RGB/geometry can adjudicate
     # them.
     initial_opacity = np.full(len(xyz), 0.025, dtype=np.float32)
-    initial_opacity[source_type == SOURCE_COLMAP] = 0.08
+    initial_opacity[source_type == SOURCE_COLMAP] = (
+        0.05 if sfm_coverage else 0.08
+    )
     measured_tracks = (source_type == SOURCE_MAST3R) & (track_id >= 0)
     initial_opacity[measured_tracks] = 0.08
     if bool(dense_rows.any()):
@@ -2974,7 +3104,17 @@ def build_surface_seed(
         "historical_trained_ply_used": False,
         "all_real_rgb_initialization_used": False,
         "geometry_source": store.get("geometry_source", "legacy_mixed"),
-        "colmap_points_or_tracks_used": not mast3r_only,
+        "colmap_points_or_tracks_used": bool(
+            sfm_coverage or not mast3r_primary
+        ),
+        "sfm_track_usage_mode": (
+            "coverage_only" if sfm_coverage else "disabled"
+        ),
+        "geometry_authority": (
+            "mast3r_matcha_primary"
+            if mast3r_primary
+            else "legacy_source_specific"
+        ),
         "scale_median": np.median(scales, axis=0).tolist(),
         "position_sigma_median": float(np.median(sigma)),
         "persistent_geometry_seed_count": int(
@@ -3057,6 +3197,20 @@ def build_surface_seed(
                 "selected": 0,
             }
         ),
+        "sfm_rigid_coverage": {
+            "enabled": bool(sfm_coverage),
+            "usage_mode": "coverage_only" if sfm_coverage else "disabled",
+            "maximum_seeds": int(maximum_sfm_rigid_coverage_seeds),
+            "minimum_distance_from_primary": float(
+                sfm_rigid_coverage_radius
+            ),
+            "admitted": int(
+                source_counts.get("sfm_rigid_coverage_admitted", 0)
+            ),
+            "camera_admission_authority": False,
+            "primary_factor_replacement_authority": False,
+            "scene_envelope": sfm_envelope_audit,
+        },
     }
     output.with_suffix(".json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
@@ -3145,6 +3299,108 @@ def _mast3r_tree_tracks(
                             index, ROLE_CANOPY
                         ]
                     ),
+                }
+            )
+    return result
+
+
+def _sfm_static_tree_tracks(
+    archive_path: Path,
+    images: dict[int, dict],
+    *,
+    minimum_track_observations: int,
+    maximum_reprojection_error: float,
+) -> list[dict[str, Any]]:
+    """Adapt stable raw SfM canopy tracks without giving them hull authority.
+
+    The archive is already classified through the fixed Cambridge cameras.
+    Here we retain only cross-traversal tracks and their fixed-camera support
+    identities. The raw archive has no trustworthy per-observation pixel
+    rows, so inventing a Python reprojection table would duplicate the
+    renderer and make initialization needlessly serial. These rows can become
+    local 3D trunk/branch or crown renderer seeds, but are never used as
+    camera poses, MAtCha depth references, or visual-hull free-space evidence.
+    """
+    with np.load(archive_path, allow_pickle=False) as archive:
+        role = archive["role_probabilities"]
+        track_ids = archive["track_id"]
+        xyz_rows = archive["xyz"]
+        rgb_rows = archive["rgb"]
+        reprojection_error = archive["reprojection_error"]
+        valid_observation_count = archive["valid_observation_count"]
+        sequence_count = archive["sequence_count"]
+        position_covariance_diag = archive["position_covariance_diag"]
+        canopy_sequences = archive.get(
+            "role_sequence_count",
+            np.repeat(
+                sequence_count[:, None],
+                role.shape[1],
+                axis=1,
+            ),
+        )[:, ROLE_CANOPY]
+        keep = (
+            (role[:, ROLE_CANOPY] >= 0.65)
+            & (
+                valid_observation_count
+                >= int(minimum_track_observations)
+            )
+            & (canopy_sequences >= 2)
+            & (
+                reprojection_error
+                <= float(maximum_reprojection_error)
+            )
+        )
+        offsets = archive["support_camera_offsets"]
+        support_ids = archive["support_camera_ids"]
+        support_roles = (
+            archive["support_camera_roles"]
+            if "support_camera_roles" in archive.files
+            else None
+        )
+        result: list[dict[str, Any]] = []
+        for index in np.flatnonzero(keep):
+            begin, end = int(offsets[index]), int(offsets[index + 1])
+            local_ids = support_ids[begin:end]
+            if support_roles is not None:
+                local_ids = local_ids[
+                    support_roles[begin:end] == ROLE_CANOPY
+                ]
+            image_ids = np.unique(local_ids).astype(np.int32)
+            image_ids = np.asarray(
+                [value for value in image_ids if int(value) in images],
+                dtype=np.int32,
+            )
+            if len(image_ids) < int(minimum_track_observations):
+                continue
+            xyz = xyz_rows[index].astype(np.float64)
+            result.append(
+                {
+                    # Keep the raw id auditable while separating its namespace
+                    # from native MASt3R and negative dense-ray identities.
+                    "id": int(500_000_000_000_000_000 + track_ids[index]),
+                    "source_track_id": int(track_ids[index]),
+                    "xyz": xyz,
+                    "rgb": rgb_rows[index].astype(np.uint8),
+                    "error": float(reprojection_error[index]),
+                    "image_ids": image_ids,
+                    "point2d_indices": np.full(
+                        len(image_ids), -1, dtype=np.int64
+                    ),
+                    "tree_image_ids": image_ids,
+                    # Support cameras are sufficient for ownership and RGB
+                    # visibility. Observation-level geometry remains owned
+                    # by the native MASt3R graph and MAtCha/DAV2 factors.
+                    "observation_camera_ids": np.empty(0, dtype=np.int32),
+                    "observation_uv": np.empty((0, 2), dtype=np.float32),
+                    "observation_depth": np.empty(0, dtype=np.float32),
+                    "tree_sequence_count": int(canopy_sequences[index]),
+                    "tree_fraction": float(role[index, ROLE_CANOPY]),
+                    "position_sigma": float(
+                        np.sqrt(
+                            position_covariance_diag[index].mean()
+                        )
+                    ),
+                    "sfm_coverage_track": True,
                 }
             )
     return result
@@ -4777,6 +5033,13 @@ def _merge_foliage(
         ],
         dtype=bool,
     )
+    sfm_coverage_track = np.asarray(
+        [
+            bool(point.get("sfm_coverage_track", False))
+            for point in tracks
+        ],
+        dtype=bool,
+    )
     dense_owner_camera_id = np.full(len(tracks), -1, dtype=np.int64)
     for row in np.flatnonzero(dense_ray_local):
         observation_ids = np.asarray(
@@ -5118,7 +5381,15 @@ def _merge_foliage(
             np.where(
                 dense_ray_local,
                 SOURCE_DENSE_RAY,
-                np.where(chart_local, SOURCE_CHART, SOURCE_MAST3R),
+                np.where(
+                    chart_local,
+                    SOURCE_CHART,
+                    np.where(
+                        sfm_coverage_track,
+                        SOURCE_COLMAP,
+                        SOURCE_MAST3R,
+                    ),
+                ),
             ),
         ).astype(np.int8),
         "occupancy_probability": occupancy_probability,
@@ -5176,6 +5447,7 @@ def _merge_foliage(
     return merged, {
         "visual_hull": int(len(hull["centers"])),
         "tree_tracks": track_count,
+        "sfm_static_tree_tracks": int(sfm_coverage_track.sum()),
         "static_skeleton": int(
             (hull["layer_role"] == 1).sum() + (layer_role == 1).sum()
         ),
@@ -5631,6 +5903,8 @@ def build_foliage_seed(
     minimum_track_sequences: int = 2,
     maximum_reprojection_error: float = 2.0,
     skeleton_linearity: float = 1.8,
+    maximum_sfm_static_tree_tracks: int = 120_000,
+    sfm_tree_coverage_radius: float = 0.018,
     rigid_calibration_ply: Path | None = None,
     rigid_calibration_resolution_scale: float = 0.125,
     seed: int = 73,
@@ -5731,8 +6005,15 @@ def build_foliage_seed(
                 "dav2_metric_alignment_and_rigid_occlusion_only"
             ),
         }
-    mast3r_only = store.get("geometry_source") == "mast3r_only"
-    if mast3r_only:
+    mast3r_primary = mast3r_is_geometry_authority(store)
+    sfm_coverage = sfm_coverage_tracks_enabled(store)
+    sfm_static_tracks: list[dict[str, Any]] = []
+    sfm_static_envelope_audit = {
+        "reference_radius": 0.0,
+        "maximum_radius": 0.0,
+        "rejected": 0,
+    }
+    if mast3r_primary:
         tracks = _mast3r_tree_tracks(
             artifact_path(store, "mast3r_multiview_tracks"),
             images,
@@ -5758,7 +6039,6 @@ def build_foliage_seed(
             # observations, keep it out of localization, and let the dynamic
             # branch explain its high frequencies.
             hull_tracks = tracks
-        native_track_count = len(tracks)
         chart_foliage = _chart_foliage_samples(
             store, images, masks
         )
@@ -5836,8 +6116,65 @@ def build_foliage_seed(
                 dav2_foliage, rigid_xyz
             )
         )
+        if sfm_coverage:
+            sfm_static_tracks = _sfm_static_tree_tracks(
+                artifact_path(store, "colmap_tracks"),
+                images,
+                minimum_track_observations=max(
+                    3, int(minimum_track_observations)
+                ),
+                maximum_reprojection_error=min(
+                    1.5, float(maximum_reprojection_error)
+                ),
+            )
+            (
+                sfm_static_tracks,
+                sfm_static_envelope_rejected,
+                sfm_static_envelope_audit,
+            ) = _filter_sequence_local_scene_envelope(
+                sfm_static_tracks, rigid_xyz
+            )
+            sfm_static_envelope_audit = {
+                **sfm_static_envelope_audit,
+                "rejected": int(sfm_static_envelope_rejected),
+            }
+            if sfm_static_tracks and tracks:
+                primary_xyz = np.stack(
+                    [point["xyz"] for point in tracks]
+                ).astype(np.float32)
+                sfm_xyz = np.stack(
+                    [point["xyz"] for point in sfm_static_tracks]
+                ).astype(np.float32)
+                distance = cKDTree(primary_xyz).query(
+                    sfm_xyz, k=1, workers=-1
+                )[0]
+                sfm_static_tracks = [
+                    point
+                    for point, novel in zip(
+                        sfm_static_tracks,
+                        distance > float(sfm_tree_coverage_radius),
+                    )
+                    if novel
+                ]
+            maximum_sfm_tracks = max(
+                int(maximum_sfm_static_tree_tracks), 0
+            )
+            if len(sfm_static_tracks) > maximum_sfm_tracks:
+                # Stable quality ordering has no common raster phase and
+                # remains deterministic across restarts.
+                sfm_static_tracks = sorted(
+                    sfm_static_tracks,
+                    key=lambda point: (
+                        -float(point["tree_fraction"]),
+                        -len(point["tree_image_ids"]),
+                        float(point["error"]),
+                        int(point["source_track_id"]),
+                    ),
+                )[:maximum_sfm_tracks]
+        native_track_count = len(tracks) + len(sfm_static_tracks)
         tracks = [
             *tracks,
+            *sfm_static_tracks,
             *calibrated_pointmap_foliage,
             *dav2_foliage,
         ]
@@ -5899,7 +6236,7 @@ def build_foliage_seed(
         raise RuntimeError("No multi-view semantic tree tracks survived")
     track_xyz = np.stack([point["xyz"] for point in tracks])
     if (
-        mast3r_only
+        mast3r_primary
         and (chart_foliage or pointmap_foliage)
         and native_track_count
     ):
@@ -5915,7 +6252,7 @@ def build_foliage_seed(
         ).astype(np.int32)
     else:
         instances = cluster_tree_instances(track_xyz)
-    if mast3r_only:
+    if mast3r_primary:
         hull_xyz = np.stack([point["xyz"] for point in hull_tracks])
         hull_instances = instances[
             cKDTree(track_xyz).query(hull_xyz, k=1)[1]
@@ -6480,7 +6817,25 @@ def build_foliage_seed(
             "geometry_source": store.get(
                 "geometry_source", "legacy_mixed"
             ),
-            "colmap_points_or_tracks_used": not mast3r_only,
+            "colmap_points_or_tracks_used": bool(
+                sfm_coverage or not mast3r_primary
+            ),
+            "sfm_track_usage_mode": (
+                "coverage_only" if sfm_coverage else "disabled"
+            ),
+            "sfm_static_tree_track_candidates_admitted": int(
+                len(sfm_static_tracks)
+            ),
+            "sfm_static_tree_contract": {
+                "maximum_tracks": int(maximum_sfm_static_tree_tracks),
+                "minimum_distance_from_primary_track": float(
+                    sfm_tree_coverage_radius
+                ),
+                "visual_hull_authority": False,
+                "camera_admission_authority": False,
+                "eligible_roles": "local_static_skeleton_or_canonical_3dgs",
+                "scene_envelope": sfm_static_envelope_audit,
+            },
             **counts,
             "posterior_camera_contract": (
                 posterior_camera_contract

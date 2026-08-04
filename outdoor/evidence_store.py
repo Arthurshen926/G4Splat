@@ -38,7 +38,13 @@ LEGACY_EVIDENCE_STORE_VERSIONS = {
     "outdoor-hybrid-teacher-evidence-v2",
     "outdoor-unified-evidence-v1",
 }
-TRACK_EVIDENCE_VERSION = "outdoor-source-track-evidence-v1"
+TRACK_EVIDENCE_VERSION = "outdoor-source-track-evidence-v2-observation-role"
+
+MAST3R_ONLY_GEOMETRY = "mast3r_only"
+MAST3R_PRIMARY_SFM_COVERAGE = "mast3r_primary_sfm_coverage"
+MAST3R_PRIMARY_GEOMETRY_SOURCES = frozenset(
+    {MAST3R_ONLY_GEOMETRY, MAST3R_PRIMARY_SFM_COVERAGE}
+)
 
 ROLE_RIGID = 0
 ROLE_CANOPY = 1
@@ -46,6 +52,26 @@ ROLE_SKY = 2
 ROLE_TRANSIENT = 3
 ROLE_UNKNOWN = 4
 ROLE_NAMES = ("rigid", "canopy", "sky", "transient", "unknown")
+
+
+def mast3r_is_geometry_authority(store_or_source: dict | str) -> bool:
+    """Return whether MASt3R/MAtCha remains the metric geometry authority."""
+    source = (
+        store_or_source.get("geometry_source")
+        if isinstance(store_or_source, dict)
+        else store_or_source
+    )
+    return str(source) in MAST3R_PRIMARY_GEOMETRY_SOURCES
+
+
+def sfm_coverage_tracks_enabled(store_or_source: dict | str) -> bool:
+    """Return whether raw SfM tracks may fill uncovered renderer support."""
+    source = (
+        store_or_source.get("geometry_source")
+        if isinstance(store_or_source, dict)
+        else store_or_source
+    )
+    return str(source) == MAST3R_PRIMARY_SFM_COVERAGE
 
 
 def _canonical_json_digest(payload: Any) -> str:
@@ -169,6 +195,9 @@ def build_track_evidence(
     }
     tracks_by_image: dict[int, list[int]] = {}
     support_camera_ids: list[list[int]] = [[] for _ in points]
+    support_role_by_camera: list[dict[int, int]] = [
+        {} for _ in points
+    ]
     for point_index, point in enumerate(points):
         for image_id in point["image_ids"]:
             image_id = int(image_id)
@@ -243,6 +272,17 @@ def build_track_evidence(
             & distortion_value
         )
         unknown = valid & ~(transient | sky | canopy | rigid)
+        observation_role = np.full(
+            len(indices), ROLE_UNKNOWN, dtype=np.int8
+        )
+        for role, chosen in enumerate(
+            (rigid, canopy, sky, transient, unknown)
+        ):
+            observation_role[chosen] = int(role)
+        for point_index, role in zip(indices, observation_role):
+            support_role_by_camera[int(point_index)][int(image_id)] = int(
+                role
+            )
         bit = sequence_bit[sequence_id(image["name"])]
         for role, chosen in enumerate(
             (rigid, canopy, sky, transient, unknown)
@@ -306,6 +346,16 @@ def build_track_evidence(
         [value for values in support_camera_ids for value in values],
         dtype=np.int32,
     )
+    flattened_camera_roles = np.asarray(
+        [
+            support_role_by_camera[index].get(
+                int(camera_id), ROLE_UNKNOWN
+            )
+            for index, camera_ids in enumerate(support_camera_ids)
+            for camera_id in camera_ids
+        ],
+        dtype=np.int8,
+    )
     archive = {
         "track_id": point_ids,
         "xyz": xyz,
@@ -320,6 +370,7 @@ def build_track_evidence(
         "position_covariance_diag": covariance_diag,
         "support_camera_offsets": offsets,
         "support_camera_ids": flattened_camera_ids,
+        "support_camera_roles": flattened_camera_roles,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **archive)
@@ -335,7 +386,10 @@ def build_track_evidence(
             for index, name in enumerate(ROLE_NAMES)
         },
         "role_probability_order": list(ROLE_NAMES),
-        "camera_support": "ragged support_camera_offsets/support_camera_ids",
+        "camera_support": (
+            "ragged support_camera_offsets/support_camera_ids with aligned "
+            "per-observation support_camera_roles"
+        ),
         "uncertainty_model": (
             "isotropic first-order reprojection covariance: "
             "(error_px+0.25)*mean_depth/mean_focal/sqrt(observations)"
@@ -448,19 +502,42 @@ class EvidenceStoreBuilder:
             artifact.payload()
             for artifact in sorted(self.artifacts, key=lambda value: value.name)
         ]
+        sfm_coverage = sfm_coverage_tracks_enabled(self.geometry_source)
+        colmap_geometry_used = bool(
+            sfm_coverage
+            or not mast3r_is_geometry_authority(self.geometry_source)
+        )
         payload: dict[str, Any] = {
             "schema_version": EVIDENCE_STORE_VERSION,
             "dataset": str(self.dataset),
             "split": self.split,
             "camera_policy": "cambridge_fixed_exact_K_and_poses",
             "camera_container": (
-                "cameras.bin/images.bin are serialization only; no "
-                "points3D.bin or COLMAP track geometry is consumed"
+                "cameras.bin/images.bin always provide the fixed camera "
+                "contract; points3D.bin is consumed only to recover sparse "
+                "track coverage and never controls camera admission"
+                if sfm_coverage
+                else (
+                    "cameras.bin/images.bin are serialization only; no "
+                    "points3D.bin or COLMAP track geometry is consumed"
+                )
             ),
             "geometry_source": self.geometry_source,
-            "colmap_points_or_tracks_used": (
-                self.geometry_source != "mast3r_only"
+            "geometry_authority": (
+                "mast3r_matcha_primary"
+                if mast3r_is_geometry_authority(self.geometry_source)
+                else "legacy_source_specific"
             ),
+            "sfm_track_usage_mode": (
+                "coverage_only"
+                if sfm_coverage
+                else (
+                    "legacy_source_specific"
+                    if colmap_geometry_used
+                    else "disabled"
+                )
+            ),
+            "colmap_points_or_tracks_used": colmap_geometry_used,
             "historical_gaussian_initialization_used": False,
             "final_model": self.final_model,
             "scene_contract": str(self.scene_contract),

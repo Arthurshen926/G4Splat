@@ -17,7 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SURFEL_ROOT = REPO_ROOT / "2d-gaussian-splatting"
 sys.path[:0] = [str(REPO_ROOT), str(SURFEL_ROOT)]
 
-from outdoor.evidence_store import load_evidence_store  # noqa: E402
+from outdoor.evidence_store import (  # noqa: E402
+    load_evidence_store,
+    mast3r_is_geometry_authority,
+    sfm_coverage_tracks_enabled,
+)
 from outdoor.lazy_scene import rgb_source_contract  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
     INITIALIZATION_VERSION,
@@ -93,6 +97,12 @@ def _parse_args() -> argparse.Namespace:
         "--dav2-rigid-cross-sequence-radius",
         type=float,
         default=0.25,
+    )
+    parser.add_argument(
+        "--maximum-sfm-rigid-coverage-seeds", type=int, default=160_000
+    )
+    parser.add_argument(
+        "--sfm-rigid-coverage-radius", type=float, default=0.025
     )
     parser.add_argument("--maximum-foliage-voxels", type=int, default=400_000)
     parser.add_argument(
@@ -177,6 +187,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--voxel-size", type=float, default=0.12)
     parser.add_argument(
+        "--maximum-sfm-static-tree-tracks", type=int, default=120_000
+    )
+    parser.add_argument(
+        "--sfm-tree-coverage-radius", type=float, default=0.018
+    )
+    parser.add_argument(
         "--rigid-calibration-ply",
         type=Path,
         help=(
@@ -254,8 +270,8 @@ def _validated_reused_foliage(
         raise RuntimeError("Reused initialization has no foliage audit")
     if foliage.get("evidence_hash") != evidence_hash:
         raise RuntimeError("Reused foliage seed/evidence hash mismatch")
-    if foliage.get("geometry_source") != "mast3r_only":
-        raise RuntimeError("Reused foliage is not MASt3R-only")
+    if not mast3r_is_geometry_authority(foliage):
+        raise RuntimeError("Reused foliage is not MASt3R/MAtCha-primary")
     if bool(foliage.get("historical_trained_ply_used", True)):
         raise RuntimeError("Reused foliage used a historical trained PLY")
     prior_rgb = payload.get("rgb_source")
@@ -389,11 +405,12 @@ def main() -> None:
                 "Interrupted surface seed does not match the current "
                 "initialization/evidence contract"
             )
+        expected_colmap = sfm_coverage_tracks_enabled(store)
         forbidden = {
             "historical_trained_ply_used": False,
             "all_real_rgb_initialization_used": False,
-            "colmap_points_or_tracks_used": False,
-            "geometry_source": "mast3r_only",
+            "colmap_points_or_tracks_used": expected_colmap,
+            "geometry_source": store["geometry_source"],
         }
         mismatched = [
             name
@@ -402,7 +419,7 @@ def main() -> None:
         ]
         if mismatched:
             raise RuntimeError(
-                "Interrupted surface seed violates the no-history/no-COLMAP "
+                "Interrupted surface seed violates the current provenance "
                 "contract: " + ", ".join(mismatched)
             )
         surface_resume = {
@@ -437,6 +454,10 @@ def main() -> None:
             dav2_rigid_cross_sequence_radius=(
                 args.dav2_rigid_cross_sequence_radius
             ),
+            maximum_sfm_rigid_coverage_seeds=(
+                args.maximum_sfm_rigid_coverage_seeds
+            ),
+            sfm_rigid_coverage_radius=args.sfm_rigid_coverage_radius,
             seed=args.seed,
         )
     foliage_reuse = None
@@ -479,6 +500,10 @@ def main() -> None:
             dynamic_birth_target_source_pixels_per_basis=(
                 args.dynamic_birth_target_source_pixels_per_basis
             ),
+            maximum_sfm_static_tree_tracks=(
+                args.maximum_sfm_static_tree_tracks
+            ),
+            sfm_tree_coverage_radius=args.sfm_tree_coverage_radius,
             rigid_calibration_ply=args.rigid_calibration_ply,
             rigid_calibration_resolution_scale=(
                 args.rigid_calibration_resolution_scale
@@ -529,7 +554,19 @@ def main() -> None:
             "dav2_rigid_cross_sequence_radius": float(
                 args.dav2_rigid_cross_sequence_radius
             ),
+            "maximum_sfm_rigid_coverage_seeds": int(
+                args.maximum_sfm_rigid_coverage_seeds
+            ),
+            "sfm_rigid_coverage_radius": float(
+                args.sfm_rigid_coverage_radius
+            ),
             "maximum_foliage_voxels": int(args.maximum_foliage_voxels),
+            "maximum_sfm_static_tree_tracks": int(
+                args.maximum_sfm_static_tree_tracks
+            ),
+            "sfm_tree_coverage_radius": float(
+                args.sfm_tree_coverage_radius
+            ),
             "selected_foliage_views": int(args.selected_foliage_views),
             "maximum_dense_rays_per_foliage_view": int(
                 args.maximum_dense_rays_per_foliage_view

@@ -31,6 +31,7 @@ from matcha.cambridge_masks import CambridgeMaskLookup  # noqa: E402
 from outdoor.evidence_store import (  # noqa: E402
     artifact_path,
     load_evidence_store,
+    mast3r_is_geometry_authority,
 )
 from outdoor.foliage_view_graph import sequence_id  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
@@ -172,8 +173,10 @@ def main() -> None:
     args = parser.parse_args()
 
     base = load_evidence_store(args.base_evidence_store)
-    if base.get("geometry_source") != "mast3r_only":
-        raise RuntimeError("Pointmap posterior requires MASt3R-only geometry")
+    if not mast3r_is_geometry_authority(base):
+        raise RuntimeError(
+            "Pointmap posterior requires MASt3R/MAtCha-primary geometry"
+        )
     output = args.output_evidence_store.expanduser().resolve()
     if output.exists():
         raise FileExistsError(output)
@@ -392,7 +395,12 @@ def main() -> None:
         "support_is_explicit_boolean_not_precision_threshold": True,
         "single_sequence_observations_remain_low_precision": True,
     }
-    manifest["colmap_points_or_tracks_used"] = False
+    # Preserve optional SfM coverage provenance. The posterior itself reads
+    # only MASt3R pointmaps and must not erase a sibling evidence source from
+    # the derived store's immutable contract.
+    manifest["colmap_points_or_tracks_used"] = bool(
+        base.get("colmap_points_or_tracks_used", False)
+    )
     manifest.setdefault("historical_gaussian_initialization_used", False)
     artifacts = [dict(row) for row in manifest["artifacts"]]
     for row in artifacts:

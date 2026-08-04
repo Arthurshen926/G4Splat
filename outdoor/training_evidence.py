@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from outdoor.evidence_store import artifact_path, load_evidence_store
+from outdoor.evidence_store import (
+    artifact_path,
+    load_evidence_store,
+    mast3r_is_geometry_authority,
+)
 from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION
 from outdoor.mast3r_track_graph import TRACK_GRAPH_VERSION
 from outdoor.role_aware_initialization import (
@@ -2074,7 +2078,7 @@ class OutdoorGeometryEvidence:
                 required=False,
             )
             if (
-                self.store.get("geometry_source") == "mast3r_only"
+                mast3r_is_geometry_authority(self.store)
                 and consensus_path is None
             ):
                 raise RuntimeError(

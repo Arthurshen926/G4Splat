@@ -2003,6 +2003,37 @@ def test_native_rigid_surface_handoff_requires_exact_digest_and_no_colmap(
         _validate_surface_warmstart(surface, manifest)
 
 
+def test_native_rigid_handoff_accepts_explicit_sfm_coverage_only(tmp_path):
+    surface = tmp_path / "surface.ply"
+    surface.write_bytes(b"mast3r-primary plus sparse coverage")
+    manifest = tmp_path / "handoff.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "protocol": "native-rigid-surface-handoff-v1",
+                "eligible_for_hybrid_surface_handoff": True,
+                "rejection_reasons": [],
+                "surface_ply": str(surface.resolve()),
+                "surface_ply_sha256": hashlib.sha256(
+                    surface.read_bytes()
+                ).hexdigest(),
+                "historical_gaussian_input_used": False,
+                "colmap_points_or_tracks_used": True,
+                "sfm_track_usage_mode": "coverage_only",
+                "geometry_authority": "mast3r_matcha_primary",
+                "surface_ownership_contract": (
+                    "rigid_pixels_tree_sky_transient_excluded"
+                ),
+                "surface_optimizer": RIGID_SURFACE_OPTIMIZER,
+            }
+        ),
+        encoding="utf-8",
+    )
+    accepted = _validate_surface_warmstart(surface, manifest)
+    assert accepted["colmap_points_or_tracks_used"]
+    assert accepted["sfm_track_usage_mode"] == "coverage_only"
+
+
 def test_legacy_rigid_handoff_recovers_validated_producer_schedule(tmp_path):
     surface = tmp_path / "surface.ply"
     surface.write_bytes(b"legacy rigid surface")

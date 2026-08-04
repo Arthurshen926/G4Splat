@@ -24,7 +24,10 @@ if str(SURFEL_ROOT) not in sys.path:
 
 from outdoor.evidence_store import (  # noqa: E402
     EVIDENCE_STORE_VERSION,
+    MAST3R_ONLY_GEOMETRY,
+    MAST3R_PRIMARY_SFM_COVERAGE,
     load_evidence_store,
+    sfm_coverage_tracks_enabled,
     sha256_file,
 )
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
@@ -505,8 +508,8 @@ def _args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--geometry-source",
-        choices=("mast3r_only",),
-        default="mast3r_only",
+        choices=(MAST3R_ONLY_GEOMETRY, MAST3R_PRIMARY_SFM_COVERAGE),
+        default=MAST3R_ONLY_GEOMETRY,
     )
     parser.add_argument(
         "--final-model",
@@ -858,9 +861,14 @@ def _write_manifest(path: Path, payload: dict) -> None:
 def main() -> None:
     args = _args()
     profile = PROFILES[args.profile]
+    geometry_suffix = (
+        "_sfm_coverage"
+        if args.geometry_source == MAST3R_PRIMARY_SFM_COVERAGE
+        else ""
+    )
     run = (
         args.run_root.expanduser().resolve()
-        / f"{args.scene}_hybrid_teacher_{args.profile}_v24"
+        / f"{args.scene}_hybrid_teacher_{args.profile}_v24{geometry_suffix}"
     )
     run.mkdir(parents=True, exist_ok=True)
     manifest_path = run / "pipeline_manifest.json"
@@ -882,6 +890,7 @@ def main() -> None:
     # individual stages below still validate their content hashes before
     # reusing artifacts.
     manifest["version"] = PIPELINE_VERSION
+    manifest["geometry_source"] = args.geometry_source
     selected = STAGES if args.stage == "all" else (args.stage,)
     python = sys.executable
     env = dict(os.environ)
@@ -911,6 +920,8 @@ def main() -> None:
             frontend / "mast3r_sfm/charts_data.npz",
             frontend / "mast3r_sfm/pointmaps",
         ]
+        if args.geometry_source == MAST3R_PRIMARY_SFM_COVERAGE:
+            required.append(dataset / "sparse/0/points3D.bin")
         missing = [path for path in required if not path.exists()]
         if missing:
             raise FileNotFoundError(
@@ -922,7 +933,10 @@ def main() -> None:
                 {
                     "frontend": str(frontend),
                     "dataset": str(dataset),
-                    "points3D_required": False,
+                    "points3D_required": bool(
+                        args.geometry_source
+                        == MAST3R_PRIMARY_SFM_COVERAGE
+                    ),
                     "points3D_read": False,
                 },
                 indent=2,
@@ -1217,6 +1231,11 @@ def main() -> None:
                     != EVIDENCE_STORE_VERSION
                 ):
                     rebuild_evidence = True
+                if (
+                    current_store.get("geometry_source")
+                    != args.geometry_source
+                ):
+                    rebuild_evidence = True
                 artifact_names = {
                     item["name"]
                     for item in current_store.get("artifacts", [])
@@ -1232,6 +1251,12 @@ def main() -> None:
                 if (
                     dav2_root is not None
                     and "dav2_index" not in artifact_names
+                ):
+                    rebuild_evidence = True
+                if (
+                    args.geometry_source
+                    == MAST3R_PRIMARY_SFM_COVERAGE
+                    and "colmap_tracks" not in artifact_names
                 ):
                     rebuild_evidence = True
                 if (
@@ -1278,6 +1303,10 @@ def main() -> None:
                 command.append("--replace")
             if dav2_root is not None:
                 command.extend(["--dav2-root", str(dav2_root)])
+            if args.geometry_source == MAST3R_PRIMARY_SFM_COVERAGE:
+                command.extend(
+                    ["--sfm-coverage-sparse", str(dataset / "sparse/0")]
+                )
             _run(
                 command,
                 env=env,
@@ -1322,7 +1351,10 @@ def main() -> None:
             "evidence_hash": store["evidence_hash"],
             "base_evidence_hash": base_store["evidence_hash"],
             "pointmap_cross_sequence_posterior": True,
-            "colmap_tracks": False,
+            "colmap_tracks": sfm_coverage_tracks_enabled(store),
+            "sfm_track_usage_mode": store.get(
+                "sfm_track_usage_mode", "disabled"
+            ),
         }
         _write_manifest(manifest_path, manifest)
     else:
@@ -1406,7 +1438,11 @@ def main() -> None:
             "dav2_rigid_cross_sequence_radius": float(
                 profile["dav2_rigid_cross_sequence_radius"]
             ),
+            "maximum_sfm_rigid_coverage_seeds": 160_000,
+            "sfm_rigid_coverage_radius": 0.025,
             "maximum_foliage_voxels": 400_000,
+            "maximum_sfm_static_tree_tracks": 120_000,
+            "sfm_tree_coverage_radius": 0.018,
             "selected_foliage_views": int(
                 profile["selected_foliage_views"]
             ),
@@ -1505,6 +1541,10 @@ def main() -> None:
                     str(profile["dav2_rigid_seeds_per_view"]),
                     "--dav2-rigid-cross-sequence-radius",
                     str(profile["dav2_rigid_cross_sequence_radius"]),
+                    "--maximum-sfm-rigid-coverage-seeds",
+                    "160000",
+                    "--sfm-rigid-coverage-radius",
+                    "0.025",
                     "--selected-foliage-views",
                     str(profile["selected_foliage_views"]),
                     "--maximum-dense-rays-per-foliage-view",
@@ -1547,6 +1587,10 @@ def main() -> None:
                     ),
                     "--maximum-foliage-voxels",
                     "400000",
+                    "--maximum-sfm-static-tree-tracks",
+                    "120000",
+                    "--sfm-tree-coverage-radius",
+                    "0.018",
                     "--voxel-size",
                     str(profile["foliage_voxel_size"]),
                     "--seed",
@@ -1653,8 +1697,21 @@ def main() -> None:
         )
         if init.get("historical_model_initialization") is not False:
             raise RuntimeError("Historical Gaussian initialization is forbidden")
-        if init["surface"].get("colmap_points_or_tracks_used") is not False:
-            raise RuntimeError("Initialization consumed COLMAP geometry")
+        expected_sfm_coverage = sfm_coverage_tracks_enabled(store)
+        if bool(
+            init["surface"].get("colmap_points_or_tracks_used", False)
+        ) != expected_sfm_coverage:
+            raise RuntimeError(
+                "Initialization/SfM coverage provenance mismatch"
+            )
+        if (
+            expected_sfm_coverage
+            and init["surface"].get("sfm_track_usage_mode")
+            != "coverage_only"
+        ):
+            raise RuntimeError(
+                "SfM tracks were not restricted to coverage-only mode"
+            )
         manifest["stages"]["initialize_teacher"] = {
             "status": "complete",
             "base_initialization": str(base_initialization),
@@ -1882,6 +1939,10 @@ def main() -> None:
                     ),
                     "--voxel-size",
                     str(profile["foliage_voxel_size"]),
+                    "--maximum-sfm-static-tree-tracks",
+                    "120000",
+                    "--sfm-tree-coverage-radius",
+                    "0.018",
                     "--rigid-calibration-resolution-scale",
                     str(
                         profile[
@@ -2410,7 +2471,15 @@ def main() -> None:
                 "transient",
             ],
             "standard_student": None,
-            "points3D_or_colmap_tracks_used": False,
+            "points3D_or_colmap_tracks_used": bool(
+                store.get("colmap_points_or_tracks_used", False)
+            ),
+            "sfm_track_usage_mode": store.get(
+                "sfm_track_usage_mode", "disabled"
+            ),
+            "geometry_authority": store.get(
+                "geometry_authority", "mast3r_matcha_primary"
+            ),
             "mesh": {
                 "status": "deferred_until_teacher_depth_render_complete",
                 "method": "rigid-only adaptive TSDF from canonical surface depth",

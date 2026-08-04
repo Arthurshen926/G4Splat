@@ -72,6 +72,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--voxel-size", type=float, default=0.12)
     parser.add_argument(
+        "--maximum-sfm-static-tree-tracks", type=int, default=120_000
+    )
+    parser.add_argument(
+        "--sfm-tree-coverage-radius", type=float, default=0.018
+    )
+    parser.add_argument(
         "--rigid-calibration-resolution-scale",
         type=float,
         default=0.125,
@@ -183,6 +189,10 @@ def main() -> None:
         dynamic_birth_target_source_pixels_per_basis=(
             args.dynamic_birth_target_source_pixels_per_basis
         ),
+        maximum_sfm_static_tree_tracks=(
+            args.maximum_sfm_static_tree_tracks
+        ),
+        sfm_tree_coverage_radius=args.sfm_tree_coverage_radius,
         rigid_calibration_ply=rigid_ply,
         rigid_calibration_resolution_scale=(
             args.rigid_calibration_resolution_scale
@@ -248,6 +258,12 @@ def main() -> None:
                 )
             ),
             "voxel_size": float(args.voxel_size),
+            "maximum_sfm_static_tree_tracks": int(
+                args.maximum_sfm_static_tree_tracks
+            ),
+            "sfm_tree_coverage_radius": float(
+                args.sfm_tree_coverage_radius
+            ),
             "seed": int(args.seed),
             "rigid_depth_calibration": rigid_contract,
         }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build a MASt3R-only immutable evidence store for the final mixed Teacher."""
+"""Build an immutable MASt3R-primary evidence store for the mixed Teacher."""
 
 from __future__ import annotations
 
@@ -15,7 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from outdoor.evidence_store import EvidenceStoreBuilder  # noqa: E402
+from outdoor.evidence_store import (  # noqa: E402
+    EvidenceStoreBuilder,
+    MAST3R_ONLY_GEOMETRY,
+    MAST3R_PRIMARY_SFM_COVERAGE,
+    build_track_evidence,
+)
 from outdoor.inverse_depth import (  # noqa: E402
     INVERSE_DEPTH_FUSION_VERSION,
     fuse_inverse_depth_directory,
@@ -104,6 +109,16 @@ def main() -> None:
     parser.add_argument("--mast3r-tracks", type=Path, required=True)
     parser.add_argument("--chart-consensus", type=Path, required=True)
     parser.add_argument("--dav2-root", type=Path)
+    parser.add_argument(
+        "--sfm-coverage-sparse",
+        type=Path,
+        help=(
+            "Optional raw sparse/0 directory. Its points3D tracks are "
+            "classified through the fixed cameras and may only fill "
+            "MASt3R/MAtCha coverage gaps; they never replace the primary "
+            "geometry factors or select training cameras."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
@@ -153,12 +168,17 @@ def main() -> None:
     semantic_contract.write_text(
         json.dumps(semantic, indent=2) + "\n", encoding="utf-8"
     )
+    geometry_source = (
+        MAST3R_PRIMARY_SFM_COVERAGE
+        if args.sfm_coverage_sparse is not None
+        else MAST3R_ONLY_GEOMETRY
+    )
     builder = EvidenceStoreBuilder(
         output,
         dataset=dataset,
         scene_contract=scene_contract,
         semantic_contract=semantic_contract,
-        geometry_source="mast3r_only",
+        geometry_source=geometry_source,
         final_model="hybrid_teacher",
     )
     builder.add_file(
@@ -169,7 +189,12 @@ def main() -> None:
         coordinate_frame="cambridge_fixed_world_and_camera",
         covariance="calibration_is_fixed_task_constraint",
         semantic_role="not_applicable",
-        validity="cameras.bin/images.bin only; points3D forbidden",
+        validity=(
+            "fixed cameras are authoritative; points3D tracks are optional "
+            "coverage evidence only"
+            if args.sfm_coverage_sparse is not None
+            else "cameras.bin/images.bin only; points3D forbidden"
+        ),
     )
     builder.add_file(
         "task_semantics",
@@ -213,6 +238,42 @@ def main() -> None:
         semantic_role="audit",
         validity="passed_true",
     )
+    if args.sfm_coverage_sparse is not None:
+        sfm_sparse = args.sfm_coverage_sparse.expanduser().resolve()
+        sfm_tracks = output / "colmap_tracks.npz"
+        build_track_evidence(
+            sfm_sparse,
+            dataset,
+            tree_mask,
+            sfm_tracks,
+            source_type="raw_sfm_coverage",
+        )
+        builder.add_file(
+            "colmap_tracks",
+            "raw_sfm_coverage_tracks",
+            sfm_tracks,
+            measurement=(
+                "sparse xyz/rgb/track support/role posterior used only in "
+                "uncovered MASt3R/MAtCha regions"
+            ),
+            coordinate_frame="cambridge_fixed_world",
+            covariance="first_order_reprojection_covariance_diag",
+            semantic_role="rigid_coverage_and_static_tree_track_candidates",
+            validity=(
+                "fixed-camera reprojection; multi-view role posterior; "
+                "coverage-only ownership"
+            ),
+        )
+        builder.add_file(
+            "colmap_tracks_summary",
+            "raw_sfm_coverage_tracks",
+            sfm_tracks.with_suffix(".json"),
+            measurement="content and selection audit for optional SfM tracks",
+            coordinate_frame="metadata",
+            covariance="documented_in_summary",
+            semantic_role="audit",
+            validity="generated together with colmap_tracks",
+        )
     builder.add_file(
         "chart_crossview_consensus",
         "matcha_crossview_consensus",
@@ -462,10 +523,15 @@ def main() -> None:
                 validity="real_view_semantic_gate",
             )
     manifest = builder.write()
-    # Explicit negative dependency audit makes accidental regressions grep-able.
+    # Keep the negative/limited dependency audit grep-able. The manifest
+    # itself already hashes the optional track archive and its raw sources.
+    sfm_coverage = args.sfm_coverage_sparse is not None
     manifest["forbidden_inputs_audit"] = {
-        "points3D_bin_read": False,
-        "colmap_tracks_read": False,
+        "points3D_bin_read": sfm_coverage,
+        "colmap_tracks_read": sfm_coverage,
+        "colmap_camera_or_pose_authority": False,
+        "colmap_dense_geometry_authority": False,
+        "sfm_track_usage_mode": "coverage_only" if sfm_coverage else "disabled",
         "historical_gaussian_initialization": False,
     }
     # Re-write through the builder is not possible after hashing; keep the

@@ -6,8 +6,11 @@ import pytest
 from outdoor.evidence_store import (
     EVIDENCE_STORE_VERSION,
     EvidenceStoreBuilder,
+    MAST3R_PRIMARY_SFM_COVERAGE,
     artifact_path,
     load_evidence_store,
+    mast3r_is_geometry_authority,
+    sfm_coverage_tracks_enabled,
 )
 
 
@@ -68,3 +71,35 @@ def test_evidence_store_detects_mutated_artifact(tmp_path):
     with pytest.raises(RuntimeError, match="changed after registration"):
         load_evidence_store(root)
 
+
+def test_sfm_coverage_preserves_mast3r_authority_and_camera_independence(
+    tmp_path,
+):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    scene = tmp_path / "scene.json"
+    semantic = tmp_path / "semantic.json"
+    tracks = tmp_path / "colmap_tracks.npz"
+    scene.write_text("{}")
+    semantic.write_text("{}")
+    tracks.write_bytes(b"raw-sfm-track-evidence")
+    builder = EvidenceStoreBuilder(
+        tmp_path / "evidence",
+        dataset=dataset,
+        scene_contract=scene,
+        semantic_contract=semantic,
+        geometry_source=MAST3R_PRIMARY_SFM_COVERAGE,
+    )
+    builder.add_file(
+        "colmap_tracks",
+        "raw_sfm_coverage_tracks",
+        tracks,
+        measurement="coverage only",
+    )
+    payload = builder.write()
+    assert mast3r_is_geometry_authority(payload)
+    assert sfm_coverage_tracks_enabled(payload)
+    assert payload["geometry_authority"] == "mast3r_matcha_primary"
+    assert payload["sfm_track_usage_mode"] == "coverage_only"
+    assert payload["colmap_points_or_tracks_used"]
+    assert "never controls camera admission" in payload["camera_container"]
