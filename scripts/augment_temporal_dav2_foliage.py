@@ -93,8 +93,10 @@ def _resize_depth(path: Path) -> np.ndarray:
 
 def _recover_alignments(
     payload: dict,
-    selected_views: list[dict],
+    camera_views: list[dict],
     dav2_records: dict,
+    *,
+    audit: dict | None = None,
 ) -> dict[str, dict]:
     """Recover ``rho = alpha + beta / dav2`` from accepted DAV2 rows."""
     source = payload["initialization_source"]
@@ -105,14 +107,19 @@ def _recover_alignments(
     error = payload["reprojection_error"][rows].numpy()
     names = {
         int(row["image_id"]): str(row["image_name"])
-        for row in selected_views
+        for row in camera_views
     }
     recovered = {}
-    for camera_id in sorted(set(map(int, camera_ids.tolist()))):
+    source_camera_ids = sorted(set(map(int, camera_ids.tolist())))
+    unmapped_camera_ids = []
+    for camera_id in source_camera_ids:
         chosen = np.flatnonzero(camera_ids == camera_id)
         if len(chosen) < 8:
             continue
-        name = names[camera_id]
+        name = names.get(camera_id)
+        if name is None:
+            unmapped_camera_ids.append(camera_id)
+            continue
         record = dav2_records.get(Path(name).stem)
         if record is None:
             continue
@@ -158,6 +165,20 @@ def _recover_alignments(
             "depth_p99": float(np.quantile(depth[chosen], 0.99)),
             "sample_count": int(len(chosen)),
         }
+    if audit is not None:
+        audit.update(
+            {
+                "camera_name_source_count": int(len(names)),
+                "dav2_source_camera_count": int(len(source_camera_ids)),
+                "unmapped_camera_count": int(len(unmapped_camera_ids)),
+                "unmapped_camera_ids": unmapped_camera_ids,
+                "recovered_alignment_count": int(len(recovered)),
+                "camera_name_source_contract": (
+                    "fixed_camera_id_to_name__missing_ids_are_audited_"
+                    "and_excluded_not_reindexed"
+                ),
+            }
+        )
     return recovered
 
 
@@ -440,11 +461,18 @@ def main() -> None:
     evidence["hit_start_depth"] = torch.from_numpy(repaired_hit_start)
     evidence["hit_end_depth"] = torch.from_numpy(repaired_hit_end)
     selected_views = coverage_payload["audit"]["selected_views"]
+    camera_views = coverage_payload["audit"].get(
+        "fixed_camera_sequences", selected_views
+    )
     dav2_records = json.loads(
         artifact_path(store, "dav2_index").read_text()
     )["records"]
+    alignment_camera_audit: dict = {}
     alignment = _recover_alignments(
-        coverage_payload, selected_views, dav2_records
+        coverage_payload,
+        camera_views,
+        dav2_records,
+        audit=alignment_camera_audit,
     )
     by_sequence: dict[str, list[dict]] = {}
     for row in alignment.values():
@@ -898,6 +926,7 @@ def main() -> None:
         "dense_source_preserved": True,
         "producer_implementation_sha256": _sha256(Path(__file__)),
         "accepted_alignment_cache_count": int(len(alignment)),
+        "alignment_camera_contract": alignment_camera_audit,
         "interpolated_view_count": int(len(per_view_audit)),
         "added_dynamic_birth_count": added_births,
         "added_ownerless_hit_ray_count": added_rays,

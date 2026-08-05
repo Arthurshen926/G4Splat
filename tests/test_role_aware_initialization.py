@@ -402,6 +402,34 @@ def test_temporal_dav2_alignment_recovers_half_open_pixel_centres(tmp_path):
     )
 
 
+def test_temporal_dav2_alignment_audits_missing_camera_names(tmp_path):
+    ordinal = np.ones((135, 240), dtype=np.float32)
+    depth_path = tmp_path / "frame.npy"
+    np.save(depth_path, ordinal)
+    count = 10
+    payload = {
+        "initialization_source": torch.full((count,), 3, dtype=torch.int8),
+        "observation_camera_ids": torch.full(
+            (count, 1), 7, dtype=torch.int32
+        ),
+        "observation_uv": torch.full((count, 1, 2), 0.5),
+        "observation_depth": torch.ones((count, 1)),
+        "reprojection_error": torch.full((count,), 0.05),
+    }
+    audit = {}
+    recovered = _recover_alignments(
+        payload,
+        [{"image_id": 1, "image_name": "seq1__frame00010.png"}],
+        {"seq1__frame00010": {"path": str(depth_path)}},
+        audit=audit,
+    )
+
+    assert recovered == {}
+    assert audit["dav2_source_camera_count"] == 1
+    assert audit["unmapped_camera_ids"] == [7]
+    assert audit["recovered_alignment_count"] == 0
+
+
 def test_zero_foliage_view_limit_reaches_all_fixed_camera_selection_layer():
     views = [{"image_id": value} for value in range(30)]
     observed = {2, 7, 11}
