@@ -6,11 +6,13 @@ from outdoor.foliage_geometry import (
     _allocate_dense_ray_budgets,
     _bounded_candidate_ray_rows,
     _confirmed_free_space_mask,
+    _candidate_rows_for_visible_tree_instances,
     _dense_component_ray_posterior,
     _dynamic_birth_limit_for_view,
     _incidence_mask,
     _invert_track_image_incidence,
     _priority_candidate_voxels,
+    _posterior_unknown_mask,
     _spatially_stratified_coverage_rows,
     _supported_view_geometry_statistics,
     semantic_tree_tracks,
@@ -30,6 +32,36 @@ from outdoor.training_evidence import EvidenceEpochSampler
 
 def _budget_view(image_id):
     return {"image_id": image_id}
+
+
+def test_unrelated_camera_is_not_an_unknown_tree_observation():
+    valid = np.asarray([True, True, True, False])
+    matched = np.asarray([True, False, True, True])
+    supported = np.asarray([False, False, True, False])
+    negative = np.asarray([False, False, False, False])
+    occluded = np.asarray([True, False, False, True])
+
+    unknown = _posterior_unknown_mask(
+        valid, matched, supported, negative, occluded
+    )
+
+    np.testing.assert_array_equal(
+        unknown, np.asarray([True, False, False, False])
+    )
+
+
+def test_candidate_projection_is_limited_to_visible_tree_instances():
+    raster = np.asarray([[3, 3, -1], [-1, 8, 8]], dtype=np.int32)
+    rows = _candidate_rows_for_visible_tree_instances(
+        raster,
+        {
+            3: np.asarray([0, 2]),
+            5: np.asarray([1, 4]),
+            8: np.asarray([3]),
+        },
+    )
+
+    np.testing.assert_array_equal(rows, np.asarray([0, 2, 3]))
 
 
 def test_track_image_incidence_is_inverted_once_for_selected_cameras():

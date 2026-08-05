@@ -94,6 +94,35 @@ def _link_or_copy(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
+def _full_foliage_initialization_contract(
+    base_contract: dict,
+    *,
+    foliage_path: Path,
+) -> dict:
+    """Retire the rigid-stage placeholder after a real foliage rebuild.
+
+    The surface seed is intentionally inherited from the rigid-only stage,
+    but its inert foliage row is not.  Copying the base contract verbatim
+    leaves ``rigid_stage_placeholder_foliage`` true and makes the mixed
+    trainer correctly reject an otherwise complete visual-hull/ray-posterior
+    initialization.  Make that ownership transition explicit and auditable.
+    """
+    contract = dict(base_contract)
+    source_was_placeholder = bool(
+        contract.get("rigid_stage_placeholder_foliage", False)
+    )
+    contract["foliage_reuse"] = {
+        "policy": (
+            "full_rigid_depth_calibrated_visual_hull_ray_posterior_rebuild"
+        ),
+        "foliage_seed_sha256": sha256_file(foliage_path),
+        "mixed_training_eligible": True,
+        "source_placeholder_retired": source_was_placeholder,
+    }
+    contract["rigid_stage_placeholder_foliage"] = False
+    return contract
+
+
 def main() -> None:
     args = _parse_args()
     runtime_provenance = collect_runtime_provenance(
@@ -102,6 +131,7 @@ def main() -> None:
             "scripts.rebuild_foliage_with_rigid_depth",
             "outdoor.role_aware_initialization",
             "outdoor.foliage_geometry",
+            "outdoor.rigid_occlusion",
             "outdoor.blue_noise_sampling",
         ),
     )
@@ -214,8 +244,9 @@ def main() -> None:
             "not_renderer_parameter_initialization"
         ),
     }
-    initialization_contract = dict(
-        base_manifest.get("initialization_contract", {})
+    initialization_contract = _full_foliage_initialization_contract(
+        base_manifest.get("initialization_contract", {}),
+        foliage_path=foliage_path,
     )
     initialization_contract.update(
         {

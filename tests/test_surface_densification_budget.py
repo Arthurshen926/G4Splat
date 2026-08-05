@@ -31,6 +31,7 @@ class _ReplacingSplitProbe:
         self._scaling = torch.full((count, 3), -3.0)
         self._opacity = torch.zeros(count, 1)
         self._source_type = torch.zeros(count, dtype=torch.int16)
+        self._track_id = torch.full((count,), -1, dtype=torch.int64)
         self._protected_flag = torch.zeros(count, dtype=torch.bool)
         self._geometry_confidence = torch.ones(count)
         self._observation_mass = torch.zeros(count)
@@ -59,6 +60,7 @@ class _ReplacingSplitProbe:
         self._scaling = self._scaling[keep]
         self._opacity = self._opacity[keep]
         self._source_type = self._source_type[keep]
+        self._track_id = self._track_id[keep]
         self._protected_flag = self._protected_flag[keep]
         self._geometry_confidence = self._geometry_confidence[keep]
         self._observation_mass = self._observation_mass[keep]
@@ -122,7 +124,7 @@ def test_replacing_splits_charge_net_growth_not_child_count(
     assert report["net_growth"] <= max_growth
 
 
-def test_saturated_budget_retires_weak_points_for_strong_splits():
+def test_saturated_budget_never_evicts_unrelated_weak_points():
     probe = _ReplacingSplitProbe()
     probe.xyz_gradient_accum[4:] = 0
     probe._opacity[4:] = torch.logit(torch.full((6, 1), 0.01))
@@ -139,11 +141,40 @@ def test_saturated_budget_retires_weak_points_for_strong_splits():
     )
 
     assert report["routine_pruned"] == 0
-    assert report["reallocated_pruned"] == 4
-    assert report["split_parents"] == 4
+    assert report["reallocated_pruned"] == 0
+    assert report["split_parents"] == 0
     assert report["after"] == 10
     assert report["model_delta"] == 0
     assert report["capacity_saturated_before"] is True
+    assert report["candidates_deferred_for_capacity"] == 4
+    assert report["global_capacity_eviction_disabled"] is True
+
+
+def test_residual_topology_cannot_prune_or_split_immutable_prefix():
+    probe = _ReplacingSplitProbe()
+    probe.xyz_gradient_accum.zero_()
+    probe.max_radii2D.zero_()
+    probe._opacity[:6] = torch.logit(torch.full((6, 1), 0.001))
+    probe._opacity[6:] = torch.logit(torch.full((4, 1), 0.5))
+    probe._observation_mass.fill_(100.0)
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=0.1,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=64,
+        max_points=20,
+        max_growth=4,
+        mutable_start=6,
+    )
+
+    assert report["pruned"] == 0
+    assert report["split_parents"] == 0
+    assert report["after"] == 10
+    assert report["mutable_start"] == 6
+    assert report["mutable_rows_before"] == 4
+    assert report["immutable_prefix_preserved"] is True
 
 
 def test_densification_statistics_accept_continuous_responsibility():
@@ -216,6 +247,154 @@ def test_dav2_opacity_cull_matures_continuously_with_observation_mass():
     assert observed_report["routine_pruned"] == 1
     assert observed_report["dav2_lineage"]["opacity_pruned"] == 1
     assert observed_report["dav2_lineage"]["after"] == 0
+
+
+def test_metric_evidence_opacity_cull_matures_continuously():
+    unseen = _ReplacingSplitProbe(count=1)
+    unseen.xyz_gradient_accum.zero_()
+    unseen.max_radii2D.zero_()
+    unseen._source_type[:] = GaussianModel.SOURCE_MAST3R_TRACK
+    unseen._opacity[:] = torch.logit(torch.tensor(0.001))
+
+    report = GaussianModel.densify_and_prune_bounded(
+        unseen,
+        max_grad=1.0,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=64,
+        max_points=10,
+        max_growth=1,
+        observation_reference_count=1487,
+    )
+
+    assert report["routine_pruned"] == 0
+    assert report["opacity_pruned"] == 0
+    assert report["after"] == 1
+
+
+def test_bound_chart_atlas_cell_requires_explicit_retirement_receiver():
+    probe = _ReplacingSplitProbe(count=1)
+    probe.xyz_gradient_accum.zero_()
+    probe.max_radii2D.zero_()
+    probe._source_type[:] = GaussianModel.SOURCE_CHART_RESIDUAL
+    probe._track_id[:] = -2
+    probe._opacity[:] = torch.logit(torch.tensor(1.0e-6))
+    probe._observation_mass[:] = 100_000.0
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=1.0,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=0,
+        max_points=10,
+        max_growth=1,
+        observation_reference_count=1,
+    )
+
+    assert report["routine_pruned"] == 0
+    assert report["after"] == 1
+    assert report["chart_atlas_lifecycle"] == {
+        "bound_before": 1,
+        "ordinary_opacity_retirement_blocked": 1,
+        "ordinary_opacity_is_retirement_authority": False,
+        "allowed_retirement": (
+            "uv_quadtree_replace_and_retire_or_independent_"
+            "geometric_contradiction"
+        ),
+    }
+
+
+def test_unbound_chart_provenance_can_follow_ordinary_opacity_lifecycle():
+    probe = _ReplacingSplitProbe(count=1)
+    probe.xyz_gradient_accum.zero_()
+    probe.max_radii2D.zero_()
+    probe._source_type[:] = GaussianModel.SOURCE_CHART_RESIDUAL
+    probe._track_id[:] = -1
+    probe._opacity[:] = torch.logit(torch.tensor(1.0e-6))
+    probe._observation_mass[:] = 100_000.0
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=1.0,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=0,
+        max_points=10,
+        max_growth=1,
+        observation_reference_count=1,
+    )
+
+    assert report["routine_pruned"] == 1
+    assert report["after"] == 0
+    assert report["chart_atlas_lifecycle"][
+        "ordinary_opacity_retirement_blocked"
+    ] == 0
+
+
+def test_oversized_surface_is_replacing_split_not_pruned():
+    probe = _ReplacingSplitProbe(count=1)
+    probe.max_radii2D[:] = 128.0
+    probe._opacity[:] = torch.logit(torch.tensor(0.5))
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=0.1,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=64,
+        max_points=10,
+        max_growth=1,
+    )
+
+    assert report["routine_pruned"] == 0
+    assert report["oversized_screen_retained_for_split"] == 1
+    assert report["split_parents"] == 1
+    assert report["after"] == 2
+
+
+def test_screen_footprint_alone_cannot_manufacture_split_evidence():
+    probe = _ReplacingSplitProbe(count=1)
+    probe.xyz_gradient_accum.zero_()
+    probe.max_radii2D[:] = 128.0
+    probe._opacity[:] = torch.logit(torch.tensor(0.5))
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=0.1,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=64,
+        max_points=10,
+        max_growth=1,
+    )
+
+    assert report["screen_evidence_candidates_before"] == 0
+    assert report["split_parents"] == 0
+    assert report["topology_priority"].find(
+        "no_independent_radius_only_split_evidence"
+    ) >= 0
+
+
+def test_screen_footprint_promotes_observed_near_threshold_residual():
+    probe = _ReplacingSplitProbe(count=1)
+    probe.xyz_gradient_accum[:] = 0.09
+    probe.denom[:] = 1.0
+    probe.max_radii2D[:] = 128.0
+    probe._opacity[:] = torch.logit(torch.tensor(0.5))
+
+    report = GaussianModel.densify_and_prune_bounded(
+        probe,
+        max_grad=0.1,
+        min_opacity=0.005,
+        extent=1.0,
+        max_screen_size=64,
+        max_points=10,
+        max_growth=1,
+    )
+
+    assert report["screen_evidence_candidates_before"] == 1
+    assert report["split_parents"] == 1
 
 
 def test_append_reseed_preserves_complete_evidence_metadata():

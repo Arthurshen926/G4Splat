@@ -49,6 +49,10 @@ from outdoor.foliage_view_graph import (
     sequence_id,
 )
 from outdoor.scene_contract import sha256_file
+from outdoor.projected_role_posterior import (
+    PROJECTED_RIGID_MAX_CAMERA_DEPTH,
+    PROJECTED_RIGID_POSTERIOR_VERSION,
+)
 from scripts.augment_foliage_seed_with_sfm_tracks import _track_frames
 
 
@@ -56,8 +60,9 @@ SINGLE_SEQUENCE_POINTMAP_PRECISION = 0.03
 
 
 INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v62-immutable-cross-sequence-"
-    "pointmap-posterior"
+    "outdoor-role-aware-initialization-v84-renderer-visible-tree-occluded-"
+    "rigid-geometry-with-exact-current-view-visibility-and-color-"
+    "arbitration"
 )
 RIGID_CALIBRATED_INITIALIZATION_VERSION = (
     "outdoor-role-aware-initialization-v77-native-rigid-depth-continuous-"
@@ -103,6 +108,90 @@ def _bilinear_rgb_at_pixel_centres(
         + image[y1, x0] * (1.0 - wx) * wy
         + image[y1, x1] * wx * wy
     )
+
+
+def _fixed_camera_canonical_quality(
+    view_records: list[dict[str, Any]], rgb_root: Path
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Measure appearance quality without granting RGB geometry authority.
+
+    The score is used only after multiview/cross-sequence geometry has made a
+    leaf cell eligible.  A small deterministic grayscale thumbnail is enough
+    to reject a blurred, clipped or badly exposed traversal as the canonical
+    colour snapshot; no pixel from this audit creates a Gaussian or depth.
+    """
+    records: list[dict[str, Any]] = []
+    raw_quality: list[float] = []
+    for view in sorted(view_records, key=lambda row: int(row["image_id"])):
+        image_path = Path(rgb_root) / str(view["image_name"])
+        if not image_path.is_file():
+            image_path = Path(rgb_root) / Path(
+                str(view["image_name"])
+            ).name
+        if not image_path.is_file():
+            raise FileNotFoundError(image_path)
+        with Image.open(image_path) as handle:
+            gray = np.asarray(
+                handle.convert("L").resize(
+                    (160, 90), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            ) / 255.0
+        horizontal = np.abs(np.diff(gray, axis=1))
+        vertical = np.abs(np.diff(gray, axis=0))
+        sharpness = float(
+            0.5
+            * (
+                np.percentile(horizontal, 90)
+                + np.percentile(vertical, 90)
+            )
+        )
+        mean = float(gray.mean())
+        contrast = float(gray.std())
+        clipped = float(((gray < 0.02) | (gray > 0.98)).mean())
+        exposure = float(
+            np.exp(-np.square((mean - 0.50) / 0.35))
+            * (1.0 - clipped)
+        )
+        raw = float(
+            max(sharpness, 1.0e-4)
+            * np.sqrt(max(contrast, 1.0e-4))
+            * max(exposure, 0.05)
+        )
+        raw_quality.append(raw)
+        records.append(
+            {
+                "image_id": int(view["image_id"]),
+                "image_name": str(view["image_name"]),
+                "sequence_id": str(view["sequence_id"]),
+                "sharpness_p90": sharpness,
+                "mean_luminance": mean,
+                "contrast": contrast,
+                "clipped_fraction": clipped,
+                "exposure_quality": exposure,
+            }
+        )
+    raw_array = np.asarray(raw_quality, dtype=np.float64)
+    finite_positive = raw_array[np.isfinite(raw_array) & (raw_array > 0)]
+    median = float(np.median(finite_positive)) if len(finite_positive) else 1.0
+    normalized = np.clip(raw_array / max(median, 1.0e-12), 0.25, 2.0)
+    for record, value in zip(records, normalized.tolist()):
+        record["canonical_quality"] = float(value)
+    return records, {
+        "contract": (
+            "thumbnail_sharpness_exposure_contrast_only__"
+            "canonical_appearance_tiebreaker_not_geometry"
+        ),
+        "camera_count": int(len(records)),
+        "raw_quality_median": median,
+        "canonical_quality_percentiles": (
+            np.percentile(normalized, [0, 10, 50, 90, 100])
+            .astype(float)
+            .tolist()
+            if len(normalized)
+            else []
+        ),
+    }
 
 
 def _effective_posterior_budget(
@@ -1400,6 +1489,152 @@ def _deduplicate(
     return distance > float(radius)
 
 
+def _nearest_cross_label_neighbour(
+    xyz: np.ndarray,
+    labels: np.ndarray,
+    *,
+    maximum_neighbours: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match a full k-NN cross-label search with progressive expansion.
+
+    Most dense Chart rows encounter a different Chart within eight nearest
+    neighbours.  Expanding only unresolved rows avoids materialising the
+    full 64-neighbour table for every Cambridge atlas sample while preserving
+    the original cKDTree rank and tie order exactly up to the same limit.
+    """
+    xyz = np.asarray(xyz, dtype=np.float32)
+    labels = np.asarray(labels).reshape(-1)
+    if len(xyz) != len(labels):
+        raise ValueError("Cross-label neighbour arrays must align")
+    distance = np.full(len(xyz), np.inf, dtype=np.float32)
+    index = np.full(len(xyz), -1, dtype=np.int64)
+    if len(xyz) < 2 or int(maximum_neighbours) < 2:
+        return distance, index
+    tree = cKDTree(xyz)
+    unresolved = np.arange(len(xyz), dtype=np.int64)
+    maximum = min(int(maximum_neighbours), len(xyz))
+    ranks = [rank for rank in (8, 16, 32, 64) if rank < maximum]
+    ranks.append(maximum)
+    for neighbour_count in dict.fromkeys(ranks):
+        local_distance, local_index = tree.query(
+            xyz[unresolved], k=neighbour_count, workers=-1
+        )
+        local_distance = np.atleast_2d(local_distance)
+        local_index = np.atleast_2d(local_index)
+        found = np.zeros(len(unresolved), dtype=bool)
+        for rank in range(1, neighbour_count):
+            candidate = local_index[:, rank]
+            take = (~found) & (labels[candidate] != labels[unresolved])
+            if bool(take.any()):
+                target = unresolved[take]
+                distance[target] = local_distance[take, rank]
+                index[target] = candidate[take]
+                found[take] = True
+        unresolved = unresolved[~found]
+        if not len(unresolved) or neighbour_count >= maximum:
+            break
+    return distance, index
+
+
+def _chart_overlap_primary_ownership(
+    xyz: np.ndarray,
+    chart_id: np.ndarray,
+    normals: np.ndarray,
+    confidence: np.ndarray,
+    independent_support: np.ndarray,
+    consensus_confirmed: np.ndarray,
+    *,
+    distance_threshold: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Choose one renderer owner for near-identical cross-Chart samples.
+
+    MAtCha rasters remain immutable evidence even when a duplicate renderer
+    sample is suppressed.  This is a sparse partition-of-unity at true Chart
+    overlaps: the best independently supported observation owns opacity,
+    while all Charts continue to contribute their source-resolution factors.
+    """
+    xyz = np.asarray(xyz, dtype=np.float32)
+    chart_id = np.asarray(chart_id, dtype=np.int32)
+    normals = np.asarray(normals, dtype=np.float32)
+    confidence = np.asarray(confidence, dtype=np.float32)
+    independent_support = np.asarray(independent_support, dtype=bool)
+    consensus_confirmed = np.asarray(consensus_confirmed, dtype=bool)
+    count = len(xyz)
+    shapes = {
+        len(chart_id),
+        len(normals),
+        len(confidence),
+        len(independent_support),
+        len(consensus_confirmed),
+    }
+    if shapes != {count}:
+        raise ValueError("Chart overlap ownership arrays must align")
+    owner = np.ones(count, dtype=bool)
+    if count < 2:
+        return owner, {
+            "contract": "cross_chart_metric_partition_of_unity",
+            "overlap_components": 0,
+            "secondary_renderer_rows_suppressed": 0,
+            "distance_threshold": float(distance_threshold),
+        }
+    distance, neighbour = _nearest_cross_label_neighbour(xyz, chart_id)
+    paired = (neighbour >= 0) & (distance <= float(distance_threshold))
+    normal_agreement = np.zeros(count, dtype=bool)
+    if bool(paired.any()):
+        normal_agreement[paired] = (
+            np.abs(
+                np.sum(normals[paired] * normals[neighbour[paired]], axis=1)
+            )
+            >= 0.90
+        )
+    paired &= normal_agreement
+    parent = np.arange(count, dtype=np.int64)
+
+    def find(row: int) -> int:
+        while parent[row] != row:
+            parent[row] = parent[parent[row]]
+            row = int(parent[row])
+        return row
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[max(first_root, second_root)] = min(
+                first_root, second_root
+            )
+
+    for first in np.flatnonzero(paired).tolist():
+        union(int(first), int(neighbour[first]))
+    components: dict[int, list[int]] = {}
+    for row in np.flatnonzero(paired | np.isin(np.arange(count), neighbour[paired])):
+        components.setdefault(find(int(row)), []).append(int(row))
+    overlap_components = 0
+    for rows in components.values():
+        rows = sorted(set(rows))
+        if len(rows) < 2 or len(np.unique(chart_id[rows])) < 2:
+            continue
+        overlap_components += 1
+        primary = max(
+            rows,
+            key=lambda row: (
+                int(independent_support[row]),
+                int(consensus_confirmed[row]),
+                float(confidence[row]),
+                -int(row),
+            ),
+        )
+        owner[rows] = False
+        owner[primary] = True
+    return owner, {
+        "contract": "cross_chart_metric_partition_of_unity",
+        "overlap_components": int(overlap_components),
+        "secondary_renderer_rows_suppressed": int((~owner).sum()),
+        "distance_threshold": float(distance_threshold),
+        "normal_cosine_threshold": 0.90,
+    }
+
+
 def _surface_frames(
     xyz: np.ndarray,
     position_sigma: np.ndarray,
@@ -1451,6 +1686,34 @@ def _surface_frames(
     return scales, quaternion, normals
 
 
+def _source_local_surface_frames(
+    xyz: np.ndarray,
+    sigma: np.ndarray,
+    source_type: np.ndarray,
+    selected: np.ndarray,
+    *,
+    maximum_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate renderer frames without cross-authority neighbourhood drift."""
+    xyz = np.asarray(xyz, dtype=np.float32)
+    sigma = np.asarray(sigma, dtype=np.float32)
+    source_type = np.asarray(source_type)
+    selected = np.asarray(selected, dtype=bool)
+    if xyz.shape != (len(source_type), 3) or sigma.shape != (len(xyz),):
+        raise ValueError("Surface frame arrays have inconsistent shapes")
+    if selected.shape != (len(xyz),):
+        raise ValueError("Surface frame selection has inconsistent shape")
+    scales = np.full((len(xyz), 2), np.nan, dtype=np.float32)
+    quaternions = np.full((len(xyz), 4), np.nan, dtype=np.float32)
+    normals = np.full((len(xyz), 3), np.nan, dtype=np.float32)
+    for source in np.unique(source_type[selected]):
+        rows = selected & (source_type == source)
+        scales[rows], quaternions[rows], normals[rows] = _surface_frames(
+            xyz[rows], sigma[rows], maximum_scale=maximum_scale
+        )
+    return scales, quaternions, normals
+
+
 def _uniform_confidence_samples(
     valid: np.ndarray,
     confidence: np.ndarray,
@@ -1489,6 +1752,257 @@ def _apply_missing_pointmap_posterior_fallback(
     supported[fallback] = False
     distance[fallback] = np.inf
     return int(fallback.sum())
+
+
+class _ProjectedRigidInitializationPosterior:
+    """Depth-consistent stable-track support for initialization candidates.
+
+    The dense point-map posterior was historically built only inside the
+    semantic rigid mask.  Reusing it to decide whether that mask may be
+    overturned is circular and necessarily returns no overrides.  The
+    all-camera projected-track archive is independent positive evidence.  A
+    projected track admits a MASt3R/MAtCha candidate only when their camera-z
+    depths agree locally, so a persistent background track behind a real
+    foreground occluder cannot pull the current observation onto itself.
+    """
+
+    def __init__(
+        self,
+        archive_path: Path | None,
+        track_archive_path: Path | None = None,
+    ):
+        self.enabled = archive_path is not None
+        self._camera_index: dict[str, int] = {}
+        if archive_path is None:
+            return
+        archive_path = Path(archive_path).resolve()
+        with np.load(archive_path, allow_pickle=False) as archive:
+            required = {
+                "schema_version",
+                "camera_names",
+                "camera_image_sizes",
+                "offsets",
+                "pixels",
+                "geometry_support_probability",
+                "visible_observation_probability",
+                "camera_depth",
+                "source_track_id",
+            }
+            missing = sorted(required - set(archive.files))
+            if missing:
+                raise RuntimeError(
+                    "Projected rigid initialization posterior lacks: "
+                    + ", ".join(missing)
+                )
+            schema = str(archive["schema_version"].item())
+            if schema != PROJECTED_RIGID_POSTERIOR_VERSION:
+                raise RuntimeError(
+                    "Unsupported projected rigid initialization posterior "
+                    f"{schema!r}"
+                )
+            names = np.asarray(archive["camera_names"]).astype(str)
+            self._camera_sizes = np.asarray(
+                archive["camera_image_sizes"], dtype=np.int32
+            )
+            self._offsets = np.asarray(archive["offsets"], dtype=np.int64)
+            self._pixels = np.asarray(archive["pixels"], dtype=np.float32)
+            self._probability = np.asarray(
+                archive["geometry_support_probability"], dtype=np.float32
+            )
+            self._visible_probability = np.asarray(
+                archive["visible_observation_probability"], dtype=np.float32
+            )
+            self._depth = np.asarray(
+                archive["camera_depth"], dtype=np.float32
+            )
+            source_track_id = np.asarray(
+                archive["source_track_id"], dtype=np.int64
+            )
+        renderer_visible_depth = (
+            np.isfinite(self._depth)
+            & (self._depth > 0.05)
+            & (
+                self._depth
+                < float(PROJECTED_RIGID_MAX_CAMERA_DEPTH)
+            )
+        )
+        self._probability *= renderer_visible_depth
+        self._visible_probability *= renderer_visible_depth
+        if self._offsets.shape != (len(names) + 1,):
+            raise RuntimeError("Projected rigid posterior offsets do not align")
+        if not (
+            len(self._pixels)
+            == len(self._probability)
+            == len(self._visible_probability)
+            == len(self._depth)
+            == len(source_track_id)
+            == int(self._offsets[-1])
+        ):
+            raise RuntimeError("Projected rigid posterior rows do not align")
+        self._camera_index = {
+            Path(name).stem: index for index, name in enumerate(names)
+        }
+        if track_archive_path is None:
+            raise RuntimeError(
+                "Projected rigid initialization requires its source track "
+                "archive for occlusion-safe canonical RGB"
+            )
+        with np.load(track_archive_path, allow_pickle=False) as tracks:
+            required_tracks = {"track_id", "rgb"}
+            missing_tracks = sorted(required_tracks - set(tracks.files))
+            if missing_tracks:
+                raise RuntimeError(
+                    "Projected rigid source tracks lack: "
+                    + ", ".join(missing_tracks)
+                )
+            track_id = np.asarray(tracks["track_id"], dtype=np.int64)
+            track_rgb = np.asarray(tracks["rgb"], dtype=np.float32)
+        order = np.argsort(track_id, kind="stable")
+        location = np.searchsorted(track_id[order], source_track_id)
+        valid_location = location < len(order)
+        matched = np.zeros(len(source_track_id), dtype=bool)
+        matched[valid_location] = (
+            track_id[order[location[valid_location]]]
+            == source_track_id[valid_location]
+        )
+        if not bool(matched.all()):
+            raise RuntimeError(
+                "Projected rigid rows reference missing source track ids"
+            )
+        self._canonical_rgb = (
+            track_rgb[order[location]].reshape(-1, 3) / 255.0
+        ).astype(np.float32)
+
+    def depth_consistent_fields(
+        self,
+        image_name: str,
+        camera_depth: np.ndarray,
+        *,
+        footprint_radius: int = 2,
+        absolute_depth_tolerance: float = 0.20,
+        relative_depth_tolerance: float = 0.02,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return geometry, current visibility and stable RGB rasters."""
+        camera_depth = np.asarray(camera_depth, dtype=np.float32)
+        if camera_depth.ndim != 2:
+            raise ValueError("Candidate camera depth must have shape [H, W]")
+        geometry_result = np.zeros(camera_depth.shape, dtype=np.float32)
+        visible_result = np.zeros(camera_depth.shape, dtype=np.float32)
+        rgb_result = np.zeros((*camera_depth.shape, 3), dtype=np.float32)
+        camera_index = self._camera_index.get(Path(str(image_name)).stem)
+        if camera_index is None:
+            return geometry_result, visible_result, rgb_result
+        start = int(self._offsets[camera_index])
+        end = int(self._offsets[camera_index + 1])
+        if end <= start:
+            return geometry_result, visible_result, rgb_result
+        source_width, source_height = map(
+            int, self._camera_sizes[camera_index]
+        )
+        height, width = camera_depth.shape
+        pixels = self._pixels[start:end]
+        center_x = np.floor(
+            (pixels[:, 0] + 0.5) / source_width * width
+        ).astype(np.int64)
+        center_y = np.floor(
+            (pixels[:, 1] + 0.5) / source_height * height
+        ).astype(np.int64)
+        track_depth = self._depth[start:end]
+        geometry = self._probability[start:end]
+        visible = self._visible_probability[start:end]
+        canonical_rgb = self._canonical_rgb[start:end]
+        radius = max(int(footprint_radius), 0)
+        for offset_y in range(-radius, radius + 1):
+            for offset_x in range(-radius, radius + 1):
+                x = center_x + offset_x
+                y = center_y + offset_y
+                valid = (
+                    (x >= 0)
+                    & (x < width)
+                    & (y >= 0)
+                    & (y < height)
+                    & np.isfinite(track_depth)
+                    & (track_depth > 0.05)
+                    & np.isfinite(geometry)
+                    & (geometry > 0.0)
+                )
+                rows = np.flatnonzero(valid)
+                if not len(rows):
+                    continue
+                candidate_depth = camera_depth[y[rows], x[rows]]
+                tolerance = np.maximum(
+                    float(absolute_depth_tolerance),
+                    float(relative_depth_tolerance) * track_depth[rows],
+                )
+                agrees = (
+                    np.isfinite(candidate_depth)
+                    & (candidate_depth > 0.05)
+                    & (np.abs(candidate_depth - track_depth[rows]) <= tolerance)
+                )
+                rows = rows[agrees]
+                if not len(rows):
+                    continue
+                flat = y[rows] * width + x[rows]
+                # One stable track owns each target pixel: select maximum
+                # geometric authority, then update only if it improves the
+                # owner established by a previous footprint offset.
+                ranked = np.lexsort((-geometry[rows], flat))
+                ranked_flat = flat[ranked]
+                first = np.r_[True, ranked_flat[1:] != ranked_flat[:-1]]
+                chosen = rows[ranked[first]]
+                improve = geometry[chosen] > geometry_result[
+                    y[chosen], x[chosen]
+                ]
+                chosen = chosen[improve]
+                if len(chosen):
+                    geometry_result[y[chosen], x[chosen]] = geometry[chosen]
+                    visible_result[y[chosen], x[chosen]] = visible[chosen]
+                    rgb_result[y[chosen], x[chosen]] = canonical_rgb[chosen]
+        return geometry_result, visible_result, rgb_result
+
+    def depth_consistent_probability(
+        self,
+        image_name: str,
+        camera_depth: np.ndarray,
+        *,
+        footprint_radius: int = 2,
+        absolute_depth_tolerance: float = 0.20,
+        relative_depth_tolerance: float = 0.02,
+        require_current_visibility: bool = True,
+    ) -> np.ndarray:
+        """Rasterize positive support whose depth matches the candidate.
+
+        Initialization samples RGB from the current calibrated image.  Its
+        safe default therefore requires the separate current-visibility
+        posterior.  Geometry-only support remains available to audits and to
+        protect an independently coloured persistent seed, but must never
+        authorize copying an occluder's RGB onto background geometry.
+        """
+        geometry, visible, _ = self.depth_consistent_fields(
+            image_name,
+            camera_depth,
+            footprint_radius=footprint_radius,
+            absolute_depth_tolerance=absolute_depth_tolerance,
+            relative_depth_tolerance=relative_depth_tolerance,
+        )
+        return visible if require_current_visibility else geometry
+
+
+def _pointmap_cross_sequence_authority(
+    native_supported: np.ndarray,
+    projected_probability: np.ndarray,
+) -> np.ndarray:
+    """Continuous capacity priority without a probability-to-bool jump."""
+    native_supported = np.asarray(native_supported, dtype=bool)
+    projected_probability = np.asarray(
+        projected_probability, dtype=np.float32
+    )
+    if native_supported.shape != projected_probability.shape:
+        raise ValueError("Pointmap authority arrays must align")
+    return np.maximum(
+        native_supported.astype(np.float32),
+        np.clip(projected_probability, 0.0, 1.0),
+    )
 
 
 def _sample_dense_mast3r_rigid_seeds(
@@ -1532,6 +2046,7 @@ def _sample_dense_mast3r_rigid_seeds(
             "cross_sequence_supported": np.empty(0, dtype=bool),
             "cross_sequence_distance": np.empty(0, dtype=np.float32),
             "cross_sequence_precision": np.empty(0, dtype=np.float32),
+            "stable_mask_override": np.empty(0, dtype=bool),
         }
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     if payload.get("coordinate_frame") != "cambridge_fixed_world":
@@ -1571,7 +2086,16 @@ def _sample_dense_mast3r_rigid_seeds(
     posterior_available_parts = []
     posterior_precision_parts = []
     posterior_supported_parts = []
+    native_posterior_supported_parts = []
     posterior_distance_parts = []
+    projected_stability_parts = []
+    stable_mask_override_parts = []
+    projected_roles = _ProjectedRigidInitializationPosterior(
+        artifact_path(
+            store, "projected_rigid_conflict_posterior", required=False
+        ),
+        artifact_path(store, "mast3r_multiview_tracks", required=False),
+    )
     for view_id, stem in enumerate(camera_order):
         record = records[stem]
         pointmap_path = Path(record["path"])
@@ -1610,24 +2134,61 @@ def _sample_dense_mast3r_rigid_seeds(
         posterior = _load_pointmap_cross_sequence_posterior(
             record, (height, width)
         )
+        world_to_camera = np.asarray(
+            scene_records[stem]["T_world_to_camera"], dtype=np.float64
+        )
+        pointmap_camera = (
+            point_flat.astype(np.float64) @ world_to_camera[:3, :3].T
+            + world_to_camera[:3, 3]
+        )
+        (
+            projected_stability,
+            projected_visibility,
+            projected_canonical_rgb,
+        ) = projected_roles.depth_consistent_fields(
+            stem, pointmap_camera[:, 2].reshape(height, width)
+        )
         masks = lookup.get_index_masks(
             staged_name,
             (0, 1, 2, 3),
             (height, width),
             torch.device("cpu"),
         ).numpy()
-        rigid = masks.all(axis=0)
+        semantic_rigid = masks.all(axis=0)
+        stable_rigid = (
+            posterior["supported"]
+            if posterior is not None
+            else np.zeros((height, width), dtype=bool)
+        )
+        stable_rigid = stable_rigid | (projected_stability > 0.0)
+        rigid_observation = semantic_rigid | stable_rigid
         valid = (
-            rigid
+            rigid_observation
+            & masks[2]
             & np.isfinite(confidence)
             & (confidence >= float(minimum_confidence))
             & np.isfinite(pointmap).all(axis=-1)
             & (np.linalg.norm(pointmap, axis=-1) > 1e-5)
             & fixed_camera_valid
         )
+        stable_authority = (
+            posterior["precision"]
+            if posterior is not None
+            else np.zeros((height, width), dtype=np.float32)
+        )
+        stable_authority = np.maximum(
+            stable_authority, projected_stability
+        )
+        sampling_score = confidence * (
+            0.35
+            + 0.65
+            * np.maximum(
+                semantic_rigid.astype(np.float32), stable_authority
+            )
+        )
         selected = _uniform_confidence_samples(
             valid,
-            confidence,
+            sampling_score,
             samples_per_view,
             seed=stable_sampling_seed(
                 "mast3r-rigid", stem, int(view_id)
@@ -1656,6 +2217,22 @@ def _sample_dense_mast3r_rigid_seeds(
         rgb = _bilinear_rgb_at_pixel_centres(
             source_rgb, source_x, source_y
         ) / 255.0
+        projected_strength = projected_stability.reshape(-1)[selected]
+        projected_visible = projected_visibility.reshape(-1)[selected]
+        projected_color = projected_canonical_rgb.reshape(-1, 3)[selected]
+        projected_rows = projected_strength > 0.0
+        if bool(projected_rows.any()):
+            current_weight = np.clip(
+                projected_visible[projected_rows]
+                / np.maximum(projected_strength[projected_rows], 1.0e-6),
+                0.0,
+                1.0,
+            )[:, None]
+            rgb[projected_rows] = (
+                current_weight * rgb[projected_rows]
+                + (1.0 - current_weight)
+                * projected_color[projected_rows]
+            )
         scales, quaternions, normals = _pointmap_surface_frames(
             pointmap, rows, columns
         )
@@ -1696,28 +2273,60 @@ def _sample_dense_mast3r_rigid_seeds(
         quaternion_parts.append(quaternions)
         normal_parts.append(normals)
         posterior_available_parts.append(
-            np.full(len(selected), posterior is not None, dtype=bool)
+            np.full(
+                len(selected),
+                posterior is not None or projected_roles.enabled,
+                dtype=bool,
+            )
         )
         if posterior is None:
             posterior_precision_parts.append(
-                np.zeros(len(selected), dtype=np.float32)
+                projected_stability.reshape(-1)[selected]
             )
             posterior_supported_parts.append(
+                (projected_stability > 0.0).reshape(-1)[selected]
+            )
+            native_posterior_supported_parts.append(
                 np.zeros(len(selected), dtype=bool)
             )
             posterior_distance_parts.append(
-                np.full(len(selected), np.inf, dtype=np.float32)
+                np.where(
+                    (projected_stability > 0.0).reshape(-1)[selected],
+                    0.5 * float(cross_sequence_radius),
+                    np.inf,
+                ).astype(np.float32)
             )
         else:
             posterior_precision_parts.append(
-                posterior["precision"].reshape(-1)[selected]
+                np.maximum(
+                    posterior["precision"], projected_stability
+                ).reshape(-1)[selected]
             )
             posterior_supported_parts.append(
+                (
+                    posterior["supported"]
+                    | (projected_stability > 0.0)
+                ).reshape(-1)[selected]
+            )
+            native_posterior_supported_parts.append(
                 posterior["supported"].reshape(-1)[selected]
             )
             posterior_distance_parts.append(
-                posterior["distance"].reshape(-1)[selected]
+                np.where(
+                    projected_stability > 0.0,
+                    np.minimum(
+                        posterior["distance"],
+                        0.5 * float(cross_sequence_radius),
+                    ),
+                    posterior["distance"],
+                ).reshape(-1)[selected]
             )
+        projected_stability_parts.append(
+            projected_stability.reshape(-1)[selected]
+        )
+        stable_mask_override_parts.append(
+            (stable_rigid & ~semantic_rigid).reshape(-1)[selected]
+        )
     if not xyz_parts:
         raise RuntimeError(
             "MASt3R pointmap index contains no valid rigid observations"
@@ -1735,7 +2344,12 @@ def _sample_dense_mast3r_rigid_seeds(
     posterior_available = np.concatenate(posterior_available_parts)
     posterior_precision = np.concatenate(posterior_precision_parts)
     cross_supported = np.concatenate(posterior_supported_parts)
+    native_cross_supported = np.concatenate(
+        native_posterior_supported_parts
+    )
     cross_distance = np.concatenate(posterior_distance_parts)
+    projected_stability = np.concatenate(projected_stability_parts)
+    stable_mask_override = np.concatenate(stable_mask_override_parts)
     # Posterior construction is a separate immutable evidence stage.  A
     # runtime nearest-neighbour recomputation changes its reference set after
     # per-view sampling and previously promoted missing artifacts to
@@ -1759,8 +2373,12 @@ def _sample_dense_mast3r_rigid_seeds(
         rows = view_id == current_view
         median = max(float(np.median(raw_confidence[rows])), 1e-6)
         normalized_confidence[rows] = raw_confidence[rows] / median
+    cross_sequence_authority = _pointmap_cross_sequence_authority(
+        native_cross_supported,
+        projected_stability,
+    )
     score = (
-        cross_supported.astype(np.float32) * 16.0
+        cross_sequence_authority * 16.0
         + np.clip(
             normalized_confidence
             * np.maximum(posterior_precision, 0.03),
@@ -1844,6 +2462,7 @@ def _sample_dense_mast3r_rigid_seeds(
         "cross_sequence_precision": posterior_precision[keep].astype(
             np.float32
         ),
+        "stable_mask_override": stable_mask_override[keep],
     }
 
 
@@ -1863,6 +2482,8 @@ def _sample_chart_seeds(
     scene_contract: Path,
     dataset: Path,
     tree_mask_pickle: Path,
+    projected_rigid_posterior: Path | None,
+    projected_rigid_tracks: Path | None,
     rigid_reference: np.ndarray,
     per_chart: int,
     maximum_total: int,
@@ -1936,6 +2557,11 @@ def _sample_chart_seeds(
     selected_normals = []
     selected_consensus_confirmed = []
     selected_sampling_multiplier = []
+    selected_stable_mask_override = []
+    projected_roles = _ProjectedRigidInitializationPosterior(
+        projected_rigid_posterior,
+        projected_rigid_tracks,
+    )
     with np.load(chart_path, allow_pickle=False) as charts:
         scale_factor = float(charts["scale_factor"])
         if not np.isfinite(scale_factor) or scale_factor <= 0:
@@ -2062,9 +2688,50 @@ def _sample_chart_seeds(
                     mode="nearest",
                 )[0, 0].numpy() > 0.5
                 resized.append(value)
-            rigid = resized[0] & resized[1] & resized[2] & resized[3]
+            semantic_rigid = (
+                resized[0] & resized[1] & resized[2] & resized[3]
+            )
+            world_to_camera = np.asarray(
+                scene_record["T_world_to_camera"], dtype=np.float64
+            )
+            chart_camera = (
+                pointmap.reshape(-1, 3).astype(np.float64)
+                @ world_to_camera[:3, :3].T
+                + world_to_camera[:3, 3]
+            )
+            (
+                projected_stability,
+                projected_visibility,
+                projected_canonical_rgb,
+            ) = projected_roles.depth_consistent_fields(
+                image_name,
+                chart_camera[:, 2].reshape(height, width),
+            )
+            stable_mask_override = consensus_confirmed | (
+                projected_stability > 0.0
+            )
+            if reference_tree is not None:
+                override_candidates = np.flatnonzero(
+                    (~semantic_rigid)
+                    & resized[2]
+                    & reference_mask[chart_index]
+                    & ~consensus_contradicted
+                    & np.isfinite(pointmap).all(axis=-1)
+                )
+                if len(override_candidates):
+                    override_distance = reference_tree.query(
+                        pointmap.reshape(-1, 3)[override_candidates], k=1
+                    )[0]
+                    stable_mask_override.reshape(-1)[
+                        override_candidates[
+                            override_distance
+                            <= max(0.40, 4.0 * float(consensus_radius))
+                        ]
+                    ] = True
+            rigid_observation = semantic_rigid | stable_mask_override
             valid = (
-                rigid
+                rigid_observation
+                & resized[2]
                 & reference_mask[chart_index]
                 & ~consensus_contradicted
                 & np.isfinite(pointmap).all(axis=-1)
@@ -2079,7 +2746,18 @@ def _sample_chart_seeds(
             # Preserve UV coverage without transferring a shared rectangular
             # sampling phase into every Chart. Confidence remains a smooth
             # priority, while coordinate hashing dephases equal-score areas.
-            confidence_flat = conf.reshape(-1)
+            confidence_flat = conf.reshape(-1) * (
+                0.35
+                + 0.65
+                * np.maximum(
+                    semantic_rigid.astype(np.float32),
+                    stable_mask_override.astype(np.float32)
+                    * np.maximum(
+                        np.maximum(consensus_trust, projected_stability),
+                        0.35,
+                    ),
+                )
+            ).reshape(-1)
             raster_rows, raster_columns = np.indices((height, width))
             chosen = deterministic_blue_noise_rows(
                 flat,
@@ -2123,6 +2801,24 @@ def _sample_chart_seeds(
             color = _bilinear_rgb_at_pixel_centres(
                 source_rgb, source_x, source_y
             ) / 255.0
+            projected_strength = projected_stability.reshape(-1)[chosen]
+            projected_visible = projected_visibility.reshape(-1)[chosen]
+            projected_color = projected_canonical_rgb.reshape(-1, 3)[chosen]
+            projected_rows = projected_strength > 0.0
+            if bool(projected_rows.any()):
+                current_weight = np.clip(
+                    projected_visible[projected_rows]
+                    / np.maximum(
+                        projected_strength[projected_rows], 1.0e-6
+                    ),
+                    0.0,
+                    1.0,
+                )[:, None]
+                color[projected_rows] = (
+                    current_weight * color[projected_rows]
+                    + (1.0 - current_weight)
+                    * projected_color[projected_rows]
+                )
             # Confidence is used only as an uncertainty proxy and remains
             # source-labelled; it is not converted into a universal truth.
             base_confidence = conf[valid]
@@ -2215,6 +2911,10 @@ def _sample_chart_seeds(
             selected_quaternions.append(quaternion)
             selected_normals.append(normal.astype(np.float32))
             selected_consensus_confirmed.append(confirmed_value)
+            selected_stable_mask_override.append(
+                (stable_mask_override & ~semantic_rigid)
+                .reshape(-1)[chosen]
+            )
             selected_sampling_multiplier.append(
                 trust_multiplier.astype(np.float32)
             )
@@ -2242,6 +2942,7 @@ def _sample_chart_seeds(
             "sampling_footprint_multiplier": np.empty(
                 0, dtype=np.float32
             ),
+            "stable_mask_override": np.empty(0, dtype=bool),
         }
     xyz = np.concatenate(selected_xyz)
     rgb = np.concatenate(selected_rgb)
@@ -2254,6 +2955,9 @@ def _sample_chart_seeds(
     normals = np.concatenate(selected_normals)
     consensus_confirmed = np.concatenate(selected_consensus_confirmed)
     sampling_multiplier = np.concatenate(selected_sampling_multiplier)
+    stable_mask_override = np.concatenate(
+        selected_stable_mask_override
+    )
     envelope_keep, scene_envelope = _rigid_scene_envelope_mask(
         xyz,
         rigid_reference,
@@ -2270,6 +2974,7 @@ def _sample_chart_seeds(
         normals,
         consensus_confirmed,
         sampling_multiplier,
+        stable_mask_override,
     ) = (
         xyz[envelope_keep],
         rgb[envelope_keep],
@@ -2282,6 +2987,7 @@ def _sample_chart_seeds(
         normals[envelope_keep],
         consensus_confirmed[envelope_keep],
         sampling_multiplier[envelope_keep],
+        stable_mask_override[envelope_keep],
     )
     independent_support = np.zeros(len(xyz), dtype=bool)
     # Measure independent support without turning it into a renderer-birth
@@ -2301,30 +3007,11 @@ def _sample_chart_seeds(
             if reference_tree is not None
             else np.full(len(xyz), np.inf, dtype=np.float32)
         )
-        neighbour_count = min(64, len(xyz))
-        if neighbour_count > 1:
-            neighbour_distance, neighbour_index = cKDTree(xyz).query(
-                xyz, k=neighbour_count
+        cross_chart_distance, cross_chart_index = (
+            _nearest_cross_label_neighbour(
+                xyz, chart_id, maximum_neighbours=64
             )
-            neighbour_distance = np.atleast_2d(neighbour_distance)
-            neighbour_index = np.atleast_2d(neighbour_index)
-            cross_chart_distance = np.full(
-                len(xyz), np.inf, dtype=np.float32
-            )
-            cross_chart_index = np.full(len(xyz), -1, dtype=np.int64)
-            for rank in range(1, neighbour_count):
-                different_chart = (
-                    chart_id[neighbour_index[:, rank]] != chart_id
-                )
-                unresolved = ~np.isfinite(cross_chart_distance)
-                take = different_chart & unresolved
-                cross_chart_distance[take] = neighbour_distance[take, rank]
-                cross_chart_index[take] = neighbour_index[take, rank]
-        else:
-            cross_chart_distance = np.full(
-                len(xyz), np.inf, dtype=np.float32
-            )
-            cross_chart_index = np.full(len(xyz), -1, dtype=np.int64)
+        )
         normal_agreement = np.zeros(len(xyz), dtype=bool)
         paired = cross_chart_index >= 0
         if bool(paired.any()):
@@ -2362,6 +3049,7 @@ def _sample_chart_seeds(
             consensus_confirmed,
             independent_support,
             sampling_multiplier,
+            stable_mask_override,
         ) = (
             xyz[order],
             rgb[order],
@@ -2375,6 +3063,7 @@ def _sample_chart_seeds(
             consensus_confirmed[order],
             independent_support[order],
             sampling_multiplier[order],
+            stable_mask_override[order],
         )
     (
         renderer_admitted,
@@ -2384,6 +3073,20 @@ def _sample_chart_seeds(
         independent_support,
         consensus_confirmed,
     )
+    partition_owner, overlap_ownership_audit = (
+        _chart_overlap_primary_ownership(
+            xyz,
+            chart_id,
+            normals,
+            confidence,
+            independent_support,
+            consensus_confirmed,
+            distance_threshold=min(
+                0.02, max(0.008, 0.12 * float(consensus_radius))
+            ),
+        )
+    )
+    renderer_admitted &= partition_owner
     return {
         "xyz": xyz,
         "rgb": rgb,
@@ -2399,8 +3102,11 @@ def _sample_chart_seeds(
         "renderer_admitted": renderer_admitted,
         "geometry_persistent": geometry_persistent,
         "initial_opacity": initial_opacity,
+        "partition_owner": partition_owner,
+        "overlap_ownership_audit": overlap_ownership_audit,
         "scene_envelope": scene_envelope,
         "sampling_footprint_multiplier": sampling_multiplier,
+        "stable_mask_override": stable_mask_override,
     }
 
 
@@ -2664,6 +3370,9 @@ def build_surface_seed(
         source_counts["mast3r_dense_single_sequence"] = int(
             (~dense_pointmap["cross_sequence_supported"]).sum()
         )
+        source_counts["mast3r_dense_stable_mask_override"] = int(
+            dense_pointmap["stable_mask_override"].sum()
+        )
     if mast3r_primary and not sum(map(len, xyz_parts)):
         raise RuntimeError(
             "MASt3R-only initialization has no valid rigid observations"
@@ -2696,6 +3405,14 @@ def build_surface_seed(
                         encoding="utf-8"
                     )
                 )["tree_mask_pickle"]
+            ),
+            projected_rigid_posterior=artifact_path(
+                store,
+                "projected_rigid_conflict_posterior",
+                required=False,
+            ),
+            projected_rigid_tracks=artifact_path(
+                store, "mast3r_multiview_tracks", required=False
             ),
             rigid_reference=(
                 np.concatenate(rigid_metric_reference_parts)
@@ -2776,13 +3493,22 @@ def build_surface_seed(
             chart_candidate_confirmed
         )
         source_counts["chart_renderer_candidates_not_admitted"] = int(
-            chart_candidate_count - chart_candidate_supported
+            chart_candidate_count
+            - int(chart["renderer_admitted"].sum())
+        )
+        source_counts["chart_overlap_secondary_suppressed"] = int(
+            chart["overlap_ownership_audit"][
+                "secondary_renderer_rows_suppressed"
+            ]
         )
         source_counts["chart_crossview_confirmed"] = int(
             chart["consensus_confirmed"].sum()
         )
         source_counts["chart_independently_supported"] = int(
             chart["independent_support"].sum()
+        )
+        source_counts["chart_stable_mask_override"] = int(
+            chart["stable_mask_override"].sum()
         )
         source_counts["chart_low_opacity_coverage"] = int(
             (~chart["independent_support"]).sum()
@@ -2793,6 +3519,13 @@ def build_surface_seed(
         source_counts["chart_unsupported_bootstrap"] = int(
             (~chart["consensus_confirmed"]).sum()
         )
+
+    # Freeze the complete MASt3R/MAtCha renderer scaffold before optional
+    # coverage sources enter.  SfM may append evidence in measured holes, but
+    # it must not change which DAV2 holes are proposed or the tangent frame of
+    # an already admitted primary row.  This makes geometry-source A/Bs causal
+    # rather than silently reparameterizing the control arm.
+    primary_renderer_reference = np.concatenate(xyz_parts).astype(np.float32)
 
     if sfm_coverage:
         # SfM is admitted only after every MASt3R/MAtCha renderer witness has
@@ -2814,15 +3547,14 @@ def build_surface_seed(
         if "sequence_count" in colmap:
             candidate_mask &= colmap["sequence_count"] >= 2
         candidate_indices = np.flatnonzero(candidate_mask)
-        primary_reference = np.concatenate(xyz_parts).astype(np.float32)
         candidate_xyz = colmap["xyz"][candidate_indices].astype(np.float32)
         envelope_keep, sfm_envelope_audit = _rigid_scene_envelope_mask(
-            candidate_xyz, primary_reference
+            candidate_xyz, primary_renderer_reference
         )
         candidate_indices = candidate_indices[envelope_keep]
         candidate_xyz = candidate_xyz[envelope_keep]
-        if len(candidate_xyz) and len(primary_reference):
-            distance_to_primary = cKDTree(primary_reference).query(
+        if len(candidate_xyz) and len(primary_renderer_reference):
+            distance_to_primary = cKDTree(primary_renderer_reference).query(
                 candidate_xyz, k=1, workers=-1
             )[0]
             coverage_hole = distance_to_primary > max(
@@ -2909,7 +3641,7 @@ def build_surface_seed(
         )
         source_counts["sfm_rigid_coverage_admitted"] = count
         source_counts["sfm_rigid_coverage_primary_reference"] = int(
-            len(primary_reference)
+            len(primary_renderer_reference)
         )
 
     if (
@@ -2919,7 +3651,9 @@ def build_surface_seed(
         semantic_payload = json.loads(
             Path(store["semantic_contract"]).read_text(encoding="utf-8")
         )
-        rigid_reference = np.concatenate(xyz_parts).astype(np.float32)
+        # DAV2 remains the same weak hole-completion control in both geometry
+        # arms. Optional SfM rows must not suppress or relocate its proposals.
+        rigid_reference = primary_renderer_reference
         dav2_rigid = _dav2_rigid_hole_completion_samples(
             store,
             dataset=dataset,
@@ -2991,9 +3725,24 @@ def build_surface_seed(
     normals = np.empty((len(xyz), 3), dtype=np.float32)
     free = source_type != SOURCE_CHART
     if bool(free.any()):
-        scales[free], quaternions[free], normals[free] = _surface_frames(
-            xyz[free], sigma[free], maximum_scale=0.08
+        # Estimate local tangent frames within each source authority.  A
+        # coverage-only SfM append previously changed the nearest neighbours,
+        # scales and rotations of every existing MASt3R track despite leaving
+        # its xyz/RGB/evidence untouched.  Source-local frames keep the primary
+        # scaffold byte-identical while still giving each appended source a
+        # well-defined local covariance.
+        free_scales, free_quaternions, free_normals = (
+            _source_local_surface_frames(
+                xyz,
+                sigma,
+                source_type,
+                free,
+                maximum_scale=0.08,
+            )
         )
+        scales[free] = free_scales[free]
+        quaternions[free] = free_quaternions[free]
+        normals[free] = free_normals[free]
     dense_rows = pointmap_view_id >= 0
     if bool(dense_rows.any()):
         if dense_pointmap is None or int(dense_rows.sum()) != len(
@@ -3236,22 +3985,34 @@ def _mast3r_tree_tracks(
             [by_stem.get(Path(name).stem, -1) for name in names],
             dtype=np.int32,
         )
+        # ``NpzFile`` is a lazy compressed archive.  Indexing a member does
+        # not return a view into a resident table: it opens and decompresses
+        # that complete ``.npy`` payload again.  The old per-track accesses
+        # below therefore turned a ~22 MB MASt3R archive into tens of GB of
+        # logical reads and made foliage initialization appear hung.  Bind
+        # every row-wise field once before entering the Python loop.
         offsets = archive["observation_offsets"]
         observation_cameras = archive["observation_camera_indices"]
         observation_pixels = archive["observation_pixels"]
         observation_depth = archive["observation_camera_depth"]
         camera_image_sizes = archive["camera_image_sizes"]
+        track_ids = archive["track_id"]
+        xyz_rows = archive["xyz"]
+        rgb_rows = archive["rgb"]
+        reprojection_error = archive["reprojection_error"]
+        sequence_count = archive["sequence_count"]
+        role_probabilities = archive["role_probabilities"]
+        valid_observation_count = archive["valid_observation_count"]
         keep = (
             (
-                archive["role_probabilities"][:, ROLE_CANOPY]
-                >= 0.55
+                role_probabilities[:, ROLE_CANOPY] >= 0.55
             )
             & (
-                archive["valid_observation_count"]
+                valid_observation_count
                 >= int(minimum_track_observations)
             )
             & (
-                archive["reprojection_error"]
+                reprojection_error
                 <= float(maximum_reprojection_error)
             )
         )
@@ -3270,12 +4031,10 @@ def _mast3r_tree_tracks(
             sizes = camera_image_sizes[camera_rows][valid_observation]
             result.append(
                 {
-                    "id": int(archive["track_id"][index]),
-                    "xyz": archive["xyz"][index].astype(np.float64),
-                    "rgb": archive["rgb"][index].astype(np.uint8),
-                    "error": float(
-                        archive["reprojection_error"][index]
-                    ),
+                    "id": int(track_ids[index]),
+                    "xyz": xyz_rows[index].astype(np.float64),
+                    "rgb": rgb_rows[index].astype(np.uint8),
+                    "error": float(reprojection_error[index]),
                     "image_ids": image_ids,
                     "point2d_indices": np.full(
                         len(image_ids), -1, dtype=np.int64
@@ -3291,13 +4050,9 @@ def _mast3r_tree_tracks(
                     "observation_depth": observation_depth[
                         begin:end
                     ][valid_observation].astype(np.float32),
-                    "tree_sequence_count": int(
-                        archive["sequence_count"][index]
-                    ),
+                    "tree_sequence_count": int(sequence_count[index]),
                     "tree_fraction": float(
-                        archive["role_probabilities"][
-                            index, ROLE_CANOPY
-                        ]
+                        role_probabilities[index, ROLE_CANOPY]
                     ),
                 }
             )
@@ -5966,6 +6721,7 @@ def build_foliage_seed(
         for image in images.values()
     ]
     rigid_calibration_depth_maps: dict[int, np.ndarray] = {}
+    rigid_calibration_renderer = None
     rigid_calibration_audit: dict[str, Any] = {
         "enabled": False,
         "depth_view_count": 0,
@@ -5977,22 +6733,19 @@ def build_foliage_seed(
         )
         if not rigid_calibration_ply.is_file():
             raise FileNotFoundError(rigid_calibration_ply)
-        from outdoor.rigid_occlusion import (
-            render_protected_depth_maps,
-        )
+        from outdoor.rigid_occlusion import ProtectedDepthRenderer
 
-        rigid_calibration_depth_maps = render_protected_depth_maps(
-            view_records,
+        # This builder requests a DAV2-alignment batch first and may discover
+        # extra posterior cameras afterwards.  Keep one immutable trained
+        # surface resident across both batches instead of loading the same
+        # large PLY twice.
+        rigid_calibration_renderer = ProtectedDepthRenderer(
             structural_ply=rigid_calibration_ply,
-            resolution_scale=float(
-                rigid_calibration_resolution_scale
-            ),
+            resolution_scale=float(rigid_calibration_resolution_scale),
         )
         rigid_calibration_audit = {
             "enabled": True,
-            "depth_view_count": int(
-                len(rigid_calibration_depth_maps)
-            ),
+            "depth_view_count": 0,
             "source": "trained_native_rigid_2dgs_surface_render",
             "structural_ply": str(rigid_calibration_ply),
             "structural_ply_sha256": sha256_file(
@@ -6005,6 +6758,26 @@ def build_foliage_seed(
                 "dav2_metric_alignment_and_rigid_occlusion_only"
             ),
         }
+
+    def ensure_rigid_calibration_depth(
+        requested_views: list[dict[str, Any]],
+    ) -> None:
+        """Render the rigid z-buffer only for cameras that consume it."""
+        if rigid_calibration_renderer is None:
+            return
+        missing = [
+            view
+            for view in requested_views
+            if int(view["image_id"])
+            not in rigid_calibration_depth_maps
+        ]
+        if missing:
+            rigid_calibration_depth_maps.update(
+                rigid_calibration_renderer(missing)
+            )
+        rigid_calibration_audit["depth_view_count"] = int(
+            len(rigid_calibration_depth_maps)
+        )
     mast3r_primary = mast3r_is_geometry_authority(store)
     sfm_coverage = sfm_coverage_tracks_enabled(store)
     sfm_static_tracks: list[dict[str, Any]] = []
@@ -6085,6 +6858,7 @@ def build_foliage_seed(
                 view_records, selected_view_count
             )
         )
+        ensure_rigid_calibration_depth(dav2_views)
         dav2_foliage, dav2_audit = _dav2_foliage_samples(
             store,
             images,
@@ -6360,6 +7134,7 @@ def build_foliage_seed(
                 f"{target_rgb_path}"
             )
         view["target_rgb_path"] = str(target_rgb_path)
+    ensure_rigid_calibration_depth(selected)
     if rigid_calibration_depth_maps:
         rigid_depth = {
             int(view["image_id"]): rigid_calibration_depth_maps[
@@ -6491,6 +7266,9 @@ def build_foliage_seed(
     dense_ray_budget = dict(hull.pop("dense_ray_budget"))
     candidate_bound_ray_budget = dict(
         hull.pop("candidate_bound_ray_budget")
+    )
+    candidate_view_pair_audit = dict(
+        hull.pop("candidate_view_pair_audit")
     )
     rigid_depth_view_count = int(hull.pop("rigid_depth_view_count"))
     hull.pop("tree_instance_count")
@@ -6687,6 +7465,9 @@ def build_foliage_seed(
             else 0.0
         ),
     }
+    fixed_camera_sequences, canonical_camera_quality_audit = (
+        _fixed_camera_canonical_quality(view_records, rgb_root)
+    )
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
         "geometry_version": (
@@ -6802,6 +7583,7 @@ def build_foliage_seed(
             "ungrouped_dynamic_visibility": "exact_owner_only",
             "positive_negative_unknown_evidence": True,
             "real_ray_depth_posterior": True,
+            "candidate_view_pair_audit": candidate_view_pair_audit,
             "sparse_rigid_occlusion_zbuffer": not bool(
                 rigid_calibration_depth_maps
             ),
@@ -6850,6 +7632,16 @@ def build_foliage_seed(
                 }
                 for view in selected_views
             ],
+            # Sequence identity belongs to the fixed camera contract, not to
+            # the bounded subset selected for ray/depth posterior evaluation.
+            # Static fusion consumes observations from MASt3R cameras outside
+            # that subset and must still be able to verify cross-sequence
+            # persistence for them.
+            "fixed_camera_sequences": fixed_camera_sequences,
+            "fixed_camera_sequence_scope": (
+                "all_fixed_database_cameras"
+            ),
+            "canonical_camera_quality": canonical_camera_quality_audit,
             "selected_instance_support": selected_instance_support,
         },
         **{

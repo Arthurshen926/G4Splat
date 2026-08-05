@@ -9,11 +9,13 @@ from outdoor.hybrid_teacher_api import (
     HybridTeacher,
     STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
     SUPPORTED_TEACHER_PROTOCOLS,
+    _apply_deployment_surface_geometry,
     _static_ray_normalized_optical_mixture,
     _static_surface_evidence_mixture,
     resolve_deployment_optical_contract,
     teacher_branch_validity,
 )
+from scene.gaussian_model import GaussianModel
 from outdoor.hybrid_gaussian_renderer import HybridRenderOutput
 
 
@@ -43,6 +45,55 @@ def _optical_test_output(
         volume_means2d=None,
         volume_replacement=rows,
     )
+
+
+def test_checkpoint_deployment_geometry_overrides_only_render_geometry():
+    model = GaussianModel(3)
+    model._xyz = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    model._scaling = torch.nn.Parameter(
+        torch.zeros(2, 2), requires_grad=False
+    )
+    model._rotation = torch.nn.Parameter(
+        torch.zeros(2, 4), requires_grad=False
+    )
+    payload = {
+        "version": "native-2dgs-deployment-geometry-v1",
+        "xyz": torch.ones(2, 3),
+        "scaling": torch.full((2, 2), -2.0),
+        "rotation": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+        ),
+        "point_count": 2,
+        "chart_baked_rows": 1,
+        "resume_surface_unchanged": True,
+    }
+
+    audit = _apply_deployment_surface_geometry(model, payload)
+
+    assert audit["applied"]
+    assert audit["chart_baked_rows"] == 1
+    torch.testing.assert_close(model._xyz, payload["xyz"])
+    torch.testing.assert_close(model._scaling, payload["scaling"])
+    torch.testing.assert_close(model._rotation, payload["rotation"])
+
+
+def test_checkpoint_deployment_geometry_rejects_row_mismatch():
+    model = GaussianModel(3)
+    model._xyz = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    model._scaling = torch.nn.Parameter(
+        torch.zeros(2, 2), requires_grad=False
+    )
+    model._rotation = torch.nn.Parameter(
+        torch.zeros(2, 4), requires_grad=False
+    )
+    with pytest.raises(RuntimeError, match="point count differs"):
+        _apply_deployment_surface_geometry(
+            model,
+            {
+                "version": "native-2dgs-deployment-geometry-v1",
+                "point_count": 1,
+            },
+        )
 
 
 def test_static_ray_normalized_optical_mixture_uses_optical_responsibility():
@@ -373,6 +424,16 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
     )
     assert (
         "cambridge_native_hybrid_teacher_v52_static_ray_local_optical_handoff"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v64_static_role_evidence_mature_"
+        "replace_split_surface"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v65_static_residual_topology_"
+        "and_weak_rigid_completion"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
 

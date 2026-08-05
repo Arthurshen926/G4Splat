@@ -140,6 +140,84 @@ def test_sequence_observations_fuse_to_one_static_model():
     assert audit["maximum_modes_per_group"] == 2
 
 
+def test_static_fusion_uses_complete_fixed_camera_sequence_contract():
+    payload = _payload()
+    payload["audit"]["selected_views"] = [
+        {"image_id": 0, "sequence_id": "seq0"}
+    ]
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload,
+        fixed_camera_sequences=[
+            {"image_id": 0, "sequence_id": "seq0"},
+            {"image_id": 1, "sequence_id": "seq1"},
+        ],
+    )
+    assert audit["camera_sequence_metadata_source"] == (
+        "runtime_fixed_camera_contract"
+    )
+    assert audit["mapped_associated_rows"] == 4
+    assert audit["unmapped_associated_rows"] == 0
+    detail_groups = fused["replacement_group"][fused["static_detail"]]
+    assert 0 in detail_groups.tolist()
+
+
+def test_cross_sequence_verified_cell_gets_local_canonical_fallback():
+    payload = _payload()
+    # Make both persistent cells part of one tree. Group zero selects seq0 as
+    # the tree snapshot, while group one is observed only in seq1/seq2. It is
+    # independently cross-sequence verified and must not disappear merely
+    # because the tree-wide snapshot did not see it.
+    payload["tree_instance_id"][1] = 0
+    payload["tree_instance_id"][5:7] = 0
+    payload["support_camera_ids"][5, 0] = 2
+    payload["support_camera_ids"][6, 0] = 3
+    payload["observation_camera_ids"][5, 0] = 2
+    payload["observation_camera_ids"][6, 0] = 3
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload,
+        fixed_camera_sequences=[
+            {"image_id": 0, "sequence_id": "seq0"},
+            {"image_id": 1, "sequence_id": "seq0"},
+            {"image_id": 2, "sequence_id": "seq1"},
+            {"image_id": 3, "sequence_id": "seq2"},
+        ],
+    )
+    assert audit["canonical_cross_sequence_fallback_groups"] == 1
+    detail_groups = fused["replacement_group"][fused["static_detail"]]
+    assert 0 in detail_groups.tolist()
+    assert 1 in detail_groups.tolist()
+
+
+def test_canonical_camera_quality_breaks_equal_support_tie():
+    payload = _payload()
+    payload["audit"]["fixed_camera_sequences"] = [
+        {
+            "image_id": 0,
+            "sequence_id": "seq0",
+            "canonical_quality": 0.25,
+        },
+        {
+            "image_id": 1,
+            "sequence_id": "seq1",
+            "canonical_quality": 2.0,
+        },
+    ]
+    fused, audit = fuse_sequence_evidence_into_static_leaves(payload)
+    detail = fused["static_detail"] & (
+        fused["replacement_group"] == 0
+    )
+    assert torch.allclose(
+        fused["centers"][detail][0], torch.tensor([-0.01, 0.00, 3.02])
+    )
+    assert audit["canonical_sequence_histogram"] == {
+        "seq0": 1,
+        "seq1": 1,
+    }
+    assert audit["canonical_camera_quality_source"] == (
+        "initialization_fixed_camera_contract"
+    )
+
+
 def test_per_tree_snapshot_is_static_production_default():
     _, scene = fuse_sequence_evidence_into_static_leaves(
         _payload(), canonical_sequence_policy="scene"

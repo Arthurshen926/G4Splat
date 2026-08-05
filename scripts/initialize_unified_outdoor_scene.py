@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import time
 from types import SimpleNamespace
 
 import torch
@@ -29,6 +30,60 @@ from outdoor.role_aware_initialization import (  # noqa: E402
     build_surface_seed,
 )
 from outdoor.scene_contract import sha256_file  # noqa: E402
+
+
+def _validate_pointmap_posterior_contract(store: dict) -> dict:
+    """Fail before initialization when the production posterior is absent.
+
+    The base Evidence Store deliberately contains the immutable MASt3R
+    pointmaps.  A separate derived store adds cross-sequence precision and
+    support rasters.  Both stores have valid hashes, so checking only the
+    evidence schema silently accepts the base store and demotes every dense
+    pointmap sample to the 0.03 single-sequence fallback.  That is a missing
+    producer stage, not low-confidence geometry, and must not be optimized.
+    """
+    if not mast3r_is_geometry_authority(store):
+        return {"required": False, "present": False}
+    artifact = next(
+        (
+            row
+            for row in store.get("artifacts", [])
+            if row.get("name") == "mast3r_pointmap_index"
+        ),
+        None,
+    )
+    if artifact is None:
+        return {"required": False, "present": False}
+    index_path = Path(artifact["path"]).expanduser().resolve()
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    posterior = payload.get("cross_sequence_posterior")
+    if not isinstance(posterior, dict):
+        raise RuntimeError(
+            "The MASt3R pointmap index has no cross-sequence posterior. "
+            "Run build_mast3r_pointmap_cross_sequence_posterior.py and "
+            "initialize from its derived Evidence Store, not the base store."
+        )
+    if posterior.get("schema_version") != (
+        "mast3r-cross-sequence-pointmap-posterior-v1"
+    ):
+        raise RuntimeError("Unsupported MASt3R pointmap posterior schema")
+    aggregate = posterior.get("aggregate", {})
+    supported_pixels = int(aggregate.get("supported_pixels", 0))
+    if supported_pixels <= 0:
+        raise RuntimeError(
+            "The MASt3R pointmap posterior has zero independently supported "
+            "pixels; refusing a nominal all-single-sequence initialization"
+        )
+    return {
+        "required": True,
+        "present": True,
+        "schema_version": posterior["schema_version"],
+        "supported_pixels": supported_pixels,
+        "supported_fraction": float(
+            aggregate.get("supported_fraction", 0.0)
+        ),
+        "mean_precision": float(aggregate.get("mean_precision", 0.0)),
+    }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -377,6 +432,9 @@ def main() -> None:
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=args.resume_existing_surface)
     store = load_evidence_store(args.evidence_store)
+    pointmap_posterior_contract = _validate_pointmap_posterior_contract(
+        store
+    )
     dataset = Path(store["dataset"]).expanduser().resolve()
     rgb_root = (
         args.rgb_root.expanduser().resolve()
@@ -385,6 +443,12 @@ def main() -> None:
     )
     rgb_contract = rgb_source_contract(
         SimpleNamespace(source_path=str(dataset), images=str(rgb_root))
+    )
+    initialization_started = time.monotonic()
+    print(
+        "[initialize] stage=surface status=start "
+        f"evidence={store['evidence_hash']}",
+        flush=True,
     )
     surface_path = output / "surface_seed.npz"
     surface_resume = None
@@ -460,6 +524,14 @@ def main() -> None:
             sfm_rigid_coverage_radius=args.sfm_rigid_coverage_radius,
             seed=args.seed,
         )
+    print(
+        "[initialize] stage=surface status=complete "
+        f"seconds={time.monotonic() - initialization_started:.1f} "
+        f"rows={surface.get('surface_count', surface.get('seed_count', -1))}",
+        flush=True,
+    )
+    foliage_started = time.monotonic()
+    print("[initialize] stage=foliage status=start", flush=True)
     foliage_reuse = None
     if args.rigid_stage_placeholder_foliage:
         foliage_path = output / "foliage_seed_gaussians.pth"
@@ -516,6 +588,12 @@ def main() -> None:
             evidence_hash=store["evidence_hash"],
             rgb_contract=rgb_contract,
         )
+    print(
+        "[initialize] stage=foliage status=complete "
+        f"seconds={time.monotonic() - foliage_started:.1f} "
+        f"rows={foliage.get('final_volume_count', foliage.get('seed_count', -1))}",
+        flush=True,
+    )
     manifest = {
         "version": INITIALIZATION_VERSION,
         "evidence_hash": store["evidence_hash"],
@@ -636,11 +714,19 @@ def main() -> None:
         },
         "historical_model_initialization": False,
         "causal_reuse": foliage_reuse,
+        "pointmap_cross_sequence_posterior": (
+            pointmap_posterior_contract
+        ),
     }
     (output / "initialization_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(manifest, indent=2))
+    print(
+        "[initialize] stage=all status=complete "
+        f"seconds={time.monotonic() - initialization_started:.1f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

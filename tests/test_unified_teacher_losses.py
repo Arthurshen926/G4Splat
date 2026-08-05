@@ -9,6 +9,7 @@ import torch
 
 from scripts.train_unified_outdoor_teacher import (
     DYNAMIC_LIFECYCLE_REPAIR_TARGET,
+    SURFACE_SCREEN_TOPOLOGY_CONTRACT,
     SURFACE_OWNERSHIP_REPAIR_TARGET,
     STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
     STATIC_DETAIL_ISOLATED_CONTRACT,
@@ -16,6 +17,7 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
     TRAINING_PROFILES,
     VOLUME_OPACITY_SETTLE_CONTRACT,
+    _apply_training_profile_optimizer_defaults,
     _adapt_volume,
     _activation_iteration,
     _accumulate_volume_stats,
@@ -45,6 +47,7 @@ from scripts.train_unified_outdoor_teacher import (
     _counterfactual_volume_transparency_loss,
     _evidence_adaptive_role_quotas,
     _geometry_losses,
+    _projected_occluded_rigid_geometry_loss,
     _inherit_surface_optimizer_contract,
     _load_dav2_observation_patches,
     _masked_clamp_max_,
@@ -55,8 +58,11 @@ from scripts.train_unified_outdoor_teacher import (
     _apply_volume_opacity_settle_policy,
     _apply_static_optical_policy,
     _apply_static_ray_local_mass_handoff,
+    _apply_surface_scale_limits_preserve_optical_mass,
+    _surface_screen_limit_rows,
     _accumulate_static_replacement_evidence,
     _update_static_child_verification_from_render,
+    _update_chart_atlas_learning_rate,
     _apply_mature_surface_gradient_policy,
     _phase,
     _public_phase_name,
@@ -65,6 +71,7 @@ from scripts.train_unified_outdoor_teacher import (
     _resume_conditioned_visit_counts,
     _refresh_split_child_owner_colors,
     _retain_checkpoint_snapshot,
+    _rollback_failed_split_families,
     _rigid_completion_seed_indices,
     _rigid_residual_patch_loss,
     _resume_training_contract_differences,
@@ -72,6 +79,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_exclusive_topology_active,
     _static_detail_ray_trainable,
     _static_detail_isolated_gradient_gates,
+    _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
     _static_detail_global_cleanup_loss,
@@ -84,11 +92,13 @@ from scripts.train_unified_outdoor_teacher import (
     _validate_fixed_cameras,
     _validate_initialization_rgb_source,
     _validate_initialization_protocol,
+    _validate_foliage_rigid_calibration,
     _validate_surface_warmstart,
     _volume_stats,
     _volume_split_authority,
     _volume_topology_active,
     _volume_topology_authority,
+    _update_volume_learning_rates,
     _write_rigid_stage_surface_handoff,
 )
 from outdoor.hybrid_gaussian_renderer import (
@@ -101,6 +111,7 @@ from outdoor.training_evidence import (
     FoliageRayEvidence,
     OutdoorGeometryEvidence,
 )
+from scene import GaussianModel
 
 RIGID_SURFACE_OPTIMIZER = {
     "position_lr_init": 1.6e-5,
@@ -112,6 +123,73 @@ RIGID_SURFACE_OPTIMIZER = {
     "scaling_lr": 0.005,
     "rotation_lr": 0.001,
 }
+RIGID_SURFACE_OPTIMIZER_WITH_POLISH = {
+    **RIGID_SURFACE_OPTIMIZER,
+    "non_position_lr_decay_from": 18_000,
+    "non_position_lr_decay_until": 24_000,
+    "non_position_lr_final_mult": 0.1,
+}
+
+
+def test_surface_screen_scale_projection_preserves_local_optical_mass():
+    opacity = torch.logit(torch.tensor([[0.2], [0.4]]))
+    surface = SimpleNamespace(
+        _scaling=torch.zeros(2, 2),
+        _opacity=opacity.clone(),
+        get_opacity=torch.sigmoid(opacity),
+    )
+    before_tau = -torch.log1p(-surface.get_opacity[:, 0])
+    before_mass = before_tau * surface._scaling.exp().prod(dim=1)
+    audit = _apply_surface_scale_limits_preserve_optical_mass(
+        surface,
+        torch.tensor([0, 1]),
+        torch.tensor([0.5, 1.0]),
+        maximum_scale=2.0,
+    )
+    after_alpha = torch.sigmoid(surface._opacity[:, 0])
+    after_mass = (
+        -torch.log1p(-after_alpha)
+        * surface._scaling.exp().prod(dim=1)
+    )
+
+    assert torch.allclose(after_mass, before_mass, rtol=1e-5, atol=1e-7)
+    assert torch.allclose(surface._scaling[0].exp(), torch.full((2,), 0.5))
+    assert audit["changed_rows"] == 1
+    assert audit["unrealized_mass"] < 1e-6
+
+
+def test_atlas_residual_screen_limit_includes_live_chart_prefix():
+    surface = SimpleNamespace(get_xyz=torch.zeros(8, 3))
+
+    class ChartProbe:
+        @staticmethod
+        def live_surface_rows(_surface):
+            assert _surface is surface
+            # Row 6 overlaps the residual suffix; row 99 must be rejected.
+            return torch.tensor([1, 4, 6, 99])
+
+    rows = _surface_screen_limit_rows(
+        surface,
+        ChartProbe(),
+        "atlas_residual",
+        residual_start=6,
+        structural_count=8,
+        device=torch.device("cpu"),
+    )
+
+    assert rows.tolist() == [1, 4, 6, 7]
+
+
+def test_frozen_screen_limit_does_not_mutate_handoff_rows():
+    rows = _surface_screen_limit_rows(
+        SimpleNamespace(get_xyz=torch.zeros(3, 3)),
+        None,
+        "appearance_only",
+        residual_start=3,
+        structural_count=3,
+        device=torch.device("cpu"),
+    )
+    assert rows.numel() == 0
 
 
 def _static_optical_policy_fixture(authority: float):
@@ -442,6 +520,46 @@ def test_resume_ray_capacity_compares_fixed_epoch_not_runtime_cursor():
     assert _resume_training_contract_differences(
         saved, changed_evidence
     ) == {"ray_evidence_epoch_capacity"}
+
+
+def test_joint_surface_partition_row_count_is_runtime_resume_state():
+    saved = {
+        "mature_handoff_surface_policy": "joint",
+        "mature_handoff_surface_partition": {
+            "rigid_prefix_rows": 670_645,
+            "completion_suffix_rows": 0,
+            "chart_atlas_learning_rate": 0.002,
+            "contract": "policy_specific_legacy_surface_ownership",
+        },
+    }
+    current = {
+        **saved,
+        "mature_handoff_surface_partition": {
+            **saved["mature_handoff_surface_partition"],
+            "rigid_prefix_rows": 665_467,
+        },
+    }
+    assert not _resume_training_contract_differences(saved, current)
+
+
+def test_nonjoint_surface_partition_remains_immutable_on_resume():
+    saved = {
+        "mature_handoff_surface_policy": "atlas_residual",
+        "mature_handoff_surface_partition": {
+            "rigid_prefix_rows": 670_645,
+            "completion_suffix_rows": 20_000,
+        },
+    }
+    current = {
+        **saved,
+        "mature_handoff_surface_partition": {
+            **saved["mature_handoff_surface_partition"],
+            "rigid_prefix_rows": 665_467,
+        },
+    }
+    assert _resume_training_contract_differences(saved, current) == {
+        "mature_handoff_surface_partition"
+    }
 
 
 def test_resume_allows_only_exact_6k_volume_topology_settle():
@@ -922,6 +1040,48 @@ def test_mature_handoff_appearance_policy_preserves_geometry_gradients():
     assert audit["geometry_trainable"] is False
     assert audit["chart_geometry_trainable"] is False
     assert audit["appearance_trainable"] is True
+
+
+def test_mature_handoff_atlas_residual_trains_only_completion_geometry():
+    surface = SimpleNamespace(
+        get_xyz=torch.ones(4, 3),
+        _xyz=torch.nn.Parameter(torch.ones(4, 3)),
+        _scaling=torch.nn.Parameter(torch.ones(4, 2)),
+        _rotation=torch.nn.Parameter(torch.ones(4, 4)),
+        _opacity=torch.nn.Parameter(torch.ones(4, 1)),
+        _features_dc=torch.nn.Parameter(torch.ones(4, 1, 3)),
+        _features_rest=torch.nn.Parameter(torch.ones(4, 3, 3)),
+    )
+    for name, parameter in vars(surface).items():
+        if isinstance(parameter, torch.nn.Parameter):
+            parameter.grad = torch.ones_like(parameter)
+    chart_parameter = torch.nn.Parameter(torch.ones(2, 3))
+    chart_parameter.grad = torch.ones_like(chart_parameter)
+
+    audit = _apply_mature_surface_gradient_policy(
+        surface,
+        "atlas_residual",
+        chart_surface=torch.nn.ParameterList([chart_parameter]),
+        residual_start=3,
+    )
+
+    for parameter in (
+        surface._xyz,
+        surface._scaling,
+        surface._rotation,
+        surface._opacity,
+    ):
+        assert not bool(parameter.grad[:3].any())
+        assert bool(parameter.grad[3:].any())
+    assert bool(surface._features_dc.grad.all())
+    assert bool(chart_parameter.grad.all())
+    assert audit["residual_rows"] == 1
+    assert audit["topology_trainable"] is True
+    assert (
+        audit["topology_trainable_scope"]
+        == "evidence_completion_suffix_only"
+    )
+    assert audit["chart_geometry_trainable"] is True
 
 
 def test_mature_handoff_disables_chart_uv_topology():
@@ -1432,6 +1592,40 @@ def test_rigid_completion_births_only_independently_supported_deficits():
     assert not disabled_audit["enabled"]
 
 
+def test_rigid_completion_admits_only_calibrated_dav2_hole_as_weak_birth():
+    seed = {
+        "xyz": np.asarray(
+            [[0.01, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        "scales": np.full((3, 2), 0.03, dtype=np.float32),
+        "geometry_confidence": np.asarray(
+            [1.0, 0.2, 1.0], dtype=np.float32
+        ),
+        "position_sigma": np.asarray(
+            [0.04, 0.25, 0.04], dtype=np.float32
+        ),
+        "pointmap_cross_sequence_supported": np.zeros(3, dtype=bool),
+        "persistent_geometry_evidence": np.zeros(3, dtype=bool),
+        "source_type": np.asarray(
+            [
+                GaussianModel.SOURCE_FREE_RESIDUAL,
+                GaussianModel.SOURCE_DAV2_RIGID_HOLE,
+                GaussianModel.SOURCE_FREE_RESIDUAL,
+            ],
+            dtype=np.int8,
+        ),
+    }
+    selected, audit = _rigid_completion_seed_indices(
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        seed,
+        maximum_seeds=4,
+    )
+    assert selected.tolist() == [1]
+    assert audit["weak_dav2_hole_selected"] == 1
+    assert "low_opacity_dav2" in audit["birth_authority"]
+
+
 def test_conditioned_base_gradient_gate_excludes_canonical_forward_owners():
     foliage = SimpleNamespace(
         dynamic_leaf_mask=torch.tensor(
@@ -1687,6 +1881,59 @@ def test_resume_contract_allows_only_camera_container_cache_digest_change():
     }
 
 
+def test_screen_evidence_resume_migrates_only_audited_topology_contract():
+    saved = {
+        "geometry_weight": 0.12,
+        "chart_atlas_lifecycle": {"ordinary_opacity_retirement": False},
+    }
+    current = {
+        **saved,
+        "surface_screen_topology": dict(SURFACE_SCREEN_TOPOLOGY_CONTRACT),
+    }
+
+    assert _resume_training_contract_differences(saved, current) == {
+        "surface_screen_topology"
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_surface_screen_evidence_repair_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        saved,
+        {**current, "geometry_weight": 0.13},
+        allow_surface_screen_evidence_repair_migration=True,
+    ) == {"geometry_weight"}
+
+
+def test_screen_evidence_resume_rejects_unattested_target_or_prior_contract():
+    saved = {"geometry_weight": 0.12}
+    corrupt_target = {
+        **saved,
+        "surface_screen_topology": {
+            **SURFACE_SCREEN_TOPOLOGY_CONTRACT,
+            "independent_radius_only_split_evidence": True,
+        },
+    }
+    with pytest.raises(RuntimeError, match="audited residual-conditioned"):
+        _resume_training_contract_differences(
+            saved,
+            corrupt_target,
+            allow_surface_screen_evidence_repair_migration=True,
+        )
+
+    already_declared = {
+        **saved,
+        "surface_screen_topology": dict(SURFACE_SCREEN_TOPOLOGY_CONTRACT),
+    }
+    with pytest.raises(RuntimeError, match="exact v67 prefix"):
+        _resume_training_contract_differences(
+            already_declared,
+            already_declared,
+            allow_surface_screen_evidence_repair_migration=True,
+        )
+
+
 def test_fast_profile_overlaps_dynamic_foliage_with_topology():
     assert TRAINING_PROFILES["fast"]["iterations"] == 30_000
     assert _phase(2_399, 30_000, "fast") == "canonical_bootstrap"
@@ -1699,6 +1946,47 @@ def test_fast_profile_overlaps_dynamic_foliage_with_topology():
     assert _phase(21_900, 30_000, "fast") == "ownership_cleanup"
     assert _phase(26_999, 30_000, "fast") == "ownership_cleanup"
     assert _phase(27_000, 30_000, "fast") == "canonical_polish"
+
+
+def test_rigid_profile_resolves_geometry_balanced_optimizer_for_direct_runs():
+    args = SimpleNamespace(
+        training_profile="hybrid_rigid_stage1",
+        geometry_gradient_ratio=0.0,
+        position_lr_init=1.6e-4,
+        position_lr_final=1.6e-6,
+        position_lr_delay_mult=0.01,
+    )
+    audit = _apply_training_profile_optimizer_defaults(args, [])
+    assert args.geometry_gradient_ratio == pytest.approx(0.15)
+    assert args.position_lr_init == pytest.approx(1.6e-5)
+    assert audit["resolved"]["geometry_gradient_ratio"]["source"] == (
+        "named_profile"
+    )
+    assert audit["resolved"]["position_lr_init"]["source"] == (
+        "named_profile"
+    )
+
+
+def test_rigid_profile_preserves_explicit_optimizer_ablation():
+    args = SimpleNamespace(
+        training_profile="hybrid_rigid_stage1",
+        geometry_gradient_ratio=0.0,
+        position_lr_init=1.6e-4,
+        position_lr_final=1.6e-6,
+        position_lr_delay_mult=0.01,
+    )
+    audit = _apply_training_profile_optimizer_defaults(
+        args,
+        ["--geometry-gradient-ratio=0.0", "--position_lr_init", "0.00016"],
+    )
+    assert args.geometry_gradient_ratio == 0.0
+    assert args.position_lr_init == pytest.approx(1.6e-4)
+    assert audit["resolved"]["geometry_gradient_ratio"]["source"] == (
+        "explicit_cli"
+    )
+    assert audit["resolved"]["position_lr_init"]["source"] == (
+        "explicit_cli"
+    )
 
 
 def test_quality_profile_keeps_final_benchmark_schedule():
@@ -2003,6 +2291,42 @@ def test_native_rigid_surface_handoff_requires_exact_digest_and_no_colmap(
         _validate_surface_warmstart(surface, manifest)
 
 
+def test_foliage_rigid_depth_calibration_requires_same_surface_digest():
+    initialization = {
+        "foliage": {
+            "rigid_depth_calibration": {
+                "enabled": True,
+                "structural_ply_sha256": "rigid-a",
+                "source": "trained_native_rigid_2dgs_surface_render",
+                "depth_view_count": 527,
+            }
+        }
+    }
+    warmstart = {"surface_ply_sha256": "rigid-a"}
+
+    audit = _validate_foliage_rigid_calibration(
+        initialization, warmstart
+    )
+
+    assert audit["validated"]
+    assert audit["depth_view_count"] == 527
+
+
+def test_foliage_rigid_depth_calibration_rejects_cross_wired_handoff():
+    initialization = {
+        "foliage": {
+            "rigid_depth_calibration": {
+                "enabled": True,
+                "structural_ply_sha256": "rigid-a",
+            }
+        }
+    }
+    with pytest.raises(RuntimeError, match="differs from the mixed surface"):
+        _validate_foliage_rigid_calibration(
+            initialization, {"surface_ply_sha256": "rigid-b"}
+        )
+
+
 def test_native_rigid_handoff_accepts_explicit_sfm_coverage_only(tmp_path):
     surface = tmp_path / "surface.ply"
     surface.write_bytes(b"mast3r-primary plus sparse coverage")
@@ -2060,9 +2384,11 @@ def test_legacy_rigid_handoff_recovers_validated_producer_schedule(tmp_path):
         json.dumps(
             {
                 "iterations": 24_000,
+                "training_profile": "hybrid_rigid_stage1",
                 "surface_ply": str(surface.resolve()),
                 "training_contract": {
-                    "surface_optimizer": RIGID_SURFACE_OPTIMIZER
+                    "schedule_horizon": 32_000,
+                    "surface_optimizer": RIGID_SURFACE_OPTIMIZER,
                 },
             }
         ),
@@ -2071,9 +2397,16 @@ def test_legacy_rigid_handoff_recovers_validated_producer_schedule(tmp_path):
 
     accepted = _validate_surface_warmstart(surface, manifest)
 
-    assert accepted["surface_optimizer"] == RIGID_SURFACE_OPTIMIZER
+    assert {
+        key: accepted["surface_optimizer"][key]
+        for key in RIGID_SURFACE_OPTIMIZER
+    } == RIGID_SURFACE_OPTIMIZER
+    assert accepted["surface_optimizer"]["non_position_lr_decay_from"] == 24_000
+    assert accepted["surface_optimizer"]["non_position_lr_decay_until"] == 32_000
+    assert accepted["surface_optimizer"]["non_position_lr_final_mult"] == 0.1
     assert accepted["surface_optimizer_source"] == (
-        "validated_legacy_producer_result"
+        "validated_legacy_producer_result_plus_validated_rigid_"
+        "lifecycle_inference"
     )
 
 
@@ -2125,7 +2458,7 @@ def test_geometry_trained_rigid_stage_writes_eligible_handoff(tmp_path):
                 "track_observation_factor": 12_000,
             }
         },
-        surface_optimizer=RIGID_SURFACE_OPTIMIZER,
+        surface_optimizer=RIGID_SURFACE_OPTIMIZER_WITH_POLISH,
     )
     payload = json.loads(destination.read_text(encoding="utf-8"))
 
@@ -2193,7 +2526,7 @@ def test_legacy_mast3r_only_store_without_colmap_boolean_is_eligible(
                 "track_observation_factor": 12_000,
             }
         },
-        surface_optimizer=RIGID_SURFACE_OPTIMIZER,
+        surface_optimizer=RIGID_SURFACE_OPTIMIZER_WITH_POLISH,
     )
     payload = json.loads(destination.read_text(encoding="utf-8"))
 
@@ -2249,7 +2582,7 @@ def test_legacy_store_with_colmap_track_artifact_fails_closed(tmp_path):
                 "track_observation_factor": 1,
             }
         },
-        surface_optimizer=RIGID_SURFACE_OPTIMIZER,
+        surface_optimizer=RIGID_SURFACE_OPTIMIZER_WITH_POLISH,
     )
     payload = json.loads(destination.read_text(encoding="utf-8"))
 
@@ -2974,6 +3307,32 @@ def test_geometry_losses_do_not_propagate_invalid_evidence():
     assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
     loss.backward()
     assert torch.isfinite(depth.grad).all()
+
+
+def test_projected_occluded_rigid_factor_updates_depth_and_coverage_not_rgb():
+    depth = torch.tensor([[[2.0, 0.0], [4.0, 0.0]]], requires_grad=True)
+    alpha = torch.tensor(
+        [[[0.25, 0.0], [0.50, 0.0]]], requires_grad=True
+    )
+    package = SimpleNamespace(surface_depth=depth, surface_alpha=alpha)
+    task = {
+        "projected_rigid_depth": torch.tensor([[3.0, 0.0], [4.0, 0.0]]),
+        "p_projected_rigid_geometry": torch.tensor(
+            [[0.8, 0.0], [0.6, 0.0]]
+        ),
+        "p_distortion_valid": torch.ones(2, 2),
+    }
+    loss, audit = _projected_occluded_rigid_geometry_loss(package, task)
+
+    assert audit["supported_pixels"] == 2
+    assert audit["depth_matched_pixels"] == 2
+    assert audit["depth"] > 0
+    assert audit["coverage"] > 0
+    loss.backward()
+    assert depth.grad[0, 0, 0] != 0
+    assert depth.grad[0, 1, 0] == 0
+    assert alpha.grad[0, 0, 0] != 0
+    assert alpha.grad[0, 0, 1] == 0
 
 
 def test_chart_owner_uses_single_support_metric_inverse_depth():
@@ -4187,6 +4546,50 @@ def test_static_detail_isolated_sh_is_all_view_but_geometry_mass_are_owned():
     assert opacity is ownership
 
 
+def test_static_stage3_rgb_routes_envelope_only_to_appearance():
+    class Foliage:
+        xyz = torch.zeros(4, 3)
+        opacities = torch.ones(4)
+        persistent_envelope_mask = torch.tensor(
+            [False, True, False, True]
+        )
+
+        def __len__(self):
+            return 4
+
+    ownership = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    geometry, appearance, opacity = _static_stage_rgb_gradient_gates(
+        Foliage(), ownership, detail_stage_active=True
+    )
+    torch.testing.assert_close(
+        geometry, torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(opacity, geometry)
+    assert appearance is None
+    # The caller's calibrated ownership tensor is immutable.
+    torch.testing.assert_close(
+        ownership, torch.tensor([1.0, 1.0, 0.0, 1.0])
+    )
+
+
+def test_static_stage2_rgb_keeps_envelope_geometry_and_mass_trainable():
+    class Foliage:
+        xyz = torch.zeros(2, 3)
+        opacities = torch.ones(2)
+        persistent_envelope_mask = torch.tensor([True, False])
+
+        def __len__(self):
+            return 2
+
+    ownership = torch.tensor([1.0, 0.0])
+    geometry, appearance, opacity = _static_stage_rgb_gradient_gates(
+        Foliage(), ownership, detail_stage_active=False
+    )
+    assert geometry is ownership
+    assert appearance is None
+    assert opacity is ownership
+
+
 def test_periodic_camera_schedule_consumes_a_contiguous_evidence_epoch():
     schedule = np.asarray([3, 1, 0, 2], dtype=np.int64)
     executed_steps = [1, 3, 5, 7]
@@ -4743,6 +5146,9 @@ def test_chart_uv_topology_obeys_mature_world_geometry_freeze():
     )
     assert not _surface_topology_active(9, args)
     assert not _chart_topology_active(9, args)
+    args.mature_handoff_surface_policy = "atlas_residual"
+    assert _surface_topology_active(9, args)
+    assert not _chart_topology_active(9, args)
     args.mature_handoff_surface_policy = "joint"
     assert _chart_topology_active(9, args)
 
@@ -4913,7 +5319,7 @@ def test_static_public_phase_names_never_advertise_dynamic_output():
     )
 
 
-def test_counterfactual_transparency_softly_retains_real_leaf_owner():
+def test_counterfactual_transparency_cannot_retire_canopy_without_rigid_permission():
     target = torch.zeros(3, 1, 2)
     mixed = torch.tensor([[[0.0, 0.4]], [[0.0, 0.4]], [[0.0, 0.4]]])
     surface = torch.tensor([[[0.8, 0.0]], [[0.8, 0.0]], [[0.8, 0.0]]])
@@ -4926,9 +5332,132 @@ def test_counterfactual_transparency_softly_retains_real_leaf_owner():
         "p_boundary_uncertain": torch.zeros(1, 2),
         "w_rgb": torch.ones(1, 2),
     }
-    _, audit = _counterfactual_volume_transparency_loss(
+    loss, audit = _counterfactual_volume_transparency_loss(
         mixed, surface, target, alpha, torch.ones(1, 1, 2), task
     )
-    # The first ray is correctly explained by the mixed leaf, while the
-    # second is better explained by the surface gap. Both remain continuous.
-    assert 0 < audit["mean_responsibility"] < 1
+    loss.backward()
+    # Surface-better RGB inside a canopy label is diagnostically visible but
+    # cannot authorize deletion without an independent rigid posterior.
+    assert audit["supported_pixels"] == 0
+    assert audit["canopy_rgb_retirement_blocked_pixels"] == 1
+    assert audit["canopy_rgb_retirement_blocked_mass"] > 0
+    assert torch.equal(alpha.grad, torch.zeros_like(alpha))
+
+
+def test_failed_split_family_rolls_back_without_optical_hole():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[1.0, 2.0, 3.0]]),
+        "scales": torch.tensor([[0.20, 0.16, 0.12]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "opacities": torch.tensor([[0.08]]),
+        "colors": torch.tensor([[0.2, 0.6, 0.1]]),
+        "primitive_role": torch.tensor([0], dtype=torch.int8),
+        "track_linearity": torch.tensor([0.0]),
+        "track_id": torch.tensor([-1]),
+        "tree_instance_id": torch.tensor([7], dtype=torch.int32),
+        "support_camera_ids": torch.tensor(
+            [[11, 12, 13, 14]], dtype=torch.int32
+        ),
+        "support_view_count": torch.tensor([4], dtype=torch.int16),
+        "support_sequence_count": torch.tensor([2], dtype=torch.int16),
+        "occupancy_probability": torch.tensor([0.8]),
+        "position_covariance": torch.eye(3)[None] * 0.02,
+        "reprojection_error": torch.tensor([0.5]),
+        "evidence_primitive_id": torch.tensor([17]),
+    }
+    foliage = VolumetricFoliageModel(1, dynamic_rank=0, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    parent_mass = foliage.integrated_optical_mass().sum().clone()
+    split = foliage.split_adaptive(
+        torch.tensor([0]), torch.tensor([2]), birth_iteration=100
+    )
+    assert split["children"] == 2
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().sum(), parent_mass
+    )
+
+    remove, representatives, audit = _rollback_failed_split_families(
+        SimpleNamespace(
+            maximum_volume_family_rollbacks_per_event=8,
+            skeleton_opacity_ceiling=0.40,
+            dynamic_leaf_opacity_ceiling=0.40,
+            canonical_crown_opacity_ceiling=0.20,
+        ),
+        foliage,
+        torch.ones(len(foliage), dtype=torch.bool),
+    )
+
+    assert audit["rolled_back_families"] == 1
+    assert int(remove.sum()) == 1
+    assert len(representatives) == 1
+    representative = representatives[0]
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass()[representative],
+        parent_mass,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    assert foliage.evidence_primitive_id[representative].item() == 17
+    assert foliage.parent_lineage_id[representative].item() == -1
+    assert foliage.verification_state[representative].item() == VERIFICATION_VERIFIED
+    foliage.replace_and_split_adaptive(
+        remove,
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+    )
+    assert len(foliage) == 1
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().sum(),
+        parent_mass,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+
+
+def test_volume_appearance_lr_decays_only_in_topology_free_polish():
+    feature = torch.nn.Parameter(torch.ones(1))
+    position = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [feature], "lr": 0.1, "name": "features"},
+            {"params": [position], "lr": 0.02, "name": "xyz"},
+        ]
+    )
+    for group in optimizer.param_groups:
+        group["base_lr"] = group["lr"]
+    args = SimpleNamespace(
+        training_profile="static_handoff_fast",
+        phase_schedule_horizon=100,
+        volume_polish_final_lr_multiplier=0.10,
+    )
+
+    before = _update_volume_learning_rates(
+        optimizer, 81, args, "ownership_cleanup"
+    )
+    assert before["multiplier"] == pytest.approx(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    final = _update_volume_learning_rates(
+        optimizer, 99, args, "canonical_polish"
+    )
+    assert final["progress"] == pytest.approx(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(0.02)
+
+
+def test_chart_atlas_inherits_absolute_rigid_polish_lifecycle():
+    atlas = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.Adam([{"params": [atlas], "lr": 2.0e-4}])
+    optimizer.param_groups[0]["base_lr"] = 2.0e-4
+    opt = SimpleNamespace(
+        non_position_lr_decay_from=24_000,
+        iterations=32_000,
+        non_position_lr_final_mult=0.10,
+    )
+
+    prefix = _update_chart_atlas_learning_rate(optimizer, 16_000, opt)
+    assert prefix["multiplier"] == pytest.approx(1.0)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
+    suffix = _update_chart_atlas_learning_rate(optimizer, 32_000, opt)
+    assert suffix["multiplier"] == pytest.approx(0.10)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-5)

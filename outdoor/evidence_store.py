@@ -30,9 +30,11 @@ from outdoor.scene_contract import sha256_file
 
 
 EVIDENCE_STORE_VERSION = (
-    "outdoor-hybrid-teacher-evidence-v5-target-raster-tracks"
+    "outdoor-hybrid-teacher-evidence-v7-all-camera-role-posterior"
 )
 LEGACY_EVIDENCE_STORE_VERSIONS = {
+    "outdoor-hybrid-teacher-evidence-v6-static-role-posterior",
+    "outdoor-hybrid-teacher-evidence-v5-target-raster-tracks",
     "outdoor-hybrid-teacher-evidence-v4-crossview-consensus",
     "outdoor-hybrid-teacher-evidence-v3-contract-closed",
     "outdoor-hybrid-teacher-evidence-v2",
@@ -554,8 +556,11 @@ class EvidenceStoreBuilder:
             "ownership_contract": {
                 "rigid": "native_2d_surfel",
                 "trunk_branch": "static_3d_gaussian",
-                "canonical_crown": "canonical_3d_gaussian",
-                "dynamic_leaf": "sequence_conditioned_3d_gaussian",
+                "canonical_crown": "persistent_static_3d_gaussian_envelope",
+                "static_leaf_detail": (
+                    "cross_sequence_support_owned_unconditional_3d_gaussian"
+                ),
+                "dynamic_leaf": "legacy_only_not_allocated_in_static_teacher",
                 "sky": "directional_training_field_then_standard_shell",
                 "transient_unknown": "spatial_uncertainty_not_geometry",
                 "canopy_surface_topology_gradient": False,
@@ -564,8 +569,11 @@ class EvidenceStoreBuilder:
                 "authoritative_model": "native_mixed_hybrid_teacher",
                 "teacher_renderer_required": True,
                 "standard_student": None,
-                "canonical_and_conditioned_renders": True,
-                "localization_assets_exclude_dynamic_leaf_and_sky": True,
+                "canonical_and_conditioned_renders": False,
+                "single_unconditional_static_render": True,
+                "localization_assets_exclude_unstable_crown_detail_and_sky": (
+                    True
+                ),
             },
         }
         payload["evidence_hash"] = _canonical_json_digest(payload)

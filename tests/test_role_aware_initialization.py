@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from scipy.spatial import cKDTree
 
 from outdoor.chart_surface_model import (
     ChartSurfaceModel,
@@ -11,11 +12,14 @@ from outdoor.chart_surface_model import (
 )
 from outdoor.evidence_store import ROLE_CANOPY, ROLE_RIGID
 from outdoor.role_aware_initialization import (
+    _ProjectedRigidInitializationPosterior,
     _align_tracks_to_local_hull_instances,
     _apply_missing_pointmap_posterior_fallback,
     _balanced_single_camera_sample_cap,
     _balanced_pointmap_seed_cap,
     _chart_hypothesis_authority,
+    _chart_overlap_primary_ownership,
+    _source_local_surface_frames,
     _compact_padded_camera_metadata,
     _cross_sequence_ray_posterior,
     _different_sequence_nearest_distance,
@@ -24,11 +28,14 @@ from outdoor.role_aware_initialization import (
     _foliage_posterior_view_pool,
     _line_supported_tree_tracks,
     _local_replacement_groups,
+    _mast3r_tree_tracks,
+    _nearest_cross_label_neighbour,
     _load_pointmap_cross_sequence_posterior,
     _native_pointmap_shape,
     _nonchart_pointmap_foliage_samples,
     _ownership_isolated_track_frames,
     _pointmap_fixed_camera_validity,
+    _pointmap_cross_sequence_authority,
     _pointmap_surface_frames,
     _rigid_scene_envelope_mask,
     _sampled_point_footprint_multiplier,
@@ -40,11 +47,321 @@ from outdoor.role_aware_initialization import (
     SOURCE_SURFACE_DAV2,
     sparse_rigid_depth_maps,
 )
+from outdoor.projected_role_posterior import (
+    PROJECTED_RIGID_POSTERIOR_VERSION,
+)
+
+
+def test_mast3r_tree_track_archive_members_are_decompressed_once(
+    monkeypatch,
+):
+    arrays = {
+        "camera_names": np.asarray(["a.png", "b.png", "c.png"]),
+        "observation_offsets": np.asarray([0, 3], dtype=np.int64),
+        "observation_camera_indices": np.asarray(
+            [0, 1, 2], dtype=np.int32
+        ),
+        "observation_pixels": np.asarray(
+            [[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]], dtype=np.float32
+        ),
+        "observation_camera_depth": np.asarray(
+            [4.0, 4.1, 4.2], dtype=np.float32
+        ),
+        "camera_image_sizes": np.asarray(
+            [[8, 6], [8, 6], [8, 6]], dtype=np.int32
+        ),
+        "track_id": np.asarray([17], dtype=np.int64),
+        "xyz": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "rgb": np.asarray([[10, 20, 30]], dtype=np.uint8),
+        "reprojection_error": np.asarray([0.2], dtype=np.float32),
+        "sequence_count": np.asarray([3], dtype=np.int16),
+        "role_probabilities": np.asarray(
+            [[0.0, 0.8, 0.0, 0.2]], dtype=np.float32
+        ),
+        "valid_observation_count": np.asarray([3], dtype=np.int16),
+    }
+
+    class CountingArchive:
+        def __init__(self):
+            self.reads = {key: 0 for key in arrays}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __getitem__(self, key):
+            self.reads[key] += 1
+            return arrays[key]
+
+    archive = CountingArchive()
+    monkeypatch.setattr(
+        "outdoor.role_aware_initialization.np.load",
+        lambda *_args, **_kwargs: archive,
+    )
+    images = {
+        index + 1: {"name": name}
+        for index, name in enumerate(("a.png", "b.png", "c.png"))
+    }
+
+    tracks = _mast3r_tree_tracks(
+        "unused.npz",
+        images,
+        minimum_track_observations=3,
+        maximum_reprojection_error=1.0,
+    )
+
+    assert len(tracks) == 1
+    assert tracks[0]["id"] == 17
+    assert tracks[0]["tree_image_ids"].tolist() == [1, 2, 3]
+    assert all(read_count == 1 for read_count in archive.reads.values())
+
+
+def test_projected_pointmap_capacity_authority_remains_continuous():
+    authority = _pointmap_cross_sequence_authority(
+        np.asarray([True, False, False, False]),
+        np.asarray([0.01, 0.9, 0.2, 0.0], dtype=np.float32),
+    )
+    assert authority.tolist() == pytest.approx([1.0, 0.9, 0.2, 0.0])
+
+
+def test_projected_rigid_initialization_requires_local_depth_agreement(
+    tmp_path,
+):
+    archive = tmp_path / "projected.npz"
+    tracks = tmp_path / "tracks.npz"
+    np.savez_compressed(
+        tracks,
+        track_id=np.asarray([11, 22], dtype=np.int64),
+        rgb=np.asarray([[64, 128, 192], [255, 0, 0]], dtype=np.uint8),
+    )
+    np.savez_compressed(
+        archive,
+        schema_version=np.asarray(PROJECTED_RIGID_POSTERIOR_VERSION),
+        camera_names=np.asarray(["frame.png"]),
+        camera_image_sizes=np.asarray([[8, 6]], dtype=np.int32),
+        offsets=np.asarray([0, 2], dtype=np.int64),
+        pixels=np.asarray([[2, 2], [6, 4]], dtype=np.uint16),
+        geometry_support_probability=np.asarray(
+            [0.8, 0.6], dtype=np.float16
+        ),
+        visible_observation_probability=np.asarray(
+            [0.8, 0.0], dtype=np.float16
+        ),
+        camera_depth=np.asarray([5.0, 8.0], dtype=np.float32),
+        source_track_id=np.asarray([11, 22], dtype=np.int64),
+    )
+    candidate_depth = np.full((6, 8), 20.0, dtype=np.float32)
+    candidate_depth[1:4, 1:4] = 5.05
+    posterior = _ProjectedRigidInitializationPosterior(archive, tracks)
+    probability = posterior.depth_consistent_probability(
+        "frame.png", candidate_depth, footprint_radius=1
+    )
+
+    assert probability[2, 2] == pytest.approx(0.8, abs=1e-3)
+    assert np.count_nonzero(probability) == 9
+    assert probability[4, 6] == 0.0
+    assert not probability[[0, 5], :].any()
+
+    geometry_only = posterior.depth_consistent_probability(
+        "frame.png",
+        candidate_depth,
+        footprint_radius=1,
+        require_current_visibility=False,
+    )
+    assert geometry_only[4, 6] == 0.0
+    candidate_depth[3:6, 5:8] = 8.05
+    geometry_only = posterior.depth_consistent_probability(
+        "frame.png",
+        candidate_depth,
+        footprint_radius=1,
+        require_current_visibility=False,
+    )
+    visible_only = posterior.depth_consistent_probability(
+        "frame.png", candidate_depth, footprint_radius=1
+    )
+    assert geometry_only[4, 6] == pytest.approx(0.6, abs=1e-3)
+    assert visible_only[4, 6] == 0.0
+    geometry, visible, canonical_rgb = posterior.depth_consistent_fields(
+        "frame.png", candidate_depth, footprint_radius=1
+    )
+    assert geometry[4, 6] == pytest.approx(0.6, abs=1e-3)
+    assert visible[4, 6] == 0.0
+    assert canonical_rgb[4, 6].tolist() == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_projected_rigid_initialization_missing_camera_is_no_evidence(
+    tmp_path,
+):
+    archive = tmp_path / "projected.npz"
+    tracks = tmp_path / "tracks.npz"
+    np.savez_compressed(
+        tracks,
+        track_id=np.empty(0, dtype=np.int64),
+        rgb=np.empty((0, 3), dtype=np.uint8),
+    )
+    np.savez_compressed(
+        archive,
+        schema_version=np.asarray(PROJECTED_RIGID_POSTERIOR_VERSION),
+        camera_names=np.asarray(["frame.png"]),
+        camera_image_sizes=np.asarray([[8, 6]], dtype=np.int32),
+        offsets=np.asarray([0, 0], dtype=np.int64),
+        pixels=np.empty((0, 2), dtype=np.uint16),
+        geometry_support_probability=np.empty(0, dtype=np.float16),
+        visible_observation_probability=np.empty(0, dtype=np.float16),
+        camera_depth=np.empty(0, dtype=np.float32),
+        source_track_id=np.empty(0, dtype=np.int64),
+    )
+    posterior = _ProjectedRigidInitializationPosterior(archive, tracks)
+    result = posterior.depth_consistent_probability(
+        "other.png", np.ones((3, 4), dtype=np.float32)
+    )
+    assert result.shape == (3, 4)
+    assert not result.any()
+
+
+def test_source_local_surface_frames_freeze_primary_parameterization():
+    primary = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [0.1, 0.1, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    coverage = np.asarray(
+        [
+            [0.001, 0.001, 0.01],
+            [0.002, 0.001, 0.02],
+            [0.001, 0.002, 0.03],
+        ],
+        dtype=np.float32,
+    )
+    primary_scale, primary_rotation, primary_normal = (
+        _source_local_surface_frames(
+            primary,
+            np.full(4, 0.003, dtype=np.float32),
+            np.ones(4, dtype=np.int8),
+            np.ones(4, dtype=bool),
+            maximum_scale=0.08,
+        )
+    )
+    combined = np.concatenate([primary, coverage])
+    scale, rotation, normal = _source_local_surface_frames(
+        combined,
+        np.full(7, 0.003, dtype=np.float32),
+        np.asarray([1, 1, 1, 1, 0, 0, 0], dtype=np.int8),
+        np.ones(7, dtype=bool),
+        maximum_scale=0.08,
+    )
+
+    np.testing.assert_array_equal(scale[:4], primary_scale)
+    np.testing.assert_array_equal(rotation[:4], primary_rotation)
+    np.testing.assert_array_equal(normal[:4], primary_normal)
 from scripts.initialize_unified_outdoor_scene import (
+    _validate_pointmap_posterior_contract,
     _validated_reused_foliage,
 )
 from scripts.augment_temporal_dav2_foliage import _recover_alignments
 from scene.gaussian_model import GaussianModel
+
+
+def test_initializer_rejects_base_pointmap_store_without_posterior(tmp_path):
+    index = tmp_path / "pointmaps.json"
+    index.write_text(
+        json.dumps({"schema_version": "mast3r-pointmap-index-v1"})
+    )
+    store = {
+        "geometry_source": "mast3r_only",
+        "artifacts": [
+            {"name": "mast3r_pointmap_index", "path": str(index)}
+        ],
+    }
+    with pytest.raises(RuntimeError, match="derived Evidence Store"):
+        _validate_pointmap_posterior_contract(store)
+
+
+def test_initializer_accepts_nonempty_cross_sequence_posterior(tmp_path):
+    index = tmp_path / "pointmaps.json"
+    index.write_text(
+        json.dumps(
+            {
+                "cross_sequence_posterior": {
+                    "schema_version": (
+                        "mast3r-cross-sequence-pointmap-posterior-v1"
+                    ),
+                    "aggregate": {
+                        "supported_pixels": 23,
+                        "supported_fraction": 0.25,
+                        "mean_precision": 0.4,
+                    },
+                }
+            }
+        )
+    )
+    audit = _validate_pointmap_posterior_contract(
+        {
+            "geometry_source": "mast3r_primary_sfm_coverage",
+            "artifacts": [
+                {"name": "mast3r_pointmap_index", "path": str(index)}
+            ],
+        }
+    )
+    assert audit["present"] is True
+    assert audit["supported_pixels"] == 23
+    assert audit["mean_precision"] == pytest.approx(0.4)
+
+
+def test_chart_overlap_partition_keeps_one_metric_renderer_owner():
+    xyz = np.asarray(
+        [
+            [0.000, 0.0, 3.0],
+            [0.006, 0.0, 3.0],
+            [1.000, 0.0, 3.0],
+        ],
+        dtype=np.float32,
+    )
+    owner, audit = _chart_overlap_primary_ownership(
+        xyz,
+        np.asarray([0, 1, 2], dtype=np.int32),
+        np.asarray([[0, 0, 1], [0, 0, 1], [0, 0, 1]], dtype=np.float32),
+        np.asarray([0.6, 0.9, 1.0], dtype=np.float32),
+        np.asarray([True, True, True]),
+        np.asarray([True, True, True]),
+        distance_threshold=0.012,
+    )
+    assert owner.tolist() == [False, True, True]
+    assert audit["overlap_components"] == 1
+    assert audit["secondary_renderer_rows_suppressed"] == 1
+
+
+def test_progressive_cross_label_neighbour_matches_full_knn():
+    rng = np.random.default_rng(7)
+    xyz = np.concatenate(
+        [
+            rng.normal((0.0, 0.0, 0.0), 0.01, (24, 3)),
+            rng.normal((0.04, 0.0, 0.0), 0.01, (24, 3)),
+            rng.normal((0.08, 0.0, 0.0), 0.01, (24, 3)),
+        ]
+    ).astype(np.float32)
+    labels = np.repeat(np.arange(3), 24)
+    distance, index = _nearest_cross_label_neighbour(
+        xyz, labels, maximum_neighbours=64
+    )
+    full_distance, full_index = cKDTree(xyz).query(xyz, k=64)
+    expected_distance = np.full(len(xyz), np.inf)
+    expected_index = np.full(len(xyz), -1, dtype=np.int64)
+    for row in range(len(xyz)):
+        for rank in range(1, 64):
+            candidate = full_index[row, rank]
+            if labels[candidate] != labels[row]:
+                expected_distance[row] = full_distance[row, rank]
+                expected_index[row] = candidate
+                break
+    np.testing.assert_allclose(distance, expected_distance, rtol=1e-6)
+    np.testing.assert_array_equal(index, expected_index)
 
 
 def test_temporal_dav2_alignment_recovers_half_open_pixel_centres(tmp_path):
@@ -1179,6 +1496,72 @@ def test_chart_runtime_geometry_applies_physical_tangent_scale_contract():
     assert primitive.tolist() == [0]
     scales = geometry[1]
     torch.testing.assert_close(scales, torch.full((1, 2), 0.5))
+
+
+def test_chart_runtime_geometry_honors_persistent_screen_scale_ceiling():
+    class AtlasProbe:
+        maximum_tangent_scale = 0.5
+
+        def _live_rows(self, surface):
+            return (
+                torch.tensor([0]),
+                torch.tensor([0]),
+                {
+                    "chart_id": torch.tensor([0]),
+                    "uv": torch.tensor([[0.5, 0.5]]),
+                    "half_uv": torch.tensor([[0.25, 0.25]]),
+                    "base_rho": torch.tensor([0.5]),
+                },
+            )
+
+        def _points(self, chart_id, uv, fallback):
+            del chart_id
+            return torch.cat([10.0 * uv, fallback[:, None]], dim=1), fallback
+
+        _jacobian_frame = staticmethod(
+            LearnableInverseDepthAtlas._jacobian_frame
+        )
+        _local_chart_geometry = LearnableInverseDepthAtlas._local_chart_geometry
+
+    class Surface:
+        get_scaling = torch.full((1, 2), 0.04)
+
+    _, _, geometry = LearnableInverseDepthAtlas._bound_geometry(
+        AtlasProbe(), Surface()
+    )
+
+    torch.testing.assert_close(geometry[1], torch.full((1, 2), 0.04))
+
+
+def test_chart_local_frame_does_not_bridge_depth_discontinuity():
+    class AtlasProbe:
+        def _points(self, chart_id, uv, fallback):
+            del chart_id, fallback
+            rho = torch.where(
+                uv[:, 0] > 0.5,
+                torch.full_like(uv[:, 0], 0.05),
+                torch.full_like(uv[:, 0], 0.5),
+            )
+            xyz = torch.stack([uv[:, 0], uv[:, 1], rho.reciprocal()], dim=1)
+            return xyz, rho
+
+        _jacobian_frame = staticmethod(
+            LearnableInverseDepthAtlas._jacobian_frame
+        )
+
+    centre, scales, quaternion = (
+        LearnableInverseDepthAtlas._local_chart_geometry(
+            AtlasProbe(),
+            torch.tensor([0]),
+            torch.tensor([[0.5, 0.5]]),
+            torch.tensor([[0.1, 0.1]]),
+            torch.tensor([0.5]),
+        )
+    )
+
+    torch.testing.assert_close(centre, torch.tensor([[0.5, 0.5, 2.0]]))
+    assert float(scales.max()) < 0.2
+    assert torch.isfinite(quaternion).all()
 
 
 def test_chart_uv_split_uses_current_jacobian_frame_at_atlas_border():

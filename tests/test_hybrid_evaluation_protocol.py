@@ -203,6 +203,39 @@ def test_projected_radius_diagnostics_ignore_invisible_rows():
     }
 
 
+def test_projected_radius_diagnostics_separate_opaque_risk_by_source():
+    stats = _projected_radius_diagnostics(
+        torch.tensor([100.0, 40.0, 30.0, 20.0]),
+        opacity=torch.tensor([1.0e-6, 0.2, 0.8, 0.9]),
+        source_type=torch.tensor([2, 2, 1, 1]),
+    )
+
+    assert stats["large_count"] == 3
+    assert stats["opacity_ge_0_1"]["large_count"] == 2
+    assert stats["opacity_ge_0_5"]["large_count"] == 1
+    assert stats["large_opaque_count_by_source_type"] == {
+        "1": 1,
+        "2": 1,
+    }
+    assert stats["optical_radius_pixels"]["maximum"] == pytest.approx(24.0)
+
+
+def test_projected_radius_diagnostics_report_role_specific_quantiles():
+    stats = _projected_radius_diagnostics(
+        torch.tensor([4.0, 8.0, 16.0, 32.0]),
+        opacity=torch.tensor([0.2, 0.4, 0.6, 0.8]),
+        source_type=torch.tensor([0, 0, 1, 1]),
+        group_label="layer_role",
+    )
+
+    crown = stats["visible_by_layer_role"]["0"]
+    skeleton = stats["visible_by_layer_role"]["1"]
+    assert crown["visible_count"] == 2
+    assert crown["radius_median_pixels"] == pytest.approx(6.0)
+    assert skeleton["radius_median_pixels"] == pytest.approx(24.0)
+    assert skeleton["large_opaque_count"] == 1
+
+
 def test_evaluation_scene_artifacts_are_isolated_from_teacher_model(tmp_path):
     teacher = tmp_path / "teacher"
     evaluation = tmp_path / "evaluation"

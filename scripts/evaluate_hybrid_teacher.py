@@ -294,9 +294,20 @@ def _projected_radius_diagnostics(
     radii: torch.Tensor,
     *,
     large_radius_pixels: float = 24.0,
+    opacity: torch.Tensor | None = None,
+    source_type: torch.Tensor | None = None,
+    group_label: str = "source_type",
 ) -> dict[str, object]:
     """Summarize visible screen footprints relevant to mixed depth order."""
     flat = torch.as_tensor(radii).detach().float().reshape(-1)
+    if opacity is not None:
+        opacity = torch.as_tensor(opacity).detach().float().reshape(-1)
+        if opacity.shape != flat.shape:
+            raise ValueError("Projected-radius opacity rows are misaligned")
+    if source_type is not None:
+        source_type = torch.as_tensor(source_type).detach().reshape(-1)
+        if source_type.shape != flat.shape:
+            raise ValueError("Projected-radius source rows are misaligned")
     visible = torch.isfinite(flat) & (flat > 0)
     source_rows = torch.nonzero(visible, as_tuple=False).flatten()
     values = flat[visible]
@@ -320,7 +331,7 @@ def _projected_radius_diagnostics(
         values, values.new_tensor([0.5, 0.95, 0.99])
     )
     large = values > float(large_radius_pixels)
-    return {
+    result = {
         "visible_count": int(len(values)),
         "median_pixels": float(quantiles[0]),
         "p95_pixels": float(quantiles[1]),
@@ -337,6 +348,69 @@ def _projected_radius_diagnostics(
             for value, order in zip(largest_values, largest_order)
         ],
     }
+    if opacity is not None:
+        visible_opacity = opacity[visible].clamp(0.0, 1.0)
+        optical_radius = values * visible_opacity
+        for threshold in (0.01, 0.1, 0.5):
+            owned = visible_opacity >= threshold
+            prefix = f"opacity_ge_{str(threshold).replace('.', '_')}"
+            result[prefix] = {
+                "count": int(owned.sum()),
+                "large_count": int(
+                    (owned & (values > float(large_radius_pixels))).sum()
+                ),
+                "maximum_pixels": (
+                    float(values[owned].max()) if bool(owned.any()) else 0.0
+                ),
+            }
+        result["optical_radius_pixels"] = {
+            "p95": float(torch.quantile(optical_radius, 0.95)),
+            "p99": float(torch.quantile(optical_radius, 0.99)),
+            "maximum": float(optical_radius.max()),
+        }
+        if source_type is not None:
+            visible_source = source_type[visible]
+            result["large_opaque_count_by_source_type"] = {
+                str(int(value)): int(
+                    (
+                        (visible_source == value)
+                        & (visible_opacity >= 0.1)
+                        & (values > float(large_radius_pixels))
+                    ).sum()
+                )
+                for value in visible_source.unique().cpu()
+            }
+            grouped: dict[str, object] = {}
+            for value in visible_source.unique().cpu():
+                owned = visible_source == value.to(visible_source.device)
+                owned_radius = values[owned]
+                owned_opacity = visible_opacity[owned]
+                radius_quantiles = torch.quantile(
+                    owned_radius,
+                    owned_radius.new_tensor([0.5, 0.95, 0.99]),
+                )
+                opacity_quantiles = torch.quantile(
+                    owned_opacity,
+                    owned_opacity.new_tensor([0.5, 0.95, 0.99]),
+                )
+                grouped[str(int(value))] = {
+                    "visible_count": int(owned.sum()),
+                    "radius_median_pixels": float(radius_quantiles[0]),
+                    "radius_p95_pixels": float(radius_quantiles[1]),
+                    "radius_p99_pixels": float(radius_quantiles[2]),
+                    "radius_maximum_pixels": float(owned_radius.max()),
+                    "opacity_median": float(opacity_quantiles[0]),
+                    "opacity_p95": float(opacity_quantiles[1]),
+                    "opacity_p99": float(opacity_quantiles[2]),
+                    "large_opaque_count": int(
+                        (
+                            (owned_radius > float(large_radius_pixels))
+                            & (owned_opacity >= 0.1)
+                        ).sum()
+                    ),
+                }
+            result[f"visible_by_{group_label}"] = grouped
+    return result
 
 
 def _route_evaluation_scene_artifacts(dataset, output: Path) -> Path:
@@ -922,6 +996,15 @@ def main() -> None:
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument(
+        "--save-layer-counterfactuals",
+        action="store_true",
+        help=(
+            "Additionally save surface-only, volume-only, skeleton-only, "
+            "envelope-only and static-detail-only RGB renders. These are "
+            "labelled attribution diagnostics and do not enter metrics."
+        ),
+    )
+    parser.add_argument(
         "--print-full-json",
         action="store_true",
         help=(
@@ -1277,6 +1360,45 @@ def main() -> None:
                 if evaluation_mode == "hybrid"
                 else None
             )
+            layer_counterfactuals = {}
+            if args.save_layer_counterfactuals:
+                layer_counterfactuals["surface_only"] = (
+                    canonical
+                    if evaluation_mode == "rigid"
+                    else teacher.render(
+                        view,
+                        task=None,
+                        conditioned=False,
+                        surface_only=True,
+                        exact_ray_render_aspect_limit=(
+                            args.exact_ray_render_aspect_limit
+                        ),
+                        optical_replacement_policy="disabled",
+                        optical_responsibility_prior=0.0,
+                    )
+                )
+                for layer, label in (
+                    ("all", "volume_only"),
+                    ("skeleton", "skeleton_only"),
+                    ("envelope", "envelope_only"),
+                    ("detail", "detail_only"),
+                ):
+                    layer_counterfactuals[label] = teacher.render(
+                        view,
+                        task=None,
+                        conditioned=False,
+                        volume_only=True,
+                        volume_layer=layer,
+                        exact_ray_render_aspect_limit=(
+                            args.exact_ray_render_aspect_limit
+                        ),
+                        # A layer-isolated forward has no competing branch
+                        # whose mass can be replaced.  Disabling replacement
+                        # makes the attribution literal and keeps it valid for
+                        # both ordinary and ray-normalized deployment states.
+                        optical_replacement_policy="disabled",
+                        optical_responsibility_prior=0.0,
+                    )
             row = {
                 "index": index,
                 "image_name": str(view.image_name),
@@ -1307,10 +1429,15 @@ def main() -> None:
                     ),
                     "projected_footprint": {
                         "surface": _projected_radius_diagnostics(
-                            render["surface_radii"]
+                            render["surface_radii"],
+                            opacity=teacher.surface.get_opacity,
+                            source_type=teacher.surface._source_type,
                         ),
                         "volume": _projected_radius_diagnostics(
-                            render["volume_radii"]
+                            render["volume_radii"],
+                            opacity=teacher.foliage.opacities,
+                            source_type=teacher.foliage.layer_role,
+                            group_label="layer_role",
                         ),
                     },
                 }
@@ -1463,6 +1590,12 @@ def main() -> None:
                     images["volume_alpha"] = conditioned[
                         "volume_alpha"
                     ].expand(3, -1, -1)
+                images.update(
+                    {
+                        label: render["rgb"]
+                        for label, render in layer_counterfactuals.items()
+                    }
+                )
                 for name, value in images.items():
                     pixels = (
                         value.clamp(0, 1)

@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
+    VERIFICATION_UNVERIFIED,
     VERIFICATION_VERIFIED,
     VolumetricFoliageModel,
 )
@@ -227,6 +229,57 @@ def test_teacher_canonical_descendants_can_split_recursively():
     second = _adapt_volume(args, model, _stats(len(model)))
     assert second["split_parents"] == 2
     assert int((model.split_generation == 2).sum()) == 4
+
+
+def test_teacher_smoothly_backpressures_unverified_topology_debt():
+    model = _model(10)
+    model.verification_state[0] = VERIFICATION_UNVERIFIED
+    args = SimpleNamespace(
+        maximum_volume_splits=10,
+        maximum_volume_gaussians=40,
+        volume_split_radius=3.0,
+        volume_verification_debt_soft_fraction=0.05,
+        volume_verification_debt_hard_fraction=0.15,
+    )
+
+    event = _adapt_volume(args, model, _stats(10))
+
+    assert event["verification_debt"]["fraction"] == pytest.approx(0.1)
+    assert event["verification_debt"][
+        "ordinary_split_capacity_scale"
+    ] == pytest.approx(0.5)
+    assert event["effective_split_limit"] == 5
+    assert event["split_parents"] <= 5
+
+
+def test_teacher_retires_only_expired_zero_witness_low_utility_child():
+    model = _model(3)
+    model.verification_state[0] = VERIFICATION_UNVERIFIED
+    # A real split child starts with no independent camera witness.  The
+    # generic fixture represents initialized/verified evidence rows and thus
+    # carries one witness until the lifecycle fields are reset explicitly.
+    model.verified_camera_count[0] = 0
+    model.birth_iteration[0] = 1
+    model.opacity_logits.data[0] = torch.logit(torch.tensor(0.001))
+    stats = _stats(3)
+    stats["contribution"] = torch.tensor([0.0, 1.0, 1.0])
+    event = _adapt_volume(
+        SimpleNamespace(
+            maximum_volume_splits=0,
+            maximum_volume_gaussians=8,
+            volume_split_radius=3.0,
+            child_verification_grace_iterations=500,
+            child_verification_timeout_iterations=3000,
+        ),
+        model,
+        stats,
+        current_iteration=3001,
+    )
+
+    assert event["pruned"] == 1
+    lifecycle = event["child_verification_lifecycle"]
+    assert lifecycle["expired_candidates"] == 1
+    assert lifecycle["expired_zero_witness_low_utility_pruned"] == 1
 
 
 def test_teacher_dynamic_split_requires_screen_bandwidth_deficit():

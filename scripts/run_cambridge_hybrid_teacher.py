@@ -31,6 +31,9 @@ from outdoor.evidence_store import (  # noqa: E402
     sha256_file,
 )
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
+from outdoor.projected_role_posterior import (  # noqa: E402
+    PROJECTED_RIGID_POSTERIOR_VERSION,
+)
 from outdoor.lazy_scene import rgb_source_contract  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
     INITIALIZATION_VERSION,
@@ -43,9 +46,11 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v45-native-rigid-depth-"
+    "cambridge-native-hybrid-teacher-mainline-v48-local-negative-permission-"
+    "topology-stable-polish-native-rigid-depth-"
     "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
-    "and-static-deployment-contract-closed"
+    "static-role-posterior-mask-soft-arbitration-atlas-residual-"
+    "verification-debt"
 )
 STAGES = (
     "prepare_cameras",
@@ -72,7 +77,7 @@ PROFILES = {
         # is still demand driven: the trainer admits only primitives whose
         # accumulated screen-space gradient exceeds the native threshold.
         "rigid_pretrain_iterations": 32_000,
-        "rigid_pretrain_surface_gaussians": 800_000,
+        "rigid_pretrain_surface_gaussians": 1_200_000,
         "rigid_pretrain_surface_growth_per_event": 5000,
         "rigid_pretrain_densify_until_iteration": 16_000,
         "rigid_geometry_gradient_ratio": 0.15,
@@ -148,7 +153,10 @@ PROFILES = {
         # The historical 18.756 dB 2DGS contains 350,998 surfels.  Capping a
         # from-scratch rigid branch below that known-good capacity made the
         # unified method an implicit low-capacity ablation.
-        "maximum_surface_gaussians": 800_000,
+        # Keep residual completion capacity separate from the mature rigid
+        # handoff.  Reusing the 1.2M rigid cap here would admit zero new rows
+        # whenever pretraining saturated, making atlas_residual a no-op.
+        "maximum_surface_gaussians": 1_400_000,
         "maximum_surface_growth_per_event": 5000,
         # The evidence seed already contains about 1.04M volumes.  The former
         # v82 saturated 1.5M with ~1.5M unresolved screen-demand rows and
@@ -157,11 +165,11 @@ PROFILES = {
         # through the first half of ownership cleanup.
         "maximum_volume_gaussians": 2_000_000,
         "maximum_volume_splits": 20_000,
-        "volume_densify_until_fraction": 0.85,
-        "surface_densify_until_fraction": 0.85,
-        "mature_handoff_surface_policy": "appearance_only",
+        "volume_densify_until_fraction": 0.60,
+        "surface_densify_until_fraction": 0.40,
+        "mature_handoff_surface_policy": "atlas_residual",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
-        "maximum_rigid_completion_seeds": 0,
+        "maximum_rigid_completion_seeds": 20_000,
         # Owner rows are sparse, but accelerating opacity alone makes an
         # opaque low-frequency layer before colour/topology can catch up.
         # The measured v80 500->1k collapse falsified that shortcut.
@@ -171,7 +179,7 @@ PROFILES = {
         "iterations": 12_000,
         "training_profile": "static_handoff_fast",
         "rigid_pretrain_iterations": 12_000,
-        "rigid_pretrain_surface_gaussians": 600_000,
+        "rigid_pretrain_surface_gaussians": 800_000,
         "rigid_pretrain_surface_growth_per_event": 5000,
         "rigid_pretrain_densify_until_iteration": 8_000,
         "rigid_geometry_gradient_ratio": 0.15,
@@ -205,15 +213,15 @@ PROFILES = {
         "use_rigid_depth_calibrated_foliage": True,
         "rigid_calibration_resolution_scale": 0.125,
         "foliage_voxel_size": 0.12,
-        "maximum_surface_gaussians": 600_000,
+        "maximum_surface_gaussians": 950_000,
         "maximum_surface_growth_per_event": 5000,
         "maximum_volume_gaussians": 2_000_000,
         "maximum_volume_splits": 20_000,
-        "volume_densify_until_fraction": 5.0 / 6.0,
-        "surface_densify_until_fraction": 5.0 / 6.0,
-        "mature_handoff_surface_policy": "appearance_only",
+        "volume_densify_until_fraction": 0.60,
+        "surface_densify_until_fraction": 0.50,
+        "mature_handoff_surface_policy": "atlas_residual",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
-        "maximum_rigid_completion_seeds": 0,
+        "maximum_rigid_completion_seeds": 10_000,
         "volume_opacity_lr": 4.0e-3,
     },
     "rigid": {
@@ -739,6 +747,11 @@ def _teacher_command(
         "static",
         "--geometry-gradient-ratio",
         str(float(geometry_gradient_ratio)),
+        # Retain the archive for an explicit localization-geometry ablation,
+        # but do not silently enable the v86/v90 projected-background factor
+        # in the selected RGB reconstruction.
+        "--projected-rigid-depth-weight",
+        "0.0",
         "--maximum-surface-gaussians",
         str(int(maximum_surface_gaussians)),
         "--maximum-surface-growth-per-event",
@@ -759,6 +772,23 @@ def _teacher_command(
         "2.0",
         "--maximum-volume-radius-pixels",
         "24",
+        "--maximum-skeleton-radius-pixels",
+        "12",
+        "--maximum-envelope-radius-pixels",
+        "24",
+        "--maximum-static-detail-radius-pixels",
+        "12",
+        "--volume-polish-final-lr-multiplier",
+        "0.1",
+        # The complete 1,487-view RGB set is only ~0.6 GB.  A full cache and
+        # deeper decoder prefetch remove repeated NFS reads without changing
+        # the deterministic camera schedule or any optimization value.
+        "--view-cache-size",
+        "2048",
+        "--image-prefetch-workers",
+        "8",
+        "--image-prefetch-depth",
+        "32",
         "--checkpoint-every",
         str(int(checkpoint_every)),
         "--mature-handoff-surface-policy",
@@ -803,6 +833,10 @@ def _teacher_command(
                 "0.01",
                 "--position_lr_max_steps",
                 str(min(max(int(iterations), 20_000), 30_000)),
+                "--non_position_lr_decay_from",
+                str(int(round(0.75 * int(iterations)))),
+                "--non_position_lr_final_mult",
+                "0.1",
             ]
         )
     if surface_warmstart_ply is not None:
@@ -959,6 +993,11 @@ def main() -> None:
     mast3r = frontend / "mast3r_sfm"
     tree_mask = args.mask_root / args.scene / "processed/masks_with_tree.pkl"
     base_mask = args.mask_root / args.scene / "processed/masks.pkl"
+    training_rgb_root = (
+        args.rgb_images.expanduser().resolve()
+        if args.rgb_images is not None
+        else (dataset / "images").resolve()
+    )
 
     chart_selection = (
         mast3r
@@ -1278,7 +1317,72 @@ def main() -> None:
                     != sha256_file(chart_consensus)
                 ):
                     rebuild_evidence = True
-            except (FileNotFoundError, RuntimeError):
+                projected_artifact = next(
+                    (
+                        item
+                        for item in current_store.get("artifacts", [])
+                        if item["name"]
+                        == "projected_rigid_conflict_posterior"
+                    ),
+                    None,
+                )
+                projected_summary_artifact = next(
+                    (
+                        item
+                        for item in current_store.get("artifacts", [])
+                        if item["name"]
+                        == "projected_rigid_conflict_posterior_summary"
+                    ),
+                    None,
+                )
+                if (
+                    projected_artifact is None
+                    or projected_summary_artifact is None
+                ):
+                    rebuild_evidence = True
+                else:
+                    projected_path = Path(projected_artifact["path"])
+                    projected_summary_path = Path(
+                        projected_summary_artifact["path"]
+                    )
+                    if not (
+                        projected_path.is_file()
+                        and projected_summary_path.is_file()
+                    ):
+                        rebuild_evidence = True
+                    else:
+                        with np.load(
+                            projected_path, allow_pickle=False
+                        ) as archive:
+                            projected_schema = str(
+                                archive["schema_version"].item()
+                            )
+                        projected_summary = json.loads(
+                            projected_summary_path.read_text()
+                        )
+                        if (
+                            projected_schema
+                            != PROJECTED_RIGID_POSTERIOR_VERSION
+                            or projected_summary.get(
+                                "producer_implementation_sha256"
+                            )
+                            != sha256_file(
+                                REPO_ROOT
+                                / "outdoor/projected_role_posterior.py"
+                            )
+                            or Path(
+                                projected_summary.get("rgb_root", "")
+                            ).resolve()
+                            != training_rgb_root
+                        ):
+                            rebuild_evidence = True
+            except (
+                FileNotFoundError,
+                KeyError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):
                 rebuild_evidence = True
         if rebuild_evidence:
             command = [
@@ -1296,6 +1400,8 @@ def main() -> None:
                 str(tracks),
                 "--chart-consensus",
                 str(chart_consensus),
+                "--rgb-root",
+                str(training_rgb_root),
                 "--output",
                 str(base_evidence),
             ]
@@ -1351,6 +1457,11 @@ def main() -> None:
             "evidence_hash": store["evidence_hash"],
             "base_evidence_hash": base_store["evidence_hash"],
             "pointmap_cross_sequence_posterior": True,
+            "all_camera_projected_rigid_posterior": {
+                "schema_version": PROJECTED_RIGID_POSTERIOR_VERSION,
+                "rgb_root": str(training_rgb_root),
+                "geometry_support_separate_from_current_rgb_visibility": True,
+            },
             "colmap_tracks": sfm_coverage_tracks_enabled(store),
             "sfm_track_usage_mode": store.get(
                 "sfm_track_usage_mode", "disabled"
@@ -1387,6 +1498,10 @@ def main() -> None:
     defer_temporal_until_rigid_calibration = bool(
         use_temporal_dav2_witnesses
         and profile.get("use_rigid_depth_calibrated_foliage", False)
+    )
+    rigid_stage_placeholder_foliage = bool(
+        args.rigid_iterations is not None
+        or profile["training_profile"] == "hybrid_rigid_stage1"
     )
     initialization = (
         run / "initialization_temporal_dav2"
@@ -1480,6 +1595,9 @@ def main() -> None:
             ),
             "voxel_size": float(profile["foliage_voxel_size"]),
             "seed": 73,
+            "rigid_stage_placeholder_foliage": (
+                rigid_stage_placeholder_foliage
+            ),
         }
         rebuild_initialization = not (
             base_initialization / "initialization_manifest.json"
@@ -1494,8 +1612,13 @@ def main() -> None:
                 current_initialization.get("evidence_hash") != store_hash
                 or current_initialization.get("version")
                 != INITIALIZATION_VERSION
-                or current_initialization.get("initialization_contract")
-                != initialization_contract
+                or any(
+                    current_initialization.get(
+                        "initialization_contract", {}
+                    ).get(key)
+                    != value
+                    for key, value in initialization_contract.items()
+                )
             )
         if rebuild_initialization:
             command = [
@@ -1596,6 +1719,8 @@ def main() -> None:
                     "--seed",
                     "73",
                 ]
+            if rigid_stage_placeholder_foliage:
+                command.append("--rigid-stage-placeholder-foliage")
             if base_initialization.exists():
                 command.append("--replace")
             _run(

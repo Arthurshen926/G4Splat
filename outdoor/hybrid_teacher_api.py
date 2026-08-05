@@ -97,6 +97,19 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v58_static_sh_ownership_decoupled",
     "cambridge_native_hybrid_teacher_v59_static_rgb_appearance_coverage_closed",
     "cambridge_native_hybrid_teacher_v60_ray_local_optical_lifecycle_closed",
+    "cambridge_native_hybrid_teacher_v61_static_role_atlas_residual",
+    "cambridge_native_hybrid_teacher_v64_static_role_evidence_mature_"
+    "replace_split_surface",
+    "cambridge_native_hybrid_teacher_v65_static_residual_topology_"
+    "and_weak_rigid_completion",
+    "cambridge_native_hybrid_teacher_v66_all_camera_role_posterior_"
+    "mask_soft_arbitration_and_surface_optical_mass",
+    "cambridge_native_hybrid_teacher_v67_all_camera_role_posterior_"
+    "chart_atlas_replace_only_retirement",
+    "cambridge_native_hybrid_teacher_v68_all_camera_role_posterior_"
+    "residual_conditioned_screen_topology",
+    "cambridge_native_hybrid_teacher_v69_local_negative_permission_"
+    "topology_stable_optical_polish",
     "unified_outdoor_mixed_teacher_v1",
 }
 
@@ -489,6 +502,90 @@ RENDER_EQUIVALENT_IMPLEMENTATION_PAIRS = {
             "later training-only maturity metadata, and excludes UV-bound "
             "Chart cells from future world-space clone/split/reallocation "
             "so a separate atlas can refine them"
+        ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "139b8ff76beda6c9786f7c8b6fe8285ad988185f135893b08ac5a44955cb5b49",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "only changes future training topology: it reserves source role 4, "
+            "adds source-local maturity and Chart ownership, retains oversized "
+            "parents for replace-split, and defers at capacity instead of "
+            "unrelated global eviction"
+        ),
+        (
+            "139b8ff76beda6c9786f7c8b6fe8285ad988185f135893b08ac5a44955cb5b49",
+            "f680766125613effeeac372864ce52f78cff91ed4879135a5c3ef842a44b3be4",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "only restricts future opacity culling and clone/replace-split "
+            "to an explicitly mutable residual suffix and applies smooth "
+            "evidence-lineage maturity during future training"
+        ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "f680766125613effeeac372864ce52f78cff91ed4879135a5c3ef842a44b3be4",
+        ): (
+            "checkpoint inference is unchanged; the runtime reserves source "
+            "role 4 and changes only future training topology, including "
+            "source-local maturity, Chart ownership, replacing splits, "
+            "capacity deferral and an explicitly mutable residual suffix"
+        ),
+        (
+            "f680766125613effeeac372864ce52f78cff91ed4879135a5c3ef842a44b3be4",
+            "ba7cbf24f0eac44498f689d3f73dfc768999276aa820676eb021a3e5ac887fb8",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "only lets measured screen-footprint deficit contribute to "
+            "future replace-split priority"
+        ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "ba7cbf24f0eac44498f689d3f73dfc768999276aa820676eb021a3e5ac887fb8",
+        ): (
+            "checkpoint inference is unchanged; all differences reserve "
+            "source role 4 or alter only future evidence-mature topology, "
+            "including screen-footprint-driven replace-split priority"
+        ),
+        (
+            "ba7cbf24f0eac44498f689d3f73dfc768999276aa820676eb021a3e5ac887fb8",
+            "77e9902a6788e8ee09dfb9f3c1f56926d23a077cb817cc331b9ed5705ec4e9f3",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "only removes ordinary opacity as future retirement authority "
+            "for UV-bound Chart atlas cells"
+        ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "77e9902a6788e8ee09dfb9f3c1f56926d23a077cb817cc331b9ed5705ec4e9f3",
+        ): (
+            "checkpoint inference is unchanged; all differences reserve "
+            "source role 4 or alter only future evidence-owned topology, "
+            "including replace-only retirement of bound Chart atlas cells"
+        ),
+        (
+            "77e9902a6788e8ee09dfb9f3c1f56926d23a077cb817cc331b9ed5705ec4e9f3",
+            "b55bc847aa638b07c06f5a9e12d9fd5fc6e81a77ba977ba9d3605415fc821618",
+        ): (
+            "checkpoint inference is unchanged; the newer GaussianModel "
+            "only makes future screen footprint multiply an observed "
+            "residual instead of independently creating split eligibility"
+        ),
+        (
+            "ba7cbf24f0eac44498f689d3f73dfc768999276aa820676eb021a3e5ac887fb8",
+            "b55bc847aa638b07c06f5a9e12d9fd5fc6e81a77ba977ba9d3605415fc821618",
+        ): (
+            "checkpoint inference is unchanged; future training additionally "
+            "requires explicit Chart retirement authority and conditions "
+            "screen-driven split priority on an observed residual"
+        ),
+        (
+            "e0439788449ba69e8590a37383373f38d7ba63752a952c4ac2032a2440868015",
+            "b55bc847aa638b07c06f5a9e12d9fd5fc6e81a77ba977ba9d3605415fc821618",
+        ): (
+            "checkpoint inference is unchanged; differences reserve source "
+            "role 4 or alter only future evidence-owned topology, including "
+            "Chart retirement and residual-conditioned screen splitting"
         ),
     },
     "hybrid_renderer": {
@@ -1211,6 +1308,53 @@ def _restore_surface(model: GaussianModel, capture: tuple) -> None:
     model._restore_point_metadata(capture[12] if len(capture) >= 13 else None)
 
 
+@torch.no_grad()
+def _apply_deployment_surface_geometry(
+    model: GaussianModel, payload: dict | None
+) -> dict:
+    """Apply a checkpoint's baked live-atlas geometry for read-only render."""
+    if payload is None:
+        return {"applied": False, "reason": "legacy_or_final_baked_surface"}
+    if payload.get("version") != "native-2dgs-deployment-geometry-v1":
+        raise RuntimeError("Unsupported deployment surface geometry protocol")
+    point_count = int(payload.get("point_count", -1))
+    if point_count != len(model.get_xyz):
+        raise RuntimeError(
+            "Deployment surface geometry point count differs from resume "
+            "surface capture"
+        )
+    expected = {
+        "xyz": model._xyz.shape,
+        "scaling": model._scaling.shape,
+        "rotation": model._rotation.shape,
+    }
+    for name, shape in expected.items():
+        value = torch.as_tensor(payload[name])
+        if value.shape != shape:
+            raise RuntimeError(
+                f"Deployment surface {name} shape is {tuple(value.shape)}, "
+                f"expected {tuple(shape)}"
+            )
+        if not bool(torch.isfinite(value).all()):
+            raise RuntimeError(
+                f"Deployment surface {name} contains non-finite values"
+            )
+        getattr(model, f"_{name}").copy_(
+            value.to(
+                device=model.get_xyz.device,
+                dtype=getattr(model, f"_{name}").dtype,
+            )
+        )
+    return {
+        "applied": True,
+        "point_count": point_count,
+        "chart_baked_rows": int(payload.get("chart_baked_rows", 0)),
+        "resume_surface_unchanged": bool(
+            payload.get("resume_surface_unchanged", False)
+        ),
+    }
+
+
 def load_hybrid_teacher(
     state_path: Path,
     *,
@@ -1244,6 +1388,11 @@ def load_hybrid_teacher(
     state["_render_implementation_validation"] = implementation_validation
     surface = GaussianModel(sh_degree)
     _restore_surface(surface, state["surface"])
+    state["_deployment_surface_geometry"] = (
+        _apply_deployment_surface_geometry(
+            surface, state.get("deployment_surface_geometry")
+        )
+    )
     foliage = VolumetricFoliageModel(
         sh_degree,
         dynamic_rank=int(state["foliage"].get("dynamic_rank", 4)),

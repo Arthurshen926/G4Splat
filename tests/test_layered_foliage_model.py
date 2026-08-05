@@ -23,6 +23,15 @@ from scripts.train_layered_foliage_v6 import (
 )
 
 
+def test_rank_zero_static_foliage_has_no_temporal_parameter_capacity():
+    model = VolumetricFoliageModel(0, dynamic_rank=0, device="cpu")
+
+    assert model.dynamic_rank == 0
+    assert model.deformation_basis.shape == (0, 0, 3)
+    assert model.dynamic_feature_basis.shape == (0, 0, 3)
+    assert model.dynamic_opacity_basis.shape == (0, 0, 1)
+
+
 def _payload():
     count = 4
     return {

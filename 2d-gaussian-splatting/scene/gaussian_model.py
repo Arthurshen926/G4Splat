@@ -1621,13 +1621,14 @@ class GaussianModel:
     ):
         """Return a continuous, observation-aware opacity cull.
 
-        Metric/Chart surfels start with direct geometric authority and use the
-        ordinary 2DGS opacity threshold.  DAV2 rigid-hole births intentionally
-        start just above that threshold and have only posterior authority.
-        Culling them after one or two random training views confuses "not yet
-        sampled" with "photometrically rejected".  Their threshold therefore
-        approaches the ordinary threshold smoothly with cumulative rendered
-        visibility mass; there is no protected interval or pass/fail count.
+        A calibrated evidence seed is not renderer clutter merely because its
+        opacity is still small after one or two random database views.  That
+        confusion used to delete metric MASt3R/Chart rows at the very first
+        post-bootstrap topology event.  Apply a smooth evidence-maturity
+        factor to every persistent source lineage, not only DAV2 holes.  The
+        ordinary threshold is recovered after repeated responsibility-bearing
+        database sweeps, so long-term transparent rows remain removable
+        without a brittle age gate.
         """
         opacity = self.get_opacity.reshape(-1)
         threshold = torch.full_like(opacity, float(min_opacity))
@@ -1639,11 +1640,8 @@ class GaussianModel:
             len(self._source_type) == len(opacity)
             and len(observation_mass) == len(opacity)
         ):
-            dav2 = (
-                self._source_type
-                == GaussianModel.SOURCE_DAV2_RIGID_HOLE
-            )
-            if bool(dav2.any()):
+            evidence_lineage = self._source_type >= 0
+            if bool(evidence_lineage.any()):
                 observations = torch.nan_to_num(
                     observation_mass.float(),
                     nan=0.0,
@@ -1651,19 +1649,58 @@ class GaussianModel:
                     neginf=0.0,
                 ).clamp_min(0.0)
                 # Maturity is measured in weighted database sweeps, not raw
-                # optimizer iterations.  Four reference-set sweeps give
-                # 63.2% of the ordinary threshold and twelve give 95.0%.
-                # Fractional visibility contributes proportionally through
-                # add_densification_stats.
+                # optimizer iterations.  Squaring the smooth saturation makes
+                # the first few sweeps primarily a validation period while
+                # still avoiding a binary protected/unprotected transition.
                 maturity_mass = 4.0 * max(
                     float(observation_reference_count), 1.0
                 )
-                dav2_maturity = -torch.expm1(
-                    -observations[dav2] / maturity_mass
+                lineage_maturity = -torch.expm1(
+                    -observations[evidence_lineage] / maturity_mass
                 )
-                maturity[dav2] = dav2_maturity
-                threshold[dav2] *= dav2_maturity
+                lineage_maturity = lineage_maturity.square()
+                maturity[evidence_lineage] = lineage_maturity
+                threshold[evidence_lineage] *= lineage_maturity
         return opacity < threshold, maturity
+
+    def _chart_atlas_bound_mask(self):
+        """Identify live native-2DGS cells owned by the Chart atlas.
+
+        ``SOURCE_CHART_RESIDUAL`` alone is provenance, while the negative
+        cell id is the live ownership binding.  Such a row can be replaced by
+        the UV quadtree (which creates an explicit receiver) or retired by an
+        independent geometric contradiction.  Low rendered opacity is only
+        weak optical responsibility and is not evidence that the metric
+        surface cell ceased to exist.
+        """
+        count = len(self.get_xyz)
+        if (
+            len(getattr(self, "_source_type", ())) != count
+            or len(getattr(self, "_track_id", ())) != count
+        ):
+            return torch.zeros(
+                count, dtype=torch.bool, device=self.get_xyz.device
+            )
+        return (
+            (self._source_type == self.SOURCE_CHART_RESIDUAL)
+            & (self._track_id < -1)
+        )
+
+    def _ordinary_opacity_prune_mask(
+        self,
+        min_opacity,
+        *,
+        observation_reference_count=2,
+    ):
+        """Apply ordinary opacity retirement only to lifecycle-owned rows."""
+        prune, maturity = GaussianModel._evidence_mature_opacity_prune_mask(
+            self,
+            min_opacity,
+            observation_reference_count=observation_reference_count,
+        )
+        chart_bound = GaussianModel._chart_atlas_bound_mask(self)
+        chart_blocked = prune & chart_bound
+        return prune & ~chart_bound, maturity, chart_blocked
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         use_mip_filter = self.use_mip_filter
@@ -1676,8 +1713,8 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask, _ = (
-            GaussianModel._evidence_mature_opacity_prune_mask(
+        prune_mask, _, _ = (
+            GaussianModel._ordinary_opacity_prune_mask(
                 self, min_opacity
             )
         )
@@ -1701,6 +1738,7 @@ class GaussianModel:
         max_points,
         max_growth,
         observation_reference_count=2,
+        mutable_start=0,
     ):
         """Run evidence-independent renderer topology under a strict budget.
 
@@ -1726,6 +1764,14 @@ class GaussianModel:
             self.set_mip_filter(False)
 
         before = int(self.get_xyz.shape[0])
+        mutable_start = int(mutable_start)
+        if not 0 <= mutable_start <= before:
+            raise ValueError(
+                "mutable_start must lie within the current surface rows"
+            )
+        mutable_before = torch.arange(
+            before, device=self.get_xyz.device
+        ) >= mutable_start
         grads = torch.nan_to_num(
             self.xyz_gradient_accum / self.denom,
             nan=0.0,
@@ -1769,9 +1815,59 @@ class GaussianModel:
             * confidence_reliability[:, None]
             * optical_maturity[:, None]
         )
+        # Screen footprint measures how much bandwidth a *validated residual*
+        # needs; it is not evidence of residual error by itself.  The former
+        # independent signal admitted 18k+ candidates at the first Cambridge
+        # event and let a single close-view maximum radius consume the whole
+        # split budget.  Continuously amplify accumulated RGB/SSIM/edge/
+        # geometry gradients instead, with a responsibility maturity from the
+        # current topology window.  A broad blurred splat can still cross the
+        # threshold, while a zero-residual metric cell cannot manufacture a
+        # split merely by being seen close-up once.
+        screen_target = (
+            min(16.0, 0.25 * float(max_screen_size))
+            if max_screen_size
+            else 16.0
+        )
+        screen_pressure = (
+            self.max_radii2D / max(screen_target, 1.0) - 1.0
+        ).clamp(0.0, 8.0)
+        observation_window_mass = torch.nan_to_num(
+            self.denom.reshape(-1).float(),
+            nan=0.0,
+            posinf=64.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        screen_responsibility_maturity = torch.sqrt(
+            observation_window_mass
+            / (observation_window_mass + 1.0)
+        )
+        screen_priority_multiplier = (
+            1.0
+            + 0.5
+            * torch.log1p(screen_pressure)
+            * screen_responsibility_maturity
+        )
+        base_priority_grads = priority_grads.abs()
+        topology_priority_grads = (
+            base_priority_grads * screen_priority_multiplier[:, None]
+        )
+        screen_evidence_candidates_before = int(
+            (
+                (torch.norm(base_priority_grads, dim=-1) < float(max_grad))
+                & (
+                    torch.norm(topology_priority_grads, dim=-1)
+                    >= float(max_grad)
+                )
+            ).sum()
+        )
 
-        opacity_prune_mask, cull_maturity = (
-            GaussianModel._evidence_mature_opacity_prune_mask(
+        (
+            opacity_prune_mask,
+            cull_maturity,
+            chart_opacity_retirement_blocked,
+        ) = (
+            GaussianModel._ordinary_opacity_prune_mask(
                 self,
                 min_opacity,
                 observation_reference_count=(
@@ -1779,6 +1875,11 @@ class GaussianModel:
                 ),
             )
         )
+        # A mature handoff can expose an immutable free-surface prefix and a
+        # separately owned completion suffix. Opacity is not retirement
+        # authority for that prefix: it may be occluded in the current view
+        # while remaining independently supported elsewhere.
+        opacity_prune_mask &= mutable_before
         prune_mask = opacity_prune_mask.clone()
         dav2_before_mask = (
             self._source_type
@@ -1810,10 +1911,14 @@ class GaussianModel:
             big_points_ws = (
                 self.get_scaling.max(dim=1).values > 0.1 * extent
             )
-            prune_mask = torch.logical_or(
-                prune_mask,
-                torch.logical_or(big_points_vs, big_points_ws),
-            )
+        else:
+            big_points_vs = torch.zeros_like(prune_mask)
+            big_points_ws = torch.zeros_like(prune_mask)
+        # Oversized support is a bandwidth deficit, not negative existence
+        # evidence.  Deleting it before candidate selection produced facade
+        # holes exactly when a replacing split should have preserved optical
+        # coverage.  The split path below already prioritizes large projected
+        # footprints and replaces each admitted parent with compact children.
         # Explicitly protected points are never removed by routine topology
         # maintenance.  Descendants inherit this metadata contract.
         if len(self._protected_flag) == len(prune_mask):
@@ -1822,13 +1927,15 @@ class GaussianModel:
             )
         routine_pruned = int(prune_mask.sum())
 
-        # A fixed maximum is a memory budget, not a topology stop condition.
-        # At saturation, retire a small number of transparent, low-confidence,
-        # low-gradient primitives so high-gradient coverage deficits can
-        # replace them in the same event.  The model therefore remains
-        # bounded while capacity follows the residual instead of historical
-        # insertion order.
-        grad_norm_before = torch.norm(priority_grads, dim=-1)
+        # A fixed maximum is a memory budget, never retirement evidence.  The
+        # old implementation evicted globally weak rows so an unrelated
+        # high-gradient split elsewhere in the scene could consume their
+        # slots.  That is precisely the destructive "borrow geometry from one
+        # object to repair another" failure mode.  Capacity is now released
+        # only by the evidence-mature opacity cull above (long-term no real
+        # contribution), or by a separate ray/pixel-local replacement event
+        # with an explicit receiver.  Otherwise the candidate is deferred.
+        grad_norm_before = torch.norm(topology_priority_grads, dim=-1)
         max_scale_before = self.get_scaling.max(dim=1).values
         projected_large_before = self.max_radii2D > min(
             16.0, 0.25 * float(max_screen_size)
@@ -1853,26 +1960,16 @@ class GaussianModel:
                 )
                 | projected_large_before
             )
-            & (max_scale_before <= 0.1 * extent)
         )
         candidate_before = (
             clone_candidate_before | split_candidate_before
         )
+        candidate_before &= mutable_before
         # Exact negative ids bind a Chart renderer cell to the learnable UV
         # atlas. Random world-space clone/split would either duplicate that
         # cell or clear its identity. Chart cells are refined separately by a
         # four-child UV quadtree replace-and-retire event.
-        chart_bound_before = (
-            (self._source_type == self.SOURCE_CHART_RESIDUAL)
-            & (self._track_id < -1)
-            if (
-                len(self._source_type) == before
-                and len(getattr(self, "_track_id", ())) == before
-            )
-            else torch.zeros(
-                before, dtype=torch.bool, device=prune_mask.device
-            )
-        )
+        chart_bound_before = GaussianModel._chart_atlas_bound_mask(self)
         candidate_before &= ~chart_bound_before
         if len(self._protected_flag) == before:
             candidate_before &= ~self._protected_flag
@@ -1881,54 +1978,14 @@ class GaussianModel:
         count_after_routine = before - routine_pruned
         free_after_routine = max(max_points - count_after_routine, 0)
         desired_admissions = min(max_growth, candidate_count_before)
-        reallocation_needed = max(
+        deferred_for_capacity = max(
             desired_admissions - free_after_routine, 0
         )
-        reallocation_limit = min(
-            max_growth,
-            max(64, int(round(0.00125 * max_points))),
-        )
-        reallocation_target = min(
-            reallocation_needed, reallocation_limit
-        )
+        reallocation_target = 0
         reallocated_pruned = 0
-        if reallocation_target > 0:
-            alpha = self.get_opacity.reshape(-1)
-            eligible = ~prune_mask & ~candidate_before
-            eligible &= ~chart_bound_before
-            if len(self._protected_flag) == before:
-                eligible &= ~self._protected_flag
-            # Only weak optical contributors may be displaced.  High-opacity
-            # surfaces remain stable even when their current gradient is low.
-            eligible &= alpha <= max(0.05, 10.0 * float(min_opacity))
-            eligible_indices = torch.nonzero(
-                eligible, as_tuple=False
-            ).flatten()
-            if len(eligible_indices):
-                visibility = torch.nan_to_num(
-                    self.denom.reshape(-1).float(),
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ).clamp_min(0.0)
-                visibility = visibility / (visibility + 2.0)
-                utility = (
-                    alpha
-                    * (0.35 + 0.65 * confidence_reliability)
-                    * (0.50 + 0.50 * visibility)
-                )
-                count = min(
-                    reallocation_target, len(eligible_indices)
-                )
-                _, order = torch.topk(
-                    -utility[eligible_indices], k=count
-                )
-                retired = eligible_indices[order]
-                prune_mask[retired] = True
-                reallocated_pruned = int(len(retired))
         pruned = int(prune_mask.sum())
         if pruned:
-            priority_grads = priority_grads[~prune_mask]
+            topology_priority_grads = topology_priority_grads[~prune_mask]
             self.prune_points(prune_mask)
 
         point_count = int(self.get_xyz.shape[0])
@@ -1939,7 +1996,7 @@ class GaussianModel:
         cloned = 0
         split_parents = 0
         if remaining > 0 and point_count:
-            grad_norm = torch.norm(priority_grads, dim=-1)
+            grad_norm = torch.norm(topology_priority_grads, dim=-1)
             max_scale = self.get_scaling.max(dim=1).values
             clone_candidates = torch.logical_and(
                 grad_norm >= max_grad,
@@ -1949,12 +2006,17 @@ class GaussianModel:
                 16.0, 0.25 * float(max_screen_size)
             )
             split_candidates = torch.logical_and(
-                priority_grads.squeeze(-1) >= max_grad,
+                topology_priority_grads.squeeze(-1) >= max_grad,
                 torch.logical_or(
                     max_scale > self.percent_dense * extent,
                     projected_large,
                 ),
             )
+            mutable_current = torch.arange(
+                point_count, device=split_candidates.device
+            ) >= mutable_start
+            split_candidates &= mutable_current
+            clone_candidates &= mutable_current
             chart_bound = (
                 (self._source_type == self.SOURCE_CHART_RESIDUAL)
                 & (self._track_id < -1)
@@ -2001,7 +2063,7 @@ class GaussianModel:
             clone_capacity = remaining - split_parent_capacity
             if clone_capacity:
                 cloned = self.densify_and_clone_limited(
-                    priority_grads,
+                    topology_priority_grads,
                     max_grad,
                     extent,
                     clone_capacity,
@@ -2016,7 +2078,7 @@ class GaussianModel:
                 )
             if split_parent_capacity:
                 split_children = self.densify_and_split_limited(
-                    priority_grads,
+                    topology_priority_grads,
                     max_grad,
                     extent,
                     split_parent_capacity * 2,
@@ -2069,6 +2131,24 @@ class GaussianModel:
             "before": before,
             "pruned": pruned,
             "routine_pruned": routine_pruned,
+            "opacity_pruned": int(opacity_prune_mask.sum()),
+            "chart_atlas_lifecycle": {
+                "bound_before": int(chart_bound_before.sum()),
+                "ordinary_opacity_retirement_blocked": int(
+                    chart_opacity_retirement_blocked.sum()
+                ),
+                "ordinary_opacity_is_retirement_authority": False,
+                "allowed_retirement": (
+                    "uv_quadtree_replace_and_retire_or_independent_"
+                    "geometric_contradiction"
+                ),
+            },
+            "oversized_screen_retained_for_split": int(
+                (big_points_vs & ~opacity_prune_mask).sum()
+            ),
+            "oversized_world_retained_for_split": int(
+                (big_points_ws & ~opacity_prune_mask).sum()
+            ),
             "reallocated_pruned": reallocated_pruned,
             "cloned": cloned,
             "split_parents": split_parents,
@@ -2078,10 +2158,18 @@ class GaussianModel:
             "budget": max_points,
             "remaining": max(max_points - after, 0),
             "candidate_count_before": candidate_count_before,
+            "screen_evidence_candidates_before": (
+                screen_evidence_candidates_before
+            ),
             "capacity_reallocation_requested": reallocation_target,
+            "candidates_deferred_for_capacity": deferred_for_capacity,
+            "global_capacity_eviction_disabled": True,
             "capacity_saturated_before": (
                 count_after_routine >= max_points
             ),
+            "mutable_start": mutable_start,
+            "mutable_rows_before": before - mutable_start,
+            "immutable_prefix_preserved": mutable_start > 0,
             "dav2_lineage": {
                 "before": dav2_before,
                 "opacity_pruned": int(
@@ -2096,9 +2184,9 @@ class GaussianModel:
                     dav2_cull_maturity_mean
                 ),
                 "cull_policy": (
-                    "min_opacity_times_one_minus_exp_"
-                    "negative_observation_mass_over_"
-                    "four_reference_set_sweeps"
+                    "all_evidence_lineages__min_opacity_times_squared_"
+                    "one_minus_exp_negative_observation_mass_over_four_"
+                    "reference_set_sweeps"
                 ),
                 "observation_reference_count": int(
                     observation_reference_count
@@ -2107,7 +2195,10 @@ class GaussianModel:
             },
             "topology_priority": (
                 "screen_gradient_times_spatial_geometry_confidence_times_"
-                "continuous_optical_maturity_and_persistent_source_lineage"
+                "continuous_optical_maturity_and_persistent_source_lineage__"
+                "continuous_screen_footprint_amplifies_observed_residual_"
+                "with_window_responsibility__no_independent_radius_only_"
+                "split_evidence__oversized_support_is_replace_split_not_prune"
             ),
         }
 

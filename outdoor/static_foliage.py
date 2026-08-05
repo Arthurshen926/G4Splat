@@ -41,8 +41,34 @@ def _camera_sequence_table(
         name = str(record.get("sequence_id", ""))
         if camera_id < 0 or camera_id >= len(table) or name not in name_to_id:
             continue
-        table[camera_id] = name_to_id[name]
+        encoded = int(name_to_id[name])
+        if int(table[camera_id]) >= 0 and int(table[camera_id]) != encoded:
+            raise ValueError(
+                "fixed camera has conflicting sequence identities: "
+                f"camera={camera_id}"
+            )
+        table[camera_id] = encoded
     return table, names
+
+
+def _camera_quality_table(
+    records: list[dict], maximum_camera_id: int
+) -> torch.Tensor:
+    """Return bounded canonical-appearance weights for fixed cameras."""
+    table = torch.ones(
+        max(int(maximum_camera_id) + 1, 0), dtype=torch.float32
+    )
+    for record in records:
+        camera_id = int(record.get("image_id", -1))
+        if camera_id < 0 or camera_id >= len(table):
+            continue
+        quality = float(record.get("canonical_quality", 1.0))
+        if not torch.isfinite(torch.tensor(quality)) or quality <= 0:
+            raise ValueError(
+                "fixed-camera canonical quality must be finite and positive"
+            )
+        table[camera_id] = float(min(max(quality, 0.25), 2.0))
+    return table
 
 
 def _canonical_sequence_per_tree(
@@ -437,6 +463,7 @@ def fuse_sequence_evidence_into_static_leaves(
     canonical_mode_voxel_size: float = 0.08,
     maximum_modes_per_group: int = 2,
     canonical_sequence_policy: str = "per_tree",
+    fixed_camera_sequences: list[dict] | None = None,
 ) -> tuple[dict, dict[str, int | float | str]]:
     """Fuse camera observations into a coherent multi-mode static snapshot.
 
@@ -535,13 +562,43 @@ def fuse_sequence_evidence_into_static_leaves(
     occupancy = torch.as_tensor(
         payload.get("occupancy_probability", torch.ones(count))
     ).float().cpu()
+    persisted_fixed_cameras = payload.get("audit", {}).get(
+        "fixed_camera_sequences", []
+    )
     selected_views = payload.get("audit", {}).get("selected_views", [])
+    if fixed_camera_sequences is not None:
+        camera_sequence_records = list(fixed_camera_sequences)
+        camera_sequence_metadata_source = "runtime_fixed_camera_contract"
+    elif persisted_fixed_cameras:
+        camera_sequence_records = list(persisted_fixed_cameras)
+        camera_sequence_metadata_source = "initialization_fixed_camera_contract"
+    else:
+        # Backward compatibility for old initialization files. Production
+        # training passes the complete fixed-camera table explicitly, so the
+        # selected posterior subset is never the authority for sequence
+        # identity again.
+        camera_sequence_records = list(selected_views)
+        camera_sequence_metadata_source = "legacy_selected_view_subset"
     maximum_selected_camera = max(
-        [int(record.get("image_id", -1)) for record in selected_views]
+        [
+            int(record.get("image_id", -1))
+            for record in camera_sequence_records
+        ]
         + [int(owner_camera[valid_camera].max())]
     )
     camera_sequence, sequence_names = _camera_sequence_table(
-        selected_views, maximum_selected_camera
+        camera_sequence_records, maximum_selected_camera
+    )
+    # Runtime camera objects are authoritative for identity, while persisted
+    # initialization records additionally carry the RGB-quality audit. Merge
+    # only that bounded tiebreaker by camera id.
+    camera_quality_records = (
+        list(persisted_fixed_cameras)
+        if persisted_fixed_cameras
+        else camera_sequence_records
+    )
+    camera_quality = _camera_quality_table(
+        camera_quality_records, maximum_selected_camera
     )
     owner_sequence = torch.full_like(owner_camera, -1)
     sequence_camera = valid_camera & (
@@ -555,6 +612,11 @@ def fuse_sequence_evidence_into_static_leaves(
         raise ValueError(
             "static leaf fusion requires calibrated camera-to-sequence metadata"
         )
+    owner_quality = torch.ones_like(owner_camera, dtype=torch.float32)
+    quality_camera = valid_camera & (owner_camera < len(camera_quality))
+    owner_quality[quality_camera] = camera_quality[
+        owner_camera[quality_camera]
+    ]
 
     # Record actual cross-sequence persistence for each envelope group.  The
     # previous implementation wrote a synthetic value of two even when all
@@ -585,7 +647,7 @@ def fuse_sequence_evidence_into_static_leaves(
             local_groups,
             owner_sequence,
             owner_camera,
-            occupancy[associated_rows].clamp(0.05, 1.0),
+            occupancy[associated_rows].clamp(0.05, 1.0) * owner_quality,
             minimum_supporting_views=minimum_supporting_views,
         )
         canonical_sequence = torch.full_like(owner_sequence, scene_sequence)
@@ -599,7 +661,7 @@ def fuse_sequence_evidence_into_static_leaves(
             tree_ids,
             owner_sequence,
             owner_camera,
-            occupancy[associated_rows].clamp(0.05, 1.0),
+            occupancy[associated_rows].clamp(0.05, 1.0) * owner_quality,
         )
     group_is_valid = torch.zeros(group_count, dtype=torch.bool)
     group_is_valid[valid_groups] = True
@@ -609,6 +671,97 @@ def fuse_sequence_evidence_into_static_leaves(
         & valid_sequence
         & (owner_sequence == canonical_sequence)
     )
+    # A tree-wide canonical acquisition may not observe every one of its
+    # persistent crown cells. Dropping those cells made static foliage
+    # bandwidth depend on sequence overlap rather than geometric evidence.
+    # For a cell that is independently supported in at least two sequences,
+    # choose its strongest internally coherent local acquisition. This does
+    # not average time-varying positions and emits no render-time condition;
+    # cross-sequence evidence only verifies the persistent envelope.
+    fallback_sequences: dict[int, int] = {}
+    if canonical_sequence_policy == "per_tree":
+        represented = torch.zeros(group_count, dtype=torch.bool)
+        represented[torch.unique(local_groups[canonical_row])] = True
+        fallback_group_mask = (
+            group_is_valid & (sequence_count >= 2) & ~represented
+        )
+        fallback_groups = torch.nonzero(
+            fallback_group_mask, as_tuple=False
+        ).flatten()
+        if len(fallback_groups):
+            eligible_rows = (
+                valid_camera
+                & valid_sequence
+                & fallback_group_mask[local_groups]
+            )
+            eligible_groups = local_groups[eligible_rows]
+            eligible_sequences = owner_sequence[eligible_rows]
+            eligible_cameras = owner_camera[eligible_rows]
+            eligible_weights = (
+                occupancy[associated_rows][eligible_rows].clamp(0.05, 1.0)
+                * owner_quality[eligible_rows]
+            )
+            group_sequence_key = (
+                eligible_groups * maximum_sequence + eligible_sequences
+            )
+            unique_group_sequence, inverse_group_sequence = torch.unique(
+                group_sequence_key, return_inverse=True
+            )
+            unique_camera_key = torch.unique(
+                group_sequence_key * maximum_camera + eligible_cameras
+            )
+            camera_group_sequence = torch.div(
+                unique_camera_key,
+                maximum_camera,
+                rounding_mode="floor",
+            )
+            camera_count = torch.bincount(
+                torch.searchsorted(
+                    unique_group_sequence, camera_group_sequence
+                ),
+                minlength=len(unique_group_sequence),
+            )
+            weight_sum = torch.zeros(len(unique_group_sequence))
+            weight_sum.index_add_(
+                0, inverse_group_sequence, eligible_weights
+            )
+            for index, key in enumerate(unique_group_sequence.tolist()):
+                group_id = int(key // maximum_sequence)
+                sequence_id = int(key % maximum_sequence)
+                score = (
+                    int(camera_count[index]),
+                    float(weight_sum[index]),
+                    -sequence_id,
+                )
+                previous = fallback_sequences.get(group_id)
+                if previous is None:
+                    fallback_sequences[group_id] = sequence_id
+                    continue
+                previous_key = group_id * maximum_sequence + previous
+                previous_index = int(
+                    torch.searchsorted(
+                        unique_group_sequence,
+                        torch.tensor(previous_key),
+                    )
+                )
+                previous_score = (
+                    int(camera_count[previous_index]),
+                    float(weight_sum[previous_index]),
+                    -previous,
+                )
+                if score > previous_score:
+                    fallback_sequences[group_id] = sequence_id
+            fallback_lookup = torch.full(
+                (group_count,), -1, dtype=torch.int64
+            )
+            for group_id, sequence_id in fallback_sequences.items():
+                fallback_lookup[group_id] = sequence_id
+            canonical_row |= (
+                group_is_valid[local_groups]
+                & valid_camera
+                & valid_sequence
+                & (owner_sequence == fallback_lookup[local_groups])
+            )
     canonical_rows = associated_rows[canonical_row]
     canonical_cameras = owner_camera[canonical_row]
     canonical_groups = groups[canonical_rows]
@@ -833,6 +986,19 @@ def fuse_sequence_evidence_into_static_leaves(
             "input_dynamic_rows": int(dynamic.sum()),
             "associated_dynamic_rows": int(associated.sum()),
             "globally_verified_groups": int(len(valid_groups)),
+            "camera_sequence_metadata_source": (
+                camera_sequence_metadata_source
+            ),
+            "camera_sequence_metadata_count": int(
+                len(camera_sequence_records)
+            ),
+            "canonical_camera_quality_source": (
+                "initialization_fixed_camera_contract"
+                if persisted_fixed_cameras
+                else "uniform_default"
+            ),
+            "mapped_associated_rows": int(valid_sequence.sum()),
+            "unmapped_associated_rows": int((~valid_sequence).sum()),
             "canonical_sequence_policy": canonical_sequence_policy,
             "canonical_scene_sequence": (
                 sequence_names[scene_sequence]
@@ -853,6 +1019,15 @@ def fuse_sequence_evidence_into_static_leaves(
                 Counter(
                     sequence_names[value]
                     for value in chosen_sequences.values()
+                )
+            ),
+            "canonical_cross_sequence_fallback_groups": int(
+                len(fallback_sequences)
+            ),
+            "canonical_cross_sequence_fallback_histogram": dict(
+                Counter(
+                    sequence_names[value]
+                    for value in fallback_sequences.values()
                 )
             ),
             "canonical_mode_voxel_size": float(canonical_mode_voxel_size),
@@ -878,6 +1053,17 @@ def fuse_sequence_evidence_into_static_leaves(
         "input_dynamic_rows": int(dynamic.sum()),
         "associated_dynamic_rows": int(associated.sum()),
         "globally_verified_groups": int(len(valid_groups)),
+        "camera_sequence_metadata_source": camera_sequence_metadata_source,
+        "camera_sequence_metadata_count": int(
+            len(camera_sequence_records)
+        ),
+        "canonical_camera_quality_source": (
+            "initialization_fixed_camera_contract"
+            if persisted_fixed_cameras
+            else "uniform_default"
+        ),
+        "mapped_associated_rows": int(valid_sequence.sum()),
+        "unmapped_associated_rows": int((~valid_sequence).sum()),
         "canonical_sequence_policy": canonical_sequence_policy,
         "canonical_scene_sequence": (
             sequence_names[scene_sequence] if scene_sequence >= 0 else None
@@ -894,6 +1080,15 @@ def fuse_sequence_evidence_into_static_leaves(
             Counter(
                 sequence_names[value]
                 for value in chosen_sequences.values()
+            )
+        ),
+        "canonical_cross_sequence_fallback_groups": int(
+            len(fallback_sequences)
+        ),
+        "canonical_cross_sequence_fallback_histogram": dict(
+            Counter(
+                sequence_names[value]
+                for value in fallback_sequences.values()
             )
         ),
         "canonical_mode_voxel_size": float(canonical_mode_voxel_size),

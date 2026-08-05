@@ -90,16 +90,17 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
     assert profile["dav2_rigid_cross_sequence_radius"] == 0.25
     assert profile["training_profile"] == "static_handoff_quality"
     assert profile["rigid_pretrain_iterations"] == 32_000
-    assert profile["rigid_pretrain_surface_gaussians"] == 800_000
+    assert profile["rigid_pretrain_surface_gaussians"] == 1_200_000
     assert profile["rigid_pretrain_surface_growth_per_event"] == 5_000
     assert profile["rigid_pretrain_densify_until_iteration"] == 16_000
     assert profile["rigid_geometry_gradient_ratio"] == 0.15
-    assert profile["maximum_surface_gaussians"] == 800_000
+    assert profile["maximum_surface_gaussians"] == 1_400_000
     assert profile["maximum_volume_gaussians"] == 2_000_000
     assert profile["maximum_volume_splits"] == 20_000
-    assert profile["volume_densify_until_fraction"] == 0.85
-    assert profile["mature_handoff_surface_policy"] == "appearance_only"
-    assert profile["maximum_rigid_completion_seeds"] == 0
+    assert profile["volume_densify_until_fraction"] == 0.60
+    assert profile["surface_densify_until_fraction"] == 0.40
+    assert profile["mature_handoff_surface_policy"] == "atlas_residual"
+    assert profile["maximum_rigid_completion_seeds"] == 20_000
     assert profile["volume_opacity_lr"] == 4.0e-3
     assert (
         profile[
@@ -172,16 +173,33 @@ def test_staged_teacher_command_closes_scale_and_rigid_lr_contract(tmp_path):
         == "24"
     )
     assert command[command.index("--position_lr_init") + 1] == "1.6e-5"
+    assert (
+        command[command.index("--non_position_lr_decay_from") + 1]
+        == "18000"
+    )
     assert command[command.index("--reconstruction-target") + 1] == "static"
     assert (
         command[command.index("--geometry-gradient-ratio") + 1]
         == "0.25"
+    )
+    assert (
+        command[command.index("--projected-rigid-depth-weight") + 1]
+        == "0.0"
     )
     assert command[command.index("--volume-split-radius") + 1] == "2.0"
     assert (
         command[command.index("--maximum-volume-radius-pixels") + 1]
         == "24"
     )
+    assert command[command.index("--maximum-skeleton-radius-pixels") + 1] == "12"
+    assert command[command.index("--maximum-envelope-radius-pixels") + 1] == "24"
+    assert (
+        command[command.index("--maximum-static-detail-radius-pixels") + 1]
+        == "12"
+    )
+    assert command[command.index("--view-cache-size") + 1] == "2048"
+    assert command[command.index("--image-prefetch-workers") + 1] == "8"
+    assert command[command.index("--image-prefetch-depth") + 1] == "32"
     assert (
         command[command.index("--volume-densify-until-iteration") + 1]
         == "20000"

@@ -141,6 +141,22 @@ class ChartSurfaceModel:
             return None
         return self.atlas.geometry_override(surface)
 
+    def live_surface_rows(self, surface) -> torch.Tensor:
+        """Return the surface rows whose geometry is owned by the atlas.
+
+        Screen-space footprint feedback is produced by the rasterizer in
+        surface-row order.  Exposing that ownership explicitly lets the
+        trainer persist a measured footprint ceiling on live Chart rows even
+        under an ``atlas_residual`` handoff; otherwise only completion rows
+        were corrected and the immutable Chart prefix could grow back into
+        large paint splats through the atlas override.
+        """
+        if self.atlas is None:
+            return torch.empty(
+                0, dtype=torch.long, device=surface.get_xyz.device
+            )
+        return self.atlas.live_surface_rows(surface)
+
     def regularizer(self) -> torch.Tensor:
         if self.atlas is None:
             if self._cache:
@@ -898,6 +914,71 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
             quaternion, dim=-1, eps=1e-6
         )
 
+    def _local_chart_geometry(
+        self,
+        chart_id: torch.Tensor,
+        uv: torch.Tensor,
+        half: torch.Tensor,
+        fallback: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate a discontinuity-safe local Chart tangent frame.
+
+        A depth atlas is a collection of surface samples, not a mesh across
+        every image-space depth discontinuity.  The former implementation
+        always differentiated towards positive ``u``/``v`` (except at the
+        image boundary).  Consequently a cell immediately to the left of a
+        foreground/background edge used the point on the other depth layer
+        as its tangent endpoint.  The resulting half-cell could be metres
+        long, was merely clamped to the global 0.5 m safety ceiling, and
+        rendered as the characteristic diagonal/needle paint stroke.
+
+        Both one-sided derivatives are observable in the source Chart.  Use
+        the side whose inverse depth is closest to the centre, then orient a
+        backward difference back into the positive UV convention.  Smooth
+        oblique surfaces retain their metric depth derivative; an actual
+        discontinuity is no longer bridged by a surfel.
+        """
+        centre, centre_rho = self._points(chart_id, uv, fallback)
+
+        def one_axis(axis: int) -> torch.Tensor:
+            plus_uv = uv.clone()
+            minus_uv = uv.clone()
+            plus_uv[:, axis] = (uv[:, axis] + half[:, axis]).clamp(0, 1)
+            minus_uv[:, axis] = (uv[:, axis] - half[:, axis]).clamp(0, 1)
+            plus, plus_rho = self._points(
+                chart_id, plus_uv, fallback
+            )
+            minus, minus_rho = self._points(
+                chart_id, minus_uv, fallback
+            )
+            plus_valid = plus_uv[:, axis] > uv[:, axis]
+            minus_valid = minus_uv[:, axis] < uv[:, axis]
+            centre_log_rho = centre_rho.clamp_min(1e-8).log()
+            plus_cost = (
+                plus_rho.clamp_min(1e-8).log() - centre_log_rho
+            ).abs()
+            minus_cost = (
+                minus_rho.clamp_min(1e-8).log() - centre_log_rho
+            ).abs()
+            infinity = torch.full_like(plus_cost, float("inf"))
+            plus_cost = torch.where(plus_valid, plus_cost, infinity)
+            minus_cost = torch.where(minus_valid, minus_cost, infinity)
+            choose_plus = plus_cost <= minus_cost
+            endpoint = torch.where(choose_plus[:, None], plus, minus)
+            sign = torch.where(
+                choose_plus,
+                torch.ones_like(plus_cost),
+                -torch.ones_like(plus_cost),
+            )
+            return centre + (endpoint - centre) * sign[:, None]
+
+        right = one_axis(0)
+        down = one_axis(1)
+        scales, quaternion = self._jacobian_frame(
+            centre, right, down
+        )
+        return centre, scales, quaternion
+
     def _live_rows(self, surface):
         device = surface.get_xyz.device
         topology = self._topology(device)
@@ -918,6 +999,11 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
             topology,
         )
 
+    def live_surface_rows(self, surface) -> torch.Tensor:
+        """Public row-order contract for renderer footprint feedback."""
+        primitive, _, _ = self._live_rows(surface)
+        return primitive
+
     def _bound_geometry(self, surface):
         primitive, atlas_row, topology = self._live_rows(surface)
         if not len(primitive):
@@ -926,33 +1012,10 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         uv = topology["uv"][atlas_row]
         half = topology["half_uv"][atlas_row]
         fallback = topology["base_rho"][atlas_row]
-        centre, _ = self._points(chart_id, uv, fallback)
-        right_uv = uv.clone()
-        right_sign = torch.where(
-            uv[:, 0] + half[:, 0] <= 1.0,
-            torch.ones_like(uv[:, 0]),
-            -torch.ones_like(uv[:, 0]),
-        )
-        right_uv[:, 0] = (
-            right_uv[:, 0] + right_sign * half[:, 0]
-        ).clamp(0, 1)
-        down_uv = uv.clone()
-        down_sign = torch.where(
-            uv[:, 1] + half[:, 1] <= 1.0,
-            torch.ones_like(uv[:, 1]),
-            -torch.ones_like(uv[:, 1]),
-        )
-        down_uv[:, 1] = (
-            down_uv[:, 1] + down_sign * half[:, 1]
-        ).clamp(0, 1)
-        right, _ = self._points(chart_id, right_uv, fallback)
-        down, _ = self._points(chart_id, down_uv, fallback)
-        # Convert backward boundary differences back to the positive UV
-        # derivative convention so normals do not flip at the atlas border.
-        right = centre + (right - centre) * right_sign[:, None]
-        down = centre + (down - centre) * down_sign[:, None]
-        scales, quaternion = self._jacobian_frame(
-            centre, right, down
+        centre, scales, quaternion = (
+            LearnableInverseDepthAtlas._local_chart_geometry(
+                self, chart_id, uv, half, fallback
+            )
         )
         # The atlas remains geometrically trainable after a validated rigid
         # handoff, including when free surface xyz/scale/rotation are frozen
@@ -964,6 +1027,22 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         # cells to reach tens of metres and become low-frequency paint
         # layers.
         scales = scales.clamp_max(self.maximum_tangent_scale)
+        # ``surface._scaling`` is the persistent per-cell bandwidth ceiling.
+        # Screen-space repair is written there after the rasterizer reports
+        # an oversized footprint.  Ignoring it here made every such repair a
+        # one-step no-op because the next live-atlas forward replaced the
+        # repaired scale with the raw Jacobian again.  Taking the minimum
+        # keeps the atlas authoritative for depth/orientation while allowing
+        # measured multi-view screen evidence to impose a durable ceiling.
+        persistent_scale_ceiling = getattr(surface, "get_scaling", None)
+        if persistent_scale_ceiling is not None:
+            persistent_scale_ceiling = persistent_scale_ceiling[primitive]
+            if persistent_scale_ceiling.shape != scales.shape:
+                raise RuntimeError(
+                    "Chart surface scale ceiling no longer aligns with "
+                    "live atlas rows"
+                )
+            scales = torch.minimum(scales, persistent_scale_ceiling)
         return primitive, atlas_row, (centre, scales, quaternion)
 
     def geometry_override(self, surface):
@@ -1111,42 +1190,17 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         )
         child_chart = parent_chart.repeat_interleave(4)
         child_fallback = parent_base_rho.repeat_interleave(4)
-        child_xyz, _ = self._points(
-            child_chart, child_uv, child_fallback
-        )
         child_half = parent_half.repeat_interleave(4, dim=0) * 0.5
-        right_uv = child_uv.clone()
-        right_sign = torch.where(
-            child_uv[:, 0] + child_half[:, 0] <= 1.0,
-            torch.ones_like(child_uv[:, 0]),
-            -torch.ones_like(child_uv[:, 0]),
-        )
-        right_uv[:, 0] = (
-            right_uv[:, 0] + right_sign * child_half[:, 0]
-        ).clamp(0, 1)
-        down_uv = child_uv.clone()
-        down_sign = torch.where(
-            child_uv[:, 1] + child_half[:, 1] <= 1.0,
-            torch.ones_like(child_uv[:, 1]),
-            -torch.ones_like(child_uv[:, 1]),
-        )
-        down_uv[:, 1] = (
-            down_uv[:, 1] + down_sign * child_half[:, 1]
-        ).clamp(0, 1)
-        child_right, _ = self._points(
-            child_chart, right_uv, child_fallback
-        )
-        child_down, _ = self._points(
-            child_chart, down_uv, child_fallback
-        )
-        child_right = child_xyz + (
-            child_right - child_xyz
-        ) * right_sign[:, None]
-        child_down = child_xyz + (
-            child_down - child_xyz
-        ) * down_sign[:, None]
-        child_scale, child_rotation = self._jacobian_frame(
-            child_xyz, child_right, child_down
+        (
+            child_xyz,
+            child_scale,
+            child_rotation,
+        ) = LearnableInverseDepthAtlas._local_chart_geometry(
+            self,
+            child_chart,
+            child_uv,
+            child_half,
+            child_fallback,
         )
         child_scale = child_scale.clamp_max(
             float(

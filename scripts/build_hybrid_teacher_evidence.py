@@ -26,6 +26,9 @@ from outdoor.inverse_depth import (  # noqa: E402
     fuse_inverse_depth_directory,
 )
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
+from outdoor.projected_role_posterior import (  # noqa: E402
+    build_projected_rigid_conflict_posterior,
+)
 from outdoor.scene_contract import build_scene_contract  # noqa: E402
 from outdoor.task_semantics import build_task_semantic_manifest  # noqa: E402
 
@@ -108,6 +111,15 @@ def main() -> None:
     parser.add_argument("--mast3r-scene", type=Path, required=True)
     parser.add_argument("--mast3r-tracks", type=Path, required=True)
     parser.add_argument("--chart-consensus", type=Path, required=True)
+    parser.add_argument(
+        "--rgb-root",
+        type=Path,
+        help=(
+            "Exact fixed-camera RGB raster used by training. It is used "
+            "only to calibrate current-view appearance visibility in the "
+            "projected rigid posterior; geometry support is RGB independent."
+        ),
+    )
     parser.add_argument("--dav2-root", type=Path)
     parser.add_argument(
         "--sfm-coverage-sparse",
@@ -134,6 +146,13 @@ def main() -> None:
     chart_consensus = args.chart_consensus.expanduser().resolve()
     mask = args.mask_pickle.expanduser().resolve()
     tree_mask = args.tree_mask_pickle.expanduser().resolve()
+    rgb_root = (
+        args.rgb_root.expanduser().resolve()
+        if args.rgb_root is not None
+        else (dataset / "images").resolve()
+    )
+    if not rgb_root.is_dir():
+        raise FileNotFoundError(rgb_root)
 
     # This validation is intentionally repeated at the evidence boundary.
     # Supplying a one-observation sparse export under the expected filename
@@ -162,9 +181,17 @@ def main() -> None:
         "independent_semantic_fields": True,
         "separate_surface_foliage_sky_models": True,
         "tree_handling": (
-            "static_skeleton_canonical_crown_sequence_conditioned_leaf"
+            "multiview_static_skeleton_persistent_crown_envelope_and_"
+            "unconditional_static_detail"
         ),
     }
+    semantic["class_availability"].update(
+        {
+            "tree_surface": "mast3r_cross_sequence_track_posterior",
+            "trunk": "mast3r_local_line_geometry_soft_subrole",
+            "branch": "mast3r_local_line_geometry_soft_subrole",
+        }
+    )
     semantic_contract.write_text(
         json.dumps(semantic, indent=2) + "\n", encoding="utf-8"
     )
@@ -227,6 +254,48 @@ def main() -> None:
         covariance="fixed_ray_information_inverse",
         semantic_role="per_track_role_posterior",
         validity="same immutable file as mast3r_multiview_tracks",
+    )
+    projected_rigid_posterior = (
+        output / "projected_rigid_conflict_posterior.npz"
+    )
+    projected_rigid_summary = build_projected_rigid_conflict_posterior(
+        tracks,
+        scene_contract,
+        dataset,
+        tree_mask,
+        projected_rigid_posterior,
+        rgb_root=rgb_root,
+    )
+    builder.add_file(
+        "projected_rigid_conflict_posterior",
+        "mast3r_all_fixed_camera_rigid_projection",
+        projected_rigid_posterior,
+        measurement=(
+            "ragged all-camera stable rigid geometry and current-RGB "
+            "visibility posterior at object/sky/tree mask conflicts"
+        ),
+        coordinate_frame="fixed_camera_mask_raster_pixels",
+        covariance=(
+            "track_reprojection_baseline_cycle_stability_and_robust_"
+            "appearance_consistency"
+        ),
+        semantic_role="positive_rigid_rescue_and_occluded_background_support",
+        validity=(
+            "cross-sequence stable tracks; nearest stable depth; geometry "
+            "support is distinct from current-image visibility"
+        ),
+    )
+    builder.add_file(
+        "projected_rigid_conflict_posterior_summary",
+        "mast3r_all_fixed_camera_rigid_projection",
+        projected_rigid_posterior.with_suffix(".json"),
+        measurement="projection coverage, mass and immutable input audit",
+        coordinate_frame="metadata",
+        covariance="documented_in_summary",
+        semantic_role="audit",
+        validity=(
+            f"{projected_rigid_summary['camera_count']} fixed cameras"
+        ),
     )
     builder.add_file(
         "mast3r_track_gate",

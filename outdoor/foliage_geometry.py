@@ -2638,6 +2638,13 @@ def build_instance_aware_canopy_volume(
         int(row["image_id"]): row
         for row in dense_ray_per_view_audit
     }
+    center_rows_by_instance = {
+        int(instance): np.flatnonzero(center_instances == instance)
+        for instance in np.unique(center_instances)
+    }
+    candidate_view_pairs_total = int(count * len(selected))
+    candidate_view_pairs_instance_relevant = 0
+    candidate_view_pairs_mask_matched = 0
     for view_index, view in enumerate(selected):
         image_id = int(view["image_id"])
         observed = _incidence_mask(
@@ -2647,38 +2654,81 @@ def build_instance_aware_canopy_volume(
             len(track_images),
         )
         raster_instance = dense_instance_rasters.pop(image_id)
-        u, v, depth, valid = _project(centers, view)
+        active_rows = _candidate_rows_for_visible_tree_instances(
+            raster_instance, center_rows_by_instance
+        )
+        candidate_view_pairs_instance_relevant += int(len(active_rows))
+        # Cameras without this physical tree instance are neither positive
+        # nor negative evidence for its candidates.  Projecting every centre
+        # into every fixed camera previously made all-camera coverage both
+        # O(N*V) and statistically wrong: unrelated frusta accumulated as
+        # thousands of ``unknown`` observations, forcing the optical prior to
+        # its minimum as the camera set grew.
+        u = np.full(count, np.nan, dtype=np.float64)
+        v = np.full(count, np.nan, dtype=np.float64)
+        depth = np.full(count, np.nan, dtype=np.float64)
+        valid = np.zeros(count, dtype=bool)
+        if len(active_rows):
+            (
+                active_u,
+                active_v,
+                active_depth,
+                active_valid,
+            ) = _project(centers[active_rows], view)
+            u[active_rows] = active_u
+            v[active_rows] = active_v
+            depth[active_rows] = active_depth
+            valid[active_rows] = active_valid
         mask_height, mask_width = raster_instance.shape
-        rows = np.clip(
-            np.round(v / view["height"] * mask_height).astype(int),
-            0,
-            mask_height - 1,
-        )
-        cols = np.clip(
-            np.round(u / view["width"] * mask_width).astype(int),
-            0,
-            mask_width - 1,
-        )
-        matched_instance = (
-            raster_instance[rows, cols] == center_instances
+        matched_instance = np.zeros(count, dtype=bool)
+        if len(active_rows):
+            active_mask_rows = np.clip(
+                np.round(
+                    active_v / view["height"] * mask_height
+                ).astype(int),
+                0,
+                mask_height - 1,
+            )
+            active_mask_cols = np.clip(
+                np.round(
+                    active_u / view["width"] * mask_width
+                ).astype(int),
+                0,
+                mask_width - 1,
+            )
+            matched_instance[active_rows] = (
+                raster_instance[active_mask_rows, active_mask_cols]
+                == center_instances[active_rows]
+            )
+        candidate_view_pairs_mask_matched += int(
+            (valid & matched_instance).sum()
         )
 
         rigid = rigid_depth_maps.get(image_id)
         if rigid is not None:
             rigid = np.asarray(rigid)
-            rigid_rows = np.clip(
-                np.round(v / view["height"] * rigid.shape[0]).astype(int),
-                0,
-                rigid.shape[0] - 1,
-            )
-            rigid_cols = np.clip(
-                np.round(u / view["width"] * rigid.shape[1]).astype(int),
-                0,
-                rigid.shape[1] - 1,
-            )
-            rigid_depth = rigid[rigid_rows, rigid_cols]
+            rigid_depth = np.full(count, np.inf, dtype=np.float64)
+            if len(active_rows):
+                rigid_rows = np.clip(
+                    np.round(
+                        active_v / view["height"] * rigid.shape[0]
+                    ).astype(int),
+                    0,
+                    rigid.shape[0] - 1,
+                )
+                rigid_cols = np.clip(
+                    np.round(
+                        active_u / view["width"] * rigid.shape[1]
+                    ).astype(int),
+                    0,
+                    rigid.shape[1] - 1,
+                )
+                rigid_depth[active_rows] = rigid[
+                    rigid_rows, rigid_cols
+                ]
             occluded = (
                 valid
+                & matched_instance
                 & np.isfinite(rigid_depth)
                 & (rigid_depth > 0)
                 & (rigid_depth + float(occlusion_margin) < depth)
@@ -2764,7 +2814,13 @@ def build_instance_aware_canopy_volume(
             # outside this traversal's observed crown. Only a measured
             # in-front-of-posterior violation is a true negative.
         )
-        ambiguous = valid & ~(supported | confirmed_negative)
+        ambiguous = _posterior_unknown_mask(
+            valid,
+            matched_instance,
+            supported,
+            confirmed_negative,
+            occluded,
+        )
         ray_valid = valid & posterior_found & matched_instance
         ray_indices = np.nonzero(ray_valid)[0]
         candidate_observation_type = np.zeros(count, dtype=np.int8)
@@ -2844,7 +2900,7 @@ def build_instance_aware_canopy_volume(
         positive += supported.astype(np.int16)
         depth_support += compatible.astype(np.int16)
         negative += confirmed_negative.astype(np.int16)
-        unknown += (ambiguous | occluded).astype(np.int16)
+        unknown += ambiguous.astype(np.int16)
         # Persist the exact confirmed-negative semantics used by the ray
         # likelihood.  Accumulating raw ``free`` here used to count invalid
         # and occluded projections as contradictions; the first adaptive
@@ -3189,10 +3245,77 @@ def build_instance_aware_canopy_volume(
                 bound_ray_truncated_view_count
             ),
         },
+        "candidate_view_pair_audit": {
+            "contract": (
+                "same_physical_tree_instance_is_required_before_a_camera_"
+                "may_update_hit_free_or_unknown_posterior"
+            ),
+            "cartesian_pairs": candidate_view_pairs_total,
+            "instance_relevant_pairs": int(
+                candidate_view_pairs_instance_relevant
+            ),
+            "mask_matched_in_frustum_pairs": int(
+                candidate_view_pairs_mask_matched
+            ),
+            "unrelated_camera_pairs_count_as_unknown": False,
+        },
         "tree_instance_count": int(center_instances.max()) + 1,
         "rigid_depth_view_count": len(rigid_depth_maps),
         "ray_evidence": ray_evidence,
     }
+
+
+def _posterior_unknown_mask(
+    valid,
+    matched_instance,
+    supported,
+    confirmed_negative,
+    occluded,
+):
+    """Return informative-but-unresolved observations for one tree owner.
+
+    A camera contributes posterior normalization only after the candidate
+    projects into the mask component assigned to the same physical tree
+    instance.  Absence of that instance from an unrelated traversal is no
+    measurement at all, not an ``unknown`` vote.
+    """
+    valid = np.asarray(valid, dtype=bool)
+    matched_instance = np.asarray(matched_instance, dtype=bool)
+    supported = np.asarray(supported, dtype=bool)
+    confirmed_negative = np.asarray(confirmed_negative, dtype=bool)
+    occluded = np.asarray(occluded, dtype=bool)
+    shape = valid.shape
+    if any(
+        value.shape != shape
+        for value in (
+            matched_instance,
+            supported,
+            confirmed_negative,
+            occluded,
+        )
+    ):
+        raise ValueError("Foliage posterior masks must have one shape")
+    considered = valid & matched_instance
+    return considered & ~(
+        supported | confirmed_negative
+    )
+
+
+def _candidate_rows_for_visible_tree_instances(
+    instance_raster: np.ndarray,
+    center_rows_by_instance: dict[int, np.ndarray],
+) -> np.ndarray:
+    """Return only candidates whose physical tree is present in this view."""
+    raster = np.asarray(instance_raster)
+    visible_instances = np.unique(raster[raster >= 0])
+    parts = [
+        np.asarray(center_rows_by_instance[int(instance)], dtype=np.int64)
+        for instance in visible_instances
+        if int(instance) in center_rows_by_instance
+    ]
+    if not parts:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(parts)
 
 
 def _project(points, view):
