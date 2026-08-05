@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -428,6 +429,18 @@ def test_temporal_dav2_alignment_audits_missing_camera_names(tmp_path):
     assert audit["dav2_source_camera_count"] == 1
     assert audit["unmapped_camera_ids"] == [7]
     assert audit["recovered_alignment_count"] == 0
+
+
+def test_temporal_augmentation_iterates_fixed_camera_contract():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/augment_temporal_dav2_foliage.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'candidate_views = coverage_payload["audit"].get(' in source
+    assert '"fixed_camera_sequences", selected_views' in source
+    assert "for selected in candidate_views:" in source
+    assert '"identity_noop": not bool(added_births)' in source
 
 
 def test_zero_foliage_view_limit_reaches_all_fixed_camera_selection_layer():

@@ -535,6 +535,17 @@ def main() -> None:
     }
     next_track = int(payload["track_id"].min()) - 1
     per_view_audit = []
+    candidate_views = coverage_payload["audit"].get(
+        "fixed_camera_sequences", selected_views
+    )
+    candidate_audit = {
+        "candidate_camera_count": int(len(candidate_views)),
+        "existing_dense_ray_camera_count": 0,
+        "missing_two_sided_alignment_count": 0,
+        "missing_depth_or_camera_record_count": 0,
+        "empty_tree_depth_support_count": 0,
+        "outside_canonical_distance_count": 0,
+    }
     target_names = {
         "seq1__frame00075.png",
         "seq1__frame00076.png",
@@ -542,11 +553,12 @@ def main() -> None:
         "seq1__frame00079.png",
     }
 
-    for selected in selected_views:
+    for selected in candidate_views:
         name = str(selected["image_name"])
         camera_id = int(selected["image_id"])
         dense = dense_by_camera.get(camera_id, {})
         if int(dense.get("accepted_rays", 0)) > 0:
+            candidate_audit["existing_dense_ray_camera_count"] += 1
             continue
         interpolation = _temporal_interpolation(
             name,
@@ -554,10 +566,12 @@ def main() -> None:
             maximum_gap=args.maximum_temporal_gap,
         )
         if interpolation is None:
+            candidate_audit["missing_two_sided_alignment_count"] += 1
             continue
         depth_record = dav2_records.get(Path(name).stem)
         image_item = image_by_name.get(name)
         if depth_record is None or image_item is None:
+            candidate_audit["missing_depth_or_camera_record_count"] += 1
             continue
         image_id, image = image_item
         if image_id != camera_id:
@@ -595,6 +609,7 @@ def main() -> None:
         )
         rows, columns = np.nonzero(valid)
         if not len(rows):
+            candidate_audit["empty_tree_depth_support_count"] += 1
             continue
         camera = cameras[int(image["camera_id"])]
         fx, fy, cx, cy = _camera_parameters(camera, ordinal.shape)
@@ -616,6 +631,7 @@ def main() -> None:
             for value in (rows, columns, z, world, nearest, distance)
         )
         if not len(rows):
+            candidate_audit["outside_canonical_distance_count"] += 1
             continue
 
         with Image.open(rgb_root / name) as handle:
@@ -878,8 +894,10 @@ def main() -> None:
 
     added_births = int(sum(row["births"] for row in per_view_audit))
     added_rays = int(sum(row["rays"] for row in per_view_audit))
-    if not added_births or not added_rays:
-        raise RuntimeError("No temporal DAV2 witnesses were generated")
+    if bool(added_births) != bool(added_rays):
+        raise RuntimeError(
+            "Temporal DAV2 augmentation must add births and rays together"
+        )
     for key, rows in tensor_rows.items():
         if rows:
             payload[key] = torch.cat([payload[key], *rows], dim=0)
@@ -927,12 +945,14 @@ def main() -> None:
         "producer_implementation_sha256": _sha256(Path(__file__)),
         "accepted_alignment_cache_count": int(len(alignment)),
         "alignment_camera_contract": alignment_camera_audit,
+        "candidate_camera_audit": candidate_audit,
         "interpolated_view_count": int(len(per_view_audit)),
         "added_dynamic_birth_count": added_births,
         "added_ownerless_hit_ray_count": added_rays,
         "canonical_birth_count": 0,
         "localization_landmark_count": 0,
         "same_sequence_two_sided_only": True,
+        "identity_noop": not bool(added_births),
         "selection_contract": (
             "deterministic_image_grid_plus_k_center_coverage__"
             "three_quarter_coverage_one_quarter_rgb_detail__"
