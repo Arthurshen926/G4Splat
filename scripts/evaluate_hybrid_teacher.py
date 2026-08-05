@@ -732,7 +732,6 @@ def _assert_rgb_source_contract(
     if not expected:
         return actual, False
     identity_fields = [
-        "image_root",
         "image_count",
         "name_set_sha256",
         "producer_manifest_sha256",
@@ -744,6 +743,13 @@ def _assert_rgb_source_contract(
     # merely the set of filenames) are unchanged at evaluation.
     if expected.get("content_mapping_sha256") is not None:
         identity_fields.extend(("content_mapping_sha256", "content_bytes"))
+    else:
+        # Legacy contracts have no byte-addressed mapping, so the resolved
+        # source path remains their only protection against replacing the
+        # raster contents under an identical filename set.  New contracts
+        # are content addressed and may be relocated between equivalent
+        # storage tiers without turning an exact evaluation into an override.
+        identity_fields.append("image_root")
     matched = all(expected.get(key) == actual.get(key) for key in identity_fields)
     if not matched and not allow_override:
         raise RuntimeError(

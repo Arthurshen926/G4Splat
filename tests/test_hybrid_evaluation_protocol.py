@@ -10,6 +10,7 @@ from scripts.evaluate_hybrid_teacher import (
     _assert_camera_geometry_contract,
     _assert_localization_query_contract,
     _assert_query_rgb_compatibility,
+    _assert_rgb_source_contract,
     _assert_resolution_contract,
     _assert_semantic_contract,
     _conditioned_visit_counts,
@@ -537,6 +538,72 @@ def test_query_rgb_requires_training_raster_convention():
                 "target_storage": "shared_uint8",
                 "canonical_image_size_wh": [1920, 1080],
             },
+        )
+
+
+def test_byte_addressed_rgb_contract_allows_exact_storage_relocation():
+    expected = {
+        "image_root": "/network/rgb",
+        "image_count": 2,
+        "name_set_sha256": "names",
+        "content_mapping_sha256": "bytes",
+        "content_bytes": 123,
+        "producer_manifest_sha256": "producer",
+        "target_storage": "shared_uint8",
+        "canonical_image_size_wh": [640, 360],
+    }
+    actual = dict(expected, image_root="/local/cache/rgb")
+    returned, matched = _assert_rgb_source_contract(
+        {"training_contract": {"rgb_source": expected}},
+        None,
+        allow_override=False,
+        actual=actual,
+    )
+    assert matched
+    assert returned == actual
+
+
+def test_byte_addressed_rgb_contract_rejects_changed_raster_bytes():
+    expected = {
+        "image_root": "/network/rgb",
+        "image_count": 2,
+        "name_set_sha256": "names",
+        "content_mapping_sha256": "bytes-a",
+        "content_bytes": 123,
+        "producer_manifest_sha256": "producer",
+        "target_storage": "shared_uint8",
+        "canonical_image_size_wh": [640, 360],
+    }
+    actual = dict(
+        expected,
+        image_root="/local/cache/rgb",
+        content_mapping_sha256="bytes-b",
+    )
+    with pytest.raises(RuntimeError, match="RGB targets differ"):
+        _assert_rgb_source_contract(
+            {"training_contract": {"rgb_source": expected}},
+            None,
+            allow_override=False,
+            actual=actual,
+        )
+
+
+def test_legacy_rgb_contract_keeps_source_path_as_identity():
+    expected = {
+        "image_root": "/network/rgb",
+        "image_count": 2,
+        "name_set_sha256": "names",
+        "producer_manifest_sha256": "producer",
+        "target_storage": "shared_uint8",
+        "canonical_image_size_wh": [640, 360],
+    }
+    actual = dict(expected, image_root="/local/cache/rgb")
+    with pytest.raises(RuntimeError, match="RGB targets differ"):
+        _assert_rgb_source_contract(
+            {"training_contract": {"rgb_source": expected}},
+            None,
+            allow_override=False,
+            actual=actual,
         )
 
 
