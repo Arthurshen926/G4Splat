@@ -53,9 +53,9 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
         "native-rigid-depth-calibrated-continuous-all-camera-posterior"
         in PIPELINE_VERSION
     )
-    assert profile["selected_foliage_views"] == 0
+    assert profile["selected_foliage_views"] == 384
     assert profile["maximum_dense_rays_per_foliage_view"] == 2_048
-    assert profile["maximum_dense_rays_total"] == 1_572_864
+    assert profile["maximum_dense_rays_total"] == 786_432
     assert profile["minimum_dense_rays_per_foliage_view"] == 512
     assert profile["maximum_bound_rays_per_foliage_view"] == 8_192
     assert profile["maximum_dynamic_births_per_foliage_view"] == 384
@@ -125,7 +125,7 @@ def test_fast_profile_shortens_training_without_halving_foliage_evidence():
     quality = PROFILES["quality"]
 
     assert fast["iterations"] < quality["iterations"]
-    assert fast["selected_foliage_views"] == 0
+    assert fast["selected_foliage_views"] == 384
     assert (
         fast["selected_foliage_views"]
         == quality["selected_foliage_views"]
@@ -133,7 +133,7 @@ def test_fast_profile_shortens_training_without_halving_foliage_evidence():
     assert (
         fast["maximum_dense_rays_total"]
         == quality["maximum_dense_rays_total"]
-        == 1_572_864
+        == 786_432
     )
     assert fast["training_profile"] == "static_handoff_fast"
     assert fast["use_temporal_dav2_witnesses"] is True

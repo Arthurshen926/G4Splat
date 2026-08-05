@@ -46,7 +46,8 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v48-local-negative-permission-"
+    "cambridge-native-hybrid-teacher-mainline-v49-positive-tree-view-budget-"
+    "local-negative-permission-"
     "topology-stable-polish-native-rigid-depth-"
     "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
     "static-role-posterior-mask-soft-arbitration-atlas-residual-"
@@ -110,13 +111,16 @@ PROFILES = {
         "dav2_rigid_selected_views": 512,
         "dav2_rigid_seeds_per_view": 384,
         "dav2_rigid_cross_sequence_radius": 0.25,
-        # Cover every fixed database camera that has measured tree support.
-        # The global row budget remains fixed; per-view caps trade redundant
-        # keyframe density for exact owner/depth coverage on interpolation
-        # views instead of forcing them through a temporal fallback.
-        "selected_foliage_views": 0,
+        # The posterior is defined only on cameras containing a physical tree
+        # instance.  Select a broad, balanced subset of those positive views;
+        # all 1,487 cameras still supervise RGB and global negative evidence,
+        # but cameras unrelated to a tree are not fabricated as depth
+        # measurements for that tree.  The 256-view contract audit was stable;
+        # 384 retains additional interpolation/target coverage without the
+        # all-camera Cartesian-product cost.
+        "selected_foliage_views": 384,
         "maximum_dense_rays_per_foliage_view": 2_048,
-        "maximum_dense_rays_total": 1_572_864,
+        "maximum_dense_rays_total": 786_432,
         "minimum_dense_rays_per_foliage_view": 512,
         # All-camera coverage must augment rather than thin the previously
         # validated free/hit basis.  The 2,048 cap reduced candidate-bound
@@ -195,12 +199,13 @@ PROFILES = {
         "dav2_rigid_selected_views": 128,
         "dav2_rigid_seeds_per_view": 160,
         "dav2_rigid_cross_sequence_radius": 0.25,
-        # ``fast`` shortens optimization, not the fixed-camera evidence
-        # manifold. Zero selects all database cameras while preserving the
-        # same global posterior-row budget as quality.
-        "selected_foliage_views": 0,
+        # ``fast`` shortens optimization, not the physical evidence contract.
+        # Match quality's balanced positive-view manifold so it remains a
+        # faithful prefix experiment rather than an all-camera negative-
+        # evidence variant.
+        "selected_foliage_views": 384,
         "maximum_dense_rays_per_foliage_view": 2_048,
-        "maximum_dense_rays_total": 1_572_864,
+        "maximum_dense_rays_total": 786_432,
         "minimum_dense_rays_per_foliage_view": 512,
         "maximum_bound_rays_per_foliage_view": 8_192,
         "maximum_dynamic_births_per_foliage_view": 384,
