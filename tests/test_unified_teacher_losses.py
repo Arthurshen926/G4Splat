@@ -38,6 +38,7 @@ from scripts.train_unified_outdoor_teacher import (
     _branch_isolated_rgb_losses,
     _bounded_surface_retirement_fractions,
     _canopy_topology_signal,
+    _checkpoint_due,
     _confirmed_contradiction_fraction,
     _complete_evidence_epoch_batch_size,
     _continued_surface_iteration,
@@ -1189,6 +1190,24 @@ def test_retained_checkpoint_snapshot_survives_rolling_replace(tmp_path):
     replacement.replace(rolling)
     assert rolling.read_bytes() == b"iteration-13000"
     assert snapshot.read_bytes() == b"iteration-12000"
+
+
+def test_early_checkpoint_cadence_bounds_pre_milestone_loss():
+    common = {
+        "final_iteration": 30_000,
+        "checkpoint_every": 3_000,
+        "early_checkpoint_every": 1_000,
+        "early_checkpoint_until": 2_000,
+        "retained_iterations": {3_000, 6_000},
+    }
+    assert _checkpoint_due(1_000, **common)
+    assert _checkpoint_due(2_000, **common)
+    assert _checkpoint_due(3_000, **common)
+    assert not _checkpoint_due(2_450, **common)
+    assert _checkpoint_due(
+        2_450, **common, graceful_stop_requested=True
+    )
+    assert _checkpoint_due(30_000, **common)
 
 
 def test_adaptive_geometry_scale_targets_bounded_gradient_ratio():

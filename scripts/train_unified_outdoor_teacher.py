@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import random
+import signal
 from pathlib import Path
 import sys
 import time
@@ -1570,6 +1571,25 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--early-checkpoint-every",
+        type=int,
+        default=0,
+        help=(
+            "Optional denser rolling-checkpoint cadence before the first "
+            "normal milestone. This changes only failure recovery, never "
+            "the optimization schedule."
+        ),
+    )
+    parser.add_argument(
+        "--early-checkpoint-until",
+        type=int,
+        default=0,
+        help=(
+            "Inclusive last iteration for --early-checkpoint-every. Both "
+            "arguments must be zero or both must be positive."
+        ),
+    )
+    parser.add_argument(
         "--retain-checkpoint-iterations",
         type=int,
         nargs="*",
@@ -2032,6 +2052,23 @@ def _parse_args():
         parser.error("--image-prefetch-depth must be non-negative")
     if args.maintenance_every < 0:
         parser.error("--maintenance-every must be non-negative")
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
+    if args.early_checkpoint_every < 0:
+        parser.error("--early-checkpoint-every must be non-negative")
+    if args.early_checkpoint_until < 0:
+        parser.error("--early-checkpoint-until must be non-negative")
+    if bool(args.early_checkpoint_every) != bool(
+        args.early_checkpoint_until
+    ):
+        parser.error(
+            "--early-checkpoint-every and --early-checkpoint-until must "
+            "both be zero or both be positive"
+        )
+    if args.early_checkpoint_until > args.iterations:
+        parser.error(
+            "--early-checkpoint-until cannot exceed --iterations"
+        )
     retained = tuple(
         sorted(set(int(value) for value in args.retain_checkpoint_iterations))
     )
@@ -2222,6 +2259,49 @@ def _surface_capture_to_device(capture, device: torch.device):
 def _save_checkpoint(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _checkpoint_due(
+    iteration: int,
+    *,
+    final_iteration: int,
+    checkpoint_every: int,
+    early_checkpoint_every: int = 0,
+    early_checkpoint_until: int = 0,
+    retained_iterations: set[int] | frozenset[int] = frozenset(),
+    graceful_stop_requested: bool = False,
+) -> bool:
+    """Return whether the exact live state must be atomically persisted.
+
+    The early cadence is deliberately absent from the optimization contract:
+    serializing state cannot change camera order, gradients, or topology. It
+    only bounds recomputation before the first multi-GiB quality milestone.
+    """
+
+    iteration = int(iteration)
+    return bool(
+        graceful_stop_requested
+        or iteration == int(final_iteration)
+        or iteration in retained_iterations
+        or (
+            int(checkpoint_every) > 0
+            and iteration % int(checkpoint_every) == 0
+        )
+        or (
+            int(early_checkpoint_every) > 0
+            and iteration <= int(early_checkpoint_until)
+            and iteration % int(early_checkpoint_every) == 0
+        )
+    )
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     temporary.replace(path)
 
 
@@ -13647,6 +13727,33 @@ def main():
 
     trace = output / "training_trace.jsonl"
     started = time.time()
+    graceful_stop: dict[str, int | str | float] = {}
+
+    def request_graceful_stop(signum, _frame) -> None:
+        # A Python signal handler must remain side-effect free with respect to
+        # CUDA and torch serialization. The training loop observes this flag
+        # only after the current optimizer/topology transaction is complete,
+        # then writes the same atomic checkpoint used by normal milestones.
+        if graceful_stop:
+            return
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(int(signum))
+        graceful_stop.update(
+            {
+                "signal": name,
+                "signal_number": int(signum),
+                "requested_at_unix": float(time.time()),
+            }
+        )
+
+    for stop_signal in (
+        signal.SIGHUP,
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+        signal.signal(stop_signal, request_graceful_stop)
     geometry_audit_warnings: set[str] = set()
     # These audits are normally overwritten after every optimizer step.  A
     # checkpoint resumed exactly at its requested stop iteration executes no
@@ -16901,10 +17008,16 @@ def main():
             )
         iteration = step + 1
         retain_checkpoint = iteration in retained_checkpoint_iterations
-        if (
-            args.checkpoint_every > 0
-            and iteration % args.checkpoint_every == 0
-        ) or retain_checkpoint or iteration == args.iterations:
+        graceful_stop_requested = bool(graceful_stop)
+        if _checkpoint_due(
+            iteration,
+            final_iteration=args.iterations,
+            checkpoint_every=args.checkpoint_every,
+            early_checkpoint_every=args.early_checkpoint_every,
+            early_checkpoint_until=args.early_checkpoint_until,
+            retained_iterations=retained_checkpoint_iterations,
+            graceful_stop_requested=graceful_stop_requested,
+        ):
             rolling_checkpoint = (
                 output / "hybrid_teacher_checkpoint.pth"
             )
@@ -17006,6 +17119,24 @@ def main():
                 _retain_checkpoint_snapshot(
                     rolling_checkpoint, iteration
                 )
+            if graceful_stop_requested:
+                interrupted_state = {
+                    "status": "interrupted_checkpointed",
+                    "iteration": int(iteration),
+                    "checkpoint": str(rolling_checkpoint),
+                    "checkpoint_atomic": True,
+                    "resume_required": True,
+                    **graceful_stop,
+                }
+                _write_json_atomic(
+                    output / "interrupted_training_state.json",
+                    interrupted_state,
+                )
+                print(
+                    "Graceful stop checkpointed at iteration "
+                    f"{iteration}: {graceful_stop['signal']}",
+                    flush=True,
+                )
         del package, canonical, target
         if (
             args.maintenance_every > 0
@@ -17017,6 +17148,16 @@ def main():
         # previously serialized the entire pipeline and defeated reuse.
         if topology_event is not None:
             torch.cuda.empty_cache()
+        if graceful_stop_requested:
+            progress.close()
+            # Conventional 128+signal status tells a supervising runner that
+            # training did not finish, while the atomic checkpoint and state
+            # sidecar prove that it is safe to resume.
+            raise SystemExit(
+                128 + int(graceful_stop["signal_number"])
+            )
+
+    (output / "interrupted_training_state.json").unlink(missing_ok=True)
 
     # Bootstrap centre-prior samplers stop being authoritative after renderer
     # witnesses are released.  Audit the permanent observation-level factors

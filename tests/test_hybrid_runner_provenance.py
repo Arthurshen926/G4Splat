@@ -200,6 +200,23 @@ def test_staged_teacher_command_closes_scale_and_rigid_lr_contract(tmp_path):
     assert command[command.index("--view-cache-size") + 1] == "2048"
     assert command[command.index("--image-prefetch-workers") + 1] == "8"
     assert command[command.index("--image-prefetch-depth") + 1] == "32"
+
+    recoverable = _teacher_command(
+        **common,
+        early_checkpoint_every=1_000,
+        early_checkpoint_until=2_000,
+        retain_checkpoint_iterations=(3_000, 6_000),
+    )
+    assert (
+        recoverable[recoverable.index("--early-checkpoint-every") + 1]
+        == "1000"
+    )
+    assert (
+        recoverable[recoverable.index("--early-checkpoint-until") + 1]
+        == "2000"
+    )
+    retained = recoverable.index("--retain-checkpoint-iterations")
+    assert recoverable[retained + 1 : retained + 3] == ["3000", "6000"]
     assert (
         command[command.index("--volume-densify-until-iteration") + 1]
         == "20000"

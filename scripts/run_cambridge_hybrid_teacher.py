@@ -84,11 +84,20 @@ PROFILES = {
         "rigid_geometry_gradient_ratio": 0.15,
         "geometry_gradient_ratio": 0.15,
         # A mixed checkpoint is roughly 1.5 GB at the current evidence/model
-        # scale. The runner keeps only the rolling file, so 1k saves spent
-        # minutes rewriting checkpoints that were never retained. Three
-        # thousand steps keeps useful 3k/6k/9k milestones and materially
-        # shortens the end-to-end quality run.
+        # scale. Keep the normal cadence at 3k, but bound pre-milestone loss
+        # with rolling 1k/2k saves; a parent PTY loss at 2.45k previously
+        # erased the complete formal prefix before any state was recoverable.
         "checkpoint_every": 3000,
+        "early_checkpoint_every": 1000,
+        "early_checkpoint_until": 2000,
+        "retain_checkpoint_iterations": (
+            3000,
+            6000,
+            12000,
+            18000,
+            24000,
+            30000,
+        ),
         "track_stride": 5,
         # Keep the complete source-resolution Chart/pointmap rasters as
         # external factors, but do not turn every sample into a renderer
@@ -189,6 +198,9 @@ PROFILES = {
         "rigid_geometry_gradient_ratio": 0.15,
         "geometry_gradient_ratio": 0.15,
         "checkpoint_every": 3000,
+        "early_checkpoint_every": 1000,
+        "early_checkpoint_until": 2000,
+        "retain_checkpoint_iterations": (3000, 6000, 12000),
         "track_stride": 7,
         "maximum_chart_seeds": 80_000,
         "chart_seeds_per_view": 3000,
@@ -233,6 +245,9 @@ PROFILES = {
         "iterations": 24_000,
         "training_profile": "hybrid_rigid_stage1",
         "checkpoint_every": 500,
+        "early_checkpoint_every": 0,
+        "early_checkpoint_until": 0,
+        "retain_checkpoint_iterations": (),
         "track_stride": 5,
         "maximum_chart_seeds": 100_000,
         "chart_seeds_per_view": 3500,
@@ -712,6 +727,9 @@ def _teacher_command(
     maximum_volume_gaussians: int,
     maximum_volume_splits: int,
     checkpoint_every: int,
+    early_checkpoint_every: int = 0,
+    early_checkpoint_until: int = 0,
+    retain_checkpoint_iterations: tuple[int, ...] = (),
     geometry_gradient_ratio: float,
     rgb_images: Path | None,
     volume_densify_until_iteration: int | None = None,
@@ -807,6 +825,20 @@ def _teacher_command(
             )
         ),
     ]
+    if int(early_checkpoint_every) > 0:
+        command.extend(
+            [
+                "--early-checkpoint-every",
+                str(int(early_checkpoint_every)),
+                "--early-checkpoint-until",
+                str(int(early_checkpoint_until)),
+            ]
+        )
+    if retain_checkpoint_iterations:
+        command.append("--retain-checkpoint-iterations")
+        command.extend(
+            str(int(value)) for value in retain_checkpoint_iterations
+        )
     if volume_densify_until_iteration is not None:
         command.extend(
             [
@@ -1915,6 +1947,15 @@ def main() -> None:
                     maximum_volume_gaussians=800_000,
                     maximum_volume_splits=1500,
                     checkpoint_every=int(profile["checkpoint_every"]),
+                    early_checkpoint_every=int(
+                        profile.get("early_checkpoint_every", 0)
+                    ),
+                    early_checkpoint_until=int(
+                        profile.get("early_checkpoint_until", 0)
+                    ),
+                    # Rigid pretraining already exports its final handoff and
+                    # does not need all mixed-stage comparison snapshots.
+                    retain_checkpoint_iterations=(),
                     geometry_gradient_ratio=float(
                         profile["rigid_geometry_gradient_ratio"]
                     ),
@@ -2305,6 +2346,18 @@ def main() -> None:
                 maximum_volume_gaussians=args.maximum_volume_gaussians,
                 maximum_volume_splits=args.maximum_volume_splits,
                 checkpoint_every=int(profile["checkpoint_every"]),
+                early_checkpoint_every=int(
+                    profile.get("early_checkpoint_every", 0)
+                ),
+                early_checkpoint_until=int(
+                    profile.get("early_checkpoint_until", 0)
+                ),
+                retain_checkpoint_iterations=tuple(
+                    int(value)
+                    for value in profile.get(
+                        "retain_checkpoint_iterations", ()
+                    )
+                ),
                 geometry_gradient_ratio=float(
                     profile["geometry_gradient_ratio"]
                 ),
