@@ -4357,12 +4357,14 @@ def _resume_training_contract_differences(
             _immutable_ray_epoch_capacity(current_ray)
         )
 
-    # ``joint`` owns every live surface row symmetrically. A replacing split
-    # or evidence-mature prune changes the compacted row count but does not
-    # create a rigid-prefix/completion-suffix ownership boundary. Treat that
-    # diagnostic count as runtime state for exact-prefix resume. The
-    # partition remains immutable for policies that actually use it to freeze
-    # or attenuate different parameter ranges.
+    # Surface topology changes the number of live rows after every retained
+    # checkpoint.  That cardinality is runtime state, not optimization
+    # identity.  ``joint`` owns every row symmetrically, so its whole
+    # diagnostic partition is runtime state.  The mature handoff policies do
+    # use ``rigid_prefix_rows`` as an immutable ownership boundary, but the
+    # suffix cardinality still grows and shrinks through legal topology
+    # events.  Comparing that derived count made every atlas-residual
+    # checkpoint with even one new child impossible to resume.
     if (
         saved.get("mature_handoff_surface_policy") == "joint"
         and current.get("mature_handoff_surface_policy") == "joint"
@@ -4371,6 +4373,27 @@ def _resume_training_contract_differences(
         current = dict(current)
         saved.pop("mature_handoff_surface_partition", None)
         current.pop("mature_handoff_surface_partition", None)
+    elif (
+        saved.get("mature_handoff_surface_policy")
+        == current.get("mature_handoff_surface_policy")
+        and saved.get("mature_handoff_surface_policy")
+        in {"atlas_residual", "appearance_only"}
+    ):
+        saved_partition = dict(
+            saved.get("mature_handoff_surface_partition", {})
+        )
+        current_partition = dict(
+            current.get("mature_handoff_surface_partition", {})
+        )
+        for runtime_key in (
+            "evidence_completion_suffix_rows",
+            # Compatibility with early handoff checkpoints.
+            "completion_suffix_rows",
+        ):
+            saved_partition.pop(runtime_key, None)
+            current_partition.pop(runtime_key, None)
+        saved["mature_handoff_surface_partition"] = saved_partition
+        current["mature_handoff_surface_partition"] = current_partition
 
     if allow_surface_screen_evidence_repair_migration:
         if current.get("surface_screen_topology") != (

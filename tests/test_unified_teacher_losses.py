@@ -564,6 +564,42 @@ def test_nonjoint_surface_partition_remains_immutable_on_resume():
     }
 
 
+def test_atlas_surface_suffix_cardinality_is_runtime_resume_state():
+    saved = {
+        "mature_handoff_surface_policy": "atlas_residual",
+        "mature_handoff_surface_partition": {
+            "rigid_prefix_rows": 1_135_055,
+            "evidence_completion_suffix_rows": 20_000,
+            "chart_atlas_learning_rate": 2e-4,
+            "contract": (
+                "mature_rigid_prefix_fixed__chart_inverse_depth_low_lr__"
+                "evidence_completion_suffix_geometry_opacity_trainable"
+            ),
+        },
+    }
+    current = {
+        **saved,
+        "mature_handoff_surface_partition": {
+            **saved["mature_handoff_surface_partition"],
+            # Nineteen legal topology children were appended before the
+            # retained checkpoint. The ownership boundary did not move.
+            "evidence_completion_suffix_rows": 20_019,
+        },
+    }
+    assert not _resume_training_contract_differences(saved, current)
+
+    changed_boundary = {
+        **current,
+        "mature_handoff_surface_partition": {
+            **current["mature_handoff_surface_partition"],
+            "rigid_prefix_rows": 1_135_054,
+        },
+    }
+    assert _resume_training_contract_differences(
+        saved, changed_boundary
+    ) == {"mature_handoff_surface_partition"}
+
+
 def test_resume_allows_only_exact_6k_volume_topology_settle():
     saved = {
         "schedule_horizon": 12_000,
