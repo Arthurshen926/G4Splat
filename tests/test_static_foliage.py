@@ -186,6 +186,16 @@ def test_cross_sequence_verified_cell_gets_local_canonical_fallback():
     detail_groups = fused["replacement_group"][fused["static_detail"]]
     assert 0 in detail_groups.tolist()
     assert 1 in detail_groups.tolist()
+    group_one = fused["static_detail"] & (
+        fused["replacement_group"] == 1
+    )
+    # Equal camera support and posterior mass are resolved by the stable
+    # lower sequence id, exactly matching the production lexicographic
+    # contract after vectorizing the dense fallback selection.
+    assert torch.allclose(
+        fused["centers"][group_one][0],
+        torch.tensor([1.01, 0.00, 3.00]),
+    )
 
 
 def test_canonical_camera_quality_breaks_equal_support_tie():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 
 import torch
 
@@ -725,37 +725,76 @@ def fuse_sequence_evidence_into_static_leaves(
             weight_sum.index_add_(
                 0, inverse_group_sequence, eligible_weights
             )
-            for index, key in enumerate(unique_group_sequence.tolist()):
-                group_id = int(key // maximum_sequence)
-                sequence_id = int(key % maximum_sequence)
-                score = (
-                    int(camera_count[index]),
-                    float(weight_sum[index]),
-                    -sequence_id,
+            candidate_group = torch.div(
+                unique_group_sequence,
+                maximum_sequence,
+                rounding_mode="floor",
+            )
+            candidate_sequence = unique_group_sequence.remainder(
+                maximum_sequence
+            )
+            # Select the lexicographic maximum
+            # (camera_count, weight_sum, -sequence_id) independently for
+            # every group.  The former Python loop issued one scalar tensor
+            # conversion and one full-table search per candidate.  A dense
+            # Cambridge initialization has O(1e5) candidates, so identical
+            # static evidence could take several CPU minutes to fuse before
+            # iteration one.  Stable tensor sorts preserve the exact tie
+            # policy while making the work O(N log N) native operations.
+            candidate_order = torch.arange(
+                len(unique_group_sequence), dtype=torch.int64
+            )
+            candidate_order = candidate_order[
+                torch.argsort(
+                    candidate_sequence[candidate_order], stable=True
                 )
-                previous = fallback_sequences.get(group_id)
-                if previous is None:
-                    fallback_sequences[group_id] = sequence_id
-                    continue
-                previous_key = group_id * maximum_sequence + previous
-                previous_index = int(
-                    torch.searchsorted(
-                        unique_group_sequence,
-                        torch.tensor(previous_key),
-                    )
+            ]
+            candidate_order = candidate_order[
+                torch.argsort(
+                    weight_sum[candidate_order],
+                    descending=True,
+                    stable=True,
                 )
-                previous_score = (
-                    int(camera_count[previous_index]),
-                    float(weight_sum[previous_index]),
-                    -previous,
+            ]
+            candidate_order = candidate_order[
+                torch.argsort(
+                    camera_count[candidate_order],
+                    descending=True,
+                    stable=True,
                 )
-                if score > previous_score:
-                    fallback_sequences[group_id] = sequence_id
+            ]
+            candidate_order = candidate_order[
+                torch.argsort(
+                    candidate_group[candidate_order], stable=True
+                )
+            ]
+            ordered_candidate_group = candidate_group[candidate_order]
+            first_candidate = torch.ones(
+                len(candidate_order), dtype=torch.bool
+            )
+            first_candidate[1:] = (
+                ordered_candidate_group[1:]
+                != ordered_candidate_group[:-1]
+            )
+            selected_candidates = candidate_order[first_candidate]
+            selected_fallback_groups = candidate_group[
+                selected_candidates
+            ]
+            selected_fallback_sequences = candidate_sequence[
+                selected_candidates
+            ]
+            fallback_sequences = dict(
+                zip(
+                    selected_fallback_groups.tolist(),
+                    selected_fallback_sequences.tolist(),
+                )
+            )
             fallback_lookup = torch.full(
                 (group_count,), -1, dtype=torch.int64
             )
-            for group_id, sequence_id in fallback_sequences.items():
-                fallback_lookup[group_id] = sequence_id
+            fallback_lookup[selected_fallback_groups] = (
+                selected_fallback_sequences
+            )
             canonical_row |= (
                 group_is_valid[local_groups]
                 & valid_camera
@@ -794,23 +833,54 @@ def fuse_sequence_evidence_into_static_leaves(
     cell_view_count.index_add_(
         0, camera_cell, torch.ones_like(camera_cell)
     )
-    cells_by_group: dict[int, list[int]] = defaultdict(list)
-    for cell_id, group_id in enumerate(cells[:, 0].tolist()):
-        cells_by_group[int(group_id)].append(int(cell_id))
-    selected_cells_list: list[int] = []
-    for group_id in sorted(cells_by_group):
-        ranked = sorted(
-            cells_by_group[group_id],
-            key=lambda cell_id: (
-                int(cell_view_count[cell_id] >= minimum_supporting_views),
-                int(cell_view_count[cell_id]),
-                float(cell_weight[cell_id]),
-                -int(cell_id),
-            ),
-            reverse=True,
+    # Rank modes with the same lexicographic policy as the former per-group
+    # Python dictionaries and ``sorted`` calls:
+    #   multiview first, then view count, posterior mass, stable cell id.
+    # Keeping the complete partition in tensors removes another O(groups)
+    # interpreter loop without changing which static modes are emitted.
+    cell_id = torch.arange(cell_count, dtype=torch.int64)
+    cell_order = cell_id
+    cell_order = cell_order[
+        torch.argsort(
+            cell_weight[cell_order], descending=True, stable=True
         )
-        selected_cells_list.extend(ranked[: int(maximum_modes_per_group)])
-    selected_cells = torch.tensor(selected_cells_list, dtype=torch.int64)
+    ]
+    cell_order = cell_order[
+        torch.argsort(
+            cell_view_count[cell_order], descending=True, stable=True
+        )
+    ]
+    cell_is_multiview = (
+        cell_view_count >= int(minimum_supporting_views)
+    ).to(torch.int8)
+    cell_order = cell_order[
+        torch.argsort(
+            cell_is_multiview[cell_order],
+            descending=True,
+            stable=True,
+        )
+    ]
+    cell_order = cell_order[
+        torch.argsort(cells[cell_order, 0], stable=True)
+    ]
+    ordered_cell_group = cells[cell_order, 0]
+    first_cell_in_group = torch.ones(len(cell_order), dtype=torch.bool)
+    first_cell_in_group[1:] = (
+        ordered_cell_group[1:] != ordered_cell_group[:-1]
+    )
+    group_starts = torch.nonzero(
+        first_cell_in_group, as_tuple=False
+    ).flatten()
+    group_ends = torch.cat(
+        [group_starts[1:], torch.tensor([len(cell_order)])]
+    )
+    group_sizes = group_ends - group_starts
+    rank_within_group = torch.arange(len(cell_order)) - (
+        torch.repeat_interleave(group_starts, group_sizes)
+    )
+    selected_cells = cell_order[
+        rank_within_group < int(maximum_modes_per_group)
+    ]
     selected_lookup = torch.full((cell_count,), -1, dtype=torch.int64)
     selected_lookup[selected_cells] = torch.arange(len(selected_cells))
     retained = selected_lookup[inverse] >= 0
