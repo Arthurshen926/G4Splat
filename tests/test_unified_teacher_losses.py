@@ -4942,13 +4942,13 @@ def test_static_detail_ray_prefit_starts_in_topology_only():
     assert not _static_detail_ray_trainable("canonical_polish")
 
 
-def test_static_detail_isolated_sh_is_all_view_but_geometry_mass_are_owned():
+def test_static_detail_isolated_positive_rgb_parameters_are_support_owned():
     ownership = torch.tensor([1.0, 0.0, 1.0])
     geometry, appearance, opacity = _static_detail_isolated_gradient_gates(
         ownership
     )
     assert geometry is ownership
-    assert appearance is None
+    assert appearance is ownership
     assert opacity is ownership
 
 
@@ -4971,7 +4971,7 @@ def test_static_stage3_rgb_routes_envelope_only_to_appearance():
         geometry, torch.tensor([1.0, 0.0, 0.0, 0.0])
     )
     torch.testing.assert_close(opacity, geometry)
-    assert appearance is None
+    torch.testing.assert_close(appearance, ownership)
     # The caller's calibrated ownership tensor is immutable.
     torch.testing.assert_close(
         ownership, torch.tensor([1.0, 1.0, 0.0, 1.0])
@@ -4992,7 +4992,7 @@ def test_static_stage2_rgb_keeps_envelope_geometry_and_mass_trainable():
         Foliage(), ownership, detail_stage_active=False
     )
     assert geometry is ownership
-    assert appearance is None
+    assert appearance is ownership
     assert opacity is ownership
 
 

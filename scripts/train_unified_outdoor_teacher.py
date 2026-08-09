@@ -116,26 +116,47 @@ STATIC_DETAIL_ISOLATED_REPAIR_PREDECESSOR = {
         "b4f15285bc7a380bf2a479ff5b14e9d0240acb6af1c684b0d76be97633148f4c"
     ),
 }
-STATIC_DETAIL_ISOLATED_CONTRACT = (
+STATIC_DETAIL_ISOLATED_APPEARANCE_PREDECESSOR_CONTRACT = (
     "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
     "and_screen_gradient_only_to_static_detail__geometry_and_topology_"
     "remain_support_sequence_owned__verified_cross_sequence_consensus_"
     "may_receive_optical_mass__sh_appearance_uses_all_real_canopy_views__"
     "persistent_envelope_cannot_occlude_its_training_signal"
 )
-STATIC_STAGE_RGB_ROLE_CONTRACT = (
+STATIC_DETAIL_ISOLATED_CONTRACT = (
+    "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
+    "and_screen_gradient_only_to_static_detail__geometry_optical_mass_sh_"
+    "and_topology_remain_support_sequence_owned__verified_cross_sequence_"
+    "consensus_may_receive_ray_optical_mass__persistent_envelope_cannot_"
+    "occlude_its_training_signal"
+)
+STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_sh_only__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
     "support_owned_static_detail_rgb_geometry__verified_cross_sequence_"
     "consensus_static_detail_optical_mass"
 )
-STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
+STATIC_STAGE_RGB_ROLE_CONTRACT = (
+    "stage2_envelope_rgb_geometry_mass__stage3_envelope_sh_only__"
+    "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
+    "support_owned_static_detail_rgb_geometry_mass_sh__verified_cross_"
+    "sequence_consensus_static_detail_ray_optical_mass"
+)
+STATIC_DETAIL_GLOBAL_CLEANUP_APPEARANCE_PREDECESSOR_CONTRACT = (
     "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
     "rigid_free_space_and_surface_better_counterfactuals_only_to_static_"
     "detail_geometry_and_optical_mass__support_sequences_route_positive_"
     "rgb_geometry_and_topology__verified_cross_sequence_consensus_routes_"
     "positive_ray_geometry_and_optical_mass__all_real_canopy_views_route_"
     "sh_appearance_only__cleanup_never_drives_topology"
+)
+STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
+    "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
+    "rigid_free_space_and_surface_better_counterfactuals_only_to_static_"
+    "detail_geometry_and_optical_mass__support_sequences_route_positive_"
+    "rgb_geometry_optical_mass_sh_and_topology__verified_cross_sequence_"
+    "consensus_routes_positive_ray_geometry_and_optical_mass__cleanup_"
+    "never_drives_topology"
 )
 PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT = (
     "persistent_envelope_is_unconditionally_visible__all_calibrated_views_"
@@ -3861,6 +3882,48 @@ def _resume_training_contract_differences(
             saved["static_optical_policy_contract"] = (
                 STATIC_OPTICAL_POLICY_CONTRACT
             )
+        # v69 correctly support-owned static-detail geometry, mass and
+        # topology, but accidentally left SH appearance globally writable.
+        # The same bug also scheduled isolated detail renders from traversals
+        # with no positive detail owner. This migration preserves every
+        # tensor, Adam moment and non-detail camera schedule while changing
+        # only future positive RGB routing and its dedicated camera cycle.
+        saved_stages = saved.get("static_training_stages")
+        current_stages = current.get("static_training_stages")
+        saved_detail = saved.get("static_detail_isolated_supervision")
+        current_detail = current.get("static_detail_isolated_supervision")
+        saved_cleanup = saved.get("static_detail_global_cleanup")
+        current_cleanup = current.get("static_detail_global_cleanup")
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_stages, dict)
+            and isinstance(current_stages, dict)
+            and saved_stages.get("rgb_role_contract")
+            == STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT
+            and current_stages.get("rgb_role_contract")
+            == STATIC_STAGE_RGB_ROLE_CONTRACT
+            and isinstance(saved_detail, dict)
+            and isinstance(current_detail, dict)
+            and saved_detail.get("contract")
+            == STATIC_DETAIL_ISOLATED_APPEARANCE_PREDECESSOR_CONTRACT
+            and current_detail.get("contract")
+            == STATIC_DETAIL_ISOLATED_CONTRACT
+            and saved_detail.get("every") == current_detail.get("every")
+            and saved_detail.get("weight") == current_detail.get("weight")
+            and isinstance(saved_cleanup, dict)
+            and isinstance(current_cleanup, dict)
+            and saved_cleanup.get("contract")
+            == STATIC_DETAIL_GLOBAL_CLEANUP_APPEARANCE_PREDECESSOR_CONTRACT
+            and current_cleanup.get("contract")
+            == STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
+        ):
+            saved["static_training_stages"] = current_stages
+            saved["static_detail_isolated_supervision"] = current_detail
+            saved["static_detail_global_cleanup"] = current_cleanup
+            saved["sampling_schedule_sha256"] = current[
+                "sampling_schedule_sha256"
+            ]
         current_static_uncertainty = current.get(
             "static_spatial_uncertainty"
         )
@@ -10267,16 +10330,22 @@ def _static_detail_ray_trainable(phase: str) -> bool:
 
 def _static_detail_isolated_gradient_gates(
     ownership_gate: torch.Tensor | None,
-) -> tuple[torch.Tensor | None, None, torch.Tensor | None]:
-    """Decouple static leaf appearance from geometry/mass ownership.
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Keep all positive static-detail RGB parameters support-owned.
 
-    Every calibrated canopy view is valid colour evidence for the standard
-    view-dependent SH representation.  Only persisted support sequences may
-    move a leaf, change its optical mass or request topology.  Keeping these
-    gates explicit prevents a later refactor from coupling SH back to the
-    non-rigid geometry owner and recreating grey, underfit crowns.
+    A static detail row may be visible from every camera in the exported map,
+    but an unrelated traversal is not positive evidence for that row's SH.
+    Routing SH from every canopy view made the numerous one-sequence leaves
+    average incompatible colours even while their geometry and mass stayed
+    correctly support-owned.  Negative free-space/counterfactual evidence is
+    still global in its separate loss path; this gate controls only positive
+    RGB supervision.
     """
-    return ownership_gate, None, ownership_gate
+    return ownership_gate, ownership_gate, ownership_gate
 
 
 def _static_stage_rgb_gradient_gates(
@@ -10284,7 +10353,11 @@ def _static_stage_rgb_gradient_gates(
     ownership_gate: torch.Tensor | None,
     *,
     detail_stage_active: bool,
-) -> tuple[torch.Tensor | None, None, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Keep the crown envelope from absorbing Stage-3 RGB residuals.
 
     The persistent envelope is the broad, ray-calibrated support for crown
@@ -10305,7 +10378,7 @@ def _static_stage_rgb_gradient_gates(
     visibility is unchanged.
     """
     if not detail_stage_active:
-        return ownership_gate, None, ownership_gate
+        return ownership_gate, ownership_gate, ownership_gate
     base = (
         torch.ones_like(foliage.opacities)
         if ownership_gate is None
@@ -10322,9 +10395,11 @@ def _static_stage_rgb_gradient_gates(
     opacity = base.clone()
     geometry[envelope] = 0
     opacity[envelope] = 0
-    # ``None`` deliberately routes colour to every visible static role.  SH
-    # appearance cannot create optical cover or move a broad kernel.
-    return geometry, None, opacity
+    # Envelope and skeleton entries in ``base`` are one and therefore retain
+    # all-view SH learning. Detail entries keep their persisted support-
+    # sequence owner, preventing cross-traversal colour averaging without
+    # changing forward visibility.
+    return geometry, base, opacity
 
 
 def _static_ray_candidate_masks(
@@ -12461,7 +12536,7 @@ def main():
     else:
         static_detail_sequence_names = set()
     static_detail_canopy_fraction_minimum = 0.005
-    static_detail_view_indices = [
+    all_canopy_view_indices = [
         index
         for index, view in enumerate(views)
         if fields.canopy_fraction(
@@ -12469,8 +12544,19 @@ def main():
         )
         > static_detail_canopy_fraction_minimum
     ]
+    static_detail_view_indices = [
+        index
+        for index in all_canopy_view_indices
+        if not static_detail_sequence_names
+        or sequence_id(views[index].image_name)
+        in static_detail_sequence_names
+    ]
     if not static_detail_view_indices:
-        static_detail_view_indices = list(range(len(views)))
+        static_detail_view_indices = (
+            all_canopy_view_indices
+            if all_canopy_view_indices
+            else list(range(len(views)))
+        )
     static_detail_schedule = _cycle_schedule(
         static_detail_view_indices,
         args.phase_schedule_horizon,
@@ -12478,13 +12564,13 @@ def main():
     )
     static_detail_schedule_audit = {
         "contract": (
-            "uniform_complete_epochs_over_all_real_canopy_cameras__"
-            "geometry_mass_support_owned__sh_appearance_all_view"
+            "uniform_complete_epochs_over_canopy_cameras_in_persisted_"
+            "detail_support_sequences__geometry_mass_sh_support_owned"
         ),
         "geometry_owner_sequence_names": sorted(
             static_detail_sequence_names
         ),
-        "appearance_sequence_names": sorted(
+        "positive_rgb_sequence_names": sorted(
             {
                 sequence_id(views[index].image_name)
                 for index in static_detail_view_indices
@@ -12880,7 +12966,7 @@ def main():
                     "all_view_ray_free_space",
                     "support_or_verified_consensus_ray_hit_interval",
                     "canonical_rgb_high_frequency",
-                    "all_canopy_view_detail_sh_appearance_only",
+                    "support_owned_detail_sh_appearance",
                     "support_owned_surface_plus_detail_geometry_mass",
                     "surface_plus_detail_isolated_screen_gradient",
                     "all_view_rigid_free_counterfactual_cleanup",
@@ -12905,7 +12991,7 @@ def main():
                 "support_sequence_static_detail_xyz_scale_rotation",
                 "support_sequence_static_detail_rgb_optical_mass",
                 "verified_consensus_static_detail_ray_optical_mass",
-                "all_real_canopy_view_static_detail_sh",
+                "support_sequence_static_detail_sh",
                 "support_sequence_static_detail_means2d_topology",
             ],
             "excluded_owners": [
@@ -13959,32 +14045,59 @@ def main():
                     "I/O/allocator-only compatibility enabled."
                 )
     if resume is not None and resume["schedule_hash"] != schedule_hash:
-        if not args.allow_conditioned_schedule_repair_resume:
-            raise RuntimeError("Resume camera schedules changed")
         saved_schedules = resume.get("schedules", {})
-        unchanged_schedule_names = ("rgb", "geometry", "topology")
+        if args.allow_trainer_repair_resume:
+            unchanged_schedule_names = (
+                "rgb",
+                "conditioned",
+                "geometry",
+                "topology",
+                "static_skeleton",
+                "static_volume",
+            )
+        elif args.allow_conditioned_schedule_repair_resume:
+            unchanged_schedule_names = (
+                "rgb",
+                "geometry",
+                "topology",
+                "static_detail",
+                "static_skeleton",
+                "static_volume",
+            )
+        else:
+            raise RuntimeError("Resume camera schedules changed")
+        current_schedules = {
+            "rgb": rgb_schedule,
+            "conditioned": conditioned_schedule,
+            "geometry": geometry_schedule,
+            "topology": topology_schedule,
+            "static_detail": static_detail_schedule,
+            "static_skeleton": static_skeleton_schedule,
+            "static_volume": static_volume_schedule,
+        }
         changed_non_conditioned = [
             name
             for name in unchanged_schedule_names
             if not np.array_equal(
                 np.asarray(saved_schedules.get(name, []), dtype=np.int64),
-                {
-                    "rgb": rgb_schedule,
-                    "geometry": geometry_schedule,
-                    "topology": topology_schedule,
-                    "static_detail": static_detail_schedule,
-                }[name],
+                current_schedules[name],
             )
         ]
         if changed_non_conditioned:
             raise RuntimeError(
-                "Conditioned schedule repair changed unrelated camera "
+                "Resume schedule repair changed unrelated camera "
                 f"schedules: {changed_non_conditioned}"
             )
-        print(
-            "Resuming with the coverage-preserving conditioned-camera "
-            "schedule; RGB, geometry and topology schedules are identical."
-        )
+        if args.allow_trainer_repair_resume:
+            print(
+                "Resuming with the support-owned static-detail camera "
+                "schedule; every non-detail schedule is identical."
+            )
+        else:
+            print(
+                "Resuming with the coverage-preserving conditioned-camera "
+                "schedule; all unrelated schedules are identical."
+            )
     contract_differences = (
         _resume_training_contract_differences(
             resume.get("training_contract", {}),
@@ -14561,8 +14674,10 @@ def main():
             "owned_detail_rows": 0,
             "total_detail_rows": int(foliage.static_leaf_mask.sum()),
             "forward_visibility": "unconditional_static",
-            "owned_positive_signals": "geometry_opacity_hit_topology",
-            "appearance_signals": "all_real_canopy_views",
+            "owned_positive_signals": (
+                "geometry_opacity_sh_hit_topology"
+            ),
+            "appearance_signals": "persisted_support_sequences",
             "global_negative_signals": "free_rigid_counterfactual_cleanup",
         }
         if (
@@ -14588,9 +14703,9 @@ def main():
                 "total_detail_rows": int(foliage.static_leaf_mask.sum()),
                 "forward_visibility": "unconditional_static",
                 "owned_positive_signals": (
-                    "geometry_opacity_hit_topology"
+                    "geometry_opacity_sh_hit_topology"
                 ),
-                "appearance_signals": "all_real_canopy_views",
+                "appearance_signals": "persisted_support_sequences",
                 "global_negative_signals": (
                     "free_rigid_counterfactual_cleanup"
                 ),
@@ -14626,11 +14741,9 @@ def main():
             volume_geometry_gradient_gate=(
                 canonical_volume_geometry_gate
             ),
-            # Geometry and optical mass remain calibrated-support owned, but
-            # every real observation is valid colour evidence for the
-            # view-dependent SH of a fixed static Gaussian.  Reusing the
-            # geometry gate here caused the normal full-epoch RGB stream to
-            # discard most tree appearance gradients.
+            # Positive geometry, optical mass and SH are calibrated-support
+            # owned. All rows remain in the forward render, and independent
+            # global negative evidence remains able to remove contradictions.
             volume_appearance_gradient_gate=(
                 canonical_volume_appearance_gate
             ),
