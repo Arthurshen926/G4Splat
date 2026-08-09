@@ -2056,11 +2056,11 @@ def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
     assert 3_000 > 4 * 639
 
 
-def test_cpu_parallelism_uses_one_bounded_process_global_pool():
-    assert _resolve_cpu_intraop_threads(32, 8) == 8
-    assert _resolve_cpu_intraop_threads(16, 8) == 8
-    assert _resolve_cpu_intraop_threads(32, 0) == 8
-    assert _resolve_cpu_intraop_threads(4, 8) == 4
+def test_cpu_parallelism_bounds_native_prefetch_callers():
+    assert _resolve_cpu_intraop_threads(32, 8) == 3
+    assert _resolve_cpu_intraop_threads(16, 8) == 1
+    assert _resolve_cpu_intraop_threads(32, 0) == 4
+    assert _resolve_cpu_intraop_threads(4, 8) == 1
 
 
 def test_cpu_parallelism_honours_bounded_explicit_override():

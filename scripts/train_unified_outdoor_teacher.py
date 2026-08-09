@@ -575,12 +575,12 @@ def _resolve_cpu_intraop_threads(
 ) -> int:
     """Bound the process-global CPU pool without starving the GPU feeder.
 
-    The Torch intra-op pool is shared by the trainer and Python prefetch
-    threads.  Dividing the core budget by ``workers + 1`` therefore reduced a
-    32-core host to three total native workers and made the GPU wait for task
-    fields and image preparation.  Eight global intra-op workers retain useful
-    host parallelism while OpenCV remains explicitly sequential, avoiding the
-    original nested-pool explosion of more than 300 process threads.
+    Torch exposes one configured intra-op width, but the image-prefetch and
+    native codec paths on this stack can still create helper pools from
+    multiple Python callers.  Auto mode therefore reserves a core share for
+    every caller and caps the configured pool at four.  A production A/B on
+    the 32-core Cambridge host measured 3 threads at 0.75 s/step versus 8 at
+    0.98 s/step while the latter created 115 process threads.
     """
     available_cpus = int(available_cpus)
     image_prefetch_workers = int(image_prefetch_workers)
@@ -593,7 +593,8 @@ def _resolve_cpu_intraop_threads(
         raise ValueError("requested_threads must be non-negative")
     if requested_threads > 0:
         return min(requested_threads, available_cpus)
-    return max(1, min(8, available_cpus))
+    consumers = max(image_prefetch_workers + 1, 1)
+    return max(1, min(4, available_cpus // consumers))
 
 
 def _configure_cpu_parallelism(args) -> dict[str, object]:
