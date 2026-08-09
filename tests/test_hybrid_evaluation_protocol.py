@@ -20,11 +20,13 @@ from scripts.evaluate_hybrid_teacher import (
     _historical_uint8_raster,
     _high_frequency_metrics,
     _historical_static_comparison_is_valid,
+    _mean_layer_counterfactual_protocol,
     _protocol_metrics,
     _projected_radius_diagnostics,
     _query_representation_contract,
     _resolve_evaluation_mode,
     _route_evaluation_scene_artifacts,
+    _semantic_protocol_regions,
     _tree_boundary_masks,
 )
 from scripts.evaluate_render_dir import metrics as historical_metrics
@@ -103,6 +105,70 @@ def test_historical_uint8_metric_is_not_labelled_by_float_equivalence():
         _historical_uint8_raster(target),
     )
     assert float_metric["mae"] != pytest.approx(png_metric["mae"])
+
+
+def test_layer_counterfactual_regions_share_primary_semantic_masks():
+    target = torch.zeros(3, 5, 7)
+    prediction = target.clone()
+    prediction[:, 2, 2] = 1.0
+    keep = torch.ones(5, 7, dtype=torch.bool)
+    tree_keep = keep.clone()
+    tree_keep[2, 2] = False
+    boundary_inside = ~tree_keep
+    boundary_outside = torch.zeros_like(keep)
+    boundary_outside[2, 3] = True
+    regions = _semantic_protocol_regions(
+        prediction,
+        target,
+        object_keep=keep,
+        sky_keep=keep,
+        distortion_keep=keep,
+        tree_keep=tree_keep,
+        tree_boundary_inside=boundary_inside,
+        tree_boundary_outside=boundary_outside,
+    )
+    assert regions["tree_static"]["mae"] == pytest.approx(1.0)
+    assert regions["non_tree_static"]["mae"] == pytest.approx(0.0)
+    assert regions["tree_boundary_inside_static"]["mae"] == pytest.approx(
+        1.0
+    )
+    assert regions["tree_boundary_outside_static"]["mae"] == pytest.approx(
+        0.0
+    )
+
+
+def test_layer_counterfactual_aggregate_is_per_view_mean():
+    rows = []
+    for psnr in (10.0, 14.0):
+        rows.append(
+            {
+                "layer_counterfactuals": {
+                    "envelope_only": {
+                        "historical_uint8_protocol": {
+                            "tree_static": {
+                                "psnr": psnr,
+                                "ssim": 0.5,
+                                "mae": 0.2,
+                                "rmse": 0.3,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    aggregate = _mean_layer_counterfactual_protocol(
+        rows,
+        "envelope_only",
+        "historical_uint8_protocol",
+        "tree_static",
+    )
+    assert aggregate == {
+        "psnr": pytest.approx(12.0),
+        "ssim": pytest.approx(0.5),
+        "mae": pytest.approx(0.2),
+        "rmse": pytest.approx(0.3),
+        "evaluated_view_count": 2,
+    }
 
 
 def test_high_frequency_metric_detects_blurred_edge():

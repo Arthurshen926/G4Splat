@@ -77,6 +77,54 @@ def _protocol_metrics(prediction, target, mask=None):
     }
 
 
+def _semantic_protocol_regions(
+    prediction,
+    target,
+    *,
+    object_keep,
+    sky_keep,
+    distortion_keep,
+    tree_keep,
+    tree_boundary_inside,
+    tree_boundary_outside,
+):
+    """Evaluate one render under the authoritative Cambridge regions.
+
+    Layer counterfactuals used to be saved only as PNGs.  That made every
+    envelope/detail ownership diagnosis depend on a separate ad-hoc mask
+    loader, even though the evaluator already had the exact content-addressed
+    four-channel mask in memory.  Keep the region construction in one helper
+    so canonical and isolated-layer measurements cannot silently diverge.
+    """
+    static_keep = object_keep & sky_keep & distortion_keep
+    dynamic_keep = object_keep & distortion_keep
+    return {
+        "raw": _protocol_metrics(prediction, target),
+        "dynamic_valid": _protocol_metrics(
+            prediction, target, dynamic_keep
+        ),
+        "static_valid": _protocol_metrics(
+            prediction, target, static_keep
+        ),
+        "non_tree_static": _protocol_metrics(
+            prediction, target, static_keep & tree_keep
+        ),
+        "tree_static": _protocol_metrics(
+            prediction, target, static_keep & ~tree_keep
+        ),
+        "tree_boundary_inside_static": _protocol_metrics(
+            prediction,
+            target,
+            static_keep & tree_boundary_inside,
+        ),
+        "tree_boundary_outside_static": _protocol_metrics(
+            prediction,
+            target,
+            static_keep & tree_boundary_outside,
+        ),
+    }
+
+
 def _historical_uint8_raster(image: torch.Tensor) -> torch.Tensor:
     """Reproduce the PNG raster consumed by the historical Cambridge metric.
 
@@ -428,6 +476,26 @@ def _mean_protocol(rows, mode, region, predicate=None):
         for row in rows
         if row[mode]["protocol"].get(region) is not None
         and (predicate is None or predicate(row))
+    ]
+    if not values:
+        return None
+    return {
+        metric: float(np.mean([value[metric] for value in values]))
+        for metric in ("psnr", "ssim", "mae", "rmse")
+    } | {"evaluated_view_count": len(values)}
+
+
+def _mean_layer_counterfactual_protocol(
+    rows, layer, raster_protocol, region
+):
+    values = [
+        row["layer_counterfactuals"][layer][raster_protocol][region]
+        for row in rows
+        if row.get("layer_counterfactuals", {})
+        .get(layer, {})
+        .get(raster_protocol, {})
+        .get(region)
+        is not None
     ]
     if not values:
         return None
@@ -1562,6 +1630,36 @@ def main() -> None:
                         )
                     ),
                 }
+            if layer_counterfactuals:
+                historical_target = _historical_uint8_raster(target)
+                row["layer_counterfactuals"] = {}
+                for label, layer_render in layer_counterfactuals.items():
+                    layer_prediction = layer_render["rgb"]
+                    layer_historical_prediction = (
+                        _historical_uint8_raster(layer_prediction)
+                    )
+                    common_masks = {
+                        "object_keep": object_keep,
+                        "sky_keep": sky_keep,
+                        "distortion_keep": distortion_keep,
+                        "tree_keep": tree_keep,
+                        "tree_boundary_inside": tree_boundary_inside,
+                        "tree_boundary_outside": tree_boundary_outside,
+                    }
+                    row["layer_counterfactuals"][label] = {
+                        "protocol": _semantic_protocol_regions(
+                            layer_prediction,
+                            target,
+                            **common_masks,
+                        ),
+                        "historical_uint8_protocol": (
+                            _semantic_protocol_regions(
+                                layer_historical_prediction,
+                                historical_target,
+                                **common_masks,
+                            )
+                        ),
+                    }
             rows.append(row)
             if not args.render_only or not args.all:
                 images = {
@@ -1668,6 +1766,39 @@ def main() -> None:
             )
         }
         for mode in modes
+    }
+    counterfactual_labels = sorted(
+        {
+            label
+            for row in rows
+            for label in row.get("layer_counterfactuals", {})
+        }
+    )
+    layer_counterfactual_protocol_aggregate = {
+        label: {
+            raster_protocol: {
+                region: _mean_layer_counterfactual_protocol(
+                    rows,
+                    label,
+                    raster_protocol,
+                    region,
+                )
+                for region in (
+                    "raw",
+                    "dynamic_valid",
+                    "static_valid",
+                    "non_tree_static",
+                    "tree_static",
+                    "tree_boundary_inside_static",
+                    "tree_boundary_outside_static",
+                )
+            }
+            for raster_protocol in (
+                "protocol",
+                "historical_uint8_protocol",
+            )
+        }
+        for label in counterfactual_labels
     }
     high_frequency_aggregate = {
         mode: {
@@ -1850,6 +1981,22 @@ def main() -> None:
         "historical_uint8_protocol_aggregate": (
             historical_uint8_protocol_aggregate
         ),
+        "layer_counterfactual_protocol_aggregate": (
+            layer_counterfactual_protocol_aggregate
+        ),
+        "layer_counterfactual_protocol": {
+            "enabled": bool(counterfactual_labels),
+            "rendering": (
+                "surface_only_or_single_volume_role_with_optical_"
+                "replacement_disabled"
+            ),
+            "region_masks": "same_content_addressed_masks_as_primary",
+            "aggregation": "per_view_then_mean",
+            "historical_uint8_raster_included": True,
+            "causal_use": (
+                "diagnose_tree_interior_gain_and_non_tree_boundary_leakage"
+            ),
+        },
         "high_frequency_aggregate": high_frequency_aggregate,
         "high_frequency_protocol": {
             "colour_space": "bt601_luminance",
