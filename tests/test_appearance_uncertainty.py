@@ -108,6 +108,10 @@ def test_uncertainty_is_smooth_spatial_and_legacy_camera_grid_is_inert():
     vertical_step = (sigma[0, 1:, :] - sigma[0, :-1, :]).abs()
     assert horizontal_step.max() < 0.05
     assert vertical_step.max() < 0.05
+    assert len(model._coordinate_basis_cache) == 1
+    cached = next(iter(model._coordinate_basis_cache.values()))
+    model.spatial_uncertainty("seq1__frame00001", (12, 16))
+    assert next(iter(model._coordinate_basis_cache.values())) is cached
     assert model.spatial_uncertainty_basis.requires_grad is False
     assert model.local_canopy_basis.requires_grad is False
 

@@ -134,6 +134,9 @@ class OutdoorAppearanceUncertainty(nn.Module):
         self.uncertainty_decoder = nn.Parameter(
             torch.zeros(self.rank, 12, device=device)
         )
+        self._coordinate_basis_cache: dict[
+            tuple[int, int, str, int | None, torch.dtype], torch.Tensor
+        ] = {}
         grouped: dict[str, list[int]] = {}
         for index, name in enumerate(names):
             grouped.setdefault(sequence_id(name), []).append(index)
@@ -194,32 +197,17 @@ class OutdoorAppearanceUncertainty(nn.Module):
         size = tuple(map(int, shape))
         local_rgb = self.uncertainty_base.new_zeros((3, *size))
         height, width = size
-        y = torch.linspace(
-            -1.0,
-            1.0,
+        key = (
             height,
-            device=self.uncertainty_base.device,
-            dtype=self.uncertainty_base.dtype,
-        )
-        x = torch.linspace(
-            -1.0,
-            1.0,
             width,
-            device=self.uncertainty_base.device,
-            dtype=self.uncertainty_base.dtype,
+            self.uncertainty_base.device.type,
+            self.uncertainty_base.device.index,
+            self.uncertainty_base.dtype,
         )
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        basis = torch.stack(
-            [
-                torch.ones_like(xx),
-                xx,
-                yy,
-                xx * yy,
-                0.5 * (3.0 * xx.square() - 1.0),
-                0.5 * (3.0 * yy.square() - 1.0),
-            ],
-            dim=0,
-        )
+        basis = self._coordinate_basis_cache.get(key)
+        if basis is None:
+            basis = self._continuous_coordinate_basis(height, width)
+            self._coordinate_basis_cache[key] = basis
         coefficients = (
             self.uncertainty_code(image_name) @ self.uncertainty_decoder
         ).reshape(2, 6)
@@ -239,6 +227,38 @@ class OutdoorAppearanceUncertainty(nn.Module):
             * torch.sigmoid(log_sigma),
         )
 
+    def _continuous_coordinate_basis(
+        self, height: int, width: int
+    ) -> torch.Tensor:
+        """Build one immutable non-periodic basis per render resolution."""
+
+        y = torch.linspace(
+            -1.0,
+            1.0,
+            height,
+            device=self.uncertainty_base.device,
+            dtype=self.uncertainty_base.dtype,
+        )
+        x = torch.linspace(
+            -1.0,
+            1.0,
+            width,
+            device=self.uncertainty_base.device,
+            dtype=self.uncertainty_base.dtype,
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        return torch.stack(
+            [
+                torch.ones_like(xx),
+                xx,
+                yy,
+                xx * yy,
+                0.5 * (3.0 * xx.square() - 1.0),
+                0.5 * (3.0 * yy.square() - 1.0),
+            ],
+            dim=0,
+        )
+
     def spatial_uncertainty(
         self,
         image_name: str,
@@ -248,10 +268,15 @@ class OutdoorAppearanceUncertainty(nn.Module):
         return self._spatial_fields(image_name, shape)[1]
 
     def uncertainty_regularization(
-        self, image_name: str, shape: tuple[int, int]
+        self,
+        image_name: str,
+        shape: tuple[int, int],
+        *,
+        sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prior and total variation for the late uncertainty curriculum."""
-        sigma = self.spatial_uncertainty(image_name, shape)
+        if sigma is None:
+            sigma = self.spatial_uncertainty(image_name, shape)
         log_sigma = sigma.clamp_min(1e-6).log()
         prior = (log_sigma + 3.0).square().mean()
         horizontal = (
@@ -302,6 +327,7 @@ class OutdoorAppearanceUncertainty(nn.Module):
         task,
         *,
         image_name: str | None = None,
+        sigma: torch.Tensor | None = None,
         epsilon=1e-3,
     ):
         if image_name is None:
@@ -310,10 +336,11 @@ class OutdoorAppearanceUncertainty(nn.Module):
             raise ValueError(
                 "Spatial uncertainty requires the calibrated training image name"
             )
-        sigma = self.spatial_uncertainty(
-            image_name,
-            (prediction.shape[-2], prediction.shape[-1]),
-        )
+        if sigma is None:
+            sigma = self.spatial_uncertainty(
+                image_name,
+                (prediction.shape[-2], prediction.shape[-1]),
+            )
         robust = torch.sqrt((prediction - target).square() + epsilon**2).mean(0)
         canopy = task["p_canopy"] * (1.0 - task["p_transient"])
         sky = task["p_sky"] * (1.0 - task["p_transient"])

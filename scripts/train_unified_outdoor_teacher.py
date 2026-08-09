@@ -8,6 +8,7 @@ import copy
 import gc
 import hashlib
 import json
+import math
 import os
 import random
 import signal
@@ -14420,6 +14421,8 @@ def main():
             * task["p_canopy"]
         )
         static_confidence_mean = owner_weight.new_tensor(1.0)
+        static_sigma_mean = owner_weight.new_zeros(())
+        canonical_sigma = None
         if dynamic_active or static_spatial_uncertainty_active:
             # Pixels that repeatedly disagree across calibrated traversals no
             # longer drag the canonical crown into a broad average. Sigma is
@@ -14427,22 +14430,37 @@ def main():
             # below and cannot reduce this loss by simply inflating itself.
             # Static reconstruction uses the same training-only confidence
             # without activating temporal leaves or conditioned rendering.
-            sigma = appearance.spatial_uncertainty(
+            canonical_sigma = appearance.spatial_uncertainty(
                 view.image_name,
                 (view.image_height, view.image_width),
-            ).detach()
-            canopy_confidence = (
-                0.10 / (sigma[0] + 0.05)
-            ).clamp(0.35, 1.0)
-            sky_confidence = (
-                0.10 / (sigma[1] + 0.05)
-            ).clamp(0.25, 1.0)
+            )
+            sigma = canonical_sigma.detach()
+            initial_sigma = sigma.new_tensor(
+                math.exp(-4.5)
+                + (math.exp(-1.5) - math.exp(-4.5))
+                / (1.0 + math.exp(3.0))
+            )
+            # Confidence responds continuously to uncertainty above its
+            # calibrated initialization instead of remaining exactly one up
+            # to the former sigma=0.05 threshold. The asymptotic floor keeps
+            # every real RGB observation informative without a binary gate.
+            canopy_confidence = 0.35 + 0.65 * torch.minimum(
+                initial_sigma / sigma[0].clamp_min(1.0e-6),
+                torch.ones_like(sigma[0]),
+            )
+            sky_confidence = 0.25 + 0.75 * torch.minimum(
+                initial_sigma / sigma[1].clamp_min(1.0e-6),
+                torch.ones_like(sigma[1]),
+            )
             background_weight = background_weight * (
                 task["p_rigid"] + task["p_sky"] * sky_confidence
             ).clamp(0, 1)
             canopy_weight = canopy_weight * canopy_confidence
             static_confidence_mean = (
                 canopy_confidence * task["p_canopy"]
+            ).sum() / task["p_canopy"].sum().clamp_min(1)
+            static_sigma_mean = (
+                sigma[0] * task["p_canopy"]
             ).sum() / task["p_canopy"].sum().clamp_min(1)
         isolated_rgb = _branch_isolated_rgb_losses(
             structural_prediction,
@@ -15553,11 +15571,13 @@ def main():
                     target,
                     task,
                     image_name=view.image_name,
+                    sigma=canonical_sigma,
                 )
                 + 0.05
                 * appearance.uncertainty_regularization(
                     view.image_name,
                     (view.image_height, view.image_width),
+                    sigma=canonical_sigma,
                 )
             )
         high_frequency_loss = canonical_loss.new_zeros(())
@@ -17220,6 +17240,9 @@ def main():
                 ),
                 "canonical_canopy_confidence": float(
                     static_confidence_mean.detach()
+                ),
+                "canonical_canopy_sigma": float(
+                    static_sigma_mean.detach()
                 ),
                 "ownership": float(ownership.detach()),
                 "surface_canopy_front_conflict": float(
