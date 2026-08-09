@@ -430,17 +430,16 @@ TRAINING_PROFILES = {
         "iterations": 20_000,
         "phases": (
             ("canonical_bootstrap", 0.02),
-            # The calibrated ray-factor schedule consumes one distinct
-            # evidence camera every four optimizer steps.  At a 30k method
-            # horizon, 3k updates therefore cover all 639 foliage witnesses
-            # once (plus margin) and the 1,487-view RGB stream twice. Keeping
-            # exact-ray static detail hidden until 6k made broad envelope
-            # kernels absorb another full sweep of colour/opacity and leak
-            # across tree boundaries before local replace-and-retire could
-            # act.  Start the detail hand-off after the first complete
-            # evidence sweep; volume topology itself remains trainable to its
-            # independent iteration limit.
-            ("topology", 0.10),
+            # The 408--412 counterfactual series identifies the causal handoff
+            # directly: tree PSNR improves through 2k (12.286 dB), then falls
+            # to 11.086 dB at 3k while surface-only stays stable and
+            # envelope-only collapses.  Waiting for all 639 ray cameras lets
+            # broad envelope kernels overfit colour/opacity before local
+            # detail replacement can act.  At 2k, 500/639 evidence cameras
+            # have already been consumed and the RGB stream has completed a
+            # full epoch.  Hand off there; ray factors and volume topology
+            # continue independently, so remaining cameras are not dropped.
+            ("topology", 1.0 / 15.0),
             ("static_foliage", 0.45),
             ("dynamic_appearance", 0.65),
             ("ownership_cleanup", 0.85),

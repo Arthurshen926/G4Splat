@@ -2039,7 +2039,7 @@ def test_handoff_profile_starts_foliage_without_rebuilding_rigid_surface():
     )
 
 
-def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
+def test_static_handoff_starts_detail_at_measured_envelope_optimum():
     profile = TRAINING_PROFILES["static_handoff_quality"]
 
     assert profile["foliage_start"] == 0.0
@@ -2047,13 +2047,14 @@ def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
         "canonical_bootstrap"
     )
     assert _phase(600, 30_000, "static_handoff_quality") == "topology"
-    assert _phase(2_999, 30_000, "static_handoff_quality") == "topology"
-    assert _phase(3_000, 30_000, "static_handoff_quality") == (
+    assert _phase(1_999, 30_000, "static_handoff_quality") == "topology"
+    assert _phase(2_000, 30_000, "static_handoff_quality") == (
         "static_foliage"
     )
-    # One ray-factor camera is consumed every four steps. The 3k transition
-    # is later than one full 639-camera evidence sweep (2,556 updates).
-    assert 3_000 > 4 * 639
+    # One ray-factor camera is consumed every four steps. The measured 2k
+    # optimum has already consumed 500/639 cameras; the same ray scheduler
+    # continues after the representation handoff and completes the epoch.
+    assert 2_000 // 4 == 500
 
 
 def test_cpu_parallelism_bounds_native_prefetch_callers():
