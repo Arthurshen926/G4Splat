@@ -40,6 +40,9 @@ from outdoor.role_aware_initialization import (  # noqa: E402
     RIGID_CALIBRATED_INITIALIZATION_VERSION,
     TEMPORAL_DAV2_AUGMENTATION_VERSION,
 )
+from outdoor.sequence_depth import (  # noqa: E402
+    SEQUENCE_METRIC_DEPTH_VERSION,
+)
 from scripts.build_crossview_chart_consensus import (  # noqa: E402
     CONSENSUS_VERSION,
 )
@@ -51,7 +54,7 @@ PIPELINE_VERSION = (
     "topology-stable-polish-native-rigid-depth-"
     "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
     "static-role-posterior-mask-soft-arbitration-atlas-residual-"
-    "verification-debt"
+    "verification-debt-sequence-metric-depth"
 )
 STAGES = (
     "prepare_cameras",
@@ -157,6 +160,7 @@ PROFILES = {
         # the immutable evidence archive, and fuse repeated observations into
         # the one static deployment map before optimization.
         "use_temporal_dav2_witnesses": True,
+        "use_sequence_metric_depth": True,
         "temporal_dav2_maximum_gap": 12,
         "temporal_dav2_maximum_rays_per_view": 2_048,
         "temporal_dav2_maximum_births_per_view": 2_048,
@@ -224,6 +228,7 @@ PROFILES = {
         "maximum_weak_continuous_dynamic_births_per_foliage_view": 2_048,
         "dynamic_birth_target_source_pixels_per_basis": 192.0,
         "use_temporal_dav2_witnesses": True,
+        "use_sequence_metric_depth": True,
         "temporal_dav2_maximum_gap": 12,
         "temporal_dav2_maximum_rays_per_view": 1_024,
         "temporal_dav2_maximum_births_per_view": 1_024,
@@ -711,6 +716,71 @@ def _run(command: list[str], *, env: dict, log: Path, dry_run: bool) -> None:
             f"Stage failed with exit {completed.returncode}: {' '.join(command)}\n"
             + tail
         )
+
+
+def _sequence_metric_initialization(
+    *,
+    python: str,
+    source: Path,
+    evidence: Path,
+    env: dict,
+    log: Path,
+    dry_run: bool,
+) -> Path:
+    """Return a content-addressed sequence-consistent foliage archive."""
+
+    output = source.with_name(source.name + "_sequence_metric_depth")
+    producer = REPO_ROOT / "scripts/regularize_sequence_dav2_foliage.py"
+    command = [
+        python,
+        str(producer),
+        "--source-initialization",
+        str(source),
+        "--evidence-store",
+        str(evidence),
+        "--output",
+        str(output),
+        "--maximum-frame-gap",
+        "3",
+        "--maximum-pixel-distance",
+        "3",
+        "--minimum-matches",
+        "64",
+        "--iterations",
+        "2",
+        "--maximum-canonical-distance",
+        "3",
+    ]
+    if dry_run:
+        _run(command, env=env, log=log, dry_run=True)
+        return output
+    source_foliage = source / "foliage_seed_gaussians.pth"
+    if not source_foliage.is_file():
+        raise FileNotFoundError(source_foliage)
+    source_sha256 = sha256_file(source_foliage)
+    producer_sha256 = sha256_file(producer)
+    current = False
+    manifest_path = output / "initialization_manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            audit = manifest["foliage"]["sequence_metric_depth"]
+            current = bool(
+                manifest.get("version") == SEQUENCE_METRIC_DEPTH_VERSION
+                and manifest.get("migrated_from", {}).get(
+                    "foliage_seed_sha256"
+                )
+                == source_sha256
+                and audit.get("producer_implementation_sha256")
+                == producer_sha256
+            )
+        except (KeyError, OSError, ValueError):
+            current = False
+    if not current:
+        if output.exists():
+            command.append("--replace")
+        _run(command, env=env, log=log, dry_run=False)
+    return output
 
 
 def _teacher_command(
@@ -1528,6 +1598,9 @@ def main() -> None:
     use_temporal_dav2_witnesses = bool(
         profile.get("use_temporal_dav2_witnesses", False)
     )
+    use_sequence_metric_depth = bool(
+        profile.get("use_sequence_metric_depth", False)
+    )
     # Quality/fast rebuild foliage after native rigid pretraining. Applying
     # temporal witnesses before that rebuild only feeds the foliage-disabled
     # rigid stage and is then silently discarded. Defer augmentation until
@@ -1854,6 +1927,18 @@ def main() -> None:
                     log=run / "logs/augment_temporal_dav2.log",
                     dry_run=args.dry_run,
                 )
+        if (
+            use_sequence_metric_depth
+            and not defer_temporal_until_rigid_calibration
+        ):
+            initialization = _sequence_metric_initialization(
+                python=python,
+                source=initialization,
+                evidence=evidence,
+                env=env,
+                log=run / "logs/regularize_sequence_metric_depth.log",
+                dry_run=args.dry_run,
+            )
         init = json.loads(
             (initialization / "initialization_manifest.json").read_text()
         )
@@ -1882,6 +1967,13 @@ def main() -> None:
             "foliage": init["foliage"],
         }
         _write_manifest(manifest_path, manifest)
+    elif (
+        use_sequence_metric_depth
+        and not defer_temporal_until_rigid_calibration
+    ):
+        initialization = initialization.with_name(
+            initialization.name + "_sequence_metric_depth"
+        )
 
     teacher = run / "teacher"
     if "train_teacher" in selected:
@@ -2265,6 +2357,26 @@ def main() -> None:
                         calibrated_initialization
                     ),
                     "static_training_fusion": True,
+                }
+                _write_manifest(manifest_path, manifest)
+
+            if use_sequence_metric_depth:
+                sequence_metric_source = initialization
+                initialization = _sequence_metric_initialization(
+                    python=python,
+                    source=sequence_metric_source,
+                    evidence=evidence,
+                    env=train_env,
+                    log=run
+                    / "logs/regularize_rigid_calibrated_sequence_metric_depth.log",
+                    dry_run=args.dry_run,
+                )
+                manifest["stages"]["sequence_metric_depth"] = {
+                    "status": "complete",
+                    "initialization": str(initialization),
+                    "source_initialization": str(sequence_metric_source),
+                    "protocol": SEQUENCE_METRIC_DEPTH_VERSION,
+                    "primitive_and_exact_ray_intervals_updated_together": True,
                 }
                 _write_manifest(manifest_path, manifest)
 
