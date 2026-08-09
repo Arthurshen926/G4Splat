@@ -430,7 +430,17 @@ TRAINING_PROFILES = {
         "iterations": 20_000,
         "phases": (
             ("canonical_bootstrap", 0.02),
-            ("topology", 0.20),
+            # The calibrated ray-factor schedule consumes one distinct
+            # evidence camera every four optimizer steps.  At a 30k method
+            # horizon, 3k updates therefore cover all 639 foliage witnesses
+            # once (plus margin) and the 1,487-view RGB stream twice. Keeping
+            # exact-ray static detail hidden until 6k made broad envelope
+            # kernels absorb another full sweep of colour/opacity and leak
+            # across tree boundaries before local replace-and-retire could
+            # act.  Start the detail hand-off after the first complete
+            # evidence sweep; volume topology itself remains trainable to its
+            # independent iteration limit.
+            ("topology", 0.10),
             ("static_foliage", 0.45),
             ("dynamic_appearance", 0.65),
             ("ownership_cleanup", 0.85),

@@ -2038,6 +2038,23 @@ def test_handoff_profile_starts_foliage_without_rebuilding_rigid_surface():
     )
 
 
+def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
+    profile = TRAINING_PROFILES["static_handoff_quality"]
+
+    assert profile["foliage_start"] == 0.0
+    assert _phase(599, 30_000, "static_handoff_quality") == (
+        "canonical_bootstrap"
+    )
+    assert _phase(600, 30_000, "static_handoff_quality") == "topology"
+    assert _phase(2_999, 30_000, "static_handoff_quality") == "topology"
+    assert _phase(3_000, 30_000, "static_handoff_quality") == (
+        "static_foliage"
+    )
+    # One ray-factor camera is consumed every four steps. The 3k transition
+    # is later than one full 639-camera evidence sweep (2,556 updates).
+    assert 3_000 > 4 * 639
+
+
 def test_absolute_schedule_makes_short_run_an_exact_method_prefix():
     profile = "hybrid_handoff_quality"
     horizon = 12_000
