@@ -5617,7 +5617,7 @@ def _line_supported_tree_tracks(
     eligible: np.ndarray,
     *,
     minimum_linearity: float,
-    maximum_radial_spread: float = 0.06,
+    maximum_radial_spread: float = 0.08,
     neighbourhood_radius: float = 0.30,
     minimum_neighbours: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -6118,6 +6118,44 @@ def _merge_foliage(
     initial_opacity[dense_ray_local] = (
         dense_initial_opacity[dense_ray_local].numpy()
     )
+    # A discrete skeleton label is insufficient for geometry optimization:
+    # the trainer needs to know how much independent evidence actually backs
+    # that role.  Earlier merged track rows inherited the hull schema's zero
+    # fill here, so even accepted SfM/MASt3R branches entered the rigidity
+    # factor with no continuous authority.  Combine independent camera and
+    # sequence support with reprojection, occupancy and local line evidence.
+    # This score is deliberately continuous; only the already physical
+    # line/cylinder test above decides the role.
+    view_confidence = np.clip(
+        (support_view_count.astype(np.float32) - 1.0) / 4.0,
+        0.0,
+        1.0,
+    )
+    sequence_confidence = np.clip(
+        (sequence_support.astype(np.float32) - 1.0) / 2.0,
+        0.0,
+        1.0,
+    )
+    reprojection_confidence = np.exp(
+        -error / max(float(maximum_reprojection_error), 1.0e-6)
+    )
+    line_confidence = np.clip(
+        (linearity - 1.0)
+        / max(float(skeleton_linearity), 1.01),
+        0.0,
+        1.0,
+    )
+    static_skeleton_confidence = np.sqrt(
+        np.clip(
+            view_confidence
+            * sequence_confidence
+            * reprojection_confidence
+            * occupancy_probability,
+            0.0,
+            1.0,
+        )
+    ) * (0.35 + 0.65 * line_confidence)
+    static_skeleton_confidence[layer_role != 1] = 0.0
     values = {
         "centers": xyz,
         "colors": rgb,
@@ -6151,6 +6189,9 @@ def _merge_foliage(
         "position_covariance": position_covariance,
         "reprojection_error": error,
         "track_linearity": linearity,
+        "static_skeleton_confidence": (
+            static_skeleton_confidence.astype(np.float32)
+        ),
         "support_camera_ids": support_camera_ids,
         "observation_camera_ids": observation_camera_ids,
         "observation_uv": observation_uv,
@@ -6657,7 +6698,7 @@ def build_foliage_seed(
     minimum_track_observations: int = 3,
     minimum_track_sequences: int = 2,
     maximum_reprojection_error: float = 2.0,
-    skeleton_linearity: float = 1.8,
+    skeleton_linearity: float = 1.55,
     maximum_sfm_static_tree_tracks: int = 120_000,
     sfm_tree_coverage_radius: float = 0.018,
     rigid_calibration_ply: Path | None = None,
@@ -7594,6 +7635,14 @@ def build_foliage_seed(
             "static_skeleton_evidence": (
                 "cross_sequence_min3_observation_depth_rgb__"
                 "same_instance_min3_local_line_cylinder_v2"
+            ),
+            "static_skeleton_linearity_minimum": float(
+                skeleton_linearity
+            ),
+            "static_skeleton_radial_spread_maximum": 0.08,
+            "static_skeleton_confidence_contract": (
+                "continuous_view_sequence_reprojection_occupancy_line_"
+                "support__zero_only_outside_static_skeleton_role"
             ),
             "historical_trained_ply_used": False,
             "geometry_source": store.get(

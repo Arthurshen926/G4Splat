@@ -1985,7 +1985,7 @@ class VolumetricFoliageModel(nn.Module):
         support_camera_ids: torch.Tensor | None = None,
         support_sequence_count: torch.Tensor | None = None,
         initial_scale: float = 0.04,
-        initial_opacity: float = 0.02,
+        initial_opacity: float = 0.04,
         birth_iteration: int = -1,
     ) -> dict[str, torch.Tensor | int]:
         """Append cross-sequence uncovered-hit consensus as static leaves."""

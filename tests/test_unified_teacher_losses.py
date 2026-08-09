@@ -47,6 +47,7 @@ from scripts.train_unified_outdoor_teacher import (
     _conditioned_photo_losses,
     _counterfactual_volume_transparency_loss,
     _evidence_adaptive_role_quotas,
+    _extend_volume_stats_for_births,
     _geometry_losses,
     _projected_occluded_rigid_geometry_loss,
     _inherit_surface_optimizer_contract,
@@ -2138,14 +2139,28 @@ def test_static_handoff_starts_detail_at_measured_envelope_optimum():
         "canonical_bootstrap"
     )
     assert _phase(600, 30_000, "static_handoff_quality") == "topology"
-    assert _phase(1_999, 30_000, "static_handoff_quality") == "topology"
-    assert _phase(2_000, 30_000, "static_handoff_quality") == (
+    assert _phase(1_499, 30_000, "static_handoff_quality") == "topology"
+    assert _phase(1_500, 30_000, "static_handoff_quality") == (
         "static_foliage"
     )
-    # One ray-factor camera is consumed every four steps. The measured 2k
-    # optimum has already consumed 500/639 cameras; the same ray scheduler
-    # continues after the representation handoff and completes the epoch.
-    assert 2_000 // 4 == 500
+    # This is a lifecycle transition after one full RGB camera epoch, not a
+    # pass/fail gate.  The ray scheduler continues after handoff and consumes
+    # the remaining calibrated evidence normally.
+    assert 1_500 >= 1_487
+
+
+def test_ray_birth_stat_extension_preserves_measured_prefix():
+    stats = {
+        "gradient": torch.tensor([1.0, 2.0]),
+        "conditioned_context_id": torch.tensor(
+            [7, 9], dtype=torch.int32
+        ),
+    }
+    extended = _extend_volume_stats_for_births(stats, 4)
+    torch.testing.assert_close(
+        extended["gradient"], torch.tensor([1.0, 2.0, 0.0, 0.0])
+    )
+    assert extended["conditioned_context_id"].tolist() == [7, 9, -1, -1]
 
 
 def test_cpu_parallelism_bounds_native_prefetch_callers():

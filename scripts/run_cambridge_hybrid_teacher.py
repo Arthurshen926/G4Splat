@@ -49,7 +49,8 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v49-positive-tree-view-budget-"
+    "cambridge-native-hybrid-teacher-mainline-v50-static-detail-birth-first-"
+    "track-skeleton-confidence-positive-tree-view-budget-"
     "local-negative-permission-"
     "topology-stable-polish-native-rigid-depth-"
     "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
@@ -306,6 +307,8 @@ def _trainer_implementation_hashes() -> dict[str, str]:
         / "outdoor/hybrid_teacher_api.py",
         "hybrid_renderer": REPO_ROOT
         / "outdoor/hybrid_gaussian_renderer.py",
+        "static_foliage": REPO_ROOT / "outdoor/static_foliage.py",
+        "static_ray_birth": REPO_ROOT / "outdoor/static_ray_birth.py",
         "mixed_forward_cuda": surfel_root
         / "submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu",
         "mixed_backward_cuda": surfel_root

@@ -441,11 +441,13 @@ TRAINING_PROFILES = {
             # to 11.086 dB at 3k while surface-only stays stable and
             # envelope-only collapses.  Waiting for all 639 ray cameras lets
             # broad envelope kernels overfit colour/opacity before local
-            # detail replacement can act.  At 2k, 500/639 evidence cameras
-            # have already been consumed and the RGB stream has completed a
-            # full epoch.  Hand off there; ray factors and volume topology
-            # continue independently, so remaining cameras are not dropped.
-            ("topology", 1.0 / 15.0),
+            # detail replacement can act.  One complete 1,487-camera RGB
+            # epoch is sufficient to establish the low-frequency envelope;
+            # hand off at 1.5k on the 30k production horizon.  Ray factors
+            # and volume topology continue independently, so later evidence
+            # is not dropped and this is a smooth lifecycle transition, not
+            # a metric gate.
+            ("topology", 0.05),
             ("static_foliage", 0.45),
             ("dynamic_appearance", 0.65),
             ("ownership_cleanup", 0.85),
@@ -6650,6 +6652,42 @@ def _volume_stats(foliage) -> dict[str, torch.Tensor]:
         "observation_gradient": torch.zeros(count, device=device),
         "observation_count": torch.zeros(count, device=device),
     }
+
+
+def _extend_volume_stats_for_births(
+    stats: dict[str, torch.Tensor], new_count: int
+) -> dict[str, torch.Tensor]:
+    """Append neutral statistics without erasing the measured old rows.
+
+    Ray-driven births are allocated before ordinary splitting.  Resetting the
+    whole statistics table after that append would discard the screen-space
+    evidence that is supposed to rank existing split candidates.  Preserve
+    the prefix exactly and give newborn rows a neutral first topology epoch;
+    their explicit verification grace protects them until real cameras have
+    observed them.
+    """
+    if not stats:
+        raise ValueError("volume statistics cannot be empty")
+    old_count = len(next(iter(stats.values())))
+    new_count = int(new_count)
+    if new_count < old_count:
+        raise ValueError("ray birth cannot shrink volume statistics")
+    if new_count == old_count:
+        return stats
+    extension = new_count - old_count
+    result = {}
+    for name, value in stats.items():
+        if len(value) != old_count:
+            raise ValueError("volume statistic tables have unequal lengths")
+        fill_value = -1 if name == "conditioned_context_id" else 0
+        suffix = torch.full(
+            (extension,),
+            fill_value,
+            device=value.device,
+            dtype=value.dtype,
+        )
+        result[name] = torch.cat([value, suffix], dim=0)
+    return result
 
 
 @torch.no_grad()
@@ -12857,7 +12895,10 @@ def main():
             "verification_debt_backpressure": (
                 "same_continuous_smoothstep_capacity_as_ordinary_split"
             ),
-            "initial_opacity": 0.02,
+            "initial_opacity": 0.04,
+            "capacity_order": (
+                "cross_sequence_uncovered_birth_before_ordinary_split"
+            ),
             "positive_permission": "cross_sequence_hit_intersection_only",
             "negative_permission": "all_calibrated_free_and_rigid_spill",
         },
@@ -17018,6 +17059,95 @@ def main():
             and (step + 1) % args.volume_densify_every == 0
             and len(foliage)
         ):
+            # Allocate newly confirmed uncovered rays before ordinary
+            # residual/footprint splits.  The old order let existing broad
+            # envelope lineages fill the global budget first and then called
+            # drain() with zero capacity, even when independent cameras and
+            # sequences had already confirmed a missing leaf volume.
+            birth_audit = {
+                "contract": "static_target_only",
+                "born": 0,
+                "eligible_cells": 0,
+            }
+            birth_event = {"appended": 0}
+            configured_birth_limit = 0
+            effective_birth_limit = 0
+            verification_capacity_scale = 1.0
+            if args.reconstruction_target == "static":
+                current_verification_state = getattr(
+                    foliage,
+                    "verification_state",
+                    torch.full_like(
+                        foliage.layer_role, VERIFICATION_VERIFIED
+                    ),
+                )
+                current_verification_debt = float(
+                    (
+                        current_verification_state
+                        == VERIFICATION_UNVERIFIED
+                    ).float().mean()
+                )
+                verification_capacity_scale = (
+                    _verification_debt_capacity_scale(
+                        current_verification_debt,
+                        soft_fraction=float(
+                            args.volume_verification_debt_soft_fraction
+                        ),
+                        hard_fraction=float(
+                            args.volume_verification_debt_hard_fraction
+                        ),
+                    )
+                )
+                configured_birth_limit = int(
+                    args.maximum_static_ray_births_per_event
+                )
+                effective_birth_limit = int(
+                    np.floor(
+                        configured_birth_limit
+                        * np.clip(
+                            verification_capacity_scale, 0.0, 1.0
+                        )
+                        + 1.0e-6
+                    )
+                )
+                (
+                    birth_centers,
+                    birth_colors,
+                    birth_support_camera_ids,
+                    birth_support_sequence_count,
+                    birth_audit,
+                ) = static_ray_births.drain(
+                    maximum_births=min(
+                        effective_birth_limit,
+                        max(int(volume_budget) - len(foliage), 0),
+                    )
+                )
+                if len(birth_centers):
+                    birth_event = foliage.append_static_ray_births(
+                        birth_centers,
+                        colors=birth_colors,
+                        support_camera_ids=birth_support_camera_ids,
+                        support_sequence_count=(
+                            birth_support_sequence_count
+                        ),
+                        birth_iteration=step + 1,
+                    )
+                    birth_mapping = birth_event.pop("_new_to_old")
+                    birth_start = int(birth_event.pop("_new_start"))
+                    volume_optimizer = _migrate_volume_optimizer(
+                        args,
+                        foliage,
+                        appearance,
+                        sky,
+                        volume_optimizer,
+                        birth_mapping,
+                    )
+                    _zero_new_volume_optimizer_rows(
+                        volume_optimizer, birth_start
+                    )
+                    volume_stats = _extend_volume_stats_for_births(
+                        volume_stats, len(foliage)
+                    )
             event = _adapt_volume(
                 args,
                 foliage,
@@ -17058,59 +17188,6 @@ def main():
                         volume_optimizer, rollback_new_rows
                     )
             if args.reconstruction_target == "static":
-                verification_capacity_scale = float(
-                    event.get("verification_debt", {}).get(
-                        "ordinary_split_capacity_scale", 1.0
-                    )
-                )
-                configured_birth_limit = int(
-                    args.maximum_static_ray_births_per_event
-                )
-                effective_birth_limit = int(
-                    np.floor(
-                        configured_birth_limit
-                        * np.clip(
-                            verification_capacity_scale, 0.0, 1.0
-                        )
-                        + 1.0e-6
-                    )
-                )
-                (
-                    birth_centers,
-                    birth_colors,
-                    birth_support_camera_ids,
-                    birth_support_sequence_count,
-                    birth_audit,
-                ) = static_ray_births.drain(
-                    maximum_births=min(
-                        effective_birth_limit,
-                        max(int(volume_budget) - len(foliage), 0),
-                    )
-                )
-                birth_event = {"appended": 0}
-                if len(birth_centers):
-                    birth_event = foliage.append_static_ray_births(
-                        birth_centers,
-                        colors=birth_colors,
-                        support_camera_ids=birth_support_camera_ids,
-                        support_sequence_count=(
-                            birth_support_sequence_count
-                        ),
-                        birth_iteration=step + 1,
-                    )
-                    birth_mapping = birth_event.pop("_new_to_old")
-                    birth_start = int(birth_event.pop("_new_start"))
-                    volume_optimizer = _migrate_volume_optimizer(
-                        args,
-                        foliage,
-                        appearance,
-                        sky,
-                        volume_optimizer,
-                        birth_mapping,
-                    )
-                    _zero_new_volume_optimizer_rows(
-                        volume_optimizer, birth_start
-                    )
                 event["ray_driven_birth"] = {
                     **birth_audit,
                     **birth_event,
@@ -17120,7 +17197,9 @@ def main():
                         verification_capacity_scale
                     ),
                     "capacity_contract": (
-                        "shared_continuous_verification_debt_backpressure"
+                        "cross_sequence_uncovered_birth_before_ordinary_"
+                        "split__shared_continuous_verification_debt_"
+                        "backpressure"
                     ),
                 }
             volume_stats = _volume_stats(foliage)

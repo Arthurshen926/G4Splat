@@ -196,7 +196,7 @@ def _append_ownerless_static_ray_births(
     voxel_size: float = 0.15,
     minimum_supporting_views: int = 2,
     minimum_supporting_sequences: int = 2,
-    initial_opacity: float = 0.02,
+    initial_opacity: float = 0.04,
 ) -> tuple[dict, dict[str, int | float]]:
     """Promote only cross-sequence consensus from ownerless hit births."""
     centers = torch.as_tensor(original["centers"]).float().cpu()
@@ -459,7 +459,7 @@ def fuse_sequence_evidence_into_static_leaves(
     payload: dict,
     *,
     minimum_supporting_views: int = 2,
-    initial_opacity: float = 0.03,
+    initial_opacity: float = 0.05,
     canonical_mode_voxel_size: float = 0.08,
     maximum_modes_per_group: int = 2,
     canonical_sequence_policy: str = "per_tree",
@@ -1011,9 +1011,27 @@ def fuse_sequence_evidence_into_static_leaves(
         parent_detail_colors - color_delta,
     ).clamp(0.02, 0.98)
     fused_scales = (parent_scales * 0.45).clamp_min(0.004)
-    fused_opacity = torch.full(
-        (mode_count, 1), float(initial_opacity), dtype=torch.float32
-    )
+    # Static detail used to start every mode at alpha=0.03 while its parent
+    # envelope retained a much broader footprint.  Before detail handoff the
+    # envelope consequently learned the entire low-frequency optical
+    # explanation, and the small detail kernels had too little transmittance
+    # leverage to take it back.  Give repeated, independently supported
+    # modes enough *initial optical existence* without granting them extra
+    # depth authority.  The floor is still conservative and the upper bound
+    # requires both view and sequence support.
+    view_strength = (
+        (selected_mode_view_count.float() - 1.0) / 3.0
+    ).clamp(0.0, 1.0)
+    sequence_strength = (
+        (sequence_count[mode_groups].float() - 1.0) / 2.0
+    ).clamp(0.0, 1.0)
+    optical_support = 0.5 * (view_strength + sequence_strength)
+    maximum_initial_opacity = min(0.10, 2.0 * float(initial_opacity))
+    fused_opacity = (
+        float(initial_opacity)
+        + (maximum_initial_opacity - float(initial_opacity))
+        * optical_support
+    )[:, None].to(torch.float32)
 
     # Preserve the actual canonical cameras supporting each mode instead of
     # copying an unrelated envelope table.
@@ -1244,4 +1262,6 @@ def fuse_sequence_evidence_into_static_leaves(
         **ownerless_audit,
         "output_static_rows": int(len(result["static_detail"])),
         "initial_opacity": float(initial_opacity),
+        "initial_opacity_maximum": float(maximum_initial_opacity),
+        "initial_opacity_mean": float(fused_opacity.mean()),
     }

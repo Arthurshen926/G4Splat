@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
@@ -125,6 +126,9 @@ def test_sequence_observations_fuse_to_one_static_model():
         payload["centers"][detail][0], torch.tensor([0.02, 0.01, 3.00])
     )
     assert int(payload["support_sequence_count"][detail][0]) == 2
+    # Cross-sequence support gives the local detail more optical leverage than
+    # a weak ownerless birth, while remaining far below an opaque splat.
+    assert 0.05 < float(payload["opacities"][detail][0]) <= 0.10
     ownerless = payload["static_detail"] & (
         payload["replacement_group"] < 0
     )
@@ -133,6 +137,7 @@ def test_sequence_observations_fuse_to_one_static_model():
     # hit/RGB supervision back to both observations.
     assert payload["support_camera_ids"][ownerless][0].tolist() == [0, 1]
     assert payload["observation_camera_ids"][ownerless][0].tolist() == [0, 1]
+    assert float(payload["opacities"][ownerless][0]) == pytest.approx(0.04)
     assert audit["canonical_sequence_tree_count"] == 2
     assert audit["canonical_sequence_policy"] == "scene"
     assert audit["canonical_scene_sequence"] == "seq0"
