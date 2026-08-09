@@ -501,3 +501,46 @@ def test_runtime_ray_birth_without_same_tree_envelope_remains_ownerless():
     )
     assert foliage.replacement_group[-1] == -1
     assert event["replacement_group_association"]["assigned"] == 0
+
+
+def test_bounded_nearest_reference_rows_matches_full_cdist(monkeypatch):
+    query = torch.tensor(
+        [[0.1, 0.0, 0.0], [2.2, 0.0, 0.0], [5.0, 0.0, 0.0]]
+    )
+    reference = torch.tensor(
+        [
+            [9.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [5.5, 0.0, 0.0],
+            [5.5, 0.0, 0.0],
+        ]
+    )
+    rows = torch.tensor([4, 2, 1, 3])
+    expected_distance, expected_local = torch.cdist(
+        query, reference[rows]
+    ).min(dim=1)
+    expected_rows = rows[expected_local]
+
+    original_cdist = torch.cdist
+    pair_counts = []
+
+    def audited_cdist(first, second, *args, **kwargs):
+        pair_counts.append(len(first) * len(second))
+        return original_cdist(first, second, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cdist", audited_cdist)
+    distance, nearest_rows = (
+        VolumetricFoliageModel._nearest_reference_rows_bounded(
+            query,
+            reference,
+            rows,
+            maximum_pairwise_entries=6,
+        )
+    )
+    torch.testing.assert_close(distance, expected_distance)
+    assert torch.equal(nearest_rows, expected_rows)
+    assert max(pair_counts) <= 6
+    # Rows 4 and 3 are tied for the last query. The original first-row rule
+    # must survive reference tiling.
+    assert nearest_rows[-1].item() == 4

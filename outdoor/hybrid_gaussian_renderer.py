@@ -1700,6 +1700,81 @@ class VolumetricFoliageModel(nn.Module):
             )
         return self._replacement_pair_cache
 
+    @staticmethod
+    @torch.no_grad()
+    def _nearest_reference_rows_bounded(
+        query_xyz: torch.Tensor,
+        reference_xyz: torch.Tensor,
+        reference_rows: torch.Tensor,
+        *,
+        maximum_pairwise_entries: int = 8_388_608,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Find exact nearest rows without materializing an O(NxM) matrix.
+
+        Ray-driven birth needs only the nearest scaffold identity.  The old
+        2,048 x 65,536 ``cdist`` tile occupied 512 MiB before CUDA workspace
+        and failed at the first topology event on an otherwise valid shared
+        GPU.  This tiled reduction preserves the same Euclidean argmin and
+        first-row tie rule while bounding the pairwise tensor to 32 MiB for
+        float32 at the default limit.
+        """
+
+        query_xyz = torch.as_tensor(query_xyz).reshape(-1, 3)
+        reference_xyz = torch.as_tensor(reference_xyz).reshape(-1, 3)
+        reference_rows = torch.as_tensor(
+            reference_rows,
+            device=reference_xyz.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if query_xyz.device != reference_xyz.device:
+            raise ValueError("Nearest-reference tensors must share a device")
+        if not len(reference_rows):
+            raise ValueError("Nearest-reference search requires candidates")
+        if int(maximum_pairwise_entries) <= 0:
+            raise ValueError("maximum_pairwise_entries must be positive")
+        if not len(query_xyz):
+            return (
+                query_xyz.new_empty((0,)),
+                reference_rows.new_empty((0,)),
+            )
+
+        maximum_pairwise_entries = int(maximum_pairwise_entries)
+        # At most 2,048 queries per outer tile keeps the number of reference
+        # launches modest for the production 2,048-birth event while still
+        # covering callers with a larger diagnostic batch.
+        query_batch_size = min(
+            len(query_xyz), maximum_pairwise_entries, 2_048
+        )
+        best_distance_parts = []
+        best_row_parts = []
+        for query_begin in range(0, len(query_xyz), query_batch_size):
+            query = query_xyz[
+                query_begin : query_begin + query_batch_size
+            ]
+            reference_batch_size = max(
+                1, maximum_pairwise_entries // max(len(query), 1)
+            )
+            best_distance = query.new_full((len(query),), float("inf"))
+            # Match torch.min's first-candidate behavior even if every
+            # distance is non-finite. Strict ``<`` below also preserves the
+            # first reference row for exact finite ties across tiles.
+            best_row = reference_rows[0].expand(len(query)).clone()
+            for reference_begin in range(
+                0, len(reference_rows), reference_batch_size
+            ):
+                rows = reference_rows[
+                    reference_begin : reference_begin
+                    + reference_batch_size
+                ]
+                distance = torch.cdist(query, reference_xyz[rows])
+                local_distance, local_index = distance.min(dim=1)
+                better = local_distance < best_distance
+                best_distance[better] = local_distance[better]
+                best_row[better] = rows[local_index[better]]
+            best_distance_parts.append(best_distance)
+            best_row_parts.append(best_row)
+        return torch.cat(best_distance_parts), torch.cat(best_row_parts)
+
     @torch.no_grad()
     def associate_static_detail_replacement_groups(
         self,
@@ -1755,11 +1830,13 @@ class VolumetricFoliageModel(nn.Module):
                 continue
             for begin in range(0, len(local_targets), int(query_batch_size)):
                 batch = local_targets[begin : begin + int(query_batch_size)]
-                distance = torch.cdist(
-                    self.xyz.detach()[batch], self.xyz.detach()[local_owners]
+                nearest_distance, owner_rows = (
+                    self._nearest_reference_rows_bounded(
+                        self.xyz.detach()[batch],
+                        self.xyz.detach(),
+                        local_owners,
+                    )
                 )
-                nearest_distance, nearest = distance.min(dim=1)
-                owner_rows = local_owners[nearest]
                 assigned_rows.append(batch)
                 assigned_groups.append(self.replacement_group[owner_rows])
                 assigned_distances.append(nearest_distance)
@@ -1952,19 +2029,11 @@ class VolumetricFoliageModel(nn.Module):
         reference_pool = torch.nonzero(
             ~self.dynamic_leaf_mask, as_tuple=False
         ).flatten()
-        best_distance = torch.full(
-            (len(centers),), float("inf"), device=self.xyz.device
+        best_distance, parent = self._nearest_reference_rows_bounded(
+            centers,
+            self.xyz.detach(),
+            reference_pool,
         )
-        parent = torch.zeros(
-            len(centers), dtype=torch.long, device=self.xyz.device
-        )
-        for begin in range(0, len(reference_pool), 65_536):
-            rows = reference_pool[begin : begin + 65_536]
-            distance = torch.cdist(centers, self.xyz.detach()[rows])
-            local_distance, local_index = distance.min(dim=1)
-            better = local_distance < best_distance
-            best_distance[better] = local_distance[better]
-            parent[better] = rows[local_index[better]]
         old_count = len(self)
         parameter_values = {}
         for name in (
