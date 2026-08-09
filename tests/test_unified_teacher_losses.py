@@ -4489,6 +4489,36 @@ def test_ownerless_ray_uses_preverified_canonical_or_exact_dynamic():
     assert dynamic.opacity_logits.grad.abs().sum() > 0
 
 
+def test_weak_ownerless_hit_routes_existence_to_verified_canonical_opacity():
+    strong_evidence = _ownerless_interval_evidence(confidence=1.0)
+    weak_evidence = _ownerless_interval_evidence(confidence=0.1)
+    strong = _interval_foliage(3.0)
+    weak = _interval_foliage(3.0)
+    strong.support_sequence_count.fill_(2)
+    weak.support_sequence_count.fill_(2)
+
+    strong_loss, strong_audit = strong_evidence.interval_factor(
+        _interval_camera(), strong
+    )
+    weak_loss, weak_audit = weak_evidence.interval_factor(
+        _interval_camera(), weak
+    )
+    strong_loss.backward()
+    weak_loss.backward()
+
+    assert weak_audit["ownerless_canonical_hit_rays"] == 1
+    assert weak_audit["hit_optical_existence"] > 0
+    # Weak metric depth scales xyz/scale placement, but the tree-labelled
+    # pixel retains one unit of opacity-only existence authority on the
+    # independently verified canonical lineage.
+    torch.testing.assert_close(
+        weak.opacity_logits.grad,
+        strong.opacity_logits.grad,
+        rtol=0.03,
+        atol=1e-6,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_ownerless_verified_row_audit_crosses_cuda_to_cpu_safely():
     evidence = FoliageRayEvidence(
