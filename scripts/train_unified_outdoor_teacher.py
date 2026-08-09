@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import json
@@ -672,6 +673,11 @@ def _trainer_repair_hash_change_is_allowed(
                 # therefore leaves every resumed optimizer/model tensor and
                 # training forward function unchanged.
                 "hybrid_teacher_api",
+                # v5 replaces the inert two-scalar static uncertainty with a
+                # training-only smooth field and explicitly migrates its one
+                # appended optimizer parameter. CUDA/image formation and all
+                # existing model tensors remain unchanged at the boundary.
+                "appearance_uncertainty",
             }
         )
     )
@@ -3793,6 +3799,34 @@ def _resume_training_contract_differences(
         ):
             if key not in saved and key in current:
                 saved[key] = current[key]
+        current_static_uncertainty = current.get(
+            "static_spatial_uncertainty"
+        )
+        if (
+            "static_spatial_uncertainty" not in saved
+            and isinstance(current_static_uncertainty, dict)
+            and current_static_uncertainty.get("contract")
+            == (
+                "training_only_per_image_degree2_legendre_"
+                "heteroscedastic_canopy_sky_field"
+            )
+            and not bool(current_static_uncertainty.get("rgb_residual"))
+            and not bool(
+                current_static_uncertainty.get(
+                    "geometry_or_opacity_owner"
+                )
+            )
+            and not bool(
+                current_static_uncertainty.get("deployment_parameter")
+            )
+        ):
+            # The appended decoder starts at exact zero, so the first resumed
+            # forward is identical to v4. Existing Adam tensors migrate
+            # losslessly; only future static-detail visits learn the robust
+            # scale field.
+            saved["static_spatial_uncertainty"] = (
+                current_static_uncertainty
+            )
         # Static v52 checkpoints coupled canonical appearance ownership to
         # every geometry/opacity contradiction.  The repaired contract adds
         # an all-camera negative-evidence path while preserving the exact
@@ -6230,6 +6264,61 @@ def _volume_optimizer(args, foliage, appearance, sky):
     for group in optimizer.param_groups:
         group["base_lr"] = float(group["lr"])
     return optimizer
+
+
+def _restore_volume_optimizer_state(
+    optimizer,
+    state_dict,
+    *,
+    allow_static_uncertainty_extension: bool = False,
+) -> bool:
+    """Restore Adam, appending only the new v5 uncertainty decoder.
+
+    The v5 spatial robust-scale decoder is registered after every v4
+    appearance parameter.  Therefore its optimizer migration is exact: all
+    existing ids and moments keep their ordering and one state-free parameter
+    is appended to the appearance group.  No foliage, sky or geometry state
+    is reinitialized.
+    """
+
+    try:
+        optimizer.load_state_dict(state_dict)
+        return False
+    except ValueError:
+        if not allow_static_uncertainty_extension:
+            raise
+    migrated = copy.deepcopy(state_dict)
+    saved_groups = migrated.get("param_groups", [])
+    current_groups = optimizer.param_groups
+    saved_by_name = {group.get("name"): group for group in saved_groups}
+    current_by_name = {group.get("name"): group for group in current_groups}
+    saved_appearance = saved_by_name.get("appearance")
+    current_appearance = current_by_name.get("appearance")
+    if (
+        saved_appearance is None
+        or current_appearance is None
+        or len(current_appearance["params"])
+        != len(saved_appearance["params"]) + 1
+        or any(
+            len(current_by_name[name]["params"])
+            != len(group["params"])
+            for name, group in saved_by_name.items()
+            if name != "appearance" and name in current_by_name
+        )
+    ):
+        raise RuntimeError(
+            "Static uncertainty repair encountered a non-appearance Adam "
+            "layout change"
+        )
+    existing_ids = [
+        int(parameter_id)
+        for group in saved_groups
+        for parameter_id in group["params"]
+    ]
+    appended_id = max(existing_ids, default=-1) + 1
+    saved_appearance["params"].append(appended_id)
+    optimizer.load_state_dict(migrated)
+    return True
 
 
 def _update_volume_learning_rates(
@@ -9888,6 +9977,27 @@ def _static_detail_stage_trainable(phase: str) -> bool:
     }
 
 
+def _static_spatial_uncertainty_active(
+    reconstruction_target: str,
+    *,
+    foliage_active: bool,
+    static_detail_active: bool,
+) -> bool:
+    """Enable robust spatial routing without enabling a temporal model.
+
+    The final representation remains one canonical static map.  This module
+    estimates only where cross-traversal RGB is unreliable after the detail
+    branch exists; it owns no geometry, opacity, RGB residual or deployment
+    parameter.
+    """
+
+    return bool(
+        reconstruction_target == "static"
+        and foliage_active
+        and static_detail_active
+    )
+
+
 def _static_detail_ray_trainable(phase: str) -> bool:
     """Pre-fit hidden static detail from calibrated rays during topology.
 
@@ -12004,7 +12114,20 @@ def main():
         args, foliage, appearance, sky
     )
     if resume is not None:
-        volume_optimizer.load_state_dict(resume["volume_optimizer"])
+        uncertainty_optimizer_migrated = _restore_volume_optimizer_state(
+            volume_optimizer,
+            resume["volume_optimizer"],
+            allow_static_uncertainty_extension=bool(
+                args.allow_trainer_repair_resume
+                and args.reconstruction_target == "static"
+            ),
+        )
+        if uncertainty_optimizer_migrated:
+            print(
+                "Migrated the v4 appearance Adam group by appending the "
+                "state-free stripe-free spatial uncertainty decoder; all "
+                "existing foliage/appearance/sky moments were preserved."
+            )
         if args.allow_trainer_repair_resume:
             dynamic = foliage.dynamic_leaf_mask
             dynamic_opacity = foliage.opacities[dynamic]
@@ -12866,6 +12989,19 @@ def main():
             "coverage_plus_full_resolution_rgb_detail"
         ),
         "appearance_grid_policy": "disabled_no_camera_plane_grid",
+        "static_spatial_uncertainty": {
+            "contract": (
+                "training_only_per_image_degree2_legendre_"
+                "heteroscedastic_canopy_sky_field"
+            ),
+            "active_after_static_detail_visibility": True,
+            "rgb_residual": False,
+            "geometry_or_opacity_owner": False,
+            "canonical_weight_uses_detached_sigma": True,
+            "likelihood_uses_detached_render": True,
+            "deployment_parameter": False,
+            "camera_plane_grid": False,
+        },
         # Backward-compatible key for the optimizer's native single-pass
         # envelope handoff. Deployment compositing is a separate immutable
         # contract below and must never be inferred from this field.
@@ -14073,6 +14209,13 @@ def main():
             args.training_profile,
             args.reconstruction_target,
         )
+        static_spatial_uncertainty_active = (
+            _static_spatial_uncertainty_active(
+                args.reconstruction_target,
+                foliage_active=foliage_active,
+                static_detail_active=static_detail_active,
+            )
+        )
         # A 24k rigid handoff is a mature reconstruction, not a fresh seed.
         # Restarting its exponential xyz schedule at iteration one raised the
         # position LR by roughly 40x and destroyed the scaffold within the
@@ -14277,12 +14420,13 @@ def main():
             * task["p_canopy"]
         )
         static_confidence_mean = owner_weight.new_tensor(1.0)
-        if dynamic_active:
-            # Once the conditioned branch is active, pixels that repeatedly
-            # disagree in space/time no longer drag the canonical crown into
-            # a broad average.  Sigma is detached here: uncertainty is trained
-            # by its proper likelihood below and cannot reduce this loss by
-            # simply inflating itself.
+        if dynamic_active or static_spatial_uncertainty_active:
+            # Pixels that repeatedly disagree across calibrated traversals no
+            # longer drag the canonical crown into a broad average. Sigma is
+            # detached here: uncertainty is trained by its proper likelihood
+            # below and cannot reduce this loss by simply inflating itself.
+            # Static reconstruction uses the same training-only confidence
+            # without activating temporal leaves or conditioned rendering.
             sigma = appearance.spatial_uncertainty(
                 view.image_name,
                 (view.image_height, view.image_width),
@@ -15397,6 +15541,25 @@ def main():
             "canopy_rgb_retirement_blocked_mass": 0.0,
         }
         uncertainty_loss = canonical_loss.new_zeros(())
+        if static_spatial_uncertainty_active:
+            # A proper heteroscedastic likelihood learns where the immutable
+            # static map cannot explain traversal-dependent foliage. The RGB
+            # prediction is detached so uncertainty cannot move geometry,
+            # colour or opacity; its detached sigma only robustifies the next
+            # canonical visits through the confidence field above.
+            uncertainty_loss = (
+                appearance.heteroscedastic_loss(
+                    canonical.detach(),
+                    target,
+                    task,
+                    image_name=view.image_name,
+                )
+                + 0.05
+                * appearance.uncertainty_regularization(
+                    view.image_name,
+                    (view.image_height, view.image_width),
+                )
+            )
         high_frequency_loss = canonical_loss.new_zeros(())
         conditioned_ownership = canonical_loss.new_zeros(())
         dynamic_observation_loss = canonical_loss.new_zeros(())
@@ -15746,6 +15909,12 @@ def main():
                 conditioned_task_fields,
                 conditioned_target,
                 conditioned_topology_signal,
+            )
+
+        if static_spatial_uncertainty_active:
+            torch.autograd.backward(
+                args.appearance_weight * uncertainty_loss,
+                inputs=appearance.uncertainty_parameters(),
             )
 
         geometry_loss = canonical_loss.new_zeros(())

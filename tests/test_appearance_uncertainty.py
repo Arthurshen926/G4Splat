@@ -83,7 +83,7 @@ def test_effective_temporal_code_has_non_collapsing_norm():
     assert torch.isclose(code.norm(), torch.tensor(0.25), atol=1e-6)
 
 
-def test_uncertainty_is_global_and_legacy_camera_grid_is_inert():
+def test_uncertainty_is_smooth_spatial_and_legacy_camera_grid_is_inert():
     model = OutdoorAppearanceUncertainty(
         ["seq1__frame00001"],
         rank=2,
@@ -92,10 +92,22 @@ def test_uncertainty_is_global_and_legacy_camera_grid_is_inert():
     )
     with torch.no_grad():
         model.uncertainty_codes[0, 0] = 1.0
+        model.uncertainty_codes[0, 1] = 0.0
+        model.uncertainty_decoder[0, 1] = 3.0
+        model.uncertainty_decoder[0, 2] = -2.0
         model.spatial_uncertainty_basis[0, 0, 0, 0] = 2.0
-    _, sigma = model._spatial_fields("seq1__frame00001", (12, 16))
+    local_rgb, sigma = model._spatial_fields(
+        "seq1__frame00001", (12, 16)
+    )
     assert sigma.shape == (2, 12, 16)
-    assert sigma[0].std().item() == 0
+    assert sigma[0].std().item() > 0
+    assert torch.equal(local_rgb, torch.zeros_like(local_rgb))
+    # The trainable field is continuous and low order: there are no grid-cell
+    # jumps capable of imprinting a fixed vertical stripe frequency.
+    horizontal_step = (sigma[0, :, 1:] - sigma[0, :, :-1]).abs()
+    vertical_step = (sigma[0, 1:, :] - sigma[0, :-1, :]).abs()
+    assert horizontal_step.max() < 0.05
+    assert vertical_step.max() < 0.05
     assert model.spatial_uncertainty_basis.requires_grad is False
     assert model.local_canopy_basis.requires_grad is False
 
@@ -112,6 +124,7 @@ def test_legacy_shared_code_checkpoint_migrates_to_split_latents():
         "foliage_codes",
         "sky_codes",
         "uncertainty_codes",
+        "uncertainty_decoder",
     ):
         legacy["state_dict"].pop(key)
     restored = OutdoorAppearanceUncertainty(

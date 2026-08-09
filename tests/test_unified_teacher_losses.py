@@ -77,6 +77,7 @@ from scripts.train_unified_outdoor_teacher import (
     _rigid_completion_seed_indices,
     _rigid_residual_patch_loss,
     _resume_training_contract_differences,
+    _restore_volume_optimizer_state,
     _soft_surface_canopy_conflict,
     _static_detail_exclusive_topology_active,
     _static_detail_ray_trainable,
@@ -85,6 +86,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
     _static_detail_global_cleanup_loss,
+    _static_spatial_uncertainty_active,
     _persistent_envelope_global_cleanup_loss,
     _surface_capture_to_device,
     _surface_topology_active,
@@ -2172,6 +2174,59 @@ def test_conditioned_branch_keeps_training_during_topology_settle():
     assert _phase(11_040, horizon, profile) == "canonical_polish"
     assert _conditioned_branch_active(11_040, horizon, profile)
     assert _conditioned_branch_active(11_999, horizon, profile)
+
+
+def test_static_spatial_uncertainty_does_not_enable_temporal_branch():
+    assert _static_spatial_uncertainty_active(
+        "static", foliage_active=True, static_detail_active=True
+    )
+    assert not _static_spatial_uncertainty_active(
+        "static", foliage_active=True, static_detail_active=False
+    )
+    assert not _static_spatial_uncertainty_active(
+        "sequence_conditioned_legacy",
+        foliage_active=True,
+        static_detail_active=True,
+    )
+
+
+def test_static_uncertainty_optimizer_migration_appends_state_free_parameter():
+    xyz = torch.nn.Parameter(torch.tensor([1.0]))
+    old_appearance = torch.nn.Parameter(torch.tensor([2.0]))
+    old = torch.optim.Adam(
+        [
+            {"params": [xyz], "lr": 1e-3, "name": "xyz"},
+            {
+                "params": [old_appearance],
+                "lr": 2e-3,
+                "name": "appearance",
+            },
+        ]
+    )
+    (xyz.square() + old_appearance.square()).backward()
+    old.step()
+    state = old.state_dict()
+
+    new_xyz = torch.nn.Parameter(torch.tensor([1.0]))
+    new_appearance = torch.nn.Parameter(torch.tensor([2.0]))
+    decoder = torch.nn.Parameter(torch.tensor([0.0]))
+    current = torch.optim.Adam(
+        [
+            {"params": [new_xyz], "lr": 1e-3, "name": "xyz"},
+            {
+                "params": [new_appearance, decoder],
+                "lr": 2e-3,
+                "name": "appearance",
+            },
+        ]
+    )
+    migrated = _restore_volume_optimizer_state(
+        current, state, allow_static_uncertainty_extension=True
+    )
+    assert migrated
+    assert "exp_avg" in current.state[new_xyz]
+    assert "exp_avg" in current.state[new_appearance]
+    assert current.state[decoder] == {}
 
 
 def test_conditioned_bases_keep_gradients_during_topology_settle():
