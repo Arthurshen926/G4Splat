@@ -2056,10 +2056,11 @@ def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
     assert 3_000 > 4 * 639
 
 
-def test_cpu_parallelism_divides_budget_across_prefetch_workers():
-    assert _resolve_cpu_intraop_threads(32, 8) == 3
-    assert _resolve_cpu_intraop_threads(16, 8) == 1
-    assert _resolve_cpu_intraop_threads(32, 0) == 4
+def test_cpu_parallelism_uses_one_bounded_process_global_pool():
+    assert _resolve_cpu_intraop_threads(32, 8) == 8
+    assert _resolve_cpu_intraop_threads(16, 8) == 8
+    assert _resolve_cpu_intraop_threads(32, 0) == 8
+    assert _resolve_cpu_intraop_threads(4, 8) == 4
 
 
 def test_cpu_parallelism_honours_bounded_explicit_override():
@@ -2067,6 +2068,18 @@ def test_cpu_parallelism_honours_bounded_explicit_override():
     assert _resolve_cpu_intraop_threads(4, 8, 16) == 4
     with pytest.raises(ValueError, match="non-negative"):
         _resolve_cpu_intraop_threads(16, -1)
+
+
+def test_cpu_parallelism_is_runtime_only_for_resume_identity():
+    saved = {
+        "reconstruction_target": "static",
+        "cpu_parallelism": {
+            "available_cpus": 32,
+            "resolved_intraop_threads": 3,
+        },
+    }
+    current = {"reconstruction_target": "static"}
+    assert not _resume_training_contract_differences(saved, current)
 
 
 def test_absolute_schedule_makes_short_run_an_exact_method_prefix():

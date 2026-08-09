@@ -573,13 +573,14 @@ def _resolve_cpu_intraop_threads(
     image_prefetch_workers: int,
     requested_threads: int = 0,
 ) -> int:
-    """Bound per-worker CPU parallelism without starving the GPU feeder.
+    """Bound the process-global CPU pool without starving the GPU feeder.
 
-    Torch/OpenMP owns a thread pool per calling Python thread on this stack.
-    Letting eight image-prefetch workers inherit the 32-core default created
-    more than 300 runnable threads in production.  Auto mode divides the CPU
-    budget across the main trainer and all prefetch workers, with a small cap
-    because image decode/resize is not the dominant GPU training workload.
+    The Torch intra-op pool is shared by the trainer and Python prefetch
+    threads.  Dividing the core budget by ``workers + 1`` therefore reduced a
+    32-core host to three total native workers and made the GPU wait for task
+    fields and image preparation.  Eight global intra-op workers retain useful
+    host parallelism while OpenCV remains explicitly sequential, avoiding the
+    original nested-pool explosion of more than 300 process threads.
     """
     available_cpus = int(available_cpus)
     image_prefetch_workers = int(image_prefetch_workers)
@@ -592,8 +593,7 @@ def _resolve_cpu_intraop_threads(
         raise ValueError("requested_threads must be non-negative")
     if requested_threads > 0:
         return min(requested_threads, available_cpus)
-    consumers = max(image_prefetch_workers + 1, 1)
-    return max(1, min(4, available_cpus // consumers))
+    return max(1, min(8, available_cpus))
 
 
 def _configure_cpu_parallelism(args) -> dict[str, object]:
@@ -625,7 +625,7 @@ def _configure_cpu_parallelism(args) -> dict[str, object]:
         pass
     return {
         "contract": (
-            "bounded_per_python_worker_torch_openmp_no_nested_opencv_pool"
+            "bounded_process_global_torch_openmp_no_nested_opencv_pool"
         ),
         "available_cpus": int(available_cpus),
         "affinity_source": affinity_source,
@@ -3770,6 +3770,16 @@ def _resume_training_contract_differences(
     ineligible for resume.  Camera identity is independently bound by the
     geometry digest and the exact per-camera validation payload.
     """
+    # CPU pools change throughput only. They do not alter a camera/evidence
+    # schedule, parameter owner, optimizer, CUDA image formation or model
+    # tensor, and therefore must not make an interrupted run ineligible for
+    # resume on a host with a different CPU allocation. Older checkpoints
+    # persisted this runtime audit in the immutable optimization contract;
+    # normalize that one legacy field away during comparison.
+    saved = dict(saved)
+    current = dict(current)
+    saved.pop("cpu_parallelism", None)
+    current.pop("cpu_parallelism", None)
     # Older checkpoints accidentally omitted three volume-topology controls
     # from the immutable optimization contract.  An explicit trainer-repair
     # resume may migrate those missing fields once; the next checkpoint
@@ -12344,7 +12354,6 @@ def main():
     )
     training_contract = {
         "reconstruction_target": args.reconstruction_target,
-        "cpu_parallelism": cpu_parallelism_audit,
         "foliage_representation": {
             "dynamic_rank": int(foliage.dynamic_rank),
             "temporal_parameters_allocated": bool(
@@ -13284,6 +13293,7 @@ def main():
             SURFEL_ROOT / "submodules/simple-knn",
         ),
     )
+    runtime_provenance["cpu_parallelism"] = cpu_parallelism_audit
     print(
         json.dumps(
             {
