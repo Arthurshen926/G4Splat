@@ -171,7 +171,7 @@ VOLUME_OPACITY_SETTLE_CONTRACT = (
     "growth_momentum_constrained__temporal_opacity_frozen__geometry_scale_"
     "rotation_and_sh_continue__retirement_window_then_automatic_freeze"
 )
-STATIC_OPTICAL_POLICY_CONTRACT = (
+STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT = (
     "single_static_map__envelope_growth_continuously_attenuated_only_by_"
     "persistent_multiview_native_t_before_alpha_ray_local_overlap__same_"
     "group_primitive_proxy_is_candidate_only__occluded_envelope_retires_"
@@ -181,6 +181,18 @@ STATIC_OPTICAL_POLICY_CONTRACT = (
     "newborn_dc_uses_distinct_view_native_responsibility_rgb__"
     "xyz_scale_rotation_and_mass_freeze_together_in_canonical_"
     "polish__scale_updates_preserve_integrated_optical_mass"
+)
+STATIC_OPTICAL_POLICY_CONTRACT = (
+    "single_static_map__stage2_envelope_positive_mass_then_stage3_"
+    "envelope_no_positive_growth__verified_canonical_ownerless_hits_"
+    "retain_optical_existence_gradient__persistent_multiview_native_t_"
+    "before_alpha_ray_local_overlap__same_group_primitive_proxy_is_"
+    "candidate_only__occluded_envelope_retires_reversibly_in_integrated_"
+    "optical_mass_space__static_detail_and_skeleton_mass_remain_"
+    "trainable__hidden_detail_consumes_exact_ray_posterior_during_"
+    "topology__newborn_dc_uses_distinct_view_native_responsibility_rgb__"
+    "xyz_scale_rotation_and_mass_freeze_together_in_canonical_polish__"
+    "scale_updates_preserve_integrated_optical_mass"
 )
 VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT = (
     "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
@@ -3835,6 +3847,20 @@ def _resume_training_contract_differences(
         ):
             if key not in saved and key in current:
                 saved[key] = current[key]
+        if (
+            saved.get("static_optical_policy_contract")
+            == STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT
+            and current.get("static_optical_policy_contract")
+            == STATIC_OPTICAL_POLICY_CONTRACT
+            and saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+        ):
+            # This repair changes only future gradient routing. The resumed
+            # parameter/optimizer tensors, schedules, evidence and renderer
+            # state are identical at the boundary.
+            saved["static_optical_policy_contract"] = (
+                STATIC_OPTICAL_POLICY_CONTRACT
+            )
         current_static_uncertainty = current.get(
             "static_spatial_uncertainty"
         )
@@ -10477,11 +10503,13 @@ def _apply_static_optical_policy(
 ) -> dict[str, object]:
     """Enforce the static parameter/loss ownership matrix continuously.
 
-    Envelope mass may grow from ray-hit evidence throughout its trainable
-    stages and from RGB while the Stage-2 support is formed.  Stage-3 RGB has
-    already detached envelope geometry/mass in the renderer, so this policy
-    sees only the remaining physical evidence plus local handoff. Static
-    detail and skeleton mass never inherit the envelope-retirement rule.
+    Envelope mass may grow from ray-hit evidence and RGB while the Stage-2
+    support is formed.  Once Stage-3 detail is visible, the envelope becomes
+    a fixed upper-support proposal: positive ray evidence must establish the
+    finer detail/skeleton owners instead of making the broad low-pass kernels
+    progressively more opaque.  Negative evidence and local handoff may
+    still reduce envelope mass. Static detail and skeleton mass never inherit
+    the envelope-retirement rule.
     During final polish, geometry, covariance and mass freeze together so
     appearance cannot create holes by moving a fixed-alpha Gaussian.
     """
@@ -10490,6 +10518,9 @@ def _apply_static_optical_policy(
         "phase": phase,
         "joint_polish_freeze": phase == "canonical_polish",
         "envelope_growth_rows_attenuated": 0,
+        "envelope_positive_growth_frozen_after_detail_takeover": bool(
+            _static_detail_stage_visible(phase)
+        ),
         "mean_envelope_replacement_authority": 0.0,
         "static_detail_mass_trainable": _static_detail_stage_trainable(phase),
         "static_detail_ray_trainable": _static_detail_ray_trainable(phase),
@@ -10585,16 +10616,25 @@ def _apply_static_optical_policy(
             }
         gradient_before = gradient.detach().clone()
         # Newborn children must be able to establish optical existence before
-        # they can participate in envelope retirement.  Even genuine detail
-        # overlap is only a replacement *candidate* until the displaced child
-        # has independent real-ray verification.
+        # they can participate in envelope retirement.  Once detail is
+        # visible, however, the broad envelope has completed its positive-mass
+        # lifecycle. Continuing to grow it from every tree ray lets the
+        # easiest low-frequency owner consume the same evidence that should
+        # make detail opaque. Negative gradients remain untouched, so global
+        # free-space cleanup and local replace-and-retire stay effective.
         growth = retirement_envelope[:, None] & (gradient < 0)
-        attenuated_growth = growth & (authority[:, None] > 0)
+        detail_takeover = _static_detail_stage_visible(phase)
+        attenuation = (
+            torch.ones_like(authority)
+            if detail_takeover
+            else authority
+        )
+        attenuated_growth = growth & (attenuation[:, None] > 0)
         audit["envelope_growth_rows_attenuated"] = int(
             attenuated_growth.flatten(1).any(dim=1).sum()
         )
         gradient[growth] *= (
-            1.0 - authority[:, None].expand_as(gradient)[growth]
+            1.0 - attenuation[:, None].expand_as(gradient)[growth]
         )
         removed = (gradient - gradient_before).clamp_min(0.0)
         for name, mask in role_masks.items():
@@ -10609,9 +10649,15 @@ def _apply_static_optical_policy(
         growth_momentum = retirement_envelope[:, None] & (
             first_moment < 0
         )
+        momentum_attenuation = (
+            torch.ones_like(authority)
+            if _static_detail_stage_visible(phase)
+            else authority
+        )
         first_moment[growth_momentum] *= (
             1.0
-            - authority[:, None].expand_as(first_moment)[growth_momentum]
+            - momentum_attenuation[:, None]
+            .expand_as(first_moment)[growth_momentum]
         )
     for parameter in (
         foliage.deformation_basis,

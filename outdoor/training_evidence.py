@@ -1173,6 +1173,7 @@ class FoliageRayEvidence:
         canonical_behind_tau_chunks = []
         verified_canonical_free_tau_chunks = []
         verified_canonical_hit_tau_chunks = []
+        verified_canonical_hit_optical_tau_chunks = []
         verified_canonical_behind_tau_chunks = []
         dynamic_free_tau_chunks = []
         dynamic_hit_tau_chunks = []
@@ -1224,6 +1225,7 @@ class FoliageRayEvidence:
                 canonical_behind_tau_chunks.append(empty)
                 verified_canonical_free_tau_chunks.append(empty)
                 verified_canonical_hit_tau_chunks.append(empty)
+                verified_canonical_hit_optical_tau_chunks.append(empty)
                 verified_canonical_behind_tau_chunks.append(empty)
                 dynamic_free_tau_chunks.append(empty)
                 dynamic_hit_tau_chunks.append(empty)
@@ -1320,6 +1322,7 @@ class FoliageRayEvidence:
                 canonical_behind_tau_chunks.append(empty)
                 verified_canonical_free_tau_chunks.append(empty)
                 verified_canonical_hit_tau_chunks.append(empty)
+                verified_canonical_hit_optical_tau_chunks.append(empty)
                 verified_canonical_behind_tau_chunks.append(empty)
                 dynamic_free_tau_chunks.append(empty)
                 dynamic_hit_tau_chunks.append(empty)
@@ -1494,6 +1497,12 @@ class FoliageRayEvidence:
                     verified_canonical_weight,
                 )
             )
+            verified_canonical_hit_optical_tau_chunks.append(
+                accumulate(
+                    local_tau_optical * hit_fraction.detach(),
+                    verified_canonical_weight,
+                )
+            )
             verified_canonical_behind_tau_chunks.append(
                 accumulate(
                     local_tau * behind_fraction,
@@ -1538,6 +1547,9 @@ class FoliageRayEvidence:
         )
         verified_canonical_hit_tau = torch.cat(
             verified_canonical_hit_tau_chunks
+        )
+        verified_canonical_hit_optical_tau = torch.cat(
+            verified_canonical_hit_optical_tau_chunks
         )
         verified_canonical_behind_tau = torch.cat(
             verified_canonical_behind_tau_chunks
@@ -1667,13 +1679,21 @@ class FoliageRayEvidence:
             seed_bound, canonical_hit_tau, ownerless_hit_tau
         )
         # Seed-bound multi-view rows retain their canonical optical owner.
-        # Ownerless single-view observations route optical existence only to
-        # the exact dynamic residual; a weak depth posterior must never make
-        # an unrelated canonical lineage opaque.
+        # An ownerless observation may also route optical existence to a
+        # canonical lineage that was *already* verified independently.  The
+        # previous implementation allowed that lineage to explain the
+        # confidence-weighted geometry term, but omitted it from the
+        # complementary optical term.  In a static reconstruction (where the
+        # dynamic branch is intentionally empty), most ownerless tree hits
+        # therefore contributed a large constant -log(1e-4) with no opacity
+        # gradient.  This path cannot promote an unrelated lineage: the
+        # verified mask is established before consuming this ray.
         selected_hit_optical_tau = torch.where(
             seed_bound,
             canonical_hit_optical_tau,
-            dynamic_hit_optical_tau + static_hit_optical_tau,
+            verified_canonical_hit_optical_tau
+            + dynamic_hit_optical_tau
+            + static_hit_optical_tau,
         )
         selected_behind_tau = torch.where(
             seed_bound, canonical_behind_tau, ownerless_behind_tau

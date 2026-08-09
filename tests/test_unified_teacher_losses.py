@@ -15,6 +15,8 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_DETAIL_ISOLATED_CONTRACT,
     PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
+    STATIC_OPTICAL_POLICY_CONTRACT,
+    STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
     TRAINING_PROFILES,
     VOLUME_OPACITY_SETTLE_CONTRACT,
     _apply_training_profile_optimizer_defaults,
@@ -227,7 +229,7 @@ def test_disabled_static_replacement_does_not_report_or_apply_attenuation():
     gradient_before = foliage.opacity_logits.grad.clone()
     moment_before = moment.clone()
     audit = _apply_static_optical_policy(
-        foliage, optimizer, "ownership_cleanup"
+        foliage, optimizer, "topology"
     )
     assert audit["envelope_growth_rows_attenuated"] == 0
     assert torch.equal(foliage.opacity_logits.grad, gradient_before)
@@ -237,7 +239,7 @@ def test_disabled_static_replacement_does_not_report_or_apply_attenuation():
 def test_local_static_replacement_attenuates_only_authorized_growth():
     foliage, optimizer, moment = _static_optical_policy_fixture(0.5)
     audit = _apply_static_optical_policy(
-        foliage, optimizer, "ownership_cleanup"
+        foliage, optimizer, "topology"
     )
     readiness = 1.0 - torch.exp(torch.tensor(-1.0))
     expected_multiplier = 1.0 - 0.5 * readiness
@@ -258,7 +260,7 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
         dtype=torch.int8,
     )
     audit = _apply_static_optical_policy(
-        foliage, optimizer, "ownership_cleanup"
+        foliage, optimizer, "topology"
     )
     readiness = 1.0 - torch.exp(torch.tensor(-1.0))
     assert foliage.opacity_logits.grad[0].item() == -2.0
@@ -270,6 +272,50 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
         "unverified_child"
     ] == 0.0
     assert moment[0].item() == -4.0
+
+
+def test_detail_takeover_freezes_only_positive_envelope_growth():
+    foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
+    # Row one receives a legitimate negative/free-space gradient.  Detail
+    # takeover must preserve that retirement direction while preventing the
+    # broad envelope from continuing to absorb positive tree evidence.
+    foliage.opacity_logits.grad[1] = 3.0
+    moment[1] = 5.0
+
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "static_foliage"
+    )
+
+    assert audit[
+        "envelope_positive_growth_frozen_after_detail_takeover"
+    ]
+    assert audit["envelope_growth_rows_attenuated"] == 1
+    assert foliage.opacity_logits.grad[0].item() == 0.0
+    assert foliage.opacity_logits.grad[1].item() == 3.0
+    assert moment[0].item() == 0.0
+    assert moment[1].item() == 5.0
+
+
+def test_trainer_repair_migrates_static_optical_lifecycle_contract():
+    saved = {
+        "reconstruction_target": "static",
+        "static_optical_policy_contract": (
+            STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT
+        ),
+    }
+    current = {
+        "reconstruction_target": "static",
+        "static_optical_policy_contract": STATIC_OPTICAL_POLICY_CONTRACT,
+    }
+
+    assert _resume_training_contract_differences(saved, current) == {
+        "static_optical_policy_contract"
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
 
 
 def test_real_ray_handoff_is_bounded_and_reversible():
@@ -4834,6 +4880,37 @@ def test_ownerless_ray_survives_dynamic_to_static_detail_fusion():
     assert audit["hit_optical_existence"] > 0
     assert foliage.opacity_logits.grad is not None
     assert float(foliage.opacity_logits.grad) < 0
+
+
+def test_ownerless_verified_canonical_retains_optical_existence_gradient():
+    strong_evidence = _ownerless_interval_evidence(confidence=1.0)
+    weak_evidence = _ownerless_interval_evidence(confidence=0.1)
+    strong = _interval_foliage(3.0)
+    weak = _interval_foliage(3.0)
+    # This support is immutable evidence established before either dense
+    # ownerless observation; consuming the ray must not promote the lineage.
+    strong.support_sequence_count.fill_(2)
+    weak.support_sequence_count.fill_(2)
+
+    strong_loss, strong_audit = strong_evidence.interval_factor(
+        _interval_camera(), strong
+    )
+    weak_loss, weak_audit = weak_evidence.interval_factor(
+        _interval_camera(), weak
+    )
+    strong_loss.backward()
+    weak_loss.backward()
+
+    assert weak_audit["ownerless_canonical_hit_rays"] == 1
+    assert weak_audit["verified_ownerless_hit_rays"] == 1
+    assert weak_audit["hit_optical_existence"] > 0
+    assert float(weak.opacity_logits.grad) < 0
+    torch.testing.assert_close(
+        weak.opacity_logits.grad,
+        strong.opacity_logits.grad,
+        rtol=0.03,
+        atol=1.0e-5,
+    )
 
 
 def test_ownerless_ray_rejects_static_detail_owned_by_another_camera():
