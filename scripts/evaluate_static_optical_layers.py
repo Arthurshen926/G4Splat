@@ -187,18 +187,30 @@ def main() -> None:
         "surface_only": {
             "surface_only": True,
             "volume_layer": "none",
+            "optical_replacement_policy": "disabled",
         },
         "envelope_only": {
             "volume_only": True,
             "volume_layer": "envelope",
+            "optical_replacement_policy": "disabled",
         },
         "detail_only": {
             "volume_only": True,
             "volume_layer": "detail",
+            "optical_replacement_policy": "disabled",
         },
-        "surface_envelope": {"volume_layer": "envelope"},
-        "surface_detail": {"volume_layer": "detail"},
-        "full_local_replacement": {"volume_layer": "all"},
+        "surface_envelope": {
+            "volume_layer": "envelope",
+            "optical_replacement_policy": "disabled",
+        },
+        "surface_detail": {
+            "volume_layer": "detail",
+            "optical_replacement_policy": "disabled",
+        },
+        "full_local_replacement": {
+            "volume_layer": "all",
+            "optical_replacement_policy": "view_depth_local",
+        },
         "full_ray_normalized": {
             "volume_layer": "all",
             "optical_replacement_policy": "ray_normalized_two_pass",
