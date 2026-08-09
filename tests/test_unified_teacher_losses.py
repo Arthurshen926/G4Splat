@@ -85,6 +85,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
+    _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
     _static_spatial_uncertainty_active,
     _persistent_envelope_global_cleanup_loss,
@@ -102,6 +103,7 @@ from scripts.train_unified_outdoor_teacher import (
     _volume_split_authority,
     _volume_topology_active,
     _volume_topology_authority,
+    _verification_debt_capacity_scale,
     _update_volume_learning_rates,
     _write_rigid_stage_surface_handoff,
 )
@@ -868,6 +870,57 @@ def test_trainer_repair_migrates_static_ray_visual_hull_contract():
         saved,
         current,
         allow_trainer_repair_migration=True,
+    )
+
+
+def test_trainer_repair_migrates_consensus_hit_and_birth_backpressure():
+    legacy_birth_contract = (
+        "uncovered_hit_uses_complete_calibrated_ray_depth_interval__"
+        "cross_sequence_segments_vote_in_multiscale_visual_hull_cells__"
+        "minimum_two_cameras_and_two_sequences_remain_mandatory__"
+        "newborn_is_low_mass_static_detail_and_free_space_prunable"
+    )
+    saved = {
+        "static_training_stages": {"detail_training_signals": ["legacy"]},
+        "static_detail_isolated_supervision": {"contract": "legacy"},
+        "static_detail_global_cleanup": {"contract": "legacy"},
+        "static_ray_birth": {"contract": legacy_birth_contract},
+        "static_detail_canonical_ownership": {
+            "gradient_owner": "persisted_support_camera_sequences"
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["legacy"]
+        },
+    }
+    current = {
+        "static_training_stages": {"detail_training_signals": ["consensus"]},
+        "static_detail_isolated_supervision": {
+            "contract": STATIC_DETAIL_ISOLATED_CONTRACT
+        },
+        "static_detail_global_cleanup": {
+            "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
+        },
+        "static_ray_birth": {
+            "contract": STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
+            "verification_debt_backpressure": (
+                "same_continuous_smoothstep_capacity_as_ordinary_split"
+            ),
+        },
+        "static_detail_canonical_ownership": {
+            "rgb_geometry_topology_owner": (
+                "persisted_support_camera_sequences"
+            ),
+            "positive_ray_owner": (
+                "persisted_support_or_verified_two_sequence_consensus"
+            ),
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["verified_consensus"]
+        },
+    }
+    assert _resume_training_contract_differences(saved, current)
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
     )
 
 
@@ -4761,21 +4814,31 @@ def test_periodic_camera_schedule_consumes_a_contiguous_evidence_epoch():
 
 def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
     class Foliage:
-        xyz = torch.zeros(3, 3)
-        static_leaf_mask = torch.tensor([False, True, True])
+        xyz = torch.zeros(4, 3)
+        static_leaf_mask = torch.tensor([False, True, True, True])
         support_camera_ids = torch.tensor(
-            [[-1, -1], [0, -1], [1, -1]], dtype=torch.int32
+            [[-1, -1], [0, -1], [1, 2], [1, 2]], dtype=torch.int32
+        )
+        support_sequence_count = torch.tensor([2, 1, 2, 2])
+        verification_state = torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_UNVERIFIED,
+            ],
+            dtype=torch.int8,
         )
 
         def __len__(self):
-            return 3
+            return 4
 
     args = SimpleNamespace(
         reconstruction_target="static",
         static_detail_canonical_ownership=True,
     )
-    active = torch.tensor([True, False, False])
-    lookup = torch.tensor([0, 1], dtype=torch.int16)
+    active = torch.tensor([True, False, False, False])
+    lookup = torch.tensor([0, 1, 1], dtype=torch.int16)
     free, hit = _static_ray_candidate_masks(
         args,
         Foliage(),
@@ -4784,8 +4847,15 @@ def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
         camera_id=0,
         camera_sequence_lookup=lookup,
     )
-    assert torch.equal(free, torch.tensor([True, True, True]))
-    assert torch.equal(hit, torch.tensor([True, True, False]))
+    assert torch.equal(free, torch.tensor([True, True, True, True]))
+    # Row two belongs to another sequence but is already verified by two
+    # sequences, so it is a positive analytic-ray owner of the static map.
+    # The otherwise identical unverified row three remains support-owned.
+    assert torch.equal(hit, torch.tensor([True, True, True, False]))
+    assert torch.equal(
+        _static_detail_consensus_hit_gate(Foliage()),
+        torch.tensor([False, False, True, False]),
+    )
 
     _, bootstrap_hit = _static_ray_candidate_masks(
         args,
@@ -4796,6 +4866,23 @@ def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
         camera_sequence_lookup=lookup,
     )
     assert torch.equal(bootstrap_hit, active)
+
+
+def test_verification_debt_capacity_is_continuous_and_shared():
+    assert _verification_debt_capacity_scale(
+        0.04, soft_fraction=0.05, hard_fraction=0.12
+    ) == pytest.approx(1.0)
+    midpoint = _verification_debt_capacity_scale(
+        0.085, soft_fraction=0.05, hard_fraction=0.12
+    )
+    assert midpoint == pytest.approx(0.5)
+    assert _verification_debt_capacity_scale(
+        0.13, soft_fraction=0.05, hard_fraction=0.12
+    ) == pytest.approx(0.0)
+    with pytest.raises(ValueError, match="0 <= soft < hard <= 1"):
+        _verification_debt_capacity_scale(
+            0.1, soft_fraction=0.2, hard_fraction=0.1
+        )
 
 
 def test_candidate_interval_descendant_index_rebuilds_after_split():

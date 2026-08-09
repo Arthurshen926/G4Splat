@@ -118,21 +118,24 @@ STATIC_DETAIL_ISOLATED_REPAIR_PREDECESSOR = {
 }
 STATIC_DETAIL_ISOLATED_CONTRACT = (
     "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
-    "and_screen_gradient_only_to_static_detail__geometry_optical_mass_and_"
-    "topology_remain_support_sequence_owned__sh_appearance_uses_all_real_"
-    "canopy_views__persistent_envelope_cannot_occlude_its_training_signal"
+    "and_screen_gradient_only_to_static_detail__geometry_and_topology_"
+    "remain_support_sequence_owned__verified_cross_sequence_consensus_"
+    "may_receive_optical_mass__sh_appearance_uses_all_real_canopy_views__"
+    "persistent_envelope_cannot_occlude_its_training_signal"
 )
 STATIC_STAGE_RGB_ROLE_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_sh_only__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
-    "support_owned_static_detail_rgb_geometry_mass"
+    "support_owned_static_detail_rgb_geometry__verified_cross_sequence_"
+    "consensus_static_detail_optical_mass"
 )
 STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
     "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
     "rigid_free_space_and_surface_better_counterfactuals_only_to_static_"
-    "detail_geometry_and_optical_mass__canonical_support_sequences_alone_"
-    "route_positive_hit_geometry_optical_mass_and_topology__all_real_canopy_"
-    "views_route_sh_appearance_only__cleanup_never_drives_topology"
+    "detail_geometry_and_optical_mass__support_sequences_route_positive_"
+    "rgb_geometry_and_topology__verified_cross_sequence_consensus_routes_"
+    "positive_ray_geometry_and_optical_mass__all_real_canopy_views_route_"
+    "sh_appearance_only__cleanup_never_drives_topology"
 )
 PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT = (
     "persistent_envelope_is_unconditionally_visible__all_calibrated_views_"
@@ -145,7 +148,8 @@ STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT = (
     "uncovered_hit_uses_complete_calibrated_ray_depth_interval__"
     "cross_sequence_segments_vote_in_multiscale_visual_hull_cells__"
     "minimum_two_cameras_and_two_sequences_remain_mandatory__"
-    "newborn_is_low_mass_static_detail_and_free_space_prunable"
+    "newborn_is_low_mass_static_detail_and_free_space_prunable__"
+    "continuous_verification_debt_backpressure"
 )
 COUNTERFACTUAL_TRANSPARENCY_CONTRACT = (
     "detached_surface_only_relative_rgb_advantage_requires_independent_"
@@ -2731,6 +2735,35 @@ def _static_detail_canonical_ownership_gate(
     return gate
 
 
+def _static_detail_consensus_hit_gate(foliage) -> torch.Tensor:
+    """Permit real hit rays to reuse already verified static consensus.
+
+    Support-sequence ownership is still the correct permission for RGB
+    geometry and screen-space topology: a moving leaf must not be dragged to
+    every traversal.  It is too narrow for the analytic ray factor, however.
+    A detail primitive that has already been verified by at least two
+    independent sequences is an established part of the one static map, so a
+    later calibrated hit ray may refine its depth and optical mass without
+    creating a new primitive or altering its support metadata.
+
+    Keeping this permission separate also prevents an ownership miss from
+    being misclassified as a geometric hole by ``StaticRayBirthAccumulator``.
+    New and split children remain support-owned until real render witnesses
+    promote them to ``VERIFICATION_VERIFIED``.
+    """
+
+    detail = foliage.static_leaf_mask
+    verification = getattr(foliage, "verification_state", None)
+    support_sequences = getattr(foliage, "support_sequence_count", None)
+    if verification is None or support_sequences is None:
+        return torch.zeros_like(detail)
+    return (
+        detail
+        & (verification == VERIFICATION_VERIFIED)
+        & (support_sequences >= 2)
+    )
+
+
 def _conditioned_base_gradient_gate(
     foliage, visibility_gate: torch.Tensor
 ) -> torch.Tensor:
@@ -3884,6 +3917,53 @@ def _resume_training_contract_differences(
             # only from future ray batches; model and Adam tensors are
             # unchanged at the repair boundary.
             saved["static_ray_birth"] = current_static_ray_birth
+        # v69 initially applied verification-debt backpressure only to
+        # ordinary splits. At the same time, a support-sequence permission
+        # miss could be reported as an uncovered hit and append another full
+        # batch of unverified static births. The repair changes no tensor at
+        # the resume boundary: it lets already verified two-sequence detail
+        # consume future analytic hit rays and shares the existing continuous
+        # debt capacity with future ray births.
+        saved_ownership = saved.get("static_detail_canonical_ownership")
+        current_ownership = current.get(
+            "static_detail_canonical_ownership"
+        )
+        saved_ray_birth = saved.get("static_ray_birth")
+        current_ray_birth = current.get("static_ray_birth")
+        legacy_ray_birth_contract = (
+            "uncovered_hit_uses_complete_calibrated_ray_depth_interval__"
+            "cross_sequence_segments_vote_in_multiscale_visual_hull_cells__"
+            "minimum_two_cameras_and_two_sequences_remain_mandatory__"
+            "newborn_is_low_mass_static_detail_and_free_space_prunable"
+        )
+        if (
+            isinstance(saved_ownership, dict)
+            and isinstance(current_ownership, dict)
+            and saved_ownership.get("gradient_owner")
+            == "persisted_support_camera_sequences"
+            and current_ownership.get("rgb_geometry_topology_owner")
+            == "persisted_support_camera_sequences"
+            and current_ownership.get("positive_ray_owner")
+            == "persisted_support_or_verified_two_sequence_consensus"
+            and isinstance(saved_ray_birth, dict)
+            and isinstance(current_ray_birth, dict)
+            and saved_ray_birth.get("contract")
+            == legacy_ray_birth_contract
+            and current_ray_birth.get("contract")
+            == STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT
+            and current_ray_birth.get("verification_debt_backpressure")
+            == "same_continuous_smoothstep_capacity_as_ordinary_split"
+        ):
+            for key in (
+                "static_training_stages",
+                "static_detail_isolated_supervision",
+                "static_detail_global_cleanup",
+                "static_ray_birth",
+                "static_detail_canonical_ownership",
+                "parameter_loss_permission_matrix",
+            ):
+                if key in current:
+                    saved[key] = current[key]
         if (
             saved.get("dynamic_lifecycle_contract")
             == DYNAMIC_LIFECYCLE_REPAIR_PREDECESSOR
@@ -3989,8 +4069,13 @@ def _resume_training_contract_differences(
             or not bool(current_ownership.get("enabled"))
             or current_ownership.get("forward_visibility")
             != "unconditional_static"
-            or current_ownership.get("gradient_owner")
-            != "persisted_support_camera_sequences"
+            or (
+                current_ownership.get(
+                    "rgb_geometry_topology_owner",
+                    current_ownership.get("gradient_owner"),
+                )
+                != "persisted_support_camera_sequences"
+            )
         ):
             raise RuntimeError(
                 "Static canonical-ownership repair requires an exact v50 "
@@ -8125,6 +8210,35 @@ def _rollback_failed_split_families(
     return remove, representative_rows, base_audit
 
 
+def _verification_debt_capacity_scale(
+    fraction: float,
+    *,
+    soft_fraction: float,
+    hard_fraction: float,
+) -> float:
+    """Continuous topology capacity while real-camera verification catches up."""
+
+    fraction = float(fraction)
+    soft_fraction = float(soft_fraction)
+    hard_fraction = float(hard_fraction)
+    if not 0.0 <= soft_fraction < hard_fraction <= 1.0:
+        raise ValueError(
+            "verification debt fractions must satisfy 0 <= soft < hard <= 1"
+        )
+    position = float(
+        np.clip(
+            (fraction - soft_fraction)
+            / (hard_fraction - soft_fraction),
+            0.0,
+            1.0,
+        )
+    )
+    # Smoothstep is deliberately continuous: this is lifecycle backpressure,
+    # not a metric gate. It applies to every source of unverified topology so
+    # one path cannot keep filling the population while another is throttled.
+    return 1.0 - position * position * (3.0 - 2.0 * position)
+
+
 def _adapt_volume(
     args,
     foliage,
@@ -8222,23 +8336,10 @@ def _adapt_volume(
     debt_hard = float(
         getattr(args, "volume_verification_debt_hard_fraction", 0.12)
     )
-    if not 0.0 <= debt_soft < debt_hard <= 1.0:
-        raise ValueError(
-            "volume verification debt fractions must satisfy "
-            "0 <= soft < hard <= 1"
-        )
-    debt_position = float(
-        np.clip(
-            (verification_debt_fraction - debt_soft)
-            / (debt_hard - debt_soft),
-            0.0,
-            1.0,
-        )
-    )
-    # Smoothstep avoids a brittle quality gate while still closing the
-    # runaway causal loop: split -> many unverified children -> split again.
-    verification_capacity_scale = 1.0 - (
-        debt_position * debt_position * (3.0 - 2.0 * debt_position)
+    verification_capacity_scale = _verification_debt_capacity_scale(
+        verification_debt_fraction,
+        soft_fraction=debt_soft,
+        hard_fraction=debt_hard,
     )
     effective_split_limit = int(
         np.floor(
@@ -9278,7 +9379,7 @@ def _adapt_volume(
         "verification_debt": {
             "contract": (
                 "continuous_unverified_population_backpressure__"
-                "contradiction_prune_and_cross_sequence_ray_birth_unaffected"
+                "ordinary_split_and_cross_sequence_ray_birth_share_capacity"
             ),
             "unverified_rows": int(unverified_before.sum()),
             "fraction": verification_debt_fraction,
@@ -10104,13 +10205,24 @@ def _static_ray_candidate_masks(
     else:
         hit_mask = hit_mask & ~detail
     if getattr(args, "static_detail_canonical_ownership", True):
-        hit_mask = hit_mask & (
+        support_owned = (
             _static_detail_canonical_ownership_gate(
                 foliage,
                 int(camera_id),
                 camera_sequence_lookup,
             )
             > 0
+        )
+        # Do not apply the detail-only ownership mask to envelope/skeleton
+        # rows. For detail, exact support is sufficient immediately; verified
+        # two-sequence consensus is additionally a global positive-hit owner
+        # of the single static map. This closes the former loop
+        # ``permission miss -> uncovered hit -> 2048 more low-mass births``.
+        detail_permission = (
+            support_owned | _static_detail_consensus_hit_gate(foliage)
+        )
+        hit_mask = hit_mask & (
+            ~foliage.static_leaf_mask | detail_permission
         )
     return free_mask, hit_mask
 
@@ -12595,7 +12707,7 @@ def main():
                 ],
                 "detail_training_signals": [
                     "all_view_ray_free_space",
-                    "canonical_support_ray_hit_interval",
+                    "support_or_verified_consensus_ray_hit_interval",
                     "canonical_rgb_high_frequency",
                     "all_canopy_view_detail_sh_appearance_only",
                     "support_owned_surface_plus_detail_geometry_mass",
@@ -12620,7 +12732,8 @@ def main():
             "view_schedule": static_detail_schedule_audit,
             "gradient_owners": [
                 "support_sequence_static_detail_xyz_scale_rotation",
-                "support_sequence_static_detail_optical_mass",
+                "support_sequence_static_detail_rgb_optical_mass",
+                "verified_consensus_static_detail_ray_optical_mass",
                 "all_real_canopy_view_static_detail_sh",
                 "support_sequence_static_detail_means2d_topology",
             ],
@@ -12741,6 +12854,9 @@ def main():
             "maximum_births_per_topology_event": int(
                 args.maximum_static_ray_births_per_event
             ),
+            "verification_debt_backpressure": (
+                "same_continuous_smoothstep_capacity_as_ordinary_split"
+            ),
             "initial_opacity": 0.02,
             "positive_permission": "cross_sequence_hit_intersection_only",
             "negative_permission": "all_calibrated_free_and_rigid_spill",
@@ -12764,17 +12880,23 @@ def main():
         "static_detail_canonical_ownership": {
             "enabled": bool(args.static_detail_canonical_ownership),
             "forward_visibility": "unconditional_static",
-            "gradient_owner": "persisted_support_camera_sequences",
+            "rgb_geometry_topology_owner": (
+                "persisted_support_camera_sequences"
+            ),
+            "positive_ray_owner": (
+                "persisted_support_or_verified_two_sequence_consensus"
+            ),
             "owned_signals": [
                 "canonical_rgb",
                 "canonical_high_frequency",
                 "detail_isolated_rgb_high_frequency",
-                "positive_ray_hit_interval",
+                "support_or_verified_consensus_positive_ray_hit_interval",
                 "screen_gradient_topology",
             ],
             "noncanonical_views": (
                 "render_plus_global_negative_geometry_optical_cleanup__"
-                "no_positive_hit_rgb_sh_or_topology_update"
+                "verified_consensus_positive_ray_only__"
+                "no_positive_rgb_geometry_sh_or_topology_update"
             ),
         },
         "parameter_loss_permission_matrix": {
@@ -12802,14 +12924,14 @@ def main():
             ],
             "static_leaf_xyz_scale": [
                 "all_view_ray_free_space",
-                "canonical_support_ray_hit",
+                "support_or_verified_consensus_ray_hit",
                 "canonical_rgb_high_frequency",
                 "detail_isolated_rgb_high_frequency",
                 "all_view_rigid_free_counterfactual_cleanup",
             ],
             "static_leaf_optical_mass": [
                 "all_view_ray_free_space",
-                "canonical_support_ray_hit",
+                "support_or_verified_consensus_ray_hit",
                 "canonical_rgb_high_frequency",
                 "detail_isolated_rgb_high_frequency",
                 "rigid_spill",
@@ -16936,6 +17058,23 @@ def main():
                         volume_optimizer, rollback_new_rows
                     )
             if args.reconstruction_target == "static":
+                verification_capacity_scale = float(
+                    event.get("verification_debt", {}).get(
+                        "ordinary_split_capacity_scale", 1.0
+                    )
+                )
+                configured_birth_limit = int(
+                    args.maximum_static_ray_births_per_event
+                )
+                effective_birth_limit = int(
+                    np.floor(
+                        configured_birth_limit
+                        * np.clip(
+                            verification_capacity_scale, 0.0, 1.0
+                        )
+                        + 1.0e-6
+                    )
+                )
                 (
                     birth_centers,
                     birth_colors,
@@ -16944,7 +17083,7 @@ def main():
                     birth_audit,
                 ) = static_ray_births.drain(
                     maximum_births=min(
-                        int(args.maximum_static_ray_births_per_event),
+                        effective_birth_limit,
                         max(int(volume_budget) - len(foliage), 0),
                     )
                 )
@@ -16975,6 +17114,14 @@ def main():
                 event["ray_driven_birth"] = {
                     **birth_audit,
                     **birth_event,
+                    "configured_birth_limit": configured_birth_limit,
+                    "effective_birth_limit": effective_birth_limit,
+                    "verification_capacity_scale": (
+                        verification_capacity_scale
+                    ),
+                    "capacity_contract": (
+                        "shared_continuous_verification_debt_backpressure"
+                    ),
                 }
             volume_stats = _volume_stats(foliage)
             if topology_event is None:
