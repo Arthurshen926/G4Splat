@@ -69,6 +69,7 @@ from scripts.train_unified_outdoor_teacher import (
     _public_phase_name,
     _prefix_stable_resume_ray_batch,
     _resolved_phase_schedule,
+    _resolve_cpu_intraop_threads,
     _resume_conditioned_visit_counts,
     _refresh_split_child_owner_colors,
     _retain_checkpoint_snapshot,
@@ -2053,6 +2054,19 @@ def test_static_handoff_starts_detail_after_one_ray_camera_sweep():
     # One ray-factor camera is consumed every four steps. The 3k transition
     # is later than one full 639-camera evidence sweep (2,556 updates).
     assert 3_000 > 4 * 639
+
+
+def test_cpu_parallelism_divides_budget_across_prefetch_workers():
+    assert _resolve_cpu_intraop_threads(32, 8) == 3
+    assert _resolve_cpu_intraop_threads(16, 8) == 1
+    assert _resolve_cpu_intraop_threads(32, 0) == 4
+
+
+def test_cpu_parallelism_honours_bounded_explicit_override():
+    assert _resolve_cpu_intraop_threads(16, 8, 2) == 2
+    assert _resolve_cpu_intraop_threads(4, 8, 16) == 4
+    with pytest.raises(ValueError, match="non-negative"):
+        _resolve_cpu_intraop_threads(16, -1)
 
 
 def test_absolute_schedule_makes_short_run_an_exact_method_prefix():

@@ -568,6 +568,75 @@ def _apply_training_profile_optimizer_defaults(
     return audit
 
 
+def _resolve_cpu_intraop_threads(
+    available_cpus: int,
+    image_prefetch_workers: int,
+    requested_threads: int = 0,
+) -> int:
+    """Bound per-worker CPU parallelism without starving the GPU feeder.
+
+    Torch/OpenMP owns a thread pool per calling Python thread on this stack.
+    Letting eight image-prefetch workers inherit the 32-core default created
+    more than 300 runnable threads in production.  Auto mode divides the CPU
+    budget across the main trainer and all prefetch workers, with a small cap
+    because image decode/resize is not the dominant GPU training workload.
+    """
+    available_cpus = int(available_cpus)
+    image_prefetch_workers = int(image_prefetch_workers)
+    requested_threads = int(requested_threads)
+    if available_cpus <= 0:
+        raise ValueError("available_cpus must be positive")
+    if image_prefetch_workers < 0:
+        raise ValueError("image_prefetch_workers must be non-negative")
+    if requested_threads < 0:
+        raise ValueError("requested_threads must be non-negative")
+    if requested_threads > 0:
+        return min(requested_threads, available_cpus)
+    consumers = max(image_prefetch_workers + 1, 1)
+    return max(1, min(4, available_cpus // consumers))
+
+
+def _configure_cpu_parallelism(args) -> dict[str, object]:
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+        affinity_source = "sched_getaffinity"
+    except (AttributeError, OSError):
+        available_cpus = int(os.cpu_count() or 1)
+        affinity_source = "os_cpu_count"
+    intraop_threads = _resolve_cpu_intraop_threads(
+        available_cpus,
+        int(args.image_prefetch_workers),
+        int(args.cpu_intraop_threads),
+    )
+    interop_threads = min(
+        int(args.cpu_interop_threads), available_cpus
+    )
+    torch.set_num_threads(intraop_threads)
+    torch.set_num_interop_threads(interop_threads)
+    opencv_threads = None
+    try:
+        import cv2
+
+        # Zero asks OpenCV to execute sequentially rather than creating a
+        # second nested worker pool underneath Python/Torch prefetch threads.
+        cv2.setNumThreads(0)
+        opencv_threads = int(cv2.getNumThreads())
+    except ImportError:
+        pass
+    return {
+        "contract": (
+            "bounded_per_python_worker_torch_openmp_no_nested_opencv_pool"
+        ),
+        "available_cpus": int(available_cpus),
+        "affinity_source": affinity_source,
+        "image_prefetch_workers": int(args.image_prefetch_workers),
+        "requested_intraop_threads": int(args.cpu_intraop_threads),
+        "resolved_intraop_threads": int(torch.get_num_threads()),
+        "resolved_interop_threads": int(torch.get_num_interop_threads()),
+        "opencv_threads": opencv_threads,
+    }
+
+
 def _validate_initialization_protocol(initialization: dict) -> None:
     version = str(initialization.get("version", ""))
     if version in REJECTED_INITIALIZATION_PROTOCOLS:
@@ -1618,6 +1687,22 @@ def _parse_args():
     parser.add_argument("--view-cache-size", type=int, default=4)
     parser.add_argument("--image-prefetch-workers", type=int, default=2)
     parser.add_argument("--image-prefetch-depth", type=int, default=4)
+    parser.add_argument(
+        "--cpu-intraop-threads",
+        type=int,
+        default=0,
+        help=(
+            "Torch/OpenMP threads per calling Python thread. Zero divides "
+            "the available CPU affinity across the trainer and image "
+            "prefetch workers, capped at four."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-interop-threads",
+        type=int,
+        default=1,
+        help="Global Torch inter-op worker count (must be positive).",
+    )
     parser.add_argument("--maintenance-every", type=int, default=1000)
     parser.add_argument("--allow-performance-resume", action="store_true")
     parser.add_argument(
@@ -2060,6 +2145,10 @@ def _parse_args():
         parser.error("--image-prefetch-workers must be non-negative")
     if args.image_prefetch_depth < 0:
         parser.error("--image-prefetch-depth must be non-negative")
+    if args.cpu_intraop_threads < 0:
+        parser.error("--cpu-intraop-threads must be non-negative")
+    if args.cpu_interop_threads <= 0:
+        parser.error("--cpu-interop-threads must be positive")
     if args.maintenance_every < 0:
         parser.error("--maintenance-every must be non-negative")
     if args.checkpoint_every < 0:
@@ -11273,6 +11362,7 @@ def _evaluate(
 
 def main():
     args, dataset, opt, _pipe = _parse_args()
+    cpu_parallelism_audit = _configure_cpu_parallelism(args)
     retained_checkpoint_iterations = set(
         args.retain_checkpoint_iterations
     )
@@ -12254,6 +12344,7 @@ def main():
     )
     training_contract = {
         "reconstruction_target": args.reconstruction_target,
+        "cpu_parallelism": cpu_parallelism_audit,
         "foliage_representation": {
             "dynamic_rank": int(foliage.dynamic_rank),
             "temporal_parameters_allocated": bool(
