@@ -161,6 +161,36 @@ def test_static_fusion_uses_complete_fixed_camera_sequence_contract():
     assert 0 in detail_groups.tolist()
 
 
+def test_selected_mode_fuses_all_consistent_group_observations():
+    payload = _payload()
+    # These observations belong to one persistent group and one coherent
+    # acquisition, but fall in different 8 cm seed voxels.  Selecting one
+    # bounded mode must not turn the other calibrated observation into
+    # discarded evidence.
+    payload["centers"][3] = torch.tensor([0.01, 0.0, 3.0])
+    payload["centers"][4] = torch.tensor([0.09, 0.0, 3.0])
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload,
+        maximum_modes_per_group=1,
+        fixed_camera_sequences=[
+            {"image_id": 0, "sequence_id": "seq0"},
+            {"image_id": 1, "sequence_id": "seq0"},
+        ],
+    )
+    detail = fused["static_detail"] & (
+        fused["replacement_group"] == 0
+    )
+    assert int(detail.sum()) == 1
+    assert torch.allclose(
+        fused["centers"][detail][0], torch.tensor([0.05, 0.0, 3.0])
+    )
+    assert fused["support_camera_ids"][detail][0].tolist() == [0, 1]
+    assert int(fused["support_view_count"][detail][0]) == 2
+    assert audit["canonical_source_rows"] == 2
+    assert audit["contributing_multiview_rows"] == 2
+    assert audit["multiview_canonical_modes"] == 1
+
+
 def test_cross_sequence_verified_cell_gets_local_canonical_fallback():
     payload = _payload()
     # Make both persistent cells part of one tree. Group zero selects seq0 as

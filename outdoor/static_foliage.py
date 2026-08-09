@@ -881,16 +881,75 @@ def fuse_sequence_evidence_into_static_leaves(
     selected_cells = cell_order[
         rank_within_group < int(maximum_modes_per_group)
     ]
-    selected_lookup = torch.full((cell_count,), -1, dtype=torch.int64)
-    selected_lookup[selected_cells] = torch.arange(len(selected_cells))
-    retained = selected_lookup[inverse] >= 0
-    source_rows = canonical_rows[retained]
-    source_modes = selected_lookup[inverse[retained]]
-    source_groups = groups[source_rows]
     mode_groups = cells[selected_cells, 0].to(torch.int64)
     mode_count = len(mode_groups)
     if mode_count == 0:
         raise RuntimeError("canonical static mode partition produced no modes")
+
+    # Selected cells are bounded mode seeds, not permission to discard the
+    # other observations of the same persistent envelope group.  The former
+    # exact-cell filter made most emitted modes single-view even when their
+    # parent group had independent calibrated observations.  Estimate each
+    # seed centre, then assign every row from the already-selected canonical
+    # snapshot to the nearest seed in its own group.  With at most K=2 modes
+    # per group this is bounded O(N*K) and cannot mix tree instances or
+    # acquisition sequences.
+    canonical_weight = occupancy[canonical_rows].clamp(0.05, 1.0)
+    cell_center_sum = torch.zeros((cell_count, 3), dtype=centers.dtype)
+    cell_center_sum.index_add_(
+        0,
+        inverse,
+        centers[canonical_rows] * canonical_weight[:, None],
+    )
+    cell_centers = cell_center_sum / cell_weight.clamp_min(1.0e-8)[:, None]
+    selected_seed_centers = cell_centers[selected_cells]
+
+    mode_counts_by_group = torch.bincount(
+        mode_groups, minlength=group_count
+    )
+    mode_starts_by_group = (
+        torch.cumsum(mode_counts_by_group, dim=0) - mode_counts_by_group
+    )
+    mode_rank = torch.arange(mode_count, dtype=torch.int64) - (
+        torch.repeat_interleave(
+            mode_starts_by_group,
+            mode_counts_by_group,
+        )
+    )
+    group_mode_ids = torch.full(
+        (group_count, int(maximum_modes_per_group)),
+        -1,
+        dtype=torch.int64,
+    )
+    group_mode_ids[mode_groups, mode_rank] = torch.arange(
+        mode_count, dtype=torch.int64
+    )
+    row_mode_candidates = group_mode_ids[groups[canonical_rows]]
+    valid_mode_candidates = row_mode_candidates >= 0
+    if bool((~valid_mode_candidates.any(dim=1)).any()):
+        raise RuntimeError("canonical static row has no selected local mode")
+    candidate_centers = selected_seed_centers[
+        row_mode_candidates.clamp_min(0)
+    ]
+    distance_square = (
+        centers[canonical_rows, None, :] - candidate_centers
+    ).square().sum(dim=-1)
+    distance_square[~valid_mode_candidates] = float("inf")
+    nearest_slot = distance_square.argmin(dim=1)
+    source_modes = row_mode_candidates.gather(
+        1, nearest_slot[:, None]
+    ).squeeze(1)
+    source_rows = canonical_rows
+
+    mode_camera_pairs = torch.unique(
+        source_modes * maximum_camera + canonical_cameras + 1
+    )
+    mode_camera_pair_modes = torch.div(
+        mode_camera_pairs, maximum_camera, rounding_mode="floor"
+    )
+    selected_mode_view_count = torch.bincount(
+        mode_camera_pair_modes, minlength=mode_count
+    )
 
     base_weight = occupancy[source_rows].clamp(0.05, 1.0)
 
@@ -942,7 +1001,6 @@ def fuse_sequence_evidence_into_static_leaves(
         envelope_rows
     ]
     parent_detail_colors = parent_colors[mode_groups]
-    selected_mode_view_count = cell_view_count[selected_cells]
     color_delta = torch.where(
         selected_mode_view_count >= minimum_supporting_views,
         torch.full((mode_count,), 0.40),
@@ -964,7 +1022,7 @@ def fuse_sequence_evidence_into_static_leaves(
     )
     mode_camera_pairs = torch.unique(
         source_modes * maximum_camera
-        + canonical_cameras[retained]
+        + canonical_cameras
         + 1
     )
     pair_mode = torch.div(
@@ -1004,7 +1062,7 @@ def fuse_sequence_evidence_into_static_leaves(
         elif name == "replacement_group":
             detail = mode_groups.to(value.dtype)
         elif name == "support_view_count":
-            detail = view_count[mode_groups].clamp_max(
+            detail = selected_mode_view_count.clamp_max(
                 torch.iinfo(value.dtype).max
             ).to(value.dtype)
         elif name == "support_sequence_count":
@@ -1048,6 +1106,12 @@ def fuse_sequence_evidence_into_static_leaves(
         result,
         payload,
         minimum_supporting_views=minimum_supporting_views,
+    )
+    rows_in_multiview_modes = int(
+        (
+            selected_mode_view_count[source_modes]
+            >= int(minimum_supporting_views)
+        ).sum()
     )
     result["audit"] = {
         **dict(payload.get("audit", {})),
@@ -1103,7 +1167,8 @@ def fuse_sequence_evidence_into_static_leaves(
             "canonical_mode_voxel_size": float(canonical_mode_voxel_size),
             "maximum_modes_per_group": int(maximum_modes_per_group),
             "canonical_source_rows": int(len(canonical_rows)),
-            "contributing_multiview_rows": int(len(source_rows)),
+            "assigned_canonical_rows": int(len(source_rows)),
+            "contributing_multiview_rows": rows_in_multiview_modes,
             "fused_static_leaf_clusters": int(mode_count),
             "multiview_canonical_modes": int(
                 (
@@ -1118,7 +1183,7 @@ def fuse_sequence_evidence_into_static_leaves(
         "contract": (
             "cross_view_verified_tree_cell__"
             f"{canonical_sequence_policy}_canonical_sequence__"
-            "bounded_multimode_static_leaf_clusters"
+            "bounded_multimode_seed_then_all_snapshot_rows_robust_fusion"
         ),
         "input_dynamic_rows": int(dynamic.sum()),
         "associated_dynamic_rows": int(associated.sum()),
@@ -1164,7 +1229,8 @@ def fuse_sequence_evidence_into_static_leaves(
         "canonical_mode_voxel_size": float(canonical_mode_voxel_size),
         "maximum_modes_per_group": int(maximum_modes_per_group),
         "canonical_source_rows": int(len(canonical_rows)),
-        "contributing_multiview_rows": int(len(source_rows)),
+        "assigned_canonical_rows": int(len(source_rows)),
+        "contributing_multiview_rows": rows_in_multiview_modes,
         "fused_static_leaf_clusters": int(mode_count),
         "multiview_canonical_modes": int(
             (
