@@ -9667,7 +9667,12 @@ def _measure_static_ray_local_replacement(
     background: torch.Tensor,
     task: dict[str, torch.Tensor],
     candidate_package,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int | str]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, float | int | str],
+]:
     """Measure detail takeover from real per-pixel mixed-kernel weights.
 
     Two role-isolated native mixed renders establish the actual alpha/depth
@@ -9683,7 +9688,7 @@ def _measure_static_ray_local_replacement(
     )
     empty = foliage.xyz.new_zeros(len(foliage))
     if not bool(envelope_mask.any()) or not bool(detail_mask.any()):
-        return empty, envelope_mask & False, {
+        return empty, envelope_mask & False, envelope_mask & False, {
             "contract": "native_t_before_alpha_ray_local_replacement",
             "scheduled": True,
             "supported_pixels": 0,
@@ -9760,10 +9765,11 @@ def _measure_static_ray_local_replacement(
     visible = verified_envelope_mask & (
         responsibility[:, 0] > epsilon
     )
+    candidate_visible = visible & candidate_mask
     # The primitive proxy supplies only group/tree locality.  Real coverage,
     # depth, transmittance and rigid safety all come from pixel contributions.
     authority = torch.where(
-        visible & candidate_mask, authority, torch.zeros_like(authority)
+        candidate_visible, authority, torch.zeros_like(authority)
     )
     supported = pixel_authority > 0.05
     audit = {
@@ -9771,7 +9777,7 @@ def _measure_static_ray_local_replacement(
         "scheduled": True,
         "supported_pixels": int(supported.sum()),
         "observed_envelope_rows": int(visible.sum()),
-        "same_tree_candidate_rows": int((visible & candidate_mask).sum()),
+        "same_tree_candidate_rows": int(candidate_visible.sum()),
         "positive_authority_rows": int((authority > 0).sum()),
         "mean_pixel_authority": float(pixel_authority[supported].mean())
         if bool(supported.any())
@@ -9786,7 +9792,7 @@ def _measure_static_ray_local_replacement(
         else 0.0,
     }
     del envelope, detail, audited, responsibility
-    return authority, visible, audit
+    return authority, visible, candidate_visible, audit
 
 
 @torch.no_grad()
@@ -9795,10 +9801,25 @@ def _accumulate_static_replacement_evidence(
     authority_observation: torch.Tensor,
     visible: torch.Tensor,
     *,
+    candidate_visible: torch.Tensor | None = None,
     camera_id: int,
     decay: float,
 ) -> dict[str, float | int | str]:
-    """Persist distinct-view real-ray replacement evidence."""
+    """Persist candidate-local positive and negative ray evidence.
+
+    Seeing an envelope is not evidence that its paired detail failed to take
+    over: most calibrated views never project the detail assigned to that
+    local cell.  The former update nevertheless decayed every visible row and
+    counted every such camera as a replacement witness.  With roughly 1,487
+    cameras this drove the overlap EMA toward zero even for repeatedly
+    confirmed detail, so the envelope kept all of its optical mass.
+
+    Positive overlap now records a distinct-view witness and keeps the
+    strongest continuously decayed authority.  A zero observation decays the
+    state only when the primitive-level same-group/depth candidate was present
+    in this very view.  This preserves reversible counter-evidence without
+    treating an unrelated camera as a negative observation.
+    """
     value = torch.as_tensor(
         authority_observation,
         device=foliage.xyz.device,
@@ -9809,23 +9830,39 @@ def _accumulate_static_replacement_evidence(
     ).reshape(-1) & foliage.persistent_envelope_mask & (
         foliage.verification_state == VERIFICATION_VERIFIED
     )
+    if candidate_visible is None:
+        candidate = visible
+    else:
+        candidate = torch.as_tensor(
+            candidate_visible,
+            device=foliage.xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1) & visible
     if len(value) != len(foliage) or len(visible) != len(foliage):
         raise ValueError("replacement evidence must align with foliage rows")
-    if bool(visible.any()):
-        foliage.replacement_overlap_ema[visible] = (
-            float(decay) * foliage.replacement_overlap_ema[visible]
-            + (1.0 - float(decay)) * value[visible]
+    if len(candidate) != len(foliage):
+        raise ValueError("replacement candidates must align with foliage rows")
+    positive = candidate & (value > 1.0e-6)
+    contradicted = candidate & ~positive
+    if bool(positive.any()):
+        retained = (
+            float(decay) * foliage.replacement_overlap_ema[positive]
+        )
+        foliage.replacement_overlap_ema[positive] = torch.maximum(
+            retained, value[positive]
         )
         bit = int(1) << (int(camera_id) % 62)
-        old_signature = foliage.replacement_camera_signature[visible]
+        old_signature = foliage.replacement_camera_signature[positive]
         new_camera = (old_signature & bit) == 0
-        foliage.replacement_camera_signature[visible] = old_signature | bit
-        count = foliage.replacement_observation_count[visible].to(torch.int32)
-        foliage.replacement_observation_count[visible] = (
+        foliage.replacement_camera_signature[positive] = old_signature | bit
+        count = foliage.replacement_observation_count[positive].to(torch.int32)
+        foliage.replacement_observation_count[positive] = (
             count.add(new_camera.to(torch.int32))
             .clamp_max(torch.iinfo(torch.int16).max)
             .to(torch.int16)
         )
+    if bool(contradicted.any()):
+        foliage.replacement_overlap_ema[contradicted] *= float(decay)
     readiness = 1.0 - torch.exp(
         -foliage.replacement_observation_count.float() / 3.0
     )
@@ -9836,7 +9873,9 @@ def _accumulate_static_replacement_evidence(
     return {
         "contract": "persistent_distinct_view_real_ray_replacement_ema",
         "observed_envelope_rows": int(visible.sum()),
-        "overlapping_envelope_rows": int((visible & (value > 0)).sum()),
+        "candidate_envelope_rows": int(candidate.sum()),
+        "overlapping_envelope_rows": int(positive.sum()),
+        "contradicted_candidate_rows": int(contradicted.sum()),
         "mean_distinct_views": float(
             foliage.replacement_observation_count[envelope].float().mean()
         )
@@ -9929,6 +9968,54 @@ def _apply_static_ray_local_mass_handoff(
         if bool(envelope.any())
         else 0.0,
     }
+
+
+@torch.no_grad()
+def _finalize_static_ray_local_mass_handoff(
+    foliage,
+    volume_optimizer,
+    *,
+    scheduled: bool,
+    maximum_fraction_per_event: float,
+) -> dict[str, float | int | str | bool]:
+    """Fold the optimizer update into reference mass, then transfer mass.
+
+    This helper is deliberately called only after ``volume_optimizer.step``
+    and scale/mass compensation.  The first synchronization preserves valid
+    new hit evidence in the unretired reference; the second records the new
+    reversible retirement state.
+    """
+    realized_before = foliage.integrated_optical_mass()
+    retained_before = (1.0 - foliage.handoff_retired_fraction).clamp_min(
+        1.0e-4
+    )
+    foliage.handoff_reference_mass.copy_(
+        realized_before / retained_before
+    )
+    audit: dict[str, float | int | str | bool]
+    if scheduled:
+        audit = _apply_static_ray_local_mass_handoff(
+            foliage,
+            volume_optimizer,
+            maximum_fraction_per_event=maximum_fraction_per_event,
+        )
+    else:
+        audit = {
+            "contract": "reversible_integrated_optical_mass_handoff",
+            "changed_rows": 0,
+            "removed_mass": 0.0,
+            "restored_mass": 0.0,
+            "scheduled_after_optimizer_step": False,
+        }
+    realized_after = foliage.integrated_optical_mass()
+    retained_after = (1.0 - foliage.handoff_retired_fraction).clamp_min(
+        1.0e-4
+    )
+    foliage.handoff_reference_mass.copy_(
+        realized_after / retained_after
+    )
+    audit["scheduled_after_optimizer_step"] = bool(scheduled)
+    return audit
 
 
 @torch.no_grad()
@@ -15677,6 +15764,7 @@ def main():
             (
                 ray_local_authority,
                 ray_local_visible,
+                ray_local_candidate_visible,
                 ray_local_measurement,
             ) = _measure_static_ray_local_replacement(
                 view,
@@ -15692,6 +15780,7 @@ def main():
                     foliage,
                     ray_local_authority,
                     ray_local_visible,
+                    candidate_visible=ray_local_candidate_visible,
                     camera_id=int(view.colmap_id),
                     decay=args.static_replacement_ema_decay,
                 ),
@@ -16663,22 +16752,20 @@ def main():
                 args,
             )
         )
-        static_mass_handoff_audit = (
-            _apply_static_ray_local_mass_handoff(
-                foliage,
-                volume_optimizer,
-                maximum_fraction_per_event=(
-                    args.static_replacement_mass_fraction_per_event
-                ),
-            )
-            if static_replacement_scheduled
-            else {
-                "contract": "reversible_integrated_optical_mass_handoff",
-                "changed_rows": 0,
-                "removed_mass": 0.0,
-                "restored_mass": 0.0,
-            }
-        )
+        # The parameter-space handoff must be applied after Adam and all
+        # scale/mass compensation below.  Applying it here changed the logit
+        # and cleared Adam state, but ``volume_optimizer.step()`` immediately
+        # consumed the already-computed positive opacity gradient and grew
+        # the same envelope back in the very same iteration.
+        static_mass_handoff_audit = {
+            "contract": "reversible_integrated_optical_mass_handoff",
+            "changed_rows": 0,
+            "removed_mass": 0.0,
+            "restored_mass": 0.0,
+            "scheduled_after_optimizer_step": bool(
+                static_replacement_scheduled
+            ),
+        }
         surface_spatial_confidence_audit = (
             _apply_surface_spatial_confidence_gradients(surface)
         )
@@ -16946,16 +17033,20 @@ def main():
                     foliage.dynamic_leaf_mask,
                     dynamic_opacity_ceiling,
                 )
-            # Keep the unretired reference synchronized with legitimate hit
-            # and opacity learning.  The next scheduled hand-off can then
-            # remove or restore only the replacement-owned fraction without
-            # erasing new optical existence evidence.
-            realized_mass = foliage.integrated_optical_mass()
-            retained_fraction = (
-                1.0 - foliage.handoff_retired_fraction
-            ).clamp_min(1.0e-4)
-            foliage.handoff_reference_mass.copy_(
-                realized_mass / retained_fraction
+            # First fold this iteration's legitimate hit/opacity update into
+            # the unretired reference.  Then apply the local transfer after
+            # Adam and scale compensation so it cannot be undone by a stale
+            # same-step gradient.  Finally synchronize the reference with the
+            # new retired fraction, preserving reversibility.
+            static_mass_handoff_audit = (
+                _finalize_static_ray_local_mass_handoff(
+                    foliage,
+                    volume_optimizer,
+                    scheduled=static_replacement_scheduled,
+                    maximum_fraction_per_event=(
+                        args.static_replacement_mass_fraction_per_event
+                    ),
+                )
             )
 
         topology_event = None

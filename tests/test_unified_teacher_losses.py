@@ -60,6 +60,7 @@ from scripts.train_unified_outdoor_teacher import (
     _apply_volume_opacity_settle_policy,
     _apply_static_optical_policy,
     _apply_static_ray_local_mass_handoff,
+    _finalize_static_ray_local_mass_handoff,
     _apply_surface_scale_limits_preserve_optical_mass,
     _surface_screen_limit_rows,
     _accumulate_static_replacement_evidence,
@@ -379,6 +380,111 @@ def test_replacement_readiness_counts_distinct_cameras_only():
         foliage, value, visible, camera_id=8, decay=0.0
     )
     assert foliage.replacement_observation_count.item() == 2
+
+
+def test_replacement_evidence_ignores_unrelated_visible_views():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    visible = torch.ones(1, dtype=torch.bool)
+    candidate = torch.ones(1, dtype=torch.bool)
+    _accumulate_static_replacement_evidence(
+        foliage,
+        torch.tensor([0.8]),
+        visible,
+        candidate_visible=candidate,
+        camera_id=7,
+        decay=0.95,
+    )
+    torch.testing.assert_close(
+        foliage.replacement_overlap_ema, torch.tensor([0.8])
+    )
+    assert foliage.replacement_observation_count.item() == 1
+
+    # Merely seeing the envelope in an unrelated camera is neither a
+    # positive witness nor a contradiction of its local detail replacement.
+    audit = _accumulate_static_replacement_evidence(
+        foliage,
+        torch.zeros(1),
+        visible,
+        candidate_visible=torch.zeros(1, dtype=torch.bool),
+        camera_id=8,
+        decay=0.95,
+    )
+    torch.testing.assert_close(
+        foliage.replacement_overlap_ema, torch.tensor([0.8])
+    )
+    assert foliage.replacement_observation_count.item() == 1
+    assert audit["contradicted_candidate_rows"] == 0
+
+    # The same local group/depth candidate with zero real pixel authority is
+    # explicit counter-evidence and therefore decays reversibly.
+    audit = _accumulate_static_replacement_evidence(
+        foliage,
+        torch.zeros(1),
+        visible,
+        candidate_visible=candidate,
+        camera_id=8,
+        decay=0.95,
+    )
+    torch.testing.assert_close(
+        foliage.replacement_overlap_ema, torch.tensor([0.76])
+    )
+    assert foliage.replacement_observation_count.item() == 1
+    assert audit["contradicted_candidate_rows"] == 1
+
+
+def test_post_step_handoff_preserves_new_unretired_mass():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    optimizer = SimpleNamespace(state={})
+    initial = foliage.integrated_optical_mass().clone()
+    foliage.replacement_overlap_ema.fill_(1.0)
+    foliage.replacement_observation_count.fill_(3)
+    _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.10
+    )
+    previous_fraction = foliage.handoff_retired_fraction.clone()
+
+    # Simulate a legitimate optimizer/ray-hit mass increase before the next
+    # local replacement event.  The post-step finalizer must fold this into
+    # the reference instead of snapping back to the stale initial mass.
+    grown = foliage.integrated_optical_mass() * 1.25
+    foliage.restore_integrated_optical_mass(grown)
+    audit = _finalize_static_ray_local_mass_handoff(
+        foliage,
+        optimizer,
+        scheduled=True,
+        maximum_fraction_per_event=0.02,
+    )
+    expected = grown * (
+        (1.0 - foliage.handoff_retired_fraction)
+        / (1.0 - previous_fraction)
+    )
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass(), expected, rtol=1e-5, atol=1e-8
+    )
+    assert audit["scheduled_after_optimizer_step"] is True
+    assert foliage.integrated_optical_mass().item() > initial.item() * 0.9
 
 
 def test_static_child_reverification_refreshes_dc_from_distinct_real_views():
