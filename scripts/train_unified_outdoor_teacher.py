@@ -87,8 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v76_absolute_bandwidth_"
-    "topology_capacity"
+    "cambridge_native_hybrid_teacher_v77_named_camera_identity_remap"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -849,6 +848,151 @@ def _validate_fixed_cameras(views, scene_contract: dict) -> dict:
         "maximum_absolute_error": maximum,
         "tolerance": tolerance,
     }
+
+
+def _remap_foliage_camera_ids_to_runtime(
+    payload: dict,
+    views,
+) -> tuple[dict, dict[str, object]]:
+    """Translate initialization camera ids through immutable image names.
+
+    Cambridge evidence is produced from the original sparse SfM image ids,
+    while ``LazyScene`` assigns the loaded database views a compact runtime
+    id.  Both namespaces can contain plausible non-negative integers, so a
+    range check cannot detect accidental cross-wiring.  Every camera-indexed
+    foliage field is therefore translated once, at the producer/consumer
+    boundary, through the unique image identity retained in the evidence.
+
+    Geometry, pixels and depth values are unchanged.  The remap only changes
+    the integer keys used for RGB ownership and ray lookup.
+    """
+    result = dict(payload)
+    audit_payload = copy.deepcopy(payload.get("audit", {}))
+    source_records = list(audit_payload.get("fixed_camera_sequences", []))
+    if not source_records:
+        raise RuntimeError(
+            "Foliage initialization has no named fixed-camera table; "
+            "camera-indexed evidence cannot be translated safely"
+        )
+
+    def identity(name: object) -> str:
+        return Path(str(name)).stem
+
+    source_by_name: dict[str, int] = {}
+    source_name_by_id: dict[int, str] = {}
+    for record in source_records:
+        name = identity(record.get("image_name", ""))
+        camera_id = int(record.get("image_id", -1))
+        if not name or camera_id < 0:
+            raise RuntimeError("Invalid named camera in foliage initialization")
+        if name in source_by_name or camera_id in source_name_by_id:
+            raise RuntimeError(
+                "Foliage initialization camera identities are not one-to-one"
+            )
+        source_by_name[name] = camera_id
+        source_name_by_id[camera_id] = name
+
+    runtime_by_name: dict[str, int] = {}
+    for view in views:
+        name = identity(view.image_name)
+        camera_id = int(view.colmap_id)
+        if name in runtime_by_name:
+            raise RuntimeError("Runtime camera image identities are duplicated")
+        runtime_by_name[name] = camera_id
+    if set(source_by_name) != set(runtime_by_name):
+        missing_runtime = sorted(set(source_by_name) - set(runtime_by_name))
+        missing_source = sorted(set(runtime_by_name) - set(source_by_name))
+        raise RuntimeError(
+            "Foliage/runtime named camera sets differ: "
+            f"missing_runtime={missing_runtime[:8]}, "
+            f"missing_source={missing_source[:8]}"
+        )
+
+    id_map = {
+        source_id: runtime_by_name[name]
+        for name, source_id in source_by_name.items()
+    }
+    maximum_source_id = max(id_map)
+    lookup = torch.full((maximum_source_id + 1,), -1, dtype=torch.int64)
+    for source_id, runtime_id in id_map.items():
+        lookup[source_id] = int(runtime_id)
+
+    remapped_entries: dict[str, int] = {}
+
+    def remap_tensor(value: torch.Tensor, field: str) -> torch.Tensor:
+        camera_ids = torch.as_tensor(value).cpu()
+        valid = camera_ids >= 0
+        if bool(valid.any()):
+            maximum = int(camera_ids[valid].max())
+            if maximum >= len(lookup):
+                raise RuntimeError(
+                    f"{field} references camera id {maximum} outside the "
+                    "named initialization camera table"
+                )
+            translated = lookup[camera_ids[valid].long()]
+            if bool((translated < 0).any()):
+                missing = torch.unique(camera_ids[valid][translated < 0])
+                raise RuntimeError(
+                    f"{field} references unnamed camera ids "
+                    f"{missing[:8].tolist()}"
+                )
+        else:
+            translated = torch.empty(0, dtype=torch.int64)
+        output = camera_ids.clone()
+        output[valid] = translated.to(output.dtype)
+        remapped_entries[field] = int(
+            (output[valid] != camera_ids[valid]).sum()
+        )
+        return output
+
+    for field in ("support_camera_ids", "observation_camera_ids"):
+        if field in payload:
+            result[field] = remap_tensor(payload[field], field)
+    if "ray_evidence" in payload:
+        rays = dict(payload["ray_evidence"])
+        rays["camera_ids"] = remap_tensor(
+            rays.get("camera_ids", torch.empty(0, dtype=torch.int32)),
+            "ray_evidence.camera_ids",
+        )
+        result["ray_evidence"] = rays
+
+    for record_key in ("fixed_camera_sequences", "selected_views"):
+        records = list(audit_payload.get(record_key, []))
+        for record in records:
+            name = identity(record.get("image_name", ""))
+            if name not in runtime_by_name:
+                raise RuntimeError(
+                    f"{record_key} contains unknown image identity {name!r}"
+                )
+            record["source_image_id"] = int(record.get("image_id", -1))
+            record["image_id"] = int(runtime_by_name[name])
+        audit_payload[record_key] = records
+    result["audit"] = audit_payload
+
+    mapping_rows = sorted(
+        (int(source_id), int(runtime_id), source_name_by_id[source_id])
+        for source_id, runtime_id in id_map.items()
+    )
+    mapping_sha256 = hashlib.sha256(
+        json.dumps(mapping_rows, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    audit = {
+        "contract": "immutable_image_name_maps_sparse_evidence_id_to_runtime_id",
+        "camera_count": len(mapping_rows),
+        "source_id_minimum": min(id_map),
+        "source_id_maximum": maximum_source_id,
+        "runtime_id_minimum": min(id_map.values()),
+        "runtime_id_maximum": max(id_map.values()),
+        "identity_id_pairs": int(
+            sum(source_id == runtime_id for source_id, runtime_id in id_map.items())
+        ),
+        "changed_id_pairs": int(
+            sum(source_id != runtime_id for source_id, runtime_id in id_map.items())
+        ),
+        "remapped_entries": remapped_entries,
+        "mapping_sha256": mapping_sha256,
+    }
+    return result, audit
 
 
 def _parse_args():
@@ -12792,6 +12936,9 @@ def main():
         dataset.sh_degree, dynamic_rank=foliage_dynamic_rank
     ).cuda()
     seed_payload = _load(Path(initialization["foliage_seed"]))
+    seed_payload, foliage_camera_identity_remap = (
+        _remap_foliage_camera_ids_to_runtime(seed_payload, views)
+    )
     static_fusion_audit = None
     if args.reconstruction_target == "static":
         fixed_camera_sequences = [
@@ -13907,6 +14054,7 @@ def main():
         "foliage_seed_sha256": _file_sha256(
             Path(initialization["foliage_seed"])
         ),
+        "foliage_camera_identity_remap": foliage_camera_identity_remap,
         # Resolution changes both the RGB objective and every screen-space
         # topology threshold.  It therefore belongs to the immutable resume
         # contract, not merely to runtime provenance.
