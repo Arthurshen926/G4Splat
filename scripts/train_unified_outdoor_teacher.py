@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v77_bootstrap_static_ray_prefit"
+    "cambridge_native_hybrid_teacher_v78_visible_static_detail_lifecycle"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -1712,6 +1712,18 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--static-ray-birth-additive-mass-fraction-per-event",
+        type=float,
+        default=0.005,
+        help=(
+            "Maximum explicit optical-mass increase allocated to strict "
+            "cross-camera/cross-sequence visual-hull births which have no "
+            "ray-local envelope donor. The fraction is relative to current "
+            "volume mass at one topology event; donor-associated transfers "
+            "remain exactly mass conserving."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         default=3000,
@@ -1985,6 +1997,15 @@ def _parse_args():
     if args.maximum_static_ray_births_per_event <= 0:
         parser.error(
             "--maximum-static-ray-births-per-event must be positive"
+        )
+    if not (
+        0.0
+        <= args.static_ray_birth_additive_mass_fraction_per_event
+        <= 0.02
+    ):
+        parser.error(
+            "--static-ray-birth-additive-mass-fraction-per-event must lie "
+            "in [0,0.02]"
         )
     if args.allow_static_detail_isolated_repair_resume and args.resume is None:
         parser.error(
@@ -10355,6 +10376,7 @@ def _initialize_static_ray_birth_mass_handoff(
     owner_rows: torch.Tensor,
     view_by_camera_id: dict[int, object],
     maximum_fraction_per_event: float,
+    maximum_additive_fraction_per_event: float = 0.005,
 ) -> dict[str, float | int | str]:
     """Fund newborn detail mass from its ray-local envelope owner.
 
@@ -10363,9 +10385,13 @@ def _initialize_static_ray_birth_mass_handoff(
     top of the persistent envelope.  For every assigned birth, evaluate its
     nearest same-tree envelope owner in all retained support cameras.  Only the
     conservative minimum image/depth overlap may move optical mass.  The
-    newborn is then initialized with exactly the mass removed from the owner,
-    while ownerless or non-overlapping proposals remain effectively transparent
-    until subsequent real-ray verification supplies a valid hand-off.
+    newborn is then initialized with exactly the mass removed from the owner.
+    A strict cross-camera/cross-sequence visual-hull proposal without a usable
+    donor cannot learn if it is appended and immediately made transparent. It
+    therefore receives a small explicit additive budget, bounded as a fraction
+    of the pre-birth model mass for the whole event. Donor-associated births
+    remain exactly mass conserving; ordinary one-view hypotheses are never
+    eligible for this fallback.
 
     The owner's pre-transfer reference mass and retired fraction make this
     reversible through :func:`_apply_static_ray_local_mass_handoff`: if the
@@ -10383,6 +10409,10 @@ def _initialize_static_ray_birth_mass_handoff(
         raise ValueError("Ray-birth rows and envelope owners must align")
     if not 0.0 <= float(maximum_fraction_per_event) <= 0.10:
         raise ValueError("Initial ray-birth transfer fraction must lie in [0,0.1]")
+    if not 0.0 <= float(maximum_additive_fraction_per_event) <= 0.02:
+        raise ValueError(
+            "Initial ray-birth additive fraction must lie in [0,0.02]"
+        )
     empty_audit = {
         "contract": "support_ray_local_conservative_initial_mass_transfer",
         "candidates": int(len(birth_rows)),
@@ -10391,6 +10421,9 @@ def _initialize_static_ray_birth_mass_handoff(
         "requested_child_mass": 0.0,
         "retained_child_mass": 0.0,
         "retired_envelope_mass": 0.0,
+        "additive_child_mass": 0.0,
+        "additive_funded_children": 0,
+        "additive_mass_budget": 0.0,
         "unfunded_child_mass": 0.0,
         "mass_before_birth": float(foliage.integrated_optical_mass().sum()),
         "mass_after_transfer": float(foliage.integrated_optical_mass().sum()),
@@ -10590,8 +10623,32 @@ def _initialize_static_ray_birth_mass_handoff(
         0, owner_inverse, transfer[assigned_local]
     )
 
+    # Visual-hull cells were promoted only after independent cameras and
+    # sequences intersected their calibrated hit intervals. When no projected
+    # donor exists, keeping their requested alpha at ~1e-12 creates an
+    # irreversible dead point: it cannot contribute, verify or receive a useful
+    # RGB gradient, while the consumed-cell tombstone prevents a retry. Give
+    # only those strong ownerless/non-overlap proposals a bounded event-level
+    # existence budget. A common scale preserves relative posterior strength.
+    strong_visual_hull = (
+        (support_count >= 2)
+        & (foliage.support_sequence_count[birth_rows] >= 2)
+    )
+    additive_eligible = strong_visual_hull & ~ray_local
+    additive_requested = (
+        mass_before[birth_rows] - transfer
+    ).clamp_min(0.0) * additive_eligible.to(mass_before.dtype)
+    additive_budget = pre_birth_total.clamp_min(0.0) * float(
+        maximum_additive_fraction_per_event
+    )
+    additive_scale = torch.minimum(
+        additive_budget / additive_requested.sum().clamp_min(1.0e-12),
+        additive_budget.new_tensor(1.0),
+    )
+    additive = additive_requested * additive_scale
+
     target_mass = mass_before.clone()
-    target_mass[birth_rows] = transfer
+    target_mass[birth_rows] = transfer + additive
     target_mass[unique_owner] = (
         mass_before[unique_owner] - transferred_by_owner
     ).clamp_min(0.0)
@@ -10613,9 +10670,10 @@ def _initialize_static_ray_birth_mass_handoff(
             value[changed_rows] = 0
     after_total = realized.sum()
     tolerance = max(float(pre_birth_total.abs()), 1.0) * 1.0e-6
-    if float(after_total - pre_birth_total) > tolerance:
+    realized_increase = after_total - pre_birth_total
+    if float(realized_increase - additive.sum()) > tolerance:
         raise RuntimeError(
-            "Initial ray-birth hand-off increased integrated optical mass"
+            "Initial ray-birth hand-off exceeded its explicit additive budget"
         )
     return {
         "contract": "support_ray_local_conservative_initial_mass_transfer",
@@ -10627,6 +10685,9 @@ def _initialize_static_ray_birth_mass_handoff(
         "retired_envelope_mass": float(
             (mass_before[unique_owner] - realized[unique_owner]).sum()
         ),
+        "additive_child_mass": float(additive.sum()),
+        "additive_funded_children": int((additive > 0).sum()),
+        "additive_mass_budget": float(additive_budget),
         "unfunded_child_mass": float(
             (mass_before[birth_rows] - realized[birth_rows]).clamp_min(0).sum()
         ),
@@ -13471,7 +13532,11 @@ def main():
                 args.static_replacement_mass_fraction_per_event
             ),
             "candidate_contract": (
-                "primitive_center_same_tree_only__no_retirement_authority"
+                "verified_same_group_exact_support_camera__primitive_center_"
+                "cannot_veto_pixel_ray_evidence"
+            ),
+            "audit_camera_schedule": (
+                "complete_cycle_over_verified_detail_exact_support_cameras"
             ),
             "authority_contract": (
                 "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
@@ -13697,9 +13762,15 @@ def main():
                 "extant_initialization_source_6_centers"
             ),
             "initial_mass_policy": (
-                "support_ray_local_transfer_from_verified_envelope"
+                "support_ray_local_transfer_from_verified_envelope__"
+                "bounded_additive_fallback_for_strict_visual_hull_without_"
+                "donor"
             ),
-            "initial_mass_nonincrease": True,
+            "donor_associated_initial_mass_nonincrease": True,
+            "ownerless_additive_mass_fraction_per_event": float(
+                args.static_ray_birth_additive_mass_fraction_per_event
+            ),
+            "ownerless_additive_mass_is_explicitly_bounded": True,
             "initial_mass_reversible_failure_rollback": True,
             "capacity_order": (
                 "cross_sequence_uncovered_birth_before_ordinary_split"
@@ -15111,6 +15182,33 @@ def main():
                                 _periodic_schedule_index(
                                     future_step,
                                     args.static_detail_isolated_every,
+                                )
+                            ]
+                        )
+                    ]
+                )
+            if (
+                args.reconstruction_target == "static"
+                and args.static_replacement_evidence_every > 0
+                and args.static_replacement_mass_fraction_per_event > 0
+                and (future_step + 1)
+                % args.static_replacement_evidence_every
+                == 0
+                and _static_detail_stage_visible(
+                    _phase(
+                        future_step,
+                        args.phase_schedule_horizon,
+                        args.training_profile,
+                    )
+                )
+            ):
+                requested.append(
+                    views[
+                        int(
+                            static_detail_schedule[
+                                _periodic_schedule_index(
+                                    future_step,
+                                    args.static_replacement_evidence_every,
                                 )
                             ]
                         )
@@ -16564,27 +16662,54 @@ def main():
             static_replacement_candidate_scheduled
         )
         if static_replacement_scheduled:
+            # Replacement evidence must visit the exact support cameras of
+            # verified detail. Reusing the random authoritative RGB camera
+            # made almost every audit a no-candidate event even though tens of
+            # thousands of supported envelope/detail groups were visible.
+            # Cycle the existing complete exact-support schedule; this changes
+            # neither the training sample nor the one-pass authoritative
+            # render, and the role-isolated audit remains read-only.
+            replacement_view = views[
+                int(
+                    static_detail_schedule[
+                        _periodic_schedule_index(
+                            step,
+                            args.static_replacement_evidence_every,
+                        )
+                    ]
+                )
+            ]
+            replacement_task = fields.fields(
+                replacement_view.image_name,
+                (
+                    replacement_view.image_height,
+                    replacement_view.image_width,
+                ),
+                torch.device("cuda"),
+            )
             (
                 ray_local_authority,
                 ray_local_visible,
                 ray_local_candidate_visible,
                 ray_local_measurement,
             ) = _measure_static_ray_local_replacement(
-                view,
+                replacement_view,
                 surface,
                 foliage,
                 background,
-                task,
+                replacement_task,
                 package,
             )
             static_replacement_audit = {
                 **ray_local_measurement,
+                "training_camera_id": int(view.colmap_id),
+                "audit_camera_id": int(replacement_view.colmap_id),
                 **_accumulate_static_replacement_evidence(
                     foliage,
                     ray_local_authority,
                     ray_local_visible,
                     candidate_visible=ray_local_candidate_visible,
-                    camera_id=int(view.colmap_id),
+                    camera_id=int(replacement_view.colmap_id),
                     decay=args.static_replacement_ema_decay,
                 ),
             }
@@ -18079,6 +18204,9 @@ def main():
                             view_by_camera_id=view_by_camera_id,
                             maximum_fraction_per_event=(
                                 args.static_replacement_mass_fraction_per_event
+                            ),
+                            maximum_additive_fraction_per_event=(
+                                args.static_ray_birth_additive_mass_fraction_per_event
                             ),
                         )
                     )

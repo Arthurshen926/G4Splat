@@ -40,11 +40,15 @@ def _initialize_static_detail_group_mass_handoff(
 
     A calibrated one-view observation has authority to create a bounded
     occupancy hypothesis, but it does not prove that the broad envelope can
-    be removed in every other view.  Such modes therefore receive at most 5%
-    of their group's reference mass (10% for same-sequence multiview modes)
-    additively while the envelope remains intact.  Only same-cell,
-    cross-sequence geometry witnesses may fund detail by retiring envelope
-    mass, up to 80% with the existing readiness and envelope-floor bounds.
+    be removed in every other view. Such modes therefore receive at most 5%
+    of their group's reference mass additively (10% when multiple appearance
+    cameras support the mode) while the envelope remains intact. Two
+    calibrated cameras in the selected coherent acquisition are
+    already valid triangulation evidence for a static reconstruction, so a
+    same-cell same-sequence mode may conservatively retire up to 40% of group
+    mass. Cross-sequence agreement is stronger persistence evidence and raises
+    that ceiling to 80%. Both tiers retain the readiness and envelope-floor
+    bounds below.
     Subsequent real-ray local coverage performs the continuous, reversible
     handoff for all modes.  This separates birth authority from retirement
     authority without deleting single-view foliage or opening background
@@ -290,8 +294,9 @@ def _initialize_static_detail_group_mass_handoff(
     ) if len(reference) else 0.0
     return {
         "contract": (
-            "single_view_detail_birth_is_bounded_additive__only_same_cell_"
-            "cross_sequence_geometry_can_retire_group_envelope_mass"
+            "single_view_detail_birth_is_bounded_additive__same_cell_"
+            "multiview_geometry_can_conservatively_retire_group_envelope_"
+            "mass__cross_sequence_agreement_has_stronger_authority"
         ),
         "funded_modes": int(authorized.sum()),
         "retirement_authorized_modes": int(retirement_authorized.sum()),
@@ -1415,11 +1420,12 @@ def fuse_sequence_evidence_into_static_leaves(
     mode_sequence_count = valid_mode_support.any(dim=1).to(torch.int64)
 
     # Appearance ownership above deliberately comes from one coherent static
-    # snapshot.  Geometry verification is a different fact: a local mode may
-    # retire persistent envelope mass only when the *same metric cell* was
-    # observed by independent cameras in at least two real sequences.  Derive
-    # that witness table from all associated rows instead of copying the broad
-    # parent group's cross-traversal count onto every compact mode.
+    # snapshot. Geometry verification is a different fact: two calibrated
+    # cameras observing the *same metric cell* already constrain a static 3D
+    # hypothesis, even in one coherent acquisition. Cross-sequence agreement
+    # remains a stronger persistence tier, not a hard existence gate. Derive
+    # the witness table from associated rows instead of copying broad parent
+    # traversal counts onto every compact mode.
     associated_cells = torch.floor(
         centers[associated_rows] / float(canonical_mode_voxel_size)
     ).to(torch.int64)
@@ -1482,9 +1488,13 @@ def fuse_sequence_evidence_into_static_leaves(
         geometry_mode_sequence_count = torch.bincount(
             geometry_sequence_pair_modes, minlength=mode_count
         )
-    detail_geometry_verified = (
+    detail_geometry_retirement_authorized = (
         geometry_mode_view_count >= int(minimum_supporting_views)
-    ) & (geometry_mode_sequence_count >= 2)
+    )
+    cross_sequence_geometry_verified = (
+        detail_geometry_retirement_authorized
+        & (geometry_mode_sequence_count >= 2)
+    )
     # Initialization rows are real calibrated evidence, not speculative split
     # children.  Accept every emitted canonical mode into the seed lifecycle;
     # the explicit camera counts below still reserve geometry/high-order SH
@@ -1580,9 +1590,16 @@ def fuse_sequence_evidence_into_static_leaves(
     result["verification_state"] = verification_state
     result["verified_camera_ids"] = result["observation_camera_ids"].clone()
     verified_width = result["verified_camera_ids"].shape[1]
-    result["verified_camera_ids"][prefix_count:] = mode_support_camera_ids[
-        :, :verified_width
-    ].to(result["verified_camera_ids"].dtype)
+    initial_verified_camera_ids = torch.where(
+        detail_geometry_retirement_authorized[:, None],
+        geometry_mode_camera_ids,
+        mode_support_camera_ids,
+    )
+    result["verified_camera_ids"][prefix_count:] = (
+        initial_verified_camera_ids[:, :verified_width].to(
+            result["verified_camera_ids"].dtype
+        )
+    )
     result["verified_camera_count"] = (
         result["verified_camera_ids"] >= 0
     ).sum(dim=1).clamp_max(torch.iinfo(torch.int16).max).to(torch.int16)
@@ -1598,7 +1615,7 @@ def fuse_sequence_evidence_into_static_leaves(
     )
     result["verified_sequence_count"] = verified_sequence_count
     initial_mass_support_camera_ids = torch.where(
-        (geometry_mode_sequence_count >= 2)[:, None],
+        detail_geometry_retirement_authorized[:, None],
         geometry_mode_camera_ids,
         mode_support_camera_ids,
     )
@@ -1612,7 +1629,9 @@ def fuse_sequence_evidence_into_static_leaves(
             detail_rows=detail_rows,
             detail_groups=mode_groups,
             detail_verified=detail_seed_accepted,
-            detail_retirement_authorized=detail_geometry_verified,
+            detail_retirement_authorized=(
+                detail_geometry_retirement_authorized
+            ),
             detail_support_camera_ids=initial_mass_support_camera_ids,
             detail_verified_sequence_count=torch.maximum(
                 mode_sequence_count, geometry_mode_sequence_count
@@ -1724,8 +1743,11 @@ def fuse_sequence_evidence_into_static_leaves(
                     >= int(minimum_supporting_views)
                 ).sum()
             ),
+            "multiview_geometry_retirement_authorized_modes": int(
+                detail_geometry_retirement_authorized.sum()
+            ),
             "cross_sequence_geometry_verified_modes": int(
-                detail_geometry_verified.sum()
+                cross_sequence_geometry_verified.sum()
             ),
             "canonical_multiview_trainable_modes": int(
                 ((mode_support_camera_ids >= 0).sum(dim=1) >= 2).sum()
@@ -1734,7 +1756,8 @@ def fuse_sequence_evidence_into_static_leaves(
                 ((mode_support_camera_ids >= 0).sum(dim=1) == 1).sum()
             ),
             "appearance_support_is_canonical_sequence_only": True,
-            "geometry_witness_is_same_cell_cross_sequence": True,
+            "geometry_witness_is_same_cell_multiview": True,
+            "cross_sequence_witness_is_stronger_not_required": True,
             "initial_mass_handoff": initial_mass_handoff_audit,
             **ownerless_audit,
         },
@@ -1807,11 +1830,15 @@ def fuse_sequence_evidence_into_static_leaves(
                 >= int(minimum_supporting_views)
             ).sum()
         ),
+        "multiview_geometry_retirement_authorized_modes": int(
+            detail_geometry_retirement_authorized.sum()
+        ),
         "cross_sequence_geometry_verified_modes": int(
-            detail_geometry_verified.sum()
+            cross_sequence_geometry_verified.sum()
         ),
         "appearance_support_is_canonical_sequence_only": True,
-        "geometry_witness_is_same_cell_cross_sequence": True,
+        "geometry_witness_is_same_cell_multiview": True,
+        "cross_sequence_witness_is_stronger_not_required": True,
         "discarded_single_view_or_ownerless_rows": int(
             dynamic.sum() - len(source_rows)
         ),

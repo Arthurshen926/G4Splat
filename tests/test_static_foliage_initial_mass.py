@@ -14,7 +14,10 @@ def _mass(result):
     return tau * projected_gaussian_cross_section(scales)
 
 
-def _cross_sequence_fusion_payload(second_center=(0.03, 0.02, 3.01)):
+def _cross_sequence_fusion_payload(
+    second_center=(0.03, 0.02, 3.01),
+    second_sequence="seq1",
+):
     centers = torch.tensor(
         [[0.0, 0.0, 3.0], [0.02, 0.01, 3.0], second_center],
         dtype=torch.float32,
@@ -41,7 +44,7 @@ def _cross_sequence_fusion_payload(second_center=(0.03, 0.02, 3.01)):
         "audit": {
             "selected_views": [
                 {"image_id": 0, "sequence_id": "seq0"},
-                {"image_id": 1, "sequence_id": "seq1"},
+                {"image_id": 1, "sequence_id": second_sequence},
             ]
         },
     }
@@ -151,7 +154,7 @@ def test_fusion_separates_canonical_appearance_from_cross_sequence_witness():
     assert fused["observation_camera_ids"][detail][0].tolist() == [0, 1]
     # Positive RGB/refinement ownership remains the canonical appearance
     # snapshot; cross-sequence cameras are a separate handoff witness table.
-    assert int(fused["verified_camera_count"][detail][0]) == 1
+    assert int(fused["verified_camera_count"][detail][0]) == 2
     assert int(fused["verified_sequence_count"][detail][0]) == 2
     assert int(fused["verification_state"][detail][0]) == 1
     assert audit["cross_sequence_geometry_verified_modes"] == 1
@@ -162,6 +165,30 @@ def test_fusion_separates_canonical_appearance_from_cross_sequence_witness():
         original_envelope_mass,
     )
     assert fused["handoff_retired_fraction"][envelope][0] > 0
+
+
+def test_same_sequence_multiview_geometry_conservatively_retires_envelope():
+    original = _cross_sequence_fusion_payload(second_sequence="seq0")
+    original_envelope_mass = _mass(original)[0]
+    fused, audit = fuse_sequence_evidence_into_static_leaves(original)
+    detail = fused["static_detail"] & (fused["replacement_group"] == 0)
+    envelope = ~fused["static_detail"] & (fused["replacement_group"] == 0)
+
+    assert int(detail.sum()) == 1
+    assert fused["support_camera_ids"][detail][0].tolist() == [0, 1]
+    assert fused["observation_camera_ids"][detail][0].tolist() == [0, 1]
+    assert int(fused["verified_camera_count"][detail][0]) == 2
+    assert int(fused["verified_sequence_count"][detail][0]) == 1
+    assert audit["multiview_geometry_retirement_authorized_modes"] == 1
+    assert audit["cross_sequence_geometry_verified_modes"] == 0
+
+    fused_mass = _mass(fused)
+    torch.testing.assert_close(
+        fused_mass[detail].sum() + fused_mass[envelope].sum(),
+        original_envelope_mass,
+    )
+    retired = float(fused["handoff_retired_fraction"][envelope][0])
+    assert 0.0 < retired <= 0.40
 
 
 def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():

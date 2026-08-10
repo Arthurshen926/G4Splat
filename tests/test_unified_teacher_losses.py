@@ -455,7 +455,7 @@ def test_runtime_ray_birth_initial_mass_is_ray_local_conserved_and_reversible():
     )
 
 
-def test_ownerless_runtime_ray_birth_cannot_add_optical_mass():
+def test_ownerless_strict_visual_hull_birth_gets_bounded_additive_mass():
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
         {
@@ -466,6 +466,9 @@ def test_ownerless_runtime_ray_birth_cannot_add_optical_mass():
             "opacities": torch.full((1, 1), 0.2),
             "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
             "layer_role": torch.tensor([0], dtype=torch.int8),
+            "support_camera_ids": torch.tensor(
+                [[-1, -1]], dtype=torch.int32
+            ),
             "tree_instance_id": torch.tensor([3], dtype=torch.int32),
         }
     )
@@ -485,6 +488,44 @@ def test_ownerless_runtime_ray_birth_cannot_add_optical_mass():
         maximum_fraction_per_event=0.02,
     )
     assert audit["ray_local_candidates"] == 0
+    after = foliage.integrated_optical_mass().sum()
+    assert audit["additive_funded_children"] == 1
+    assert 0.0 < audit["additive_child_mass"] <= float(before * 0.005)
+    assert before < after <= before * 1.005 + 1.0e-8
+
+
+def test_ownerless_single_sequence_birth_has_no_additive_authority():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+            "support_camera_ids": torch.tensor(
+                [[-1, -1]], dtype=torch.int32
+            ),
+        }
+    )
+    before = foliage.integrated_optical_mass().sum().clone()
+    appended = foliage.append_static_ray_births(
+        torch.tensor([[3.0, 0.0, 2.0]]),
+        support_camera_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+        support_sequence_count=torch.tensor([1], dtype=torch.int16),
+    )
+    birth = int(appended["_new_start"])
+    audit = _initialize_static_ray_birth_mass_handoff(
+        foliage,
+        SimpleNamespace(state={}),
+        birth_rows=torch.tensor([birth]),
+        owner_rows=torch.tensor([-1]),
+        view_by_camera_id={},
+        maximum_fraction_per_event=0.02,
+    )
+    assert audit["additive_funded_children"] == 0
     torch.testing.assert_close(
         foliage.integrated_optical_mass().sum(), before, rtol=1e-5, atol=1e-8
     )
