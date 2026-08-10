@@ -125,10 +125,14 @@ def test_sequence_observations_fuse_to_one_static_model():
     assert torch.allclose(
         payload["centers"][detail][0], torch.tensor([0.02, 0.01, 3.00])
     )
-    assert int(payload["support_sequence_count"][detail][0]) == 2
-    # Cross-sequence support gives the local detail more optical leverage than
-    # a weak ownerless birth, while remaining far below an opaque splat.
-    assert 0.05 < float(payload["opacities"][detail][0]) <= 0.10
+    # The local leaf mode belongs to the selected static snapshot only. The
+    # broad parent may span traversals, but that must not fabricate appearance
+    # or verification support for this particular leaf position.
+    assert int(payload["support_sequence_count"][detail][0]) == 1
+    assert int(payload["verified_sequence_count"][detail][0]) == 1
+    assert int(payload["verified_camera_count"][detail][0]) == 1
+    assert int(payload["verification_state"][detail][0]) == 0
+    assert float(payload["opacities"][detail][0]) == pytest.approx(0.05)
     ownerless = payload["static_detail"] & (
         payload["replacement_group"] < 0
     )

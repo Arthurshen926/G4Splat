@@ -9,6 +9,8 @@ import torch
 from outdoor.hybrid_gaussian_renderer import (
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
+    VERIFICATION_UNVERIFIED,
+    VERIFICATION_VERIFIED,
 )
 
 
@@ -1022,9 +1024,10 @@ def fuse_sequence_evidence_into_static_leaves(
     view_strength = (
         (selected_mode_view_count.float() - 1.0) / 3.0
     ).clamp(0.0, 1.0)
-    sequence_strength = (
-        (sequence_count[mode_groups].float() - 1.0) / 2.0
-    ).clamp(0.0, 1.0)
+    # These local modes are emitted from one deliberately selected canonical
+    # snapshot. Parent cross-traversal coverage establishes the broad hull but
+    # cannot be reused as optical support for this particular leaf position.
+    sequence_strength = torch.zeros_like(view_strength)
     optical_support = 0.5 * (view_strength + sequence_strength)
     maximum_initial_opacity = min(0.10, 2.0 * float(initial_opacity))
     fused_opacity = (
@@ -1056,6 +1059,29 @@ def fuse_sequence_evidence_into_static_leaves(
     mode_support_camera_ids[
         pair_mode[within_width], pair_rank[within_width]
     ] = pair_camera[within_width].to(support.dtype)
+    valid_mode_support = mode_support_camera_ids >= 0
+    safe_mode_support = mode_support_camera_ids.clamp(
+        0, max(len(camera_sequence) - 1, 0)
+    ).long()
+    mode_support_sequences = torch.where(
+        valid_mode_support,
+        camera_sequence[safe_mode_support],
+        torch.full_like(safe_mode_support, -1),
+    )
+    # Every mode is partitioned only after selecting one canonical sequence
+    # for its tree, so all valid support slots share one sequence.  Assert the
+    # invariant vectorially and avoid an O(number_of_modes) Python loop.
+    first_mode_sequence = torch.where(
+        mode_support_sequences >= 0,
+        mode_support_sequences,
+        torch.full_like(mode_support_sequences, torch.iinfo(torch.int64).max),
+    ).min(dim=1).values
+    same_sequence = (mode_support_sequences < 0) | (
+        mode_support_sequences == first_mode_sequence[:, None]
+    )
+    if not bool(same_sequence.all()):
+        raise RuntimeError("canonical static detail mode spans sequences")
+    mode_sequence_count = valid_mode_support.any(dim=1).to(torch.int64)
     parent_rows = envelope_rows[mode_groups]
 
     row_fields = {
@@ -1084,7 +1110,12 @@ def fuse_sequence_evidence_into_static_leaves(
                 torch.iinfo(value.dtype).max
             ).to(value.dtype)
         elif name == "support_sequence_count":
-            detail = sequence_count[mode_groups].clamp_max(
+            # Appearance owners contain only the selected canonical snapshot.
+            # The parent's cross-traversal count is geometric context, not
+            # evidence that this local leaf mode was observed in those other
+            # traversals.  Copying it falsely promoted single-sequence modes
+            # to globally verified static detail.
+            detail = mode_sequence_count.clamp_max(
                 torch.iinfo(value.dtype).max
             ).to(value.dtype)
         elif name in {"track_id", "evidence_primitive_id"}:
@@ -1120,6 +1151,37 @@ def fuse_sequence_evidence_into_static_leaves(
     result["replacement_observation_count"] = torch.zeros(
         len(static_detail), dtype=torch.int16
     )
+    # Seed verification is derived from the actual emitted camera table, not
+    # inherited from the broad parent envelope.  Two calibrated owner cameras
+    # in the chosen static snapshot are sufficient to initialize a coherent
+    # static detail hypothesis; cross-traversal consensus remains recorded
+    # separately and is never fabricated.
+    prefix_count = int(keep.sum())
+    verification_state = torch.full(
+        (len(static_detail),), VERIFICATION_VERIFIED, dtype=torch.int8
+    )
+    detail_multiview = selected_mode_view_count >= int(
+        minimum_supporting_views
+    )
+    verification_state[prefix_count:] = torch.where(
+        detail_multiview,
+        torch.full((mode_count,), VERIFICATION_VERIFIED, dtype=torch.int8),
+        torch.full((mode_count,), VERIFICATION_UNVERIFIED, dtype=torch.int8),
+    )
+    result["verification_state"] = verification_state
+    result["verified_camera_ids"] = result[
+        "observation_camera_ids"
+    ].clone()
+    result["verified_camera_count"] = (
+        result["verified_camera_ids"] >= 0
+    ).sum(dim=1).clamp_max(torch.iinfo(torch.int16).max).to(torch.int16)
+    verified_sequence_count = result["support_sequence_count"].to(
+        torch.int16
+    ).clone()
+    verified_sequence_count[prefix_count:] = mode_sequence_count.clamp_max(
+        torch.iinfo(torch.int16).max
+    ).to(torch.int16)
+    result["verified_sequence_count"] = verified_sequence_count
     result, ownerless_audit = _append_ownerless_static_ray_births(
         result,
         payload,

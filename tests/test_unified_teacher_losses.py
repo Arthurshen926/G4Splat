@@ -218,6 +218,7 @@ def _static_optical_policy_fixture(authority: float):
         static_leaf_mask=torch.tensor([False, False]),
         replacement_observation_count=torch.tensor([3, 3]),
         replacement_overlap_ema=torch.full((2,), float(authority)),
+        handoff_retired_fraction=torch.full((2,), float(authority)),
     )
     moment = torch.tensor([[-4.0], [-5.0]])
     optimizer = SimpleNamespace(state={opacity: {"exp_avg": moment}})
@@ -241,8 +242,7 @@ def test_local_static_replacement_attenuates_only_authorized_growth():
     audit = _apply_static_optical_policy(
         foliage, optimizer, "topology"
     )
-    readiness = 1.0 - torch.exp(torch.tensor(-1.0))
-    expected_multiplier = 1.0 - 0.5 * readiness
+    expected_multiplier = 0.5
     assert audit["envelope_growth_rows_attenuated"] == 2
     assert torch.allclose(
         foliage.opacity_logits.grad,
@@ -262,11 +262,10 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
     audit = _apply_static_optical_policy(
         foliage, optimizer, "topology"
     )
-    readiness = 1.0 - torch.exp(torch.tensor(-1.0))
     assert foliage.opacity_logits.grad[0].item() == -2.0
     torch.testing.assert_close(
         foliage.opacity_logits.grad[1],
-        torch.tensor([-3.0 * (1.0 - readiness)]),
+        torch.tensor([-0.15]),
     )
     assert audit["opacity_growth_removed_by_policy"][
         "unverified_child"
@@ -274,11 +273,12 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
     assert moment[0].item() == -4.0
 
 
-def test_detail_takeover_freezes_only_positive_envelope_growth():
+def test_detail_visibility_without_handoff_keeps_envelope_growth():
     foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
     # Row one receives a legitimate negative/free-space gradient.  Detail
-    # takeover must preserve that retirement direction while preventing the
-    # broad envelope from continuing to absorb positive tree evidence.
+    # Stage visibility is not replacement evidence. The positive envelope
+    # fill direction must remain available until local mass was truly handed
+    # off, while the negative/free-space direction is always preserved.
     foliage.opacity_logits.grad[1] = 3.0
     moment[1] = 5.0
 
@@ -286,13 +286,13 @@ def test_detail_takeover_freezes_only_positive_envelope_growth():
         foliage, optimizer, "static_foliage"
     )
 
-    assert audit[
-        "envelope_positive_growth_frozen_after_detail_takeover"
-    ]
-    assert audit["envelope_growth_rows_attenuated"] == 1
-    assert foliage.opacity_logits.grad[0].item() == 0.0
+    assert audit["envelope_positive_growth_attenuation"] == (
+        "actual_local_handoff_retired_fraction"
+    )
+    assert audit["envelope_growth_rows_attenuated"] == 0
+    assert foliage.opacity_logits.grad[0].item() == -2.0
     assert foliage.opacity_logits.grad[1].item() == 3.0
-    assert moment[0].item() == 0.0
+    assert moment[0].item() == -4.0
     assert moment[1].item() == 5.0
 
 
@@ -473,7 +473,8 @@ def test_replacement_evidence_ignores_unrelated_visible_views():
     assert audit["contradicted_candidate_rows"] == 0
 
     # The same local group/depth candidate with zero real pixel authority is
-    # explicit counter-evidence and therefore decays reversibly.
+    # explicit counter-evidence and therefore lowers the safe coverage
+    # envelope immediately.
     audit = _accumulate_static_replacement_evidence(
         foliage,
         torch.zeros(1),
@@ -483,9 +484,9 @@ def test_replacement_evidence_ignores_unrelated_visible_views():
         decay=0.95,
     )
     torch.testing.assert_close(
-        foliage.replacement_overlap_ema, torch.tensor([0.76])
+        foliage.replacement_overlap_ema, torch.tensor([0.0])
     )
-    assert foliage.replacement_observation_count.item() == 1
+    assert foliage.replacement_observation_count.item() == 2
     assert audit["contradicted_candidate_rows"] == 1
 
 
