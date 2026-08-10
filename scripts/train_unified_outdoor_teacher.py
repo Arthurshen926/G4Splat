@@ -87,8 +87,8 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v71_static_optical_mass_"
-    "ownership_closed"
+    "cambridge_native_hybrid_teacher_v72_evidence_continuous_"
+    "static_detail_mass"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -8855,6 +8855,8 @@ def _adapt_volume(
     )
     pre_canonical_lineage_supported = (
         foliage.support_sequence_count >= 2
+    ) | (
+        foliage.static_leaf_mask & (foliage.support_view_count >= 2)
     ) | (foliage.split_generation > 0)
     pre_skeleton_eligible = (
         pre_evidence_eligible
@@ -9116,6 +9118,8 @@ def _adapt_volume(
     # evaluated globally and does not depend on duplicated evidence ids.
     canonical_lineage_supported = (
         foliage.support_sequence_count >= 2
+    ) | (
+        foliage.static_leaf_mask & (foliage.support_view_count >= 2)
     ) | (foliage.split_generation > 0)
     canonical_eligible = (
         evidence_eligible

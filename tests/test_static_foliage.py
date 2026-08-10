@@ -131,10 +131,10 @@ def test_sequence_observations_fuse_to_one_static_model():
     assert int(payload["support_sequence_count"][detail][0]) == 1
     assert int(payload["verified_sequence_count"][detail][0]) == 1
     assert int(payload["verified_camera_count"][detail][0]) == 1
-    assert int(payload["verification_state"][detail][0]) == 0
-    # A single-view mode remains an explicit candidate but cannot add a second
-    # extinction layer or retire its persistent envelope before verification.
-    assert float(payload["opacities"][detail][0]) == 0.0
+    assert int(payload["verification_state"][detail][0]) == 1
+    # A single-view mode remains exact-owner/DC-only, but receives a small
+    # mass-conserving share from its envelope instead of being born invisible.
+    assert float(payload["opacities"][detail][0]) > 0.0
     ownerless = payload["static_detail"] & (
         payload["replacement_group"] < 0
     )

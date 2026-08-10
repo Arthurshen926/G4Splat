@@ -115,20 +115,21 @@ def test_initial_handoff_metadata_is_reversible_and_evidence_owned():
     retired = result["handoff_retired_fraction"][0]
     torch.testing.assert_close(reference, before[0])
     torch.testing.assert_close(reference * (1.0 - retired), after[0])
-    torch.testing.assert_close(reference, after[0] + after[1])
+    torch.testing.assert_close(reference, after[0] + after[1] + after[2])
 
-    # Two distinct verified cameras are two real readiness observations. The
+    # All distinct support cameras are real readiness observations. The
     # stored prior reproduces the initialized retirement exactly under the
     # downstream desired = overlap * min(count/3,1) * .95 equation.
-    assert result["replacement_observation_count"][0] == 2
+    assert result["replacement_observation_count"][0] == 3
     readiness = result["replacement_observation_count"][0].float() / 3.0
     desired = result["replacement_overlap_ema"][0] * readiness * 0.95
     torch.testing.assert_close(desired, retired)
     assert result["replacement_camera_signature"][0] != 0
 
-    # Even two appearance cameras in one sequence are not independent geometry
-    # persistence. The mode stays transparent and has no retirement authority.
-    assert after[2] == 0
+    # Same-sequence multiview evidence receives a bounded 20% group tier. It
+    # gains optical leverage without adding mass; cross-sequence evidence in
+    # the same group permits the larger tier shared proportionally by modes.
+    assert after[2] > 0
     assert result["handoff_retired_fraction"][2] == 0
     assert result["replacement_observation_count"][2] == 0
 
@@ -146,7 +147,9 @@ def test_fusion_separates_canonical_appearance_from_cross_sequence_witness():
     assert int(fused["support_sequence_count"][detail][0]) == 1
     # Geometry verification comes from the same metric cell in seq0 and seq1.
     assert fused["observation_camera_ids"][detail][0].tolist() == [0, 1]
-    assert int(fused["verified_camera_count"][detail][0]) == 2
+    # Positive RGB/refinement ownership remains the canonical appearance
+    # snapshot; cross-sequence cameras are a separate handoff witness table.
+    assert int(fused["verified_camera_count"][detail][0]) == 1
     assert int(fused["verified_sequence_count"][detail][0]) == 2
     assert int(fused["verification_state"][detail][0]) == 1
     assert audit["cross_sequence_geometry_verified_modes"] == 1
@@ -169,7 +172,12 @@ def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():
 
     assert int(fused["support_sequence_count"][detail][0]) == 1
     assert int(fused["verified_sequence_count"][detail][0]) == 1
-    assert int(fused["verification_state"][detail][0]) == 0
-    assert float(fused["opacities"][detail][0]) == 0.0
-    assert float(fused["handoff_retired_fraction"][envelope][0]) == 0.0
+    # The calibrated canonical seed remains trainable even though the parent
+    # traversal does not verify this exact leaf cell. Its one-camera tier may
+    # borrow only 5% of envelope mass and cannot use multiview refinement.
+    assert int(fused["verification_state"][detail][0]) == 1
+    assert int(fused["verified_camera_count"][detail][0]) == 1
+    assert float(fused["opacities"][detail][0]) > 0.0
+    retired = float(fused["handoff_retired_fraction"][envelope][0])
+    assert 0.0 < retired <= 0.05 + 1.0e-6
     assert audit["cross_sequence_geometry_verified_modes"] == 0

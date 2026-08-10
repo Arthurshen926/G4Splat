@@ -36,10 +36,12 @@ def _initialize_static_detail_group_mass_handoff(
     is removed from that group's envelope, so neither the number of modes nor
     anisotropic footprint shape can increase initial group extinction.
 
-    A bounded envelope floor preserves coverage before real-ray replacement
-    evidence matures.  The evidence prior records only the distinct calibrated
-    cameras that actually verified an emitted mode.  Unverified modes remain
-    explicit, transparent hypotheses and cannot retire an envelope.
+    A bounded, evidence-continuous envelope floor preserves coverage before
+    real-ray replacement evidence matures.  A one-camera canonical mode may
+    borrow at most 5% of its group's mass, a same-sequence multiview mode 20%,
+    and a same-cell cross-sequence mode 80%.  This gives sparse real leaf
+    evidence optical leverage without either a binary persistence gate or a
+    second extinction layer.
     """
 
     retained_floor = float(minimum_envelope_retained_fraction)
@@ -83,18 +85,24 @@ def _initialize_static_detail_group_mass_handoff(
     ):
         raise ValueError("detail row is outside static foliage table")
 
-    distinct_mode_camera_count = torch.tensor(
-        [
-            len(torch.unique(row[row >= 0]))
-            for row in support
-        ],
-        dtype=torch.int64,
-    )
-    authorized = (
-        detail_verified
-        & (distinct_mode_camera_count >= 2)
-        & (verified_sequence_count >= 2)
-    )
+    # Fusion constructs this table from unique (mode,camera) pairs. Keep the
+    # count vectorized; checking every row with torch.unique made fresh-scene
+    # initialization CPU-bound at Cambridge scale.
+    distinct_mode_camera_count = (support >= 0).sum(dim=1).to(torch.int64)
+    authorized = detail_verified & (distinct_mode_camera_count >= 1)
+    mode_retirement_limit = torch.where(
+        (distinct_mode_camera_count >= 2) & (verified_sequence_count >= 2),
+        torch.full_like(distinct_mode_camera_count, 0.80, dtype=torch.float32),
+        torch.where(
+            distinct_mode_camera_count >= 2,
+            torch.full_like(
+                distinct_mode_camera_count, 0.20, dtype=torch.float32
+            ),
+            torch.full_like(
+                distinct_mode_camera_count, 0.05, dtype=torch.float32
+            ),
+        ),
+    ) * authorized.to(torch.float32)
 
     area = projected_gaussian_cross_section(scales).clamp_min(1.0e-12)
     tau = -torch.log1p(-opacity.clamp(0.0, 1.0 - 1.0e-6))
@@ -128,8 +136,33 @@ def _initialize_static_detail_group_mass_handoff(
 
     observation_count = group_camera_count.clamp(max=3)
     readiness = observation_count.to(torch.float32) / 3.0
+    group_retirement_limit = reference.new_zeros(len(envelope_rows))
+    if len(detail_rows):
+        # The three possible evidence tiers admit an exact vectorized maximum
+        # without relying on scatter_reduce availability.  This path runs over
+        # ~84k modes at every fresh start, so per-mode Python/tensor dispatch
+        # would dominate initialization time.
+        for tier in (0.05, 0.20, 0.80):
+            tier_count = torch.zeros_like(group_retirement_limit)
+            tier_rows = mode_retirement_limit == tier
+            if bool(tier_rows.any()):
+                tier_count.index_add_(
+                    0,
+                    detail_groups[tier_rows],
+                    torch.ones(
+                        int(tier_rows.sum()), dtype=tier_count.dtype
+                    ),
+                )
+                group_retirement_limit = torch.where(
+                    tier_count > 0,
+                    torch.full_like(group_retirement_limit, tier),
+                    group_retirement_limit,
+                )
     maximum_retired_fraction = torch.minimum(
-        reference.new_full(reference.shape, 1.0 - retained_floor),
+        torch.minimum(
+            reference.new_full(reference.shape, 1.0 - retained_floor),
+            group_retirement_limit,
+        ),
         0.95 * readiness,
     )
     capacity = reference * maximum_retired_fraction
@@ -190,9 +223,28 @@ def _initialize_static_detail_group_mass_handoff(
         (realized_group_mass - reference).clamp_min(0.0).max()
     ) if len(reference) else 0.0
     return {
-        "contract": "verified_detail_funded_by_group_envelope_optical_mass",
-        "verified_modes": int(authorized.sum()),
-        "unverified_modes": int((~authorized).sum()),
+        "contract": (
+            "evidence_continuous_detail_funded_by_group_envelope_optical_mass"
+        ),
+        "funded_modes": int(authorized.sum()),
+        "single_camera_funded_modes": int(
+            (authorized & (distinct_mode_camera_count == 1)).sum()
+        ),
+        "same_sequence_multiview_funded_modes": int(
+            (
+                authorized
+                & (distinct_mode_camera_count >= 2)
+                & (verified_sequence_count < 2)
+            ).sum()
+        ),
+        "cross_sequence_funded_modes": int(
+            (
+                authorized
+                & (distinct_mode_camera_count >= 2)
+                & (verified_sequence_count >= 2)
+            ).sum()
+        ),
+        "unfunded_modes": int((~authorized).sum()),
         "retired_envelope_groups": int((transfer_by_group > 0).sum()),
         "requested_detail_mass": float(requested.sum()),
         "transferred_detail_mass": float(transferred_detail_mass.sum()),
@@ -1355,6 +1407,13 @@ def fuse_sequence_evidence_into_static_leaves(
     detail_geometry_verified = (
         geometry_mode_view_count >= int(minimum_supporting_views)
     ) & (geometry_mode_sequence_count >= 2)
+    # Initialization rows are real calibrated evidence, not speculative split
+    # children.  Accept every emitted canonical mode into the seed lifecycle;
+    # the explicit camera counts below still reserve geometry/high-order SH
+    # refinement for multiview modes, while single-view rows receive only
+    # exact-owner DC/opacity/ray supervision.  This keeps global child debt
+    # from treating 56k real one-view leaf observations as failed topology.
+    detail_seed_accepted = valid_mode_support.any(dim=1)
     parent_rows = envelope_rows[mode_groups]
 
     row_fields = {
@@ -1436,14 +1495,16 @@ def fuse_sequence_evidence_into_static_leaves(
         (len(static_detail),), VERIFICATION_VERIFIED, dtype=torch.int8
     )
     verification_state[prefix_count:] = torch.where(
-        detail_geometry_verified,
+        detail_seed_accepted,
         torch.full((mode_count,), VERIFICATION_VERIFIED, dtype=torch.int8),
         torch.full((mode_count,), VERIFICATION_UNVERIFIED, dtype=torch.int8),
     )
     result["verification_state"] = verification_state
-    result["verified_camera_ids"] = result[
-        "observation_camera_ids"
-    ].clone()
+    result["verified_camera_ids"] = result["observation_camera_ids"].clone()
+    verified_width = result["verified_camera_ids"].shape[1]
+    result["verified_camera_ids"][prefix_count:] = mode_support_camera_ids[
+        :, :verified_width
+    ].to(result["verified_camera_ids"].dtype)
     result["verified_camera_count"] = (
         result["verified_camera_ids"] >= 0
     ).sum(dim=1).clamp_max(torch.iinfo(torch.int16).max).to(torch.int16)
@@ -1451,11 +1512,18 @@ def fuse_sequence_evidence_into_static_leaves(
         torch.int16
     ).clone()
     verified_sequence_count[prefix_count:] = (
-        geometry_mode_sequence_count.clamp_max(
+        torch.maximum(
+            mode_sequence_count, geometry_mode_sequence_count
+        ).clamp_max(
             torch.iinfo(torch.int16).max
         ).to(torch.int16)
     )
     result["verified_sequence_count"] = verified_sequence_count
+    initial_mass_support_camera_ids = torch.where(
+        (geometry_mode_sequence_count >= 2)[:, None],
+        geometry_mode_camera_ids,
+        mode_support_camera_ids,
+    )
     original_to_kept = torch.cumsum(keep.to(torch.int64), dim=0) - 1
     output_envelope_rows = original_to_kept[envelope_rows]
     detail_rows = prefix_count + torch.arange(mode_count, dtype=torch.int64)
@@ -1465,9 +1533,11 @@ def fuse_sequence_evidence_into_static_leaves(
             envelope_rows=output_envelope_rows,
             detail_rows=detail_rows,
             detail_groups=mode_groups,
-            detail_verified=detail_geometry_verified,
-            detail_support_camera_ids=geometry_mode_camera_ids,
-            detail_verified_sequence_count=geometry_mode_sequence_count,
+            detail_verified=detail_seed_accepted,
+            detail_support_camera_ids=initial_mass_support_camera_ids,
+            detail_verified_sequence_count=torch.maximum(
+                mode_sequence_count, geometry_mode_sequence_count
+            ),
         )
     )
     pre_ownerless_count = len(result["centers"])
@@ -1568,6 +1638,12 @@ def fuse_sequence_evidence_into_static_leaves(
             ),
             "cross_sequence_geometry_verified_modes": int(
                 detail_geometry_verified.sum()
+            ),
+            "canonical_multiview_trainable_modes": int(
+                ((mode_support_camera_ids >= 0).sum(dim=1) >= 2).sum()
+            ),
+            "single_view_trainable_modes": int(
+                ((mode_support_camera_ids >= 0).sum(dim=1) == 1).sum()
             ),
             "appearance_support_is_canonical_sequence_only": True,
             "geometry_witness_is_same_cell_cross_sequence": True,

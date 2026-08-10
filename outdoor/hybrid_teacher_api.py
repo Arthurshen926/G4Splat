@@ -114,6 +114,8 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "lineage_debt_safe_local_handoff",
     "cambridge_native_hybrid_teacher_v71_static_optical_mass_"
     "ownership_closed",
+    "cambridge_native_hybrid_teacher_v72_evidence_continuous_"
+    "static_detail_mass",
     "unified_outdoor_mixed_teacher_v1",
 }
 
