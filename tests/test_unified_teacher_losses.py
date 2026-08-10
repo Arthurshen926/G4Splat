@@ -17,6 +17,7 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
     STATIC_OPTICAL_POLICY_CONTRACT,
     STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
+    STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT,
     TRAINING_PROFILES,
     VOLUME_OPACITY_SETTLE_CONTRACT,
     _apply_training_profile_optimizer_defaults,
@@ -276,26 +277,43 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
     assert moment[0].item() == -4.0
 
 
-def test_detail_visibility_freezes_envelope_growth_but_keeps_cleanup():
+def test_detail_visibility_keeps_only_canonical_evidence_envelope_growth():
     foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
-    # Row one receives a legitimate negative/free-space gradient.  Detail
-    # Stage 2 already established broad support. Stage 3 positive mass belongs
-    # to exact detail/ray evidence, while negative free-space cleanup remains.
+    # Row zero has -0.75 canonical ray growth and -1.25 auxiliary growth;
+    # only the former remains. Row one receives legitimate free-space cleanup.
     foliage.opacity_logits.grad[1] = 3.0
     moment[1] = 5.0
+    canonical_evidence = torch.tensor([[-0.75], [0.5]])
 
     audit = _apply_static_optical_policy(
-        foliage, optimizer, "static_foliage"
+        foliage,
+        optimizer,
+        "static_foliage",
+        canonical_evidence_opacity_gradient=canonical_evidence,
     )
 
     assert audit["envelope_positive_growth_attenuation"] == (
-        "stage3_freeze__stage2_actual_local_handoff_retired_fraction"
+        "stage3_canonical_geometry_ray_only__stage2_actual_local_"
+        "handoff_retired_fraction"
     )
     assert audit["envelope_growth_rows_attenuated"] == 1
-    assert foliage.opacity_logits.grad[0].item() == 0.0
+    assert foliage.opacity_logits.grad[0].item() == -0.75
     assert foliage.opacity_logits.grad[1].item() == 3.0
-    assert moment[0].item() == 0.0
+    assert moment[0].item() == -4.0
     assert moment[1].item() == 5.0
+
+
+def test_detail_visibility_without_source_gradient_uses_safe_freeze():
+    foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
+
+    _apply_static_optical_policy(
+        foliage, optimizer, "static_foliage"
+    )
+
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad, torch.zeros(2, 1)
+    )
+    torch.testing.assert_close(moment, torch.zeros(2, 1))
 
 
 def test_static_detail_stage_freezes_envelope_high_order_sh_only():
@@ -337,6 +355,18 @@ def test_trainer_repair_migrates_static_optical_lifecycle_contract():
     }
     assert not _resume_training_contract_differences(
         saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
+
+    stage3_freeze = {
+        "reconstruction_target": "static",
+        "static_optical_policy_contract": (
+            STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT
+        ),
+    }
+    assert not _resume_training_contract_differences(
+        stage3_freeze,
         current,
         allow_trainer_repair_migration=True,
     )

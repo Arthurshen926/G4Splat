@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v80_canonical_multiview_handoff"
+    "cambridge_native_hybrid_teacher_v81_ray_owned_envelope_repair"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -204,9 +204,23 @@ STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT = (
     "xyz_scale_rotation_and_mass_freeze_together_in_canonical_"
     "polish__scale_updates_preserve_integrated_optical_mass"
 )
-STATIC_OPTICAL_POLICY_CONTRACT = (
+STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT = (
     "single_static_map__stage3_envelope_positive_growth_and_high_order_sh_"
     "frozen_while_negative_cleanup_and_dc_remain_trainable__verified_support_"
+    "camera_detail_groups_define_"
+    "handoff_candidates__native_t_before_alpha_pixel_coverage_tracks_"
+    "conservative_cross_view_lower_envelope__retirement_is_reversible_in_"
+    "integrated_optical_mass_space__failed_zero_owner_witness_split_"
+    "families_rollback_mass_conservingly__strict_cross_sequence_ray_birth_"
+    "retains_independent_capacity__unverified_detail_keeps_dc_mass_and_ray_"
+    "training_but_not_high_bandwidth_refinement__canonical_polish_freezes_"
+    "geometry_covariance_and_mass_together__scale_updates_preserve_"
+    "integrated_optical_mass"
+)
+STATIC_OPTICAL_POLICY_CONTRACT = (
+    "single_static_map__stage3_envelope_positive_growth_only_from_canonical_"
+    "geometry_ray_evidence_while_non_evidence_growth_and_high_order_sh_are_"
+    "frozen_and_negative_cleanup_and_dc_remain_trainable__verified_support_"
     "camera_detail_groups_define_"
     "handoff_candidates__native_t_before_alpha_pixel_coverage_tracks_"
     "conservative_cross_view_lower_envelope__retirement_is_reversible_in_"
@@ -4060,7 +4074,10 @@ def _resume_training_contract_differences(
                 saved[key] = current[key]
         if (
             saved.get("static_optical_policy_contract")
-            == STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT
+            in {
+                STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
+                STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT,
+            }
             and current.get("static_optical_policy_contract")
             == STATIC_OPTICAL_POLICY_CONTRACT
             and saved.get("reconstruction_target") == "static"
@@ -11241,16 +11258,18 @@ def _apply_static_optical_policy(
     foliage,
     volume_optimizer,
     phase: str,
+    *,
+    canonical_evidence_opacity_gradient: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Enforce the static parameter/loss ownership matrix continuously.
 
     Envelope mass may grow from ray-hit evidence and RGB while the Stage-2
-    support is formed.  Once Stage-3 detail is visible, the envelope becomes
-    a fixed upper-support proposal: positive ray evidence must establish the
-    finer detail/skeleton owners instead of making the broad low-pass kernels
-    progressively more opaque.  Negative evidence and local handoff may
-    still reduce envelope mass. Static detail and skeleton mass never inherit
-    the envelope-retirement rule.
+    support is formed.  Once Stage-3 detail is visible, RGB is detached from
+    envelope opacity, but canonical geometry/ray evidence must still be able
+    to repair a real occlusion hole.  All other positive-growth components
+    are removed while every negative/free-space component is retained.
+    Static detail and skeleton mass never inherit the envelope-retirement
+    rule.
     During final polish, geometry, covariance and mass freeze together so
     appearance cannot create holes by moving a fixed-alpha Gaussian.
     """
@@ -11260,7 +11279,8 @@ def _apply_static_optical_policy(
         "joint_polish_freeze": phase == "canonical_polish",
         "envelope_growth_rows_attenuated": 0,
         "envelope_positive_growth_attenuation": (
-            "stage3_freeze__stage2_actual_local_handoff_retired_fraction"
+            "stage3_canonical_geometry_ray_only__stage2_actual_local_"
+            "handoff_retired_fraction"
         ),
         "envelope_high_order_sh_rows_frozen": 0,
         "mean_envelope_replacement_authority": 0.0,
@@ -11401,12 +11421,11 @@ def _apply_static_optical_policy(
             }
         gradient_before = gradient.detach().clone()
         # Newborn children must be able to establish optical existence before
-        # they can participate in envelope retirement.  Once detail is
-        # visible, however, the broad envelope has completed its positive-mass
-        # lifecycle. Continuing to grow it from every tree ray lets the
-        # easiest low-frequency owner consume the same evidence that should
-        # make detail opaque. Negative gradients remain untouched, so global
-        # free-space cleanup and local replace-and-retire stay effective.
+        # they can participate in envelope retirement. Once detail is visible
+        # the broad envelope may grow only from the canonical geometry/ray
+        # objective. Stage-3 RGB already has a zero envelope-opacity gate;
+        # keeping this source separately prevents any auxiliary loss from
+        # recreating the old global low-pass opacity shortcut.
         growth_owner = envelope if detail_visible else retirement_envelope
         growth = growth_owner[:, None] & (gradient < 0)
         attenuated_growth = (
@@ -11418,11 +11437,24 @@ def _apply_static_optical_policy(
             attenuated_growth.flatten(1).any(dim=1).sum()
         )
         if detail_visible:
-            # Stage-2 already established the broad support. Stage-3 optical
-            # existence belongs to exact-owner detail/ray posterior and the
-            # conserved local handoff. Free-space gradients have the opposite
-            # sign and remain untouched.
-            gradient[growth] = 0
+            if canonical_evidence_opacity_gradient is None:
+                # Backward-compatible conservative fallback for callers that
+                # do not expose source-separated gradients.
+                gradient[growth] = 0
+            else:
+                evidence = torch.as_tensor(
+                    canonical_evidence_opacity_gradient,
+                    device=gradient.device,
+                    dtype=gradient.dtype,
+                )
+                if evidence.shape != gradient.shape:
+                    raise ValueError(
+                        "canonical evidence opacity gradient must align "
+                        "with foliage opacity"
+                    )
+                non_evidence = gradient_before - evidence
+                routed = evidence + non_evidence.clamp_min(0.0)
+                gradient[envelope] = routed[envelope]
         else:
             gradient[growth] *= (
                 1.0 - attenuation[:, None].expand_as(gradient)[growth]
@@ -11442,7 +11474,17 @@ def _apply_static_optical_policy(
             first_moment < 0
         )
         if detail_visible:
-            first_moment[growth_momentum] = 0
+            if canonical_evidence_opacity_gradient is None:
+                first_moment[growth_momentum] = 0
+            else:
+                evidence_growth = (
+                    canonical_evidence_opacity_gradient.to(
+                        device=first_moment.device,
+                        dtype=first_moment.dtype,
+                    )
+                    < 0
+                )
+                first_moment[growth_momentum & ~evidence_growth] = 0
         else:
             first_moment[growth_momentum] *= (
                 1.0
@@ -16557,6 +16599,12 @@ def main():
         # branch.  This keeps the exact same jointly sorted image formation,
         # but prevents tree pixels from painting structural surfels or sky.
         canonical_loss.backward(retain_graph=foliage_active)
+        canonical_evidence_opacity_gradient = (
+            foliage.opacity_logits.grad.detach().clone()
+            if foliage_active
+            and foliage.opacity_logits.grad is not None
+            else None
+        )
         if foliage_active:
             torch.autograd.backward(
                 canopy_photo
@@ -17784,6 +17832,9 @@ def main():
                 foliage,
                 volume_optimizer,
                 phase,
+                canonical_evidence_opacity_gradient=(
+                    canonical_evidence_opacity_gradient
+                ),
             )
             if args.reconstruction_target == "static"
             else _apply_volume_opacity_settle_policy(
