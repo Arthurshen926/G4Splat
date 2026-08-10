@@ -87,8 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v76_absolute_bandwidth_"
-    "topology_capacity"
+    "cambridge_native_hybrid_teacher_v77_bootstrap_static_ray_prefit"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -10844,17 +10843,18 @@ def _static_spatial_uncertainty_active(
 
 
 def _static_detail_ray_trainable(phase: str) -> bool:
-    """Pre-fit hidden static detail from calibrated rays during topology.
+    """Pre-fit hidden static detail from calibrated rays from iteration one.
 
-    Static detail is absent from topology RGB renders and cannot collect
-    screen-space split statistics there.  Its only gradients are therefore
-    geometry/free-space posterior factors. Freezing those gradients consumed
-    a complete camera epoch while tree-dominant views stayed empty.
+    Static detail is absent from bootstrap/topology RGB renders and cannot
+    steal a colour explanation from the persistent envelope or rigid scene.
+    Its calibrated exact-owner ray/depth posterior is nevertheless valid
+    before RGB activation.  Deferring this factor consumed the first and, in
+    a short causal prefix, only evidence visit of low-id cameras while the
+    intended detail owner was frozen.  Keep the final polish freeze, but let
+    real hit/free/depth evidence establish geometry and optical existence
+    from the first scheduled ray epoch.
     """
-    return str(phase) not in {
-        "canonical_bootstrap",
-        "canonical_polish",
-    }
+    return str(phase) != "canonical_polish"
 
 
 def _static_detail_isolated_gradient_gates(

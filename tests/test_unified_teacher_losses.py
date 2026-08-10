@@ -5134,8 +5134,8 @@ def test_ownerless_ray_rejects_static_detail_owned_by_another_camera():
     assert float(foliage.opacity_logits.grad) >= 0
 
 
-def test_static_detail_ray_prefit_starts_in_topology_only():
-    assert not _static_detail_ray_trainable("canonical_bootstrap")
+def test_static_detail_ray_prefit_starts_in_bootstrap():
+    assert _static_detail_ray_trainable("canonical_bootstrap")
     assert _static_detail_ray_trainable("topology")
     assert _static_detail_ray_trainable("static_foliage")
     assert not _static_detail_ray_trainable("canonical_polish")
@@ -5297,7 +5297,10 @@ def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
         camera_id=0,
         camera_sequence_lookup=lookup,
     )
-    assert torch.equal(bootstrap_hit, active)
+    # Bootstrap now pre-fits the same exact-owner/verified static detail as
+    # topology.  This prevents the first evidence epoch from being consumed
+    # while hidden detail remains frozen.
+    assert torch.equal(bootstrap_hit, hit)
 
 
 def test_verification_debt_capacity_is_continuous_and_shared():

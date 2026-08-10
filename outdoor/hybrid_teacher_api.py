@@ -124,6 +124,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "deferred_retirement",
     "cambridge_native_hybrid_teacher_v76_absolute_bandwidth_"
     "topology_capacity",
+    "cambridge_native_hybrid_teacher_v77_bootstrap_static_ray_prefit",
     "unified_outdoor_mixed_teacher_v1",
 }
 
