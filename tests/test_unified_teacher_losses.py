@@ -93,6 +93,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
+    _static_detail_same_sequence_appearance_gate,
     _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
     _static_spatial_uncertainty_active,
@@ -1140,6 +1141,44 @@ def test_static_detail_gradients_are_owned_by_exact_support_cameras():
         Foliage(), 4, lookup
     )
     assert torch.equal(missing, torch.tensor([1.0, 0.0, 0.0, 0.0]))
+
+
+def test_static_detail_appearance_softly_uses_same_sequence_cameras():
+    class Foliage:
+        xyz = torch.zeros(5, 3)
+        static_leaf_mask = torch.tensor([False, True, True, True, True])
+        support_camera_ids = torch.tensor(
+            [
+                [-1, -1],
+                [0, -1],
+                [1, -1],
+                [2, -1],
+                [-1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        def __len__(self):
+            return 5
+
+    foliage = Foliage()
+    lookup = torch.tensor([0, 0, 1], dtype=torch.int16)
+    exact = _static_detail_canonical_ownership_gate(
+        foliage, 0, lookup
+    )
+    appearance = _static_detail_same_sequence_appearance_gate(
+        foliage,
+        0,
+        lookup,
+        exact,
+        fallback_weight=0.35,
+    )
+    # Non-detail rows retain global appearance ownership. Exact camera zero
+    # owns row one, camera one is the same acquisition and receives a soft
+    # SH update, while the other sequence and unsupported row remain zero.
+    torch.testing.assert_close(
+        appearance, torch.tensor([1.0, 1.0, 0.35, 0.0, 0.0])
+    )
 
 
 def test_static_canonical_ownership_resume_migrates_only_new_contract():
@@ -5307,11 +5346,12 @@ def test_static_detail_ray_prefit_starts_in_bootstrap():
 
 def test_static_detail_isolated_positive_rgb_parameters_are_support_owned():
     ownership = torch.tensor([1.0, 0.0, 1.0])
+    appearance_permission = torch.tensor([1.0, 0.35, 1.0])
     geometry, appearance, opacity = _static_detail_isolated_gradient_gates(
-        ownership
+        ownership, appearance_permission
     )
     assert geometry is ownership
-    assert appearance is ownership
+    assert appearance is appearance_permission
     torch.testing.assert_close(opacity, torch.zeros_like(ownership))
 
 
@@ -5337,12 +5377,14 @@ def test_static_volume_isolated_only_refines_verified_exact_detail():
             return 5
 
     exact_owner = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+    appearance_owner = torch.tensor([1.0, 1.0, 0.35, 0.35, 0.35])
     geometry, appearance, opacity = _static_volume_isolated_gradient_gates(
-        Foliage(), exact_owner
+        Foliage(), exact_owner, appearance_owner
     )
     expected = torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])
+    expected_appearance = torch.tensor([0.0, 0.0, 0.35, 0.0, 0.0])
     torch.testing.assert_close(geometry, expected)
-    torch.testing.assert_close(appearance, expected)
+    torch.testing.assert_close(appearance, expected_appearance)
     torch.testing.assert_close(opacity, torch.zeros_like(expected))
 
 
@@ -5358,14 +5400,18 @@ def test_static_stage3_rgb_routes_envelope_only_to_appearance():
             return 4
 
     ownership = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    appearance_permission = torch.tensor([1.0, 1.0, 0.35, 1.0])
     geometry, appearance, opacity = _static_stage_rgb_gradient_gates(
-        Foliage(), ownership, detail_stage_active=True
+        Foliage(),
+        ownership,
+        detail_stage_active=True,
+        appearance_gate=appearance_permission,
     )
     torch.testing.assert_close(
         geometry, torch.tensor([1.0, 0.0, 0.0, 0.0])
     )
     torch.testing.assert_close(opacity, geometry)
-    torch.testing.assert_close(appearance, ownership)
+    torch.testing.assert_close(appearance, appearance_permission)
     # The caller's calibrated ownership tensor is immutable.
     torch.testing.assert_close(
         ownership, torch.tensor([1.0, 1.0, 0.0, 1.0])

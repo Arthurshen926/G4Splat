@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v81_ray_owned_envelope_repair"
+    "cambridge_native_hybrid_teacher_v82_soft_sequence_appearance"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -126,7 +126,8 @@ STATIC_DETAIL_ISOLATED_CONTRACT = (
     "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
     "and_screen_gradient_only_to_verified_multiview_static_detail__"
     "unverified_rows_retain_exact_owner_dc_mass_and_ray_training__geometry_"
-    "sh_and_topology_remain_exact_support_camera_owned__opacity_is_read_only__"
+    "and_topology_remain_exact_support_camera_owned__sh_appearance_uses_"
+    "soft_same_sequence_support__opacity_is_read_only__"
     "persistent_envelope_cannot_occlude_its_training_signal"
 )
 STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT = (
@@ -139,7 +140,8 @@ STATIC_STAGE_RGB_ROLE_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_dc_only_no_positive_"
     "mass_growth__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
-    "exact_support_camera_owned_static_detail_rgb_geometry_mass_sh__verified_"
+    "exact_support_camera_owned_static_detail_geometry_mass__soft_same_"
+    "sequence_static_detail_sh__verified_"
     "multiview_only_high_bandwidth_refinement__verified_cross_"
     "sequence_consensus_static_detail_ray_optical_mass"
 )
@@ -958,6 +960,18 @@ def _parse_args():
             "RGB, high-frequency, ray and screen-topology gradients only "
             "from calibrated sequences recorded in its support table. "
             "Disable only for the cross-time averaging ablation."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-same-sequence-appearance-weight",
+        type=float,
+        default=0.35,
+        help=(
+            "Continuous SH/RGB permission for calibrated cameras in the "
+            "same acquisition sequence as a static-detail support camera. "
+            "Geometry, opacity, ray ownership and topology remain exact-"
+            "camera/verified-evidence owned. Set to zero for the former "
+            "strict exact-camera appearance ablation."
         ),
     )
     parser.add_argument(
@@ -1962,6 +1976,11 @@ def _parse_args():
         )
     if args.static_leaf_min_supporting_views < 2:
         parser.error("--static-leaf-min-supporting-views must be >= 2")
+    if not 0.0 <= args.static_detail_same_sequence_appearance_weight <= 1.0:
+        parser.error(
+            "--static-detail-same-sequence-appearance-weight must be in "
+            "[0, 1]"
+        )
     if args.static_detail_isolated_every < 0:
         parser.error("--static-detail-isolated-every must be >= 0")
     if args.static_detail_isolated_weight < 0:
@@ -2872,6 +2891,53 @@ def _static_detail_support_sequence_audit_gate(
             valid & (camera_sequence_lookup[safe] == current_sequence)
         ).any(dim=1)
     return gate & foliage.static_leaf_mask
+
+
+def _static_detail_same_sequence_appearance_gate(
+    foliage,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+    exact_ownership_gate: torch.Tensor,
+    *,
+    fallback_weight: float,
+) -> torch.Tensor:
+    """Give stable neighbouring cameras soft colour ownership only.
+
+    The support table stores a small set of calibrated seed/owner cameras,
+    not the complete set of views in which a leaf cluster can provide valid
+    colour evidence.  Requiring an exact camera-id match therefore left most
+    detail rows with no SH update at all.  Cameras from the same acquisition
+    sequence observe the same physical foliage configuration and may refine
+    its appearance, but they must not move it, create optical mass or request
+    topology.  Cross-sequence residuals remain in the authoritative image and
+    are robustified by the spatial uncertainty field; they receive no direct
+    detail appearance permission here.
+    """
+    weight = float(fallback_weight)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("same-sequence appearance weight must be in [0, 1]")
+    exact = torch.as_tensor(
+        exact_ownership_gate,
+        device=foliage.xyz.device,
+        dtype=foliage.xyz.dtype,
+    ).reshape(-1)
+    if len(exact) != len(foliage):
+        raise ValueError("exact ownership gate must align with foliage")
+    appearance = exact.clone()
+    if weight <= 0.0 or not bool(foliage.static_leaf_mask.any()):
+        return appearance
+    same_sequence = _static_detail_support_sequence_audit_gate(
+        foliage,
+        int(camera_id),
+        camera_sequence_lookup,
+    )
+    fallback = (
+        same_sequence
+        & foliage.static_leaf_mask
+        & (exact <= 0)
+    )
+    appearance[fallback] = weight
+    return appearance
 
 
 def _static_detail_consensus_hit_gate(foliage) -> torch.Tensor:
@@ -4135,6 +4201,47 @@ def _resume_training_contract_differences(
             saved["sampling_schedule_sha256"] = current[
                 "sampling_schedule_sha256"
             ]
+        # v81 made geometry/mass ownership correctly camera exact, but used
+        # that sparse seed-owner table as the SH permission as well.  v82
+        # leaves every geometric/optical tensor and schedule unchanged and
+        # only gives same-acquisition cameras a continuous appearance weight.
+        # This is a future-gradient routing repair, so an explicit trainer
+        # repair resume may preserve the checkpoint and optimizer tensors.
+        saved_ownership = saved.get("static_detail_canonical_ownership")
+        current_ownership = current.get(
+            "static_detail_canonical_ownership"
+        )
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_ownership, dict)
+            and isinstance(current_ownership, dict)
+            and saved_ownership.get("rgb_geometry_topology_owner")
+            == "persisted_exact_support_cameras_and_verified_multiview"
+            and current_ownership.get("geometry_mass_topology_owner")
+            == "persisted_exact_support_cameras_and_verified_multiview"
+            and current_ownership.get("appearance_owner")
+            == (
+                "exact_support_camera_weight1_plus_same_acquisition_"
+                "sequence_soft_weight"
+            )
+            and 0.0
+            <= float(
+                current_ownership.get(
+                    "same_sequence_appearance_weight", -1.0
+                )
+            )
+            <= 1.0
+        ):
+            for key in (
+                "static_training_stages",
+                "static_detail_isolated_supervision",
+                "static_volume_isolated_supervision",
+                "static_detail_canonical_ownership",
+                "parameter_loss_permission_matrix",
+            ):
+                if key in current:
+                    saved[key] = current[key]
         current_static_uncertainty = current.get(
             "static_spatial_uncertainty"
         )
@@ -11001,7 +11108,8 @@ def _static_detail_ray_trainable(phase: str) -> bool:
 
 
 def _static_detail_isolated_gradient_gates(
-    ownership_gate: torch.Tensor | None,
+    geometry_gate: torch.Tensor | None,
+    appearance_gate: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor | None,
@@ -11017,22 +11125,31 @@ def _static_detail_isolated_gradient_gates(
     still global in its separate loss path; this gate controls only positive
     RGB supervision.
     """
-    if ownership_gate is None:
+    if geometry_gate is None:
         raise ValueError(
             "static detail isolated supervision requires an explicit owner gate"
         )
-    opacity_gate = torch.zeros_like(ownership_gate)
-    return ownership_gate, ownership_gate, opacity_gate
+    if appearance_gate is None:
+        appearance_gate = geometry_gate
+    opacity_gate = torch.zeros_like(geometry_gate)
+    return geometry_gate, appearance_gate, opacity_gate
 
 
 def _static_volume_isolated_gradient_gates(
     foliage,
     ownership_gate: torch.Tensor | None,
+    appearance_gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Grant volume-isolated bandwidth only to verified exact-owner detail."""
+    """Refine detail geometry exactly and appearance softly in-sequence."""
     refinement = _static_detail_refinement_gate(foliage, ownership_gate)
     detail = refinement * foliage.static_leaf_mask.to(refinement.dtype)
-    return detail, detail, torch.zeros_like(detail)
+    if appearance_gate is None:
+        appearance = detail
+    else:
+        appearance = _static_detail_refinement_gate(
+            foliage, appearance_gate
+        ) * foliage.static_leaf_mask.to(detail.dtype)
+    return detail, appearance, torch.zeros_like(detail)
 
 
 def _static_stage_rgb_gradient_gates(
@@ -11040,6 +11157,7 @@ def _static_stage_rgb_gradient_gates(
     ownership_gate: torch.Tensor | None,
     *,
     detail_stage_active: bool,
+    appearance_gate: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor | None,
@@ -11064,8 +11182,10 @@ def _static_stage_rgb_gradient_gates(
     detail keeps its calibrated support-sequence ownership.  Forward
     visibility is unchanged.
     """
+    if appearance_gate is None:
+        appearance_gate = ownership_gate
     if not detail_stage_active:
-        return ownership_gate, ownership_gate, ownership_gate
+        return ownership_gate, appearance_gate, ownership_gate
     base = (
         torch.ones_like(foliage.opacities)
         if ownership_gate is None
@@ -11086,7 +11206,18 @@ def _static_stage_rgb_gradient_gates(
     # all-view SH learning. Detail entries keep their persisted support-
     # sequence owner, preventing cross-traversal colour averaging without
     # changing forward visibility.
-    return geometry, base, opacity
+    appearance = (
+        base
+        if appearance_gate is None
+        else torch.as_tensor(
+            appearance_gate,
+            device=foliage.xyz.device,
+            dtype=foliage.xyz.dtype,
+        ).reshape(-1)
+    )
+    if len(appearance) != len(foliage):
+        raise ValueError("static RGB appearance gate must align with foliage")
+    return geometry, appearance, opacity
 
 
 def _static_ray_candidate_masks(
@@ -13761,7 +13892,7 @@ def main():
                     "all_view_ray_free_space",
                     "support_or_verified_consensus_ray_hit_interval",
                     "exact_support_verified_canonical_rgb_geometry",
-                    "exact_support_detail_sh_appearance",
+                    "exact_support_plus_soft_same_sequence_detail_sh_appearance",
                     "exact_support_verified_surface_plus_detail_geometry",
                     "surface_plus_detail_isolated_screen_gradient",
                     "all_view_rigid_free_counterfactual_cleanup",
@@ -13784,7 +13915,8 @@ def main():
             "view_schedule": static_detail_schedule_audit,
             "gradient_owners": [
                 "verified_exact_support_static_detail_xyz_scale_rotation",
-                "verified_exact_support_static_detail_rgb",
+                "verified_exact_support_static_detail_geometry_rgb",
+                "verified_soft_same_sequence_static_detail_sh_rgb",
                 "verified_consensus_static_detail_ray_optical_mass",
                 "verified_exact_support_static_detail_sh",
                 "verified_exact_support_static_detail_means2d_topology",
@@ -13831,7 +13963,7 @@ def main():
             "view_schedule": static_volume_schedule_audit,
             "gradient_owners": [
                 "verified_exact_support_static_detail_xyz_scale_rotation",
-                "verified_exact_support_static_detail_sh",
+                "verified_soft_same_sequence_static_detail_sh",
                 "verified_exact_support_static_detail_means2d_topology",
             ],
             "excluded_owners": [
@@ -13956,8 +14088,15 @@ def main():
         "static_detail_canonical_ownership": {
             "enabled": bool(args.static_detail_canonical_ownership),
             "forward_visibility": "unconditional_static",
-            "rgb_geometry_topology_owner": (
+            "geometry_mass_topology_owner": (
                 "persisted_exact_support_cameras_and_verified_multiview"
+            ),
+            "appearance_owner": (
+                "exact_support_camera_weight1_plus_same_acquisition_"
+                "sequence_soft_weight"
+            ),
+            "same_sequence_appearance_weight": float(
+                args.static_detail_same_sequence_appearance_weight
             ),
             "positive_ray_owner": (
                 "persisted_support_or_verified_two_sequence_consensus"
@@ -13971,8 +14110,8 @@ def main():
             ],
             "noncanonical_views": (
                 "render_plus_global_negative_geometry_optical_cleanup__"
-                "verified_consensus_positive_ray_only__"
-                "no_positive_rgb_geometry_sh_or_topology_update"
+                "verified_consensus_positive_ray_only__same_sequence_"
+                "appearance_only__no_positive_geometry_mass_or_topology"
             ),
         },
         "parameter_loss_permission_matrix": {
@@ -14015,8 +14154,9 @@ def main():
             ],
             "static_leaf_sh": [
                 "robust_canonical_rgb",
-                "verified_exact_support_high_frequency",
-                "verified_exact_support_detail_isolated_rgb_high_frequency",
+                "verified_exact_plus_soft_same_sequence_high_frequency",
+                "verified_exact_plus_soft_same_sequence_detail_isolated_"
+                "rgb_high_frequency",
             ],
             "uncertainty": ["photometric_likelihood_only"],
         },
@@ -15526,6 +15666,7 @@ def main():
             static_training_gate = torch.ones_like(foliage.opacities)
             static_training_gate[foliage.static_leaf_mask] = 0.0
         static_detail_gradient_gate = None
+        static_detail_appearance_gradient_gate = None
         static_detail_refinement_gradient_gate = None
         static_detail_ownership_audit = {
             "enabled": False,
@@ -15536,7 +15677,13 @@ def main():
             "owned_positive_signals": (
                 "geometry_opacity_sh_hit_topology"
             ),
-            "appearance_signals": "persisted_exact_support_cameras",
+            "appearance_signals": (
+                "exact_support_plus_soft_same_acquisition_sequence"
+            ),
+            "soft_same_sequence_appearance_rows": 0,
+            "same_sequence_appearance_weight": float(
+                args.static_detail_same_sequence_appearance_weight
+            ),
             "refinement_rows": 0,
             "same_sequence_non_support_rows": 0,
             "global_negative_signals": "free_rigid_counterfactual_cleanup",
@@ -15551,6 +15698,17 @@ def main():
                     foliage,
                     int(view.colmap_id),
                     camera_sequence_lookup,
+                )
+            )
+            static_detail_appearance_gradient_gate = (
+                _static_detail_same_sequence_appearance_gate(
+                    foliage,
+                    int(view.colmap_id),
+                    camera_sequence_lookup,
+                    static_detail_gradient_gate,
+                    fallback_weight=(
+                        args.static_detail_same_sequence_appearance_weight
+                    ),
                 )
             )
             owned_detail = (
@@ -15589,7 +15747,19 @@ def main():
                 "owned_positive_signals": (
                     "geometry_opacity_sh_hit_topology"
                 ),
-                "appearance_signals": "persisted_exact_support_cameras",
+                "appearance_signals": (
+                    "exact_support_plus_soft_same_acquisition_sequence"
+                ),
+                "soft_same_sequence_appearance_rows": int(
+                    (
+                        foliage.static_leaf_mask
+                        & (static_detail_appearance_gradient_gate > 0)
+                        & ~owned_detail
+                    ).sum()
+                ),
+                "same_sequence_appearance_weight": float(
+                    args.static_detail_same_sequence_appearance_weight
+                ),
                 "global_negative_signals": (
                     "free_rigid_counterfactual_cleanup"
                 ),
@@ -15606,6 +15776,7 @@ def main():
                 foliage,
                 static_detail_gradient_gate,
                 detail_stage_active=static_detail_active,
+                appearance_gate=static_detail_appearance_gradient_gate,
             )
             if (
                 static_detail_active
@@ -15802,6 +15973,7 @@ def main():
         static_detail_isolated_ownership_gate = None
         static_detail_isolated_refinement_gate = None
         static_detail_isolated_qualified_rows = 0
+        static_detail_isolated_appearance_rows = 0
         static_detail_isolated_view = None
         static_detail_isolated_photo = canonical.new_zeros(())
         static_detail_isolated_high_frequency = canonical.new_zeros(())
@@ -15860,10 +16032,27 @@ def main():
                     foliage, static_detail_isolated_ownership_gate
                 )
             )
+            static_detail_isolated_appearance_gate = (
+                _static_detail_same_sequence_appearance_gate(
+                    foliage,
+                    int(static_detail_isolated_view.colmap_id),
+                    camera_sequence_lookup,
+                    static_detail_isolated_ownership_gate,
+                    fallback_weight=(
+                        args.static_detail_same_sequence_appearance_weight
+                    ),
+                )
+            )
             static_detail_isolated_qualified_rows = int(
                 (
                     foliage.static_leaf_mask
                     & (static_detail_isolated_refinement_gate > 0)
+                ).sum()
+            )
+            static_detail_isolated_appearance_rows = int(
+                (
+                    foliage.static_leaf_mask
+                    & (static_detail_isolated_appearance_gate > 0)
                 ).sum()
             )
             static_detail_gate = foliage.static_leaf_mask.to(
@@ -15874,7 +16063,8 @@ def main():
                 static_detail_isolated_appearance_gate,
                 static_detail_isolated_opacity_gate,
             ) = _static_detail_isolated_gradient_gates(
-                static_detail_isolated_refinement_gate
+                static_detail_isolated_refinement_gate,
+                static_detail_isolated_appearance_gate,
             )
             static_detail_isolated_package = render_hybrid(
                 static_detail_isolated_view,
@@ -16037,6 +16227,7 @@ def main():
         static_volume_isolated_view = None
         static_volume_refinement_gate = None
         static_volume_isolated_qualified_rows = 0
+        static_volume_isolated_appearance_rows = 0
         static_volume_isolated_scheduled = bool(
             args.reconstruction_target == "static"
             and foliage_active
@@ -16087,16 +16278,34 @@ def main():
                 and args.static_detail_canonical_ownership
                 else None
             )
+            static_volume_appearance_ownership_gate = (
+                _static_detail_same_sequence_appearance_gate(
+                    foliage,
+                    int(static_volume_isolated_view.colmap_id),
+                    camera_sequence_lookup,
+                    static_volume_ownership_gate,
+                    fallback_weight=(
+                        args.static_detail_same_sequence_appearance_weight
+                    ),
+                )
+                if static_volume_ownership_gate is not None
+                else None
+            )
             (
                 static_volume_geometry_gate,
                 static_volume_appearance_gate,
                 static_volume_opacity_gate,
             ) = _static_volume_isolated_gradient_gates(
-                foliage, static_volume_ownership_gate
+                foliage,
+                static_volume_ownership_gate,
+                static_volume_appearance_ownership_gate,
             )
             static_volume_refinement_gate = static_volume_geometry_gate
             static_volume_isolated_qualified_rows = int(
                 (static_volume_refinement_gate > 0).sum()
+            )
+            static_volume_isolated_appearance_rows = int(
+                (static_volume_appearance_gate > 0).sum()
             )
             static_volume_isolated_package = render_hybrid(
                 static_volume_isolated_view,
@@ -18576,6 +18785,9 @@ def main():
                     "qualified_detail_rows": int(
                         static_detail_isolated_qualified_rows
                     ),
+                    "appearance_detail_rows": int(
+                        static_detail_isolated_appearance_rows
+                    ),
                     "view_index": (
                         None
                         if static_detail_isolated_view is None
@@ -18627,9 +18839,15 @@ def main():
                     "every": int(args.static_volume_isolated_every),
                     "weight": float(args.static_volume_isolated_weight),
                     "opacity_gradient_permission": False,
-                    "gradient_roles": ["verified_exact_owner_static_detail"],
+                    "gradient_roles": [
+                        "verified_exact_owner_static_detail_geometry",
+                        "verified_soft_same_sequence_static_detail_sh",
+                    ],
                     "qualified_detail_rows": int(
                         static_volume_isolated_qualified_rows
+                    ),
+                    "appearance_detail_rows": int(
+                        static_volume_isolated_appearance_rows
                     ),
                     "image_name": (
                         None
