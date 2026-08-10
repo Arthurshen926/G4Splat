@@ -74,7 +74,6 @@ from scripts.train_unified_outdoor_teacher import (
     _public_phase_name,
     _prefix_stable_resume_ray_batch,
     _resolved_phase_schedule,
-    _remap_foliage_camera_ids_to_runtime,
     _resolve_cpu_intraop_threads,
     _resume_conditioned_visit_counts,
     _refresh_split_child_owner_colors,
@@ -3208,57 +3207,6 @@ def test_fixed_camera_contract_checks_exact_scaled_k_and_pose():
         RuntimeError, "camera calibration differs"
     ):
         _validate_fixed_cameras([bad_view], contract)
-
-
-def test_foliage_camera_ids_are_remapped_by_unique_image_identity():
-    views = [
-        SimpleNamespace(image_name="seq1__frame00001", colmap_id=0),
-        SimpleNamespace(image_name="seq1__frame00002", colmap_id=1),
-    ]
-    payload = {
-        "support_camera_ids": torch.tensor([[20, -1], [10, 20]]),
-        "observation_camera_ids": torch.tensor([[10], [20]]),
-        "ray_evidence": {
-            "camera_ids": torch.tensor([20, 10, 20], dtype=torch.int32),
-        },
-        "audit": {
-            "fixed_camera_sequences": [
-                {
-                    "image_id": 10,
-                    "image_name": "seq1__frame00001.png",
-                    "sequence_id": "seq1",
-                },
-                {
-                    "image_id": 20,
-                    "image_name": "seq1__frame00002.png",
-                    "sequence_id": "seq1",
-                },
-            ],
-            "selected_views": [
-                {
-                    "image_id": 20,
-                    "image_name": "seq1__frame00002.png",
-                    "sequence_id": "seq1",
-                }
-            ],
-        },
-    }
-
-    remapped, audit = _remap_foliage_camera_ids_to_runtime(payload, views)
-
-    assert remapped["support_camera_ids"].tolist() == [[1, -1], [0, 1]]
-    assert remapped["observation_camera_ids"].tolist() == [[0], [1]]
-    assert remapped["ray_evidence"]["camera_ids"].tolist() == [1, 0, 1]
-    assert remapped["audit"]["fixed_camera_sequences"][0]["image_id"] == 0
-    assert remapped["audit"]["fixed_camera_sequences"][0]["source_image_id"] == 10
-    assert remapped["audit"]["selected_views"][0]["image_id"] == 1
-    assert audit["changed_id_pairs"] == 2
-    assert audit["identity_id_pairs"] == 0
-    assert audit["remapped_entries"] == {
-        "support_camera_ids": 3,
-        "observation_camera_ids": 2,
-        "ray_evidence.camera_ids": 3,
-    }
 
 
 def test_contradiction_fraction_uses_all_confirmed_binary_evidence():
