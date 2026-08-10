@@ -128,6 +128,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v78_visible_static_detail_lifecycle",
     "cambridge_native_hybrid_teacher_v79_funded_static_visual_hull",
     "cambridge_native_hybrid_teacher_v80_canonical_multiview_handoff",
+    "cambridge_native_hybrid_teacher_v81_ray_owned_envelope_repair",
     "unified_outdoor_mixed_teacher_v1",
 }
 
