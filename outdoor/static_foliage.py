@@ -1488,11 +1488,17 @@ def fuse_sequence_evidence_into_static_leaves(
         geometry_mode_sequence_count = torch.bincount(
             geometry_sequence_pair_modes, minlength=mode_count
         )
-    detail_geometry_retirement_authorized = (
+    canonical_multiview_geometry = (
+        selected_mode_view_count >= int(minimum_supporting_views)
+    )
+    associated_multiview_geometry = (
         geometry_mode_view_count >= int(minimum_supporting_views)
     )
+    detail_geometry_retirement_authorized = (
+        canonical_multiview_geometry | associated_multiview_geometry
+    )
     cross_sequence_geometry_verified = (
-        detail_geometry_retirement_authorized
+        associated_multiview_geometry
         & (geometry_mode_sequence_count >= 2)
     )
     # Initialization rows are real calibrated evidence, not speculative split
@@ -1591,7 +1597,7 @@ def fuse_sequence_evidence_into_static_leaves(
     result["verified_camera_ids"] = result["observation_camera_ids"].clone()
     verified_width = result["verified_camera_ids"].shape[1]
     initial_verified_camera_ids = torch.where(
-        detail_geometry_retirement_authorized[:, None],
+        associated_multiview_geometry[:, None],
         geometry_mode_camera_ids,
         mode_support_camera_ids,
     )
@@ -1615,7 +1621,7 @@ def fuse_sequence_evidence_into_static_leaves(
     )
     result["verified_sequence_count"] = verified_sequence_count
     initial_mass_support_camera_ids = torch.where(
-        detail_geometry_retirement_authorized[:, None],
+        associated_multiview_geometry[:, None],
         geometry_mode_camera_ids,
         mode_support_camera_ids,
     )
@@ -1746,6 +1752,12 @@ def fuse_sequence_evidence_into_static_leaves(
             "multiview_geometry_retirement_authorized_modes": int(
                 detail_geometry_retirement_authorized.sum()
             ),
+            "canonical_multiview_geometry_modes": int(
+                canonical_multiview_geometry.sum()
+            ),
+            "associated_multiview_geometry_modes": int(
+                associated_multiview_geometry.sum()
+            ),
             "cross_sequence_geometry_verified_modes": int(
                 cross_sequence_geometry_verified.sum()
             ),
@@ -1832,6 +1844,12 @@ def fuse_sequence_evidence_into_static_leaves(
         ),
         "multiview_geometry_retirement_authorized_modes": int(
             detail_geometry_retirement_authorized.sum()
+        ),
+        "canonical_multiview_geometry_modes": int(
+            canonical_multiview_geometry.sum()
+        ),
+        "associated_multiview_geometry_modes": int(
+            associated_multiview_geometry.sum()
         ),
         "cross_sequence_geometry_verified_modes": int(
             cross_sequence_geometry_verified.sum()

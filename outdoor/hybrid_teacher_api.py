@@ -127,6 +127,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v77_bootstrap_static_ray_prefit",
     "cambridge_native_hybrid_teacher_v78_visible_static_detail_lifecycle",
     "cambridge_native_hybrid_teacher_v79_funded_static_visual_hull",
+    "cambridge_native_hybrid_teacher_v80_canonical_multiview_handoff",
     "unified_outdoor_mixed_teacher_v1",
 }
 

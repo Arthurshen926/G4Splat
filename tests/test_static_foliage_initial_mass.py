@@ -180,6 +180,7 @@ def test_same_sequence_multiview_geometry_conservatively_retires_envelope():
     assert int(fused["verified_camera_count"][detail][0]) == 2
     assert int(fused["verified_sequence_count"][detail][0]) == 1
     assert audit["multiview_geometry_retirement_authorized_modes"] == 1
+    assert audit["canonical_multiview_geometry_modes"] == 1
     assert audit["cross_sequence_geometry_verified_modes"] == 0
 
     fused_mass = _mass(fused)
