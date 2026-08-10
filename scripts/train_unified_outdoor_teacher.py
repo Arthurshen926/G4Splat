@@ -87,8 +87,8 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v72_evidence_continuous_"
-    "static_detail_mass"
+    "cambridge_native_hybrid_teacher_v73_topology_safe_"
+    "static_detail_audit"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -15511,6 +15511,7 @@ def main():
         static_detail_isolated_package = None
         static_detail_isolated_ownership_gate = None
         static_detail_isolated_refinement_gate = None
+        static_detail_isolated_qualified_rows = 0
         static_detail_isolated_view = None
         static_detail_isolated_photo = canonical.new_zeros(())
         static_detail_isolated_high_frequency = canonical.new_zeros(())
@@ -15568,6 +15569,12 @@ def main():
                 _static_detail_refinement_gate(
                     foliage, static_detail_isolated_ownership_gate
                 )
+            )
+            static_detail_isolated_qualified_rows = int(
+                (
+                    foliage.static_leaf_mask
+                    & (static_detail_isolated_refinement_gate > 0)
+                ).sum()
             )
             static_detail_gate = foliage.static_leaf_mask.to(
                 dtype=foliage.opacities.dtype
@@ -15739,6 +15746,7 @@ def main():
         static_volume_isolated_pixels = 0
         static_volume_isolated_view = None
         static_volume_refinement_gate = None
+        static_volume_isolated_qualified_rows = 0
         static_volume_isolated_scheduled = bool(
             args.reconstruction_target == "static"
             and foliage_active
@@ -15797,6 +15805,9 @@ def main():
                 foliage, static_volume_ownership_gate
             )
             static_volume_refinement_gate = static_volume_geometry_gate
+            static_volume_isolated_qualified_rows = int(
+                (static_volume_refinement_gate > 0).sum()
+            )
             static_volume_isolated_package = render_hybrid(
                 static_volume_isolated_view,
                 surface,
@@ -18231,15 +18242,10 @@ def main():
                     "every": int(args.static_detail_isolated_every),
                     "weight": float(args.static_detail_isolated_weight),
                     "opacity_gradient_permission": False,
-                    "qualified_detail_rows": (
-                        0
-                        if static_detail_isolated_refinement_gate is None
-                        else int(
-                            (
-                                foliage.static_leaf_mask
-                                & (static_detail_isolated_refinement_gate > 0)
-                            ).sum()
-                        )
+                    # Snapshot before any topology mutation changes the row
+                    # count later in this iteration.
+                    "qualified_detail_rows": int(
+                        static_detail_isolated_qualified_rows
                     ),
                     "view_index": (
                         None
@@ -18293,10 +18299,8 @@ def main():
                     "weight": float(args.static_volume_isolated_weight),
                     "opacity_gradient_permission": False,
                     "gradient_roles": ["verified_exact_owner_static_detail"],
-                    "qualified_detail_rows": (
-                        0
-                        if static_volume_refinement_gate is None
-                        else int((static_volume_refinement_gate > 0).sum())
+                    "qualified_detail_rows": int(
+                        static_volume_isolated_qualified_rows
                     ),
                     "image_name": (
                         None

@@ -116,6 +116,8 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "ownership_closed",
     "cambridge_native_hybrid_teacher_v72_evidence_continuous_"
     "static_detail_mass",
+    "cambridge_native_hybrid_teacher_v73_topology_safe_"
+    "static_detail_audit",
     "unified_outdoor_mixed_teacher_v1",
 }
 

@@ -451,6 +451,11 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "static_detail_mass"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v73_topology_safe_"
+        "static_detail_audit"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():
