@@ -72,6 +72,7 @@ def test_verified_anisotropic_multimode_detail_conserves_group_mass():
         detail_rows=torch.tensor([2, 3, 4]),
         detail_groups=torch.tensor([0, 0, 1]),
         detail_verified=torch.tensor([True, True, False]),
+        detail_retirement_authorized=torch.tensor([True, True, False]),
         detail_support_camera_ids=torch.tensor(
             [[7, 8, 9, -1], [8, 9, 10, -1], [11, -1, -1, -1]]
         ),
@@ -106,6 +107,7 @@ def test_initial_handoff_metadata_is_reversible_and_evidence_owned():
         detail_rows=torch.tensor([1, 2]),
         detail_groups=torch.tensor([0, 0]),
         detail_verified=torch.tensor([True, True]),
+        detail_retirement_authorized=torch.tensor([True, True]),
         detail_support_camera_ids=torch.tensor([[3, 4], [5, 6]]),
         detail_verified_sequence_count=torch.tensor([2, 1]),
     )
@@ -166,6 +168,7 @@ def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():
     original = _cross_sequence_fusion_payload(
         second_center=(0.18, 0.02, 3.01)
     )
+    original_envelope_mass = _mass(original)[0]
     fused, audit = fuse_sequence_evidence_into_static_leaves(original)
     detail = fused["static_detail"] & (fused["replacement_group"] == 0)
     envelope = ~fused["static_detail"] & (fused["replacement_group"] == 0)
@@ -173,11 +176,19 @@ def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():
     assert int(fused["support_sequence_count"][detail][0]) == 1
     assert int(fused["verified_sequence_count"][detail][0]) == 1
     # The calibrated canonical seed remains trainable even though the parent
-    # traversal does not verify this exact leaf cell. Its one-camera tier may
-    # borrow only 15% of envelope mass and cannot use multiview refinement.
+    # traversal does not verify this exact leaf cell. It may be born as a
+    # bounded one-camera occupancy hypothesis but cannot retire envelope mass
+    # or use multiview refinement.
     assert int(fused["verification_state"][detail][0]) == 1
     assert int(fused["verified_camera_count"][detail][0]) == 1
     assert float(fused["opacities"][detail][0]) > 0.0
-    retired = float(fused["handoff_retired_fraction"][envelope][0])
-    assert 0.0 < retired <= 0.15 + 1.0e-6
+    fused_mass = _mass(fused)
+    torch.testing.assert_close(
+        fused_mass[envelope].sum(), original_envelope_mass
+    )
+    assert 0.0 < float(fused_mass[detail].sum()) <= float(
+        0.05 * original_envelope_mass + 1.0e-7
+    )
+    assert float(fused["handoff_retired_fraction"][envelope][0]) == 0.0
+    assert audit["initial_mass_additive_only_modes"] == 1
     assert audit["cross_sequence_geometry_verified_modes"] == 0

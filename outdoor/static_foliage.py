@@ -22,28 +22,33 @@ def _initialize_static_detail_group_mass_handoff(
     detail_rows: torch.Tensor,
     detail_groups: torch.Tensor,
     detail_verified: torch.Tensor,
+    detail_retirement_authorized: torch.Tensor,
     detail_support_camera_ids: torch.Tensor,
     detail_verified_sequence_count: torch.Tensor,
     minimum_envelope_retained_fraction: float = 0.20,
 ) -> dict[str, float | int | str]:
-    """Fund verified static detail from its persistent envelope group.
+    """Initialize detail existence separately from envelope retirement.
 
     The historical fusion path appended one or two compact detail modes while
     leaving the broad envelope opacity unchanged.  That creates a second
     extinction layer before either branch has seen an RGB gradient.  Here the
     requested detail mass is ``tau * projected_cross_section`` and every
-    group's verified modes receive one common continuous scale.  The same mass
-    is removed from that group's envelope, so neither the number of modes nor
-    anisotropic footprint shape can increase initial group extinction.
+    evidence tier receives a groupwise continuous scale.  For modes with true
+    retirement authority, the same mass is removed from the envelope. Lower
+    authority birth-only modes instead use the bounded additive allowance
+    below and leave the envelope untouched.
 
-    A bounded, evidence-continuous envelope floor preserves coverage before
-    real-ray replacement evidence matures.  A one-camera canonical mode may
-    borrow at most 15% of its group's mass, a same-sequence multiview mode
-    40%, and a same-cell cross-sequence mode 80%.  Single-view foliage is a
-    spatial occupancy hypothesis rather than disposable noise: moving leaves
-    rarely occupy the same metric voxel in another traversal.  The retained
-    envelope and exact-camera ownership keep that hypothesis reversible
-    without either a binary persistence gate or a second extinction layer.
+    A calibrated one-view observation has authority to create a bounded
+    occupancy hypothesis, but it does not prove that the broad envelope can
+    be removed in every other view.  Such modes therefore receive at most 5%
+    of their group's reference mass (10% for same-sequence multiview modes)
+    additively while the envelope remains intact.  Only same-cell,
+    cross-sequence geometry witnesses may fund detail by retiring envelope
+    mass, up to 80% with the existing readiness and envelope-floor bounds.
+    Subsequent real-ray local coverage performs the continuous, reversible
+    handoff for all modes.  This separates birth authority from retirement
+    authority without deleting single-view foliage or opening background
+    holes before replacement coverage exists.
     """
 
     retained_floor = float(minimum_envelope_retained_fraction)
@@ -53,6 +58,9 @@ def _initialize_static_detail_group_mass_handoff(
     detail_rows = torch.as_tensor(detail_rows, dtype=torch.long).cpu()
     detail_groups = torch.as_tensor(detail_groups, dtype=torch.long).cpu()
     detail_verified = torch.as_tensor(detail_verified, dtype=torch.bool).cpu()
+    retirement_authorized = torch.as_tensor(
+        detail_retirement_authorized, dtype=torch.bool
+    ).cpu()
     support = torch.as_tensor(detail_support_camera_ids).long().cpu()
     verified_sequence_count = torch.as_tensor(
         detail_verified_sequence_count, dtype=torch.long
@@ -62,6 +70,7 @@ def _initialize_static_detail_group_mass_handoff(
     if not (
         detail_groups.shape
         == detail_verified.shape
+        == retirement_authorized.shape
         == verified_sequence_count.shape
         == (len(detail_rows),)
     ):
@@ -92,6 +101,7 @@ def _initialize_static_detail_group_mass_handoff(
     # initialization CPU-bound at Cambridge scale.
     distinct_mode_camera_count = (support >= 0).sum(dim=1).to(torch.int64)
     authorized = detail_verified & (distinct_mode_camera_count >= 1)
+    retirement_authorized = authorized & retirement_authorized
     mode_retirement_limit = torch.where(
         (distinct_mode_camera_count >= 2) & (verified_sequence_count >= 2),
         torch.full_like(distinct_mode_camera_count, 0.80, dtype=torch.float32),
@@ -104,23 +114,42 @@ def _initialize_static_detail_group_mass_handoff(
                 distinct_mode_camera_count, 0.15, dtype=torch.float32
             ),
         ),
-    ) * authorized.to(torch.float32)
+    ) * retirement_authorized.to(torch.float32)
+    mode_additive_limit = torch.where(
+        distinct_mode_camera_count >= 2,
+        torch.full_like(
+            distinct_mode_camera_count, 0.10, dtype=torch.float32
+        ),
+        torch.full_like(
+            distinct_mode_camera_count, 0.05, dtype=torch.float32
+        ),
+    ) * (authorized & ~retirement_authorized).to(torch.float32)
 
     area = projected_gaussian_cross_section(scales).clamp_min(1.0e-12)
     tau = -torch.log1p(-opacity.clamp(0.0, 1.0 - 1.0e-6))
     original_mass = tau * area
     reference = original_mass[envelope_rows].clone()
     requested = original_mass[detail_rows] * authorized.to(torch.float32)
-    requested_by_group = reference.new_zeros(len(envelope_rows))
+    retirement_requested = requested * retirement_authorized.to(torch.float32)
+    additive_requested = requested * (
+        authorized & ~retirement_authorized
+    ).to(torch.float32)
+    retirement_requested_by_group = reference.new_zeros(len(envelope_rows))
+    additive_requested_by_group = reference.new_zeros(len(envelope_rows))
     if len(detail_rows):
-        requested_by_group.index_add_(0, detail_groups, requested)
+        retirement_requested_by_group.index_add_(
+            0, detail_groups, retirement_requested
+        )
+        additive_requested_by_group.index_add_(
+            0, detail_groups, additive_requested
+        )
 
     # Count distinct calibrated cameras per group, not duplicated mode slots.
     # Three observations make the downstream replacement readiness equal one;
     # two retain the exact 2/3 readiness represented by the existing schema.
     group_camera_count = torch.zeros(len(envelope_rows), dtype=torch.int64)
     group_signature = torch.zeros(len(envelope_rows), dtype=torch.int64)
-    valid_support = authorized[:, None] & (support >= 0)
+    valid_support = retirement_authorized[:, None] & (support >= 0)
     if bool(valid_support.any()):
         support_group = detail_groups[:, None].expand_as(support)[valid_support]
         support_camera = support[valid_support]
@@ -139,6 +168,7 @@ def _initialize_static_detail_group_mass_handoff(
     observation_count = group_camera_count.clamp(max=3)
     readiness = observation_count.to(torch.float32) / 3.0
     group_retirement_limit = reference.new_zeros(len(envelope_rows))
+    group_additive_limit = reference.new_zeros(len(envelope_rows))
     if len(detail_rows):
         # The three possible evidence tiers admit an exact vectorized maximum
         # without relying on scatter_reduce availability.  This path runs over
@@ -160,6 +190,22 @@ def _initialize_static_detail_group_mass_handoff(
                     torch.full_like(group_retirement_limit, tier),
                     group_retirement_limit,
                 )
+        for tier in (0.05, 0.10):
+            tier_count = torch.zeros_like(group_additive_limit)
+            tier_rows = mode_additive_limit == tier
+            if bool(tier_rows.any()):
+                tier_count.index_add_(
+                    0,
+                    detail_groups[tier_rows],
+                    torch.ones(
+                        int(tier_rows.sum()), dtype=tier_count.dtype
+                    ),
+                )
+                group_additive_limit = torch.where(
+                    tier_count > 0,
+                    torch.full_like(group_additive_limit, tier),
+                    group_additive_limit,
+                )
     maximum_retired_fraction = torch.minimum(
         torch.minimum(
             reference.new_full(reference.shape, 1.0 - retained_floor),
@@ -168,16 +214,34 @@ def _initialize_static_detail_group_mass_handoff(
         0.95 * readiness,
     )
     capacity = reference * maximum_retired_fraction
-    transfer_by_group = torch.minimum(requested_by_group, capacity)
-    group_scale = torch.where(
-        requested_by_group > 0,
-        transfer_by_group / requested_by_group.clamp_min(1.0e-12),
-        torch.zeros_like(requested_by_group),
+    transfer_by_group = torch.minimum(
+        retirement_requested_by_group, capacity
+    )
+    additive_by_group = torch.minimum(
+        additive_requested_by_group,
+        reference * group_additive_limit,
+    )
+    retirement_group_scale = torch.where(
+        retirement_requested_by_group > 0,
+        transfer_by_group
+        / retirement_requested_by_group.clamp_min(1.0e-12),
+        torch.zeros_like(retirement_requested_by_group),
     ).clamp(0.0, 1.0)
-    transferred_detail_mass = requested * group_scale[detail_groups]
+    additive_group_scale = torch.where(
+        additive_requested_by_group > 0,
+        additive_by_group / additive_requested_by_group.clamp_min(1.0e-12),
+        torch.zeros_like(additive_requested_by_group),
+    ).clamp(0.0, 1.0)
+    transferred_detail_mass = (
+        retirement_requested * retirement_group_scale[detail_groups]
+    )
+    additive_detail_mass = (
+        additive_requested * additive_group_scale[detail_groups]
+    )
+    realized_detail_mass = transferred_detail_mass + additive_detail_mass
 
     target_mass = original_mass.clone()
-    target_mass[detail_rows] = transferred_detail_mass
+    target_mass[detail_rows] = realized_detail_mass
     target_mass[envelope_rows] = (reference - transfer_by_group).clamp_min(0.0)
     target_tau = target_mass / area
     target_opacity = -torch.expm1(-target_tau)
@@ -226,9 +290,14 @@ def _initialize_static_detail_group_mass_handoff(
     ) if len(reference) else 0.0
     return {
         "contract": (
-            "evidence_continuous_detail_funded_by_group_envelope_optical_mass"
+            "single_view_detail_birth_is_bounded_additive__only_same_cell_"
+            "cross_sequence_geometry_can_retire_group_envelope_mass"
         ),
         "funded_modes": int(authorized.sum()),
+        "retirement_authorized_modes": int(retirement_authorized.sum()),
+        "additive_only_modes": int(
+            (authorized & ~retirement_authorized).sum()
+        ),
         "single_camera_funded_modes": int(
             (authorized & (distinct_mode_camera_count == 1)).sum()
         ),
@@ -250,6 +319,7 @@ def _initialize_static_detail_group_mass_handoff(
         "retired_envelope_groups": int((transfer_by_group > 0).sum()),
         "requested_detail_mass": float(requested.sum()),
         "transferred_detail_mass": float(transferred_detail_mass.sum()),
+        "additive_detail_mass": float(additive_detail_mass.sum()),
         "retired_envelope_mass": float(transfer_by_group.sum()),
         "minimum_envelope_retained_fraction": retained_floor,
         "minimum_realized_envelope_fraction": float(
@@ -1542,6 +1612,7 @@ def fuse_sequence_evidence_into_static_leaves(
             detail_rows=detail_rows,
             detail_groups=mode_groups,
             detail_verified=detail_seed_accepted,
+            detail_retirement_authorized=detail_geometry_verified,
             detail_support_camera_ids=initial_mass_support_camera_ids,
             detail_verified_sequence_count=torch.maximum(
                 mode_sequence_count, geometry_mode_sequence_count

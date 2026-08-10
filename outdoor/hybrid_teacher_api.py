@@ -118,6 +118,10 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "static_detail_mass",
     "cambridge_native_hybrid_teacher_v73_topology_safe_"
     "static_detail_audit",
+    "cambridge_native_hybrid_teacher_v74_single_view_static_"
+    "occupancy_lifecycle",
+    "cambridge_native_hybrid_teacher_v75_single_view_birth_"
+    "deferred_retirement",
     "unified_outdoor_mixed_teacher_v1",
 }
 
