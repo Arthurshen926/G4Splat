@@ -924,6 +924,29 @@ def test_resume_ray_capacity_compares_fixed_epoch_not_runtime_cursor():
     ) == {"ray_evidence_epoch_capacity"}
 
 
+def test_resume_ray_capacity_accepts_completed_nonempty_epoch():
+    saved_audit = _ray_epoch_capacity_audit(
+        prior=0, remaining=3_079_774
+    )
+    completed_audit = {
+        **_ray_epoch_capacity_audit(prior=750, remaining=0),
+        "runtime_aggregate_minimum_batch_with_five_percent_margin": 0,
+        "minimum_batch_for_runtime_completion": 0,
+        "required_factor_calls": 0,
+        "unused_factor_calls": 2250,
+    }
+    saved = {
+        "ray_posterior_maximum_rays": 1173,
+        "ray_evidence_epoch_capacity": saved_audit,
+    }
+    current = {
+        "ray_posterior_maximum_rays": 1173,
+        "ray_evidence_epoch_capacity": completed_audit,
+    }
+
+    assert not _resume_training_contract_differences(saved, current)
+
+
 def test_joint_surface_partition_row_count_is_runtime_resume_state():
     saved = {
         "mature_handoff_surface_policy": "joint",

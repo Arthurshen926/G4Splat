@@ -3990,7 +3990,11 @@ def _immutable_ray_epoch_capacity(value: dict) -> dict:
     nonempty_evidence = (
         camera_count > 0
         and full_rows > 0
-        and 0 < remaining <= full_rows
+        # A checkpoint can land exactly after every per-camera sampler has
+        # completed its first no-wrap epoch.  The immutable evidence identity
+        # is still non-empty even though no rows remain in that epoch; the
+        # next interval starts a new coverage epoch from the persisted cursor.
+        and 0 <= remaining <= full_rows
         and clean_batch >= max(clean_minimum, clean_aggregate)
     )
     if (
