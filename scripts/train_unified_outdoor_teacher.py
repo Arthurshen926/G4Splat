@@ -3855,6 +3855,52 @@ def _schedule_digest(*schedules: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _restore_resume_camera_schedules(
+    computed: dict[str, np.ndarray],
+    resume: dict | None,
+    *,
+    horizon: int,
+    allow_conditioned_repair: bool = False,
+) -> tuple[dict[str, np.ndarray], frozenset[str]]:
+    """Restore immutable checkpoint schedules before hashing/consumption.
+
+    Some evidence schedules are derived from the current primitive metadata.
+    That metadata legitimately changes during training, so recomputing those
+    schedules after loading a checkpoint does *not* reproduce the original
+    optimization trajectory.  The checkpoint arrays are the authority for an
+    exact resume.  Explicit schedule-repair modes may replace only the stream
+    named by their migration contract; every other stream remains byte exact.
+    """
+
+    schedules = {
+        name: np.asarray(value, dtype=np.int64)
+        for name, value in computed.items()
+    }
+    if resume is None:
+        return schedules, frozenset()
+    saved = resume.get("schedules")
+    if not isinstance(saved, dict):
+        raise RuntimeError("Resume checkpoint has no camera schedules")
+    preserved = set(schedules)
+    if allow_conditioned_repair:
+        preserved.discard("conditioned")
+    expected_shape = (int(horizon),)
+    for name in sorted(preserved):
+        if name not in saved:
+            raise RuntimeError(
+                f"Resume checkpoint has no {name} camera schedule"
+            )
+        value = np.asarray(saved[name], dtype=np.int64)
+        if value.shape != expected_shape:
+            raise RuntimeError(
+                "Resume camera schedule length does not match the fixed "
+                f"horizon: {name} has {value.shape}, expected "
+                f"{expected_shape}"
+            )
+        schedules[name] = value.copy()
+    return schedules, frozenset(preserved)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -13491,6 +13537,57 @@ def main():
     topology_schedule = _cycle_schedule(
         boundary_indices, args.phase_schedule_horizon, args.seed + 3
     )
+    camera_schedules, restored_schedule_names = (
+        _restore_resume_camera_schedules(
+            {
+                "rgb": rgb_schedule,
+                "conditioned": conditioned_schedule,
+                "geometry": geometry_schedule,
+                "topology": topology_schedule,
+                "static_detail": static_detail_schedule,
+                "static_skeleton": static_skeleton_schedule,
+                "static_volume": static_volume_schedule,
+            },
+            resume,
+            horizon=args.phase_schedule_horizon,
+            allow_conditioned_repair=(
+                args.allow_conditioned_schedule_repair_resume
+            ),
+        )
+    )
+    rgb_schedule = camera_schedules["rgb"]
+    conditioned_schedule = camera_schedules["conditioned"]
+    geometry_schedule = camera_schedules["geometry"]
+    topology_schedule = camera_schedules["topology"]
+    static_detail_schedule = camera_schedules["static_detail"]
+    static_skeleton_schedule = camera_schedules["static_skeleton"]
+    static_volume_schedule = camera_schedules["static_volume"]
+    if resume is not None:
+        saved_contract = resume.get("training_contract", {})
+        if "conditioned" in restored_schedule_names:
+            conditioned_schedule_audit = copy.deepcopy(
+                saved_contract.get(
+                    "conditioned_sampling", conditioned_schedule_audit
+                )
+            )
+        saved_static_audits = {
+            "static_detail": "static_detail_isolated_supervision",
+            "static_skeleton": "static_skeleton_isolated_supervision",
+            "static_volume": "static_volume_isolated_supervision",
+        }
+        for schedule_name, contract_name in saved_static_audits.items():
+            if schedule_name not in restored_schedule_names:
+                continue
+            saved_audit = saved_contract.get(contract_name, {}).get(
+                "view_schedule"
+            )
+            if saved_audit is not None:
+                if schedule_name == "static_detail":
+                    static_detail_schedule_audit = copy.deepcopy(saved_audit)
+                elif schedule_name == "static_skeleton":
+                    static_skeleton_schedule_audit = copy.deepcopy(saved_audit)
+                else:
+                    static_volume_schedule_audit = copy.deepcopy(saved_audit)
     schedule_hash = _schedule_digest(
         rgb_schedule,
         conditioned_schedule,

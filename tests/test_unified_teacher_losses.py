@@ -76,6 +76,7 @@ from scripts.train_unified_outdoor_teacher import (
     _resolved_phase_schedule,
     _resolve_cpu_intraop_threads,
     _resume_conditioned_visit_counts,
+    _restore_resume_camera_schedules,
     _refresh_split_child_owner_colors,
     _retain_checkpoint_snapshot,
     _rollback_failed_split_families,
@@ -2607,6 +2608,74 @@ def test_absolute_schedule_makes_short_run_an_exact_method_prefix():
             step >= 240
         )
         assert _foliage_enabled(step, horizon, profile)
+
+
+def test_exact_resume_restores_model_derived_camera_schedules():
+    names = (
+        "rgb",
+        "conditioned",
+        "geometry",
+        "topology",
+        "static_detail",
+        "static_skeleton",
+        "static_volume",
+    )
+    saved = {
+        name: np.arange(12, dtype=np.int64) + 100 * index
+        for index, name in enumerate(names)
+    }
+    computed = {name: value + 7 for name, value in saved.items()}
+
+    restored, preserved = _restore_resume_camera_schedules(
+        computed,
+        {"schedules": saved},
+        horizon=12,
+    )
+
+    assert preserved == frozenset(names)
+    for name in names:
+        np.testing.assert_array_equal(restored[name], saved[name])
+        assert restored[name] is not saved[name]
+
+
+def test_explicit_conditioned_schedule_repair_preserves_other_streams():
+    names = (
+        "rgb",
+        "conditioned",
+        "geometry",
+        "topology",
+        "static_detail",
+        "static_skeleton",
+        "static_volume",
+    )
+    saved = {
+        name: np.arange(8, dtype=np.int64) + 10 * index
+        for index, name in enumerate(names)
+    }
+    computed = {name: value + 1 for name, value in saved.items()}
+
+    restored, preserved = _restore_resume_camera_schedules(
+        computed,
+        {"schedules": saved},
+        horizon=8,
+        allow_conditioned_repair=True,
+    )
+
+    assert "conditioned" not in preserved
+    np.testing.assert_array_equal(
+        restored["conditioned"], computed["conditioned"]
+    )
+    for name in set(names) - {"conditioned"}:
+        np.testing.assert_array_equal(restored[name], saved[name])
+
+
+def test_resume_camera_schedule_rejects_wrong_horizon():
+    with pytest.raises(RuntimeError, match="fixed horizon"):
+        _restore_resume_camera_schedules(
+            {"rgb": np.arange(4, dtype=np.int64)},
+            {"schedules": {"rgb": np.arange(3, dtype=np.int64)}},
+            horizon=4,
+        )
 
 
 def test_surface_topology_schedule_can_extend_past_named_topology_phase():
