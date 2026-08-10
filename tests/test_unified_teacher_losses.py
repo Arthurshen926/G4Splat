@@ -490,6 +490,37 @@ def test_replacement_evidence_ignores_unrelated_visible_views():
     assert audit["contradicted_candidate_rows"] == 1
 
 
+def test_replacement_evidence_tracks_weakest_support_view():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    visible = torch.ones(1, dtype=torch.bool)
+    for camera_id, authority in ((1, 0.9), (2, 0.1), (3, 0.9)):
+        _accumulate_static_replacement_evidence(
+            foliage,
+            torch.tensor([authority]),
+            visible,
+            camera_id=camera_id,
+            decay=0.95,
+        )
+    # The weak view lowers safe retirement immediately; a later strong view
+    # can only recover it gradually, never turn max-camera coverage into a
+    # transparent hole in the weak view.
+    torch.testing.assert_close(
+        foliage.replacement_overlap_ema, torch.tensor([0.14])
+    )
+    assert foliage.replacement_observation_count.item() == 3
+
+
 def test_post_step_handoff_preserves_new_unretired_mass():
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
@@ -5078,6 +5109,12 @@ def test_verification_debt_capacity_is_continuous_and_shared():
     assert _verification_debt_capacity_scale(
         0.13, soft_fraction=0.05, hard_fraction=0.12
     ) == pytest.approx(0.0)
+    assert _verification_debt_capacity_scale(
+        0.13,
+        soft_fraction=0.05,
+        hard_fraction=0.12,
+        minimum_scale=0.02,
+    ) == pytest.approx(0.02)
     with pytest.raises(ValueError, match="0 <= soft < hard <= 1"):
         _verification_debt_capacity_scale(
             0.1, soft_fraction=0.2, hard_fraction=0.1
