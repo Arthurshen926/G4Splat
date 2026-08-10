@@ -110,6 +110,8 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "residual_conditioned_screen_topology",
     "cambridge_native_hybrid_teacher_v69_local_negative_permission_"
     "topology_stable_optical_polish",
+    "cambridge_native_hybrid_teacher_v70_persistent_detail_"
+    "lineage_debt_safe_local_handoff",
     "unified_outdoor_mixed_teacher_v1",
 }
 
