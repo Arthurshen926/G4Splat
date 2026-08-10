@@ -87,8 +87,8 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v73_topology_safe_"
-    "static_detail_audit"
+    "cambridge_native_hybrid_teacher_v74_single_view_static_"
+    "occupancy_lifecycle"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (

@@ -38,10 +38,12 @@ def _initialize_static_detail_group_mass_handoff(
 
     A bounded, evidence-continuous envelope floor preserves coverage before
     real-ray replacement evidence matures.  A one-camera canonical mode may
-    borrow at most 5% of its group's mass, a same-sequence multiview mode 20%,
-    and a same-cell cross-sequence mode 80%.  This gives sparse real leaf
-    evidence optical leverage without either a binary persistence gate or a
-    second extinction layer.
+    borrow at most 15% of its group's mass, a same-sequence multiview mode
+    40%, and a same-cell cross-sequence mode 80%.  Single-view foliage is a
+    spatial occupancy hypothesis rather than disposable noise: moving leaves
+    rarely occupy the same metric voxel in another traversal.  The retained
+    envelope and exact-camera ownership keep that hypothesis reversible
+    without either a binary persistence gate or a second extinction layer.
     """
 
     retained_floor = float(minimum_envelope_retained_fraction)
@@ -96,10 +98,10 @@ def _initialize_static_detail_group_mass_handoff(
         torch.where(
             distinct_mode_camera_count >= 2,
             torch.full_like(
-                distinct_mode_camera_count, 0.20, dtype=torch.float32
+                distinct_mode_camera_count, 0.40, dtype=torch.float32
             ),
             torch.full_like(
-                distinct_mode_camera_count, 0.05, dtype=torch.float32
+                distinct_mode_camera_count, 0.15, dtype=torch.float32
             ),
         ),
     ) * authorized.to(torch.float32)
@@ -142,7 +144,7 @@ def _initialize_static_detail_group_mass_handoff(
         # without relying on scatter_reduce availability.  This path runs over
         # ~84k modes at every fresh start, so per-mode Python/tensor dispatch
         # would dominate initialization time.
-        for tier in (0.05, 0.20, 0.80):
+        for tier in (0.15, 0.40, 0.80):
             tier_count = torch.zeros_like(group_retirement_limit)
             tier_rows = mode_retirement_limit == tier
             if bool(tier_rows.any()):
@@ -724,13 +726,16 @@ def fuse_sequence_evidence_into_static_leaves(
 
     A sequence-owned Gaussian is not a valid primitive in a localization map.
     Its calibrated xyz/RGB observation remains valuable evidence, however.
-    Cross-view evidence first verifies each persistent visual-hull cell. One
+    Cross-view evidence verifies persistent geometry, while every calibrated
+    single-view crown cell remains a low-authority occupancy hypothesis. One
     internally consistent canonical sequence is selected for each independent
-    tree instance, and up to a bounded number of spatial/color modes are
-    retained per cell. Different trees have no shared non-rigid state, so a
-    scene-global sequence needlessly discards valid trees absent from that
-    acquisition. The emitted primitives still form one unconditional static
-    model; sequence identity is training evidence, never a render condition.
+    tree instance; cells absent from that traversal fall back to their own
+    strongest coherent acquisition instead of being deleted. Up to a bounded
+    number of spatial/color modes are retained per cell. Different trees have
+    no shared non-rigid state, so a scene-global sequence needlessly discards
+    valid trees absent from that acquisition. The emitted primitives still
+    form one unconditional static model; sequence identity is training
+    evidence, never a render condition.
     """
     minimum_supporting_views = int(minimum_supporting_views)
     if minimum_supporting_views < 2:
@@ -798,9 +803,15 @@ def fuse_sequence_evidence_into_static_leaves(
     view_count.index_add_(
         0, pair_group, torch.ones_like(pair_group, dtype=torch.int64)
     )
-    valid_groups = torch.nonzero(
+    verified_groups = torch.nonzero(
         view_count >= minimum_supporting_views, as_tuple=False
     ).flatten()
+    # Persistence and admission are different facts.  Requiring two cameras
+    # for *admission* deleted the majority of calibrated foliage because a
+    # moving leaf normally has no second metric-voxel match.  Keep every
+    # camera-owned cell as a bounded static occupancy mode, but preserve the
+    # stricter multiview table for refinement/verification authority.
+    valid_groups = torch.nonzero(view_count >= 1, as_tuple=False).flatten()
     if not len(valid_groups):
         for name, value in payload.items():
             if torch.is_tensor(value) and value.ndim and len(value) == count:
@@ -926,20 +937,17 @@ def fuse_sequence_evidence_into_static_leaves(
         & valid_sequence
         & (owner_sequence == canonical_sequence)
     )
-    # A tree-wide canonical acquisition may not observe every one of its
-    # persistent crown cells. Dropping those cells made static foliage
-    # bandwidth depend on sequence overlap rather than geometric evidence.
-    # For a cell that is independently supported in at least two sequences,
-    # choose its strongest internally coherent local acquisition. This does
-    # not average time-varying positions and emits no render-time condition;
-    # cross-sequence evidence only verifies the persistent envelope.
+    # A tree-wide canonical acquisition cannot observe every moving leaf.
+    # Dropping an absent cell made static foliage bandwidth depend on temporal
+    # overlap rather than calibrated occupancy evidence.  Every unrepresented
+    # cell therefore chooses its strongest internally coherent local
+    # acquisition.  Cross-sequence support still controls verification and
+    # refinement authority; it is no longer a hard admission gate.
     fallback_sequences: dict[int, int] = {}
     if canonical_sequence_policy == "per_tree":
         represented = torch.zeros(group_count, dtype=torch.bool)
         represented[torch.unique(local_groups[canonical_row])] = True
-        fallback_group_mask = (
-            group_is_valid & (sequence_count >= 2) & ~represented
-        )
+        fallback_group_mask = group_is_valid & ~represented
         fallback_groups = torch.nonzero(
             fallback_group_mask, as_tuple=False
         ).flatten()
@@ -1579,7 +1587,11 @@ def fuse_sequence_evidence_into_static_leaves(
             "minimum_supporting_views": minimum_supporting_views,
             "input_dynamic_rows": int(dynamic.sum()),
             "associated_dynamic_rows": int(associated.sum()),
-            "globally_verified_groups": int(len(valid_groups)),
+            "globally_verified_groups": int(len(verified_groups)),
+            "static_detail_candidate_groups": int(len(valid_groups)),
+            "single_view_candidate_groups": int(
+                (view_count[valid_groups] == 1).sum()
+            ),
             "camera_sequence_metadata_source": (
                 camera_sequence_metadata_source
             ),
@@ -1615,13 +1627,18 @@ def fuse_sequence_evidence_into_static_leaves(
                     for value in chosen_sequences.values()
                 )
             ),
+            "canonical_local_fallback_groups": int(len(fallback_sequences)),
             "canonical_cross_sequence_fallback_groups": int(
-                len(fallback_sequences)
+                sum(
+                    int(sequence_count[group]) >= 2
+                    for group in fallback_sequences
+                )
             ),
             "canonical_cross_sequence_fallback_histogram": dict(
                 Counter(
                     sequence_names[value]
-                    for value in fallback_sequences.values()
+                    for group, value in fallback_sequences.items()
+                    if int(sequence_count[group]) >= 2
                 )
             ),
             "canonical_mode_voxel_size": float(canonical_mode_voxel_size),
@@ -1659,7 +1676,11 @@ def fuse_sequence_evidence_into_static_leaves(
         ),
         "input_dynamic_rows": int(dynamic.sum()),
         "associated_dynamic_rows": int(associated.sum()),
-        "globally_verified_groups": int(len(valid_groups)),
+        "globally_verified_groups": int(len(verified_groups)),
+        "static_detail_candidate_groups": int(len(valid_groups)),
+        "single_view_candidate_groups": int(
+            (view_count[valid_groups] == 1).sum()
+        ),
         "camera_sequence_metadata_source": camera_sequence_metadata_source,
         "camera_sequence_metadata_count": int(
             len(camera_sequence_records)
@@ -1689,13 +1710,18 @@ def fuse_sequence_evidence_into_static_leaves(
                 for value in chosen_sequences.values()
             )
         ),
+        "canonical_local_fallback_groups": int(len(fallback_sequences)),
         "canonical_cross_sequence_fallback_groups": int(
-            len(fallback_sequences)
+            sum(
+                int(sequence_count[group]) >= 2
+                for group in fallback_sequences
+            )
         ),
         "canonical_cross_sequence_fallback_histogram": dict(
             Counter(
                 sequence_names[value]
-                for value in fallback_sequences.values()
+                for group, value in fallback_sequences.items()
+                if int(sequence_count[group]) >= 2
             )
         ),
         "canonical_mode_voxel_size": float(canonical_mode_voxel_size),

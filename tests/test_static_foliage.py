@@ -108,13 +108,15 @@ def test_sequence_observations_fuse_to_one_static_model():
         _payload(), canonical_sequence_policy="scene"
     )
     assert not bool((payload["layer_role"] == LAYER_DYNAMIC_LEAF).any())
-    # Group 0 has two cameras; group 1 has only camera 0. The ownerless voxel
-    # has cameras from two independent sequences and becomes a ray birth.
-    assert audit["fused_static_leaf_clusters"] == 1
+    # Group 0 has two cameras; group 1 has only camera 0. Both calibrated
+    # occupancy cells survive, while the ownerless cross-sequence voxel
+    # becomes a separate ray birth.
+    assert audit["fused_static_leaf_clusters"] == 2
     assert audit["ownerless_static_births"] == 1
-    assert int(payload["static_detail"].sum()) == 2
+    assert int(payload["static_detail"].sum()) == 3
     assert payload["replacement_group"][payload["static_detail"]].tolist() == [
         0,
+        1,
         -1,
     ]
     # Tree 0 has a tie between seq0 and seq1. Stable canonical selection uses
@@ -201,7 +203,9 @@ def test_selected_mode_fuses_all_consistent_group_observations():
     )
     assert fused["support_camera_ids"][detail][0].tolist() == [0, 1]
     assert int(fused["support_view_count"][detail][0]) == 2
-    assert audit["canonical_source_rows"] == 2
+    # The single-view second group is admitted as low-authority occupancy and
+    # therefore contributes its two same-camera rows as well.
+    assert audit["canonical_source_rows"] == 4
     assert audit["contributing_multiview_rows"] == 2
     assert audit["multiview_canonical_modes"] == 1
 
@@ -241,6 +245,36 @@ def test_cross_sequence_verified_cell_gets_local_canonical_fallback():
         fused["centers"][group_one][0],
         torch.tensor([1.01, 0.00, 3.00]),
     )
+
+
+def test_single_view_cell_missing_from_tree_snapshot_remains_static_occupancy():
+    payload = _payload()
+    # Group zero makes seq0 the coherent tree snapshot.  Group one belongs to
+    # the same tree but is visible only from camera 2 in seq1.  A moving leaf
+    # cannot be expected to match a second metric voxel, so the calibrated
+    # single-view cell must survive with low authority rather than disappear.
+    payload["tree_instance_id"][1] = 0
+    payload["tree_instance_id"][5:7] = 0
+    payload["support_camera_ids"][5:7, 0] = 2
+    payload["observation_camera_ids"][5:7, 0] = 2
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload,
+        fixed_camera_sequences=[
+            {"image_id": 0, "sequence_id": "seq0"},
+            {"image_id": 1, "sequence_id": "seq0"},
+            {"image_id": 2, "sequence_id": "seq1"},
+        ],
+    )
+    group_one = fused["static_detail"] & (
+        fused["replacement_group"] == 1
+    )
+    assert int(group_one.sum()) == 1
+    assert fused["support_camera_ids"][group_one][0, 0] == 2
+    assert int(fused["verified_camera_count"][group_one][0]) == 1
+    assert float(fused["opacities"][group_one][0]) > 0.0
+    assert audit["single_view_candidate_groups"] >= 1
+    assert audit["canonical_local_fallback_groups"] >= 1
+    assert audit["canonical_cross_sequence_fallback_groups"] == 0
 
 
 def test_canonical_camera_quality_breaks_equal_support_tie():

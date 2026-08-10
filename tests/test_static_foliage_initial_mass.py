@@ -126,7 +126,7 @@ def test_initial_handoff_metadata_is_reversible_and_evidence_owned():
     torch.testing.assert_close(desired, retired)
     assert result["replacement_camera_signature"][0] != 0
 
-    # Same-sequence multiview evidence receives a bounded 20% group tier. It
+    # Same-sequence multiview evidence receives a bounded 40% group tier. It
     # gains optical leverage without adding mass; cross-sequence evidence in
     # the same group permits the larger tier shared proportionally by modes.
     assert after[2] > 0
@@ -174,10 +174,10 @@ def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():
     assert int(fused["verified_sequence_count"][detail][0]) == 1
     # The calibrated canonical seed remains trainable even though the parent
     # traversal does not verify this exact leaf cell. Its one-camera tier may
-    # borrow only 5% of envelope mass and cannot use multiview refinement.
+    # borrow only 15% of envelope mass and cannot use multiview refinement.
     assert int(fused["verification_state"][detail][0]) == 1
     assert int(fused["verified_camera_count"][detail][0]) == 1
     assert float(fused["opacities"][detail][0]) > 0.0
     retired = float(fused["handoff_retired_fraction"][envelope][0])
-    assert 0.0 < retired <= 0.05 + 1.0e-6
+    assert 0.0 < retired <= 0.15 + 1.0e-6
     assert audit["cross_sequence_geometry_verified_modes"] == 0
