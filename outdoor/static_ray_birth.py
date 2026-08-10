@@ -48,6 +48,14 @@ class StaticRayBirthAccumulator:
             raise ValueError("maximum proposals per update must be positive")
         self.cells: dict[tuple[int, int, int], _Cell] = {}
         self.visual_hull_cells: dict[tuple[int, int, int], _Cell] = {}
+        # A drained consensus cell represents one persistent occupancy
+        # hypothesis.  Deleting it without a tombstone allowed later cameras to
+        # rebuild the same voxel and append another alpha=.04 Gaussian every
+        # topology event.  Persist both grids independently because their cell
+        # sizes and evidence meanings differ.
+        self.consumed_midpoint_cells: set[tuple[int, int, int]] = set()
+        self.consumed_visual_hull_cells: set[tuple[int, int, int]] = set()
+        self.suppressed_consumed_cells = 0
         self.total_proposals = 0
         self.segment_proposals = 0
         self.total_births = 0
@@ -185,9 +193,13 @@ class StaticRayBirthAccumulator:
                 key_tensor = torch.floor(
                     center / self.voxel_size
                 ).to(torch.int64)
+                key = tuple(int(part) for part in key_tensor.tolist())
+                if key in self.consumed_midpoint_cells:
+                    self.suppressed_consumed_cells += 1
+                    continue
                 self._accumulate(
                     self.cells,
-                    key=tuple(int(part) for part in key_tensor.tolist()),
+                    key=key,
                     center=center,
                     color=color,
                     weight=weight,
@@ -226,11 +238,15 @@ class StaticRayBirthAccumulator:
             ).to(torch.int64)
             unique_keys = torch.unique(keys, dim=0)
             for key_tensor in unique_keys:
+                key = tuple(int(part) for part in key_tensor.tolist())
+                if key in self.consumed_visual_hull_cells:
+                    self.suppressed_consumed_cells += 1
+                    continue
                 member = (keys == key_tensor[None]).all(dim=1)
                 representative = points[member].mean(dim=0)
                 self._accumulate(
                     self.visual_hull_cells,
-                    key=tuple(int(part) for part in key_tensor.tolist()),
+                    key=key,
                     center=representative,
                     color=color,
                     weight=weight,
@@ -312,8 +328,10 @@ class StaticRayBirthAccumulator:
             support_sequence_count[row] = len(cell.sequences)
         for source, key, _ in selected:
             if source == "midpoint":
+                self.consumed_midpoint_cells.add(key)
                 del self.cells[key]
             else:
+                self.consumed_visual_hull_cells.add(key)
                 del self.visual_hull_cells[key]
         self.total_births += len(selected)
         visual_hull_born = sum(
@@ -342,12 +360,47 @@ class StaticRayBirthAccumulator:
             "total_births": self.total_births,
             "voxel_size": self.voxel_size,
             "visual_hull_voxel_size": self.visual_hull_voxel_size,
+            "consumed_midpoint_cells": len(self.consumed_midpoint_cells),
+            "consumed_visual_hull_cells": len(
+                self.consumed_visual_hull_cells
+            ),
+            "suppressed_consumed_cells": self.suppressed_consumed_cells,
             },
+        )
+
+    def mark_consumed_centers(self, centers: torch.Tensor) -> int:
+        """Tombstone runtime births restored from a pre-v5 checkpoint.
+
+        Older accumulator states did not retain the drained cell key.  The
+        corresponding model rows do retain their world-space centres and
+        ``initialization_source=6`` provenance, which is sufficient to block
+        both midpoint and visual-hull grids around every extant birth.
+        """
+
+        centers = torch.as_tensor(centers).float().cpu().reshape(-1, 3)
+        before = len(self.consumed_midpoint_cells) + len(
+            self.consumed_visual_hull_cells
+        )
+        if len(centers):
+            midpoint = torch.floor(centers / self.voxel_size).to(torch.int64)
+            visual_hull = torch.floor(
+                centers / self.visual_hull_voxel_size
+            ).to(torch.int64)
+            self.consumed_midpoint_cells.update(
+                tuple(int(value) for value in row.tolist()) for row in midpoint
+            )
+            self.consumed_visual_hull_cells.update(
+                tuple(int(value) for value in row.tolist()) for row in visual_hull
+            )
+        return (
+            len(self.consumed_midpoint_cells)
+            + len(self.consumed_visual_hull_cells)
+            - before
         )
 
     def capture(self) -> dict:
         return {
-            "version": "static-ray-birth-accumulator-v4",
+            "version": "static-ray-birth-accumulator-v5",
             "voxel_size": self.voxel_size,
             "visual_hull_voxel_size": self.visual_hull_voxel_size,
             "maximum_segment_samples": self.maximum_segment_samples,
@@ -355,6 +408,11 @@ class StaticRayBirthAccumulator:
             "total_proposals": self.total_proposals,
             "segment_proposals": self.segment_proposals,
             "total_births": self.total_births,
+            "suppressed_consumed_cells": self.suppressed_consumed_cells,
+            "consumed_midpoint_cells": sorted(self.consumed_midpoint_cells),
+            "consumed_visual_hull_cells": sorted(
+                self.consumed_visual_hull_cells
+            ),
             "cells": [
                 {
                     "key": key,
@@ -388,6 +446,7 @@ class StaticRayBirthAccumulator:
         if version not in {
             "static-ray-birth-accumulator-v3",
             "static-ray-birth-accumulator-v4",
+            "static-ray-birth-accumulator-v5",
         }:
             raise RuntimeError("Unsupported static ray-birth accumulator state")
         if float(state["voxel_size"]) != self.voxel_size:
@@ -397,7 +456,10 @@ class StaticRayBirthAccumulator:
             != self.maximum_proposals_per_update
         ):
             raise RuntimeError("Static ray-birth proposal cap changed on resume")
-        if version == "static-ray-birth-accumulator-v4":
+        if version in {
+            "static-ray-birth-accumulator-v4",
+            "static-ray-birth-accumulator-v5",
+        }:
             if (
                 float(state["visual_hull_voxel_size"])
                 != self.visual_hull_voxel_size
@@ -415,6 +477,17 @@ class StaticRayBirthAccumulator:
         self.total_proposals = int(state.get("total_proposals", 0))
         self.segment_proposals = int(state.get("segment_proposals", 0))
         self.total_births = int(state.get("total_births", 0))
+        self.suppressed_consumed_cells = int(
+            state.get("suppressed_consumed_cells", 0)
+        )
+        self.consumed_midpoint_cells = {
+            tuple(int(value) for value in row)
+            for row in state.get("consumed_midpoint_cells", [])
+        }
+        self.consumed_visual_hull_cells = {
+            tuple(int(value) for value in row)
+            for row in state.get("consumed_visual_hull_cells", [])
+        }
         def restore_cells(rows: list[dict]) -> dict[tuple[int, int, int], _Cell]:
             restored = {}
             for row in rows:

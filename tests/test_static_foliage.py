@@ -132,7 +132,9 @@ def test_sequence_observations_fuse_to_one_static_model():
     assert int(payload["verified_sequence_count"][detail][0]) == 1
     assert int(payload["verified_camera_count"][detail][0]) == 1
     assert int(payload["verification_state"][detail][0]) == 0
-    assert float(payload["opacities"][detail][0]) == pytest.approx(0.05)
+    # A single-view mode remains an explicit candidate but cannot add a second
+    # extinction layer or retire its persistent envelope before verification.
+    assert float(payload["opacities"][detail][0]) == 0.0
     ownerless = payload["static_detail"] & (
         payload["replacement_group"] < 0
     )
@@ -141,6 +143,10 @@ def test_sequence_observations_fuse_to_one_static_model():
     # hit/RGB supervision back to both observations.
     assert payload["support_camera_ids"][ownerless][0].tolist() == [0, 1]
     assert payload["observation_camera_ids"][ownerless][0].tolist() == [0, 1]
+    assert payload["verified_camera_ids"][ownerless][0].tolist() == [-1, -1]
+    assert int(payload["verified_camera_count"][ownerless][0]) == 0
+    assert int(payload["verified_sequence_count"][ownerless][0]) == 0
+    assert int(payload["verification_state"][ownerless][0]) == 0
     assert float(payload["opacities"][ownerless][0]) == pytest.approx(0.04)
     assert audit["canonical_sequence_tree_count"] == 2
     assert audit["canonical_sequence_policy"] == "scene"
@@ -495,6 +501,99 @@ def test_cross_sequence_hit_intervals_form_visual_hull_birth():
     assert audit["segment_proposals"] == 2
     assert int((cameras[0] >= 0).sum()) == 2
     assert int(sequences[0]) == 2
+    consumed_before = set(accumulator.consumed_visual_hull_cells)
+
+    # A later pair of cameras traversing the same occupied cells must refine
+    # the extant model, not recreate another alpha owner in every drained
+    # visual-hull voxel.
+    add_segment(
+        center=[0.0, 0.0, 3.0],
+        origin=[-1.0, 0.0, 3.0],
+        direction=[1.0, 0.0, 0.0],
+        hit_start=0.5,
+        hit_end=1.5,
+        camera=2,
+        sequence="seq2",
+    )
+    add_segment(
+        center=[0.0, 0.3, 3.0],
+        origin=[0.0, -1.0, 3.0],
+        direction=[0.0, 1.0, 0.0],
+        hit_start=0.9,
+        hit_end=1.7,
+        camera=3,
+        sequence="seq3",
+    )
+    repeated_centers = accumulator.drain(maximum_births=8)[0]
+    repeated_keys = {
+        tuple(int(value) for value in row.tolist())
+        for row in torch.floor(
+            repeated_centers / accumulator.visual_hull_voxel_size
+        ).to(torch.int64)
+    }
+    assert repeated_keys.isdisjoint(consumed_before)
+    assert accumulator.suppressed_consumed_cells > 0
+
+
+def test_consumed_ray_birth_cells_survive_capture_and_legacy_recovery():
+    producer = StaticRayBirthAccumulator(voxel_size=0.15)
+
+    def add(camera, sequence):
+        producer.add(
+            {
+                "centers": torch.tensor([[0.01, 0.01, 3.01]]),
+                "confidence": torch.tensor([0.9]),
+                "camera_id": camera,
+            },
+            sequence_id=sequence,
+        )
+
+    add(0, "seq0")
+    add(1, "seq1")
+    assert len(producer.drain(maximum_births=1)[0]) == 1
+    state = producer.capture()
+    assert state["version"] == "static-ray-birth-accumulator-v5"
+
+    restored = StaticRayBirthAccumulator(voxel_size=0.15)
+    restored.restore(state)
+    restored.add(
+        {
+            "centers": torch.tensor([[0.01, 0.01, 3.01]]),
+            "confidence": torch.tensor([0.9]),
+            "camera_id": 2,
+        },
+        sequence_id="seq2",
+    )
+    restored.add(
+        {
+            "centers": torch.tensor([[0.01, 0.01, 3.01]]),
+            "confidence": torch.tensor([0.9]),
+            "camera_id": 3,
+        },
+        sequence_id="seq3",
+    )
+    assert len(restored.drain(maximum_births=1)[0]) == 0
+
+    # Pre-v5 checkpoints have no tombstone list. Runtime model provenance
+    # reconstructs both grids before any new proposal is accumulated.
+    legacy = dict(state)
+    legacy["version"] = "static-ray-birth-accumulator-v4"
+    legacy.pop("consumed_midpoint_cells")
+    legacy.pop("consumed_visual_hull_cells")
+    recovered = StaticRayBirthAccumulator(voxel_size=0.15)
+    recovered.restore(legacy)
+    assert recovered.mark_consumed_centers(
+        torch.tensor([[0.01, 0.01, 3.01]])
+    ) == 2
+    recovered.add(
+        {
+            "centers": torch.tensor([[0.01, 0.01, 3.01]]),
+            "confidence": torch.tensor([0.9]),
+            "camera_id": 4,
+        },
+        sequence_id="seq4",
+    )
+    assert len(recovered.cells) == 0
 
 
 def test_v3_midpoint_birth_state_restores_into_visual_hull_accumulator():

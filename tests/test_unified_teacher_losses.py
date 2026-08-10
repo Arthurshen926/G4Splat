@@ -53,6 +53,7 @@ from scripts.train_unified_outdoor_teacher import (
     _geometry_losses,
     _projected_occluded_rigid_geometry_loss,
     _inherit_surface_optimizer_contract,
+    _initialize_static_ray_birth_mass_handoff,
     _load_dav2_observation_patches,
     _masked_clamp_max_,
     _masked_ssim_loss,
@@ -86,6 +87,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_exclusive_topology_active,
     _static_detail_ray_trainable,
     _static_detail_isolated_gradient_gates,
+    _static_volume_isolated_gradient_gates,
     _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
@@ -273,12 +275,11 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
     assert moment[0].item() == -4.0
 
 
-def test_detail_visibility_without_handoff_keeps_envelope_growth():
+def test_detail_visibility_freezes_envelope_growth_but_keeps_cleanup():
     foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
     # Row one receives a legitimate negative/free-space gradient.  Detail
-    # Stage visibility is not replacement evidence. The positive envelope
-    # fill direction must remain available until local mass was truly handed
-    # off, while the negative/free-space direction is always preserved.
+    # Stage 2 already established broad support. Stage 3 positive mass belongs
+    # to exact detail/ray evidence, while negative free-space cleanup remains.
     foliage.opacity_logits.grad[1] = 3.0
     moment[1] = 5.0
 
@@ -287,13 +288,35 @@ def test_detail_visibility_without_handoff_keeps_envelope_growth():
     )
 
     assert audit["envelope_positive_growth_attenuation"] == (
-        "actual_local_handoff_retired_fraction"
+        "stage3_freeze__stage2_actual_local_handoff_retired_fraction"
     )
-    assert audit["envelope_growth_rows_attenuated"] == 0
-    assert foliage.opacity_logits.grad[0].item() == -2.0
+    assert audit["envelope_growth_rows_attenuated"] == 1
+    assert foliage.opacity_logits.grad[0].item() == 0.0
     assert foliage.opacity_logits.grad[1].item() == 3.0
-    assert moment[0].item() == -4.0
+    assert moment[0].item() == 0.0
     assert moment[1].item() == 5.0
+
+
+def test_static_detail_stage_freezes_envelope_high_order_sh_only():
+    foliage, optimizer, _ = _static_optical_policy_fixture(0.0)
+    foliage.features = torch.nn.Parameter(torch.zeros(2, 3, 3))
+    foliage.features.grad = torch.ones_like(foliage.features)
+    feature_moment = torch.full_like(foliage.features, 2.0)
+    optimizer.state[foliage.features] = {"exp_avg": feature_moment}
+
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "static_foliage"
+    )
+
+    assert audit["envelope_high_order_sh_rows_frozen"] == 2
+    torch.testing.assert_close(
+        foliage.features.grad[:, 0], torch.ones(2, 3)
+    )
+    torch.testing.assert_close(
+        foliage.features.grad[:, 1:], torch.zeros(2, 2, 3)
+    )
+    torch.testing.assert_close(feature_moment[:, 0], torch.full((2, 3), 2.0))
+    torch.testing.assert_close(feature_moment[:, 1:], torch.zeros(2, 2, 3))
 
 
 def test_trainer_repair_migrates_static_optical_lifecycle_contract():
@@ -349,6 +372,121 @@ def test_real_ray_handoff_is_bounded_and_reversible():
     assert restored["restored_mass"] > 0
     assert torch.allclose(
         foliage.integrated_optical_mass(), initial, rtol=1e-5
+    )
+
+
+def test_runtime_ray_birth_initial_mass_is_ray_local_conserved_and_reversible():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+            "tree_instance_id": torch.tensor([3], dtype=torch.int32),
+            "support_camera_ids": torch.tensor(
+                [[0, 1]], dtype=torch.int32
+            ),
+            "support_view_count": torch.tensor([2], dtype=torch.int16),
+            "support_sequence_count": torch.tensor([2], dtype=torch.int16),
+        }
+    )
+    pre_birth_mass = foliage.integrated_optical_mass().sum().clone()
+    appended = foliage.append_static_ray_births(
+        torch.tensor([[0.0, 0.0, 2.0]]),
+        support_camera_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+        support_sequence_count=torch.tensor([2], dtype=torch.int16),
+        birth_iteration=100,
+    )
+    birth_start = int(appended["_new_start"])
+    replacement_rows = appended["_replacement_rows"]
+    owner_rows = appended["_replacement_owner_rows"]
+    assert replacement_rows.tolist() == [birth_start]
+    assert owner_rows.tolist() == [0]
+
+    identity_view = SimpleNamespace(
+        world_view_transform=torch.eye(4),
+        focal_x=100.0,
+        focal_y=100.0,
+        cx=50.0,
+        cy=50.0,
+    )
+    optimizer = SimpleNamespace(state={})
+    audit = _initialize_static_ray_birth_mass_handoff(
+        foliage,
+        optimizer,
+        birth_rows=torch.tensor([birth_start]),
+        owner_rows=owner_rows,
+        view_by_camera_id={7: identity_view, 8: identity_view},
+        maximum_fraction_per_event=0.02,
+    )
+
+    realized = foliage.integrated_optical_mass()
+    assert audit["ray_local_candidates"] == 1
+    assert audit["changed_owner_rows"] == 1
+    assert realized[birth_start] > 0
+    assert realized[0] < pre_birth_mass
+    # The newborn is funded entirely by its owner: no new integrated
+    # extinction is added at the topology event.
+    torch.testing.assert_close(
+        realized.sum(), pre_birth_mass, rtol=1e-5, atol=1e-8
+    )
+
+    # Simulate failed-child retirement. Once the child disappears, the normal
+    # reversible handoff restores exactly the donor mass rather than leaving a
+    # background hole.
+    failed = realized.clone()
+    failed[birth_start] = 0
+    foliage.restore_integrated_optical_mass(failed, minimum_opacity=1.0e-12)
+    foliage.replacement_overlap_ema.zero_()
+    foliage.replacement_observation_count.zero_()
+    restored = _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.02
+    )
+    assert restored["restored_mass"] > 0
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass()[0],
+        pre_birth_mass,
+        rtol=1e-5,
+        atol=1e-8,
+    )
+
+
+def test_ownerless_runtime_ray_birth_cannot_add_optical_mass():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+            "tree_instance_id": torch.tensor([3], dtype=torch.int32),
+        }
+    )
+    before = foliage.integrated_optical_mass().sum().clone()
+    appended = foliage.append_static_ray_births(
+        torch.tensor([[3.0, 0.0, 2.0]]),
+        support_camera_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+        support_sequence_count=torch.tensor([2], dtype=torch.int16),
+    )
+    birth = int(appended["_new_start"])
+    audit = _initialize_static_ray_birth_mass_handoff(
+        foliage,
+        SimpleNamespace(state={}),
+        birth_rows=torch.tensor([birth]),
+        owner_rows=torch.tensor([-1]),
+        view_by_camera_id={},
+        maximum_fraction_per_event=0.02,
+    )
+    assert audit["ray_local_candidates"] == 0
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().sum(), before, rtol=1e-5, atol=1e-8
     )
 
 
@@ -886,7 +1024,7 @@ def test_volume_stats_ownership_gate_routes_means2d_only_to_detail_rows():
     assert torch.equal(stats["contribution"], detail.float())
 
 
-def test_static_detail_gradients_are_owned_by_support_sequences():
+def test_static_detail_gradients_are_owned_by_exact_support_cameras():
     class Foliage:
         xyz = torch.zeros(4, 3)
         static_leaf_mask = torch.tensor([False, True, True, True])
@@ -897,7 +1035,9 @@ def test_static_detail_gradients_are_owned_by_support_sequences():
         def __len__(self):
             return 4
 
-    lookup = torch.tensor([0, 1], dtype=torch.int16)
+    # Both cameras belong to one sequence; only exact camera zero may own the
+    # update, proving sequence membership is not an appearance permission.
+    lookup = torch.tensor([0, 0], dtype=torch.int16)
     gate = _static_detail_canonical_ownership_gate(Foliage(), 0, lookup)
     assert torch.equal(gate, torch.tensor([1.0, 1.0, 0.0, 1.0]))
     missing = _static_detail_canonical_ownership_gate(
@@ -4981,7 +5121,38 @@ def test_static_detail_isolated_positive_rgb_parameters_are_support_owned():
     )
     assert geometry is ownership
     assert appearance is ownership
-    assert opacity is ownership
+    torch.testing.assert_close(opacity, torch.zeros_like(ownership))
+
+
+def test_static_volume_isolated_only_refines_verified_exact_detail():
+    class Foliage:
+        xyz = torch.zeros(5, 3)
+        opacities = torch.ones(5)
+        static_leaf_mask = torch.tensor([False, False, True, True, True])
+        verification_state = torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_UNVERIFIED,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        )
+        verified_camera_count = torch.tensor([2, 2, 2, 2, 1])
+        verified_sequence_count = torch.ones(5, dtype=torch.int16)
+
+        def __len__(self):
+            return 5
+
+    exact_owner = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+    geometry, appearance, opacity = _static_volume_isolated_gradient_gates(
+        Foliage(), exact_owner
+    )
+    expected = torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])
+    torch.testing.assert_close(geometry, expected)
+    torch.testing.assert_close(appearance, expected)
+    torch.testing.assert_close(opacity, torch.zeros_like(expected))
 
 
 def test_static_stage3_rgb_routes_envelope_only_to_appearance():
@@ -5049,7 +5220,11 @@ def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
         support_camera_ids = torch.tensor(
             [[-1, -1], [0, -1], [1, 2], [1, 2]], dtype=torch.int32
         )
-        support_sequence_count = torch.tensor([2, 1, 2, 2])
+        # Appearance ownership stays in one canonical snapshot even when a
+        # child later accumulates true cross-sequence geometric witnesses.
+        support_sequence_count = torch.tensor([2, 1, 1, 1])
+        verified_camera_count = torch.tensor([2, 1, 2, 2])
+        verified_sequence_count = torch.tensor([2, 1, 2, 2])
         verification_state = torch.tensor(
             [
                 VERIFICATION_VERIFIED,

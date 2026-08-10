@@ -441,6 +441,11 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "lineage_debt_safe_local_handoff"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v71_static_optical_mass_"
+        "ownership_closed"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():

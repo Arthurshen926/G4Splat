@@ -1781,7 +1781,7 @@ class VolumetricFoliageModel(nn.Module):
         rows: torch.Tensor | None = None,
         *,
         query_batch_size: int = 128,
-    ) -> dict[str, int | float | str]:
+    ) -> dict[str, object]:
         """Attach unowned static detail to its nearest same-tree envelope.
 
         Cross-view ray births are genuine new geometry, but leaving every one
@@ -1815,6 +1815,7 @@ class VolumetricFoliageModel(nn.Module):
                 "maximum_world_distance": 0.0,
             }
         assigned_rows = []
+        assigned_owner_rows = []
         assigned_groups = []
         assigned_distances = []
         target_trees = self.tree_instance_id[target_rows].long()
@@ -1838,10 +1839,18 @@ class VolumetricFoliageModel(nn.Module):
                     )
                 )
                 assigned_rows.append(batch)
+                assigned_owner_rows.append(owner_rows)
                 assigned_groups.append(self.replacement_group[owner_rows])
                 assigned_distances.append(nearest_distance)
+        assigned_rows_tensor = torch.empty(
+            0, dtype=torch.long, device=self.xyz.device
+        )
+        assigned_owner_rows_tensor = torch.empty(
+            0, dtype=torch.long, device=self.xyz.device
+        )
         if assigned_rows:
             assigned_rows_tensor = torch.cat(assigned_rows)
+            assigned_owner_rows_tensor = torch.cat(assigned_owner_rows)
             assigned_groups_tensor = torch.cat(assigned_groups)
             distances = torch.cat(assigned_distances)
             self.replacement_group[assigned_rows_tensor] = (
@@ -1855,7 +1864,7 @@ class VolumetricFoliageModel(nn.Module):
             assigned_count = 0
             mean_distance = 0.0
             maximum_distance = 0.0
-        return {
+        audit: dict[str, object] = {
             "contract": "nearest_same_tree_group_then_view_ray_overlap",
             "candidates": int(len(target_rows)),
             "assigned": assigned_count,
@@ -1865,6 +1874,14 @@ class VolumetricFoliageModel(nn.Module):
             "mean_world_distance": mean_distance,
             "maximum_world_distance": maximum_distance,
         }
+        # Runtime ray births need the exact candidate/owner pairing for their
+        # initial optical-mass transfer.  Keep these tensors private and only
+        # expose them for an explicitly bounded row request; the all-model
+        # association audit is serialized into the training contract.
+        if rows is not None:
+            audit["_assigned_rows"] = assigned_rows_tensor
+            audit["_owner_rows"] = assigned_owner_rows_tensor
+        return audit
 
     @property
     def metadata_names(self) -> tuple[str, ...]:
@@ -2172,11 +2189,21 @@ class VolumetricFoliageModel(nn.Module):
         association = self.associate_static_detail_replacement_groups(
             torch.arange(old_count, len(self), device=self.xyz.device)
         )
+        replacement_rows = association.pop(
+            "_assigned_rows",
+            torch.empty(0, dtype=torch.long, device=self.xyz.device),
+        )
+        replacement_owner_rows = association.pop(
+            "_owner_rows",
+            torch.empty(0, dtype=torch.long, device=self.xyz.device),
+        )
         return {
             "appended": int(len(centers)),
             "replacement_group_association": association,
             "_new_to_old": new_to_old,
             "_new_start": old_count,
+            "_replacement_rows": replacement_rows,
+            "_replacement_owner_rows": replacement_owner_rows,
         }
 
     @torch.no_grad()
