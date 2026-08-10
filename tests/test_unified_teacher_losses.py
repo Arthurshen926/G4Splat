@@ -422,6 +422,7 @@ def test_runtime_ray_birth_initial_mass_is_ray_local_conserved_and_reversible():
         owner_rows=owner_rows,
         view_by_camera_id={7: identity_view, 8: identity_view},
         maximum_fraction_per_event=0.02,
+        maximum_additive_fraction_per_event=0.0,
     )
 
     realized = foliage.integrated_optical_mass()

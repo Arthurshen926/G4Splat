@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v78_visible_static_detail_lifecycle"
+    "cambridge_native_hybrid_teacher_v79_funded_static_visual_hull"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -10389,9 +10389,10 @@ def _initialize_static_ray_birth_mass_handoff(
     A strict cross-camera/cross-sequence visual-hull proposal without a usable
     donor cannot learn if it is appended and immediately made transparent. It
     therefore receives a small explicit additive budget, bounded as a fraction
-    of the pre-birth model mass for the whole event. Donor-associated births
-    remain exactly mass conserving; ordinary one-view hypotheses are never
-    eligible for this fallback.
+    of the pre-birth model mass for the whole event. A projected donor funds
+    the overlapping component conservatively; any remaining visual-hull
+    existence mass shares the same explicit event budget. Ordinary one-view
+    hypotheses are never eligible for this fallback.
 
     The owner's pre-transfer reference mass and retired fraction make this
     reversible through :func:`_apply_static_ray_local_mass_handoff`: if the
@@ -10424,6 +10425,8 @@ def _initialize_static_ray_birth_mass_handoff(
         "additive_child_mass": 0.0,
         "additive_funded_children": 0,
         "additive_mass_budget": 0.0,
+        "donor_funded_children": 0,
+        "fully_donor_funded_children": 0,
         "unfunded_child_mass": 0.0,
         "mass_before_birth": float(foliage.integrated_optical_mass().sum()),
         "mass_after_transfer": float(foliage.integrated_optical_mass().sum()),
@@ -10634,7 +10637,15 @@ def _initialize_static_ray_birth_mass_handoff(
         (support_count >= 2)
         & (foliage.support_sequence_count[birth_rows] >= 2)
     )
-    additive_eligible = strong_visual_hull & ~ray_local
+    # ``ray_local`` only means that both centres project validly; it does not
+    # mean the donor actually funded the birth. In real Cambridge events most
+    # assigned rows had sub-percent overlap and were still reduced to nearly
+    # transparent points. Allocate the *unfunded remainder* of every strict
+    # visual-hull proposal under one shared cap. The donor-transferred component
+    # remains exactly conserved and is never counted twice.
+    additive_eligible = strong_visual_hull & (
+        transfer < mass_before[birth_rows] * (1.0 - 1.0e-6)
+    )
     additive_requested = (
         mass_before[birth_rows] - transfer
     ).clamp_min(0.0) * additive_eligible.to(mass_before.dtype)
@@ -10688,6 +10699,10 @@ def _initialize_static_ray_birth_mass_handoff(
         "additive_child_mass": float(additive.sum()),
         "additive_funded_children": int((additive > 0).sum()),
         "additive_mass_budget": float(additive_budget),
+        "donor_funded_children": int((transfer > 0).sum()),
+        "fully_donor_funded_children": int(
+            (transfer >= mass_before[birth_rows] * (1.0 - 1.0e-6)).sum()
+        ),
         "unfunded_child_mass": float(
             (mass_before[birth_rows] - realized[birth_rows]).clamp_min(0).sum()
         ),
@@ -13766,7 +13781,8 @@ def main():
                 "bounded_additive_fallback_for_strict_visual_hull_without_"
                 "donor"
             ),
-            "donor_associated_initial_mass_nonincrease": True,
+            "donor_transfer_component_is_mass_conserving": True,
+            "unfunded_visual_hull_remainder_uses_shared_additive_budget": True,
             "ownerless_additive_mass_fraction_per_event": float(
                 args.static_ray_birth_additive_mass_fraction_per_event
             ),
