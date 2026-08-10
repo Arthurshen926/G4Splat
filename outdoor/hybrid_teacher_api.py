@@ -122,6 +122,8 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "occupancy_lifecycle",
     "cambridge_native_hybrid_teacher_v75_single_view_birth_"
     "deferred_retirement",
+    "cambridge_native_hybrid_teacher_v76_absolute_bandwidth_"
+    "topology_capacity",
     "unified_outdoor_mixed_teacher_v1",
 }
 

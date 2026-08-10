@@ -87,8 +87,8 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v75_single_view_birth_"
-    "deferred_retirement"
+    "cambridge_native_hybrid_teacher_v76_absolute_bandwidth_"
+    "topology_capacity"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -7225,6 +7225,7 @@ def _evidence_adaptive_role_quotas(
     *,
     observable_counts: dict[str, int] | None = None,
     effective_eligible_mass: dict[str, float] | None = None,
+    normalize_by_observable_population: bool = True,
 ) -> dict[str, int]:
     """Allocate capacity from the unresolved fraction of each physical role.
 
@@ -7244,17 +7245,16 @@ def _evidence_adaptive_role_quotas(
     its representation with a screen-bandwidth deficit was smaller.
 
     Eligible rows already encode screen-bandwidth deficit, evidence validity,
-    rendered contribution and role-specific observation support. Their
-    optional effective mass additionally carries continuous spatial geometry
-    authority; normalize that mass by the *observable population in this
-    topology epoch*, then use deterministic capped weighted apportionment.
-    This distinction matters for the per-camera dynamic branch: rows belonging
-    to cameras not sampled in the last epoch are not evidence that the sampled
-    owner views have no unresolved bandwidth, while a weak single-view depth
-    posterior is not equivalent to a multi-view canonical lineage. Falling
-    back to raw eligible counts preserves legacy callers. Every role remains
-    eligible in every phase; there is no fixed role percentage or pass/fail
-    gate.
+    rendered contribution and role-specific observation support. For generic
+    row allocation the optional effective mass is normalized by the
+    *observable population in this topology epoch*, preventing producer row
+    density from becoming self-reinforcing. Physical split growth is
+    different: one slot resolves one unit of projected bandwidth irrespective
+    of how many low-frequency rows a role happens to contain. Its caller
+    therefore supplies total authority-weighted screen-bandwidth demand and
+    disables population normalization. Falling back to raw eligible counts
+    preserves legacy callers. Every role remains eligible in every phase;
+    there is no fixed role percentage or pass/fail gate.
     """
     role_order = (
         "static_skeleton",
@@ -7292,7 +7292,7 @@ def _evidence_adaptive_role_quotas(
         }
     )
     if any(
-        value < 0
+        (not np.isfinite(value)) or value < 0
         for value in (
             *counts.values(),
             *populations.values(),
@@ -7317,7 +7317,10 @@ def _evidence_adaptive_role_quotas(
             raise ValueError(
                 f"Eligible {role} count exceeds its observable population"
             )
-        if effective_mass[role] > counts[role] + 1e-5:
+        if (
+            normalize_by_observable_population
+            and effective_mass[role] > counts[role] + 1e-5
+        ):
             raise ValueError(
                 f"Effective eligible {role} mass exceeds its eligible count"
             )
@@ -7331,9 +7334,13 @@ def _evidence_adaptive_role_quotas(
     order_index = {role: index for index, role in enumerate(role_order)}
     demand = {
         role: (
-            effective_mass[role] / float(observable[role])
-            if observable[role] > 0
-            else 0.0
+            (
+                effective_mass[role] / float(observable[role])
+                if observable[role] > 0
+                else 0.0
+            )
+            if normalize_by_observable_population
+            else effective_mass[role]
         )
         for role in role_order
     }
@@ -9257,23 +9264,37 @@ def _adapt_volume(
             ).sum()
         ),
     }
-    effective_eligible_mass = {
-        "static_skeleton": float(
-            topology_authority[skeleton_eligible].sum()
-        ),
-        "canonical_crown": float(
-            topology_authority[canonical_eligible].sum()
-        ),
-        "dynamic_leaf": float(
-            topology_authority[dynamic_eligible].sum()
-        ),
+    # Split capacity is measured in net child rows, not eligible parents.
+    # A parent at >=2x the target radius consumes three net rows for the
+    # four-child mutation; an ordinary parent consumes one.  Using parent
+    # count as the cap silently dropped two thirds of the available growth
+    # whenever a role contained mostly broad Gaussians.
+    role_masks = {
+        "static_skeleton": skeleton_eligible,
+        "canonical_crown": canonical_eligible,
+        "dynamic_leaf": dynamic_eligible,
     }
+    role_growth_capacity = {}
+    effective_eligible_mass = {}
+    target_radius = max(float(args.volume_split_radius), 1.0e-6)
+    screen_bandwidth_deficit = (
+        (topology_radius / target_radius).square() - 1.0
+    ).clamp(0.0, 3.0)
+    for name, mask in role_masks.items():
+        broad = mask & (topology_radius >= 2.0 * target_radius)
+        role_growth_capacity[name] = int(mask.sum()) + 2 * int(broad.sum())
+        effective_eligible_mass[name] = float(
+            (
+                topology_authority[mask]
+                * screen_bandwidth_deficit[mask]
+            ).sum()
+        )
     role_quotas = _evidence_adaptive_role_quotas(
-        eligible_counts,
-        population_counts,
+        role_growth_capacity,
+        role_growth_capacity,
         capacity,
-        observable_counts=observable_counts,
         effective_eligible_mass=effective_eligible_mass,
+        normalize_by_observable_population=False,
     )
     # Capacity fairness is defined over physical proposals, not descendant
     # rows.  Without a lineage key, one repeatedly split envelope family can
@@ -9741,7 +9762,19 @@ def _adapt_volume(
         "effective_eligible_demand_by_role": (
             effective_eligible_mass
         ),
+        "net_growth_capacity_by_role": role_growth_capacity,
+        "role_capacity_contract": (
+            "absolute_authority_weighted_unresolved_projected_bandwidth__"
+            "quota_and_global_budget_are_net_growth_rows"
+        ),
         "mean_topology_authority_by_eligible_role": {
+            role: (
+                float(topology_authority[role_masks[role]].sum())
+                / max(eligible_counts[role], 1)
+            )
+            for role in eligible_counts
+        },
+        "mean_unresolved_bandwidth_demand_by_eligible_role": {
             role: (
                 effective_eligible_mass[role]
                 / max(eligible_counts[role], 1)

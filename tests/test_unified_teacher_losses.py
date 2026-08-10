@@ -2186,6 +2186,33 @@ def test_evidence_adaptive_role_quotas_use_continuous_geometry_authority():
     assert sum(quotas.values()) == 6_000
 
 
+def test_evidence_adaptive_role_quotas_use_absolute_bandwidth_for_growth():
+    quotas = _evidence_adaptive_role_quotas(
+        {
+            "static_skeleton": 7_000,
+            "canonical_crown": 250_000,
+            "dynamic_leaf": 0,
+        },
+        {
+            "static_skeleton": 7_000,
+            "canonical_crown": 250_000,
+            "dynamic_leaf": 0,
+        },
+        1_481,
+        effective_eligible_mass={
+            "static_skeleton": 2_398.8,
+            "canonical_crown": 79_034.5,
+            "dynamic_leaf": 0.0,
+        },
+        normalize_by_observable_population=False,
+    )
+    # This reproduces the v110 trace that previously inverted the physical
+    # demand (923 skeleton / 558 crown) after population normalization.
+    assert quotas["canonical_crown"] > 1_400
+    assert quotas["static_skeleton"] < 50
+    assert sum(quotas.values()) == 1_481
+
+
 def test_volume_topology_authority_is_continuous_and_owner_aware():
     foliage = SimpleNamespace(
         ray_depth_nll=torch.tensor([0.0, 15.0, 15.0, 399.0]),
