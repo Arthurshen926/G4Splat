@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v86_sequence_geometry_optical_handoff"
+    "cambridge_native_hybrid_teacher_v87_static_optical_ownership_calibration"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -281,7 +281,7 @@ STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT = (
     "geometry_covariance_and_mass_together__scale_updates_preserve_"
     "integrated_optical_mass"
 )
-STATIC_OPTICAL_POLICY_CONTRACT = (
+STATIC_OPTICAL_POLICY_V86_PREDECESSOR_CONTRACT = (
     "single_static_map__stage3_envelope_positive_growth_only_from_canonical_"
     "geometry_ray_evidence_while_non_evidence_growth_and_high_order_sh_are_"
     "frozen_and_negative_cleanup_and_dc_remain_trainable__verified_support_"
@@ -294,6 +294,15 @@ STATIC_OPTICAL_POLICY_CONTRACT = (
     "training_but_not_high_bandwidth_refinement__canonical_polish_freezes_"
     "geometry_covariance_and_mass_together__scale_updates_preserve_"
     "integrated_optical_mass"
+)
+STATIC_OPTICAL_POLICY_CONTRACT = (
+    "single_static_map__topology_establishes_optical_existence__late_ray_hit_"
+    "keeps_full_geometry_gradient_but_phase_attenuates_only_positive_opacity_"
+    "growth__static_detail_positive_mass_growth_anneals_during_ownership_"
+    "cleanup__envelope_high_order_sh_frozen_after_detail_activation__"
+    "persistent_handoff_uses_reversible_expected_cross_view_coverage__"
+    "negative_free_space_and_cleanup_remain_trainable__canonical_polish_"
+    "freezes_geometry_covariance_and_mass_together"
 )
 VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT = (
     "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
@@ -4593,6 +4602,7 @@ def _resume_training_contract_differences(
             in {
                 STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
                 STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT,
+                STATIC_OPTICAL_POLICY_V86_PREDECESSOR_CONTRACT,
             }
             and current.get("static_optical_policy_contract")
             == STATIC_OPTICAL_POLICY_CONTRACT
@@ -4866,6 +4876,49 @@ def _resume_training_contract_differences(
                 "static_detail_canonical_ownership",
                 "static_ray_local_mass_handoff",
                 "static_detail_global_cleanup",
+                "parameter_loss_permission_matrix",
+            ):
+                if key in current:
+                    saved[key] = current[key]
+        # v86 restored useful sequence-owned geometry and detail coverage, but
+        # retained two incompatible late optical estimators: the ray hit
+        # likelihood had an unbounded full-strength opacity derivative while
+        # persistent handoff approximated the weakest seasonal snapshot.  v87
+        # keeps ray geometry/free-space exact, anneals only positive hit mass,
+        # and uses symmetric expected persistence for reversible handoff.  The
+        # explicit resume repair rebases realized mass and clears only crown
+        # opacity moments, so this contract migration is restricted to that
+        # precise predecessor/current pair.
+        saved_handoff = saved.get("static_ray_local_mass_handoff")
+        current_handoff = current.get("static_ray_local_mass_handoff")
+        current_ray_ownership = current.get("static_ray_optical_ownership")
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_handoff, dict)
+            and isinstance(current_handoff, dict)
+            and saved_handoff.get("authority_contract")
+            == (
+                "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
+                "distinct_view_persistent"
+            )
+            and current_handoff.get("authority_contract")
+            == (
+                "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
+                "distinct_view_static_persistence_expected_coverage_ema"
+            )
+            and isinstance(current_ray_ownership, dict)
+            and current_ray_ownership.get("contract")
+            == (
+                "full_hit_geometry_derivative__phase_annealed_hit_"
+                "opacity_derivative__full_free_space_derivative"
+            )
+        ):
+            for key in (
+                "static_optical_policy_contract",
+                "static_ray_local_mass_handoff",
+                "static_ray_optical_ownership",
+                "static_training_stages",
                 "parameter_loss_permission_matrix",
             ):
                 if key in current:
@@ -11131,13 +11184,15 @@ def _accumulate_static_replacement_evidence(
     cameras this drove the overlap EMA toward zero even for repeatedly
     confirmed detail, so the envelope kept all of its optical mass.
 
-    The stored value is a conservative streaming lower coverage envelope:
-    worse support views reduce it immediately, while better observations
-    recover it only through an EMA.  This is the correct direction for
-    preventing holes: a globally retired fraction must be safe for every
-    observed support view, not merely the best one. Zero authority from a
-    support-owned group is explicit counter-evidence; unrelated views do not
-    touch the state.
+    The stored value is a reversible EMA of calibrated support-view coverage.
+    The former asymmetric minimum reacted instantly to one seasonal low-
+    coverage observation but recovered only slowly from all later positive
+    views.  In a static target that estimator converged toward the least
+    persistent leaf snapshot, so almost no envelope could ever hand optical
+    ownership to repeatedly observed detail.  Positive and negative support
+    evidence now have equal temporal semantics; unrelated views still do not
+    touch the state, and the bounded reversible handoff below prevents a
+    transient estimate from opening a one-way hole.
     """
     value = torch.as_tensor(
         authority_observation,
@@ -11167,13 +11222,10 @@ def _accumulate_static_replacement_evidence(
         previous = foliage.replacement_overlap_ema[candidate]
         observed = value[candidate]
         first = foliage.replacement_observation_count[candidate] <= 0
-        recovered = previous + (1.0 - float(decay)) * (
-            observed - previous
-        )
         updated = torch.where(
             first,
             observed,
-            torch.where(observed < previous, observed, recovered),
+            previous + (1.0 - float(decay)) * (observed - previous),
         )
         foliage.replacement_overlap_ema[candidate] = updated
         bit = int(1) << (int(camera_id) % 62)
@@ -11194,7 +11246,9 @@ def _accumulate_static_replacement_evidence(
         foliage.verification_state == VERIFICATION_VERIFIED
     )
     return {
-        "contract": "persistent_distinct_view_real_ray_replacement_ema",
+        "contract": (
+            "persistent_distinct_view_real_ray_expected_coverage_ema"
+        ),
         "observed_envelope_rows": int(visible.sum()),
         "candidate_envelope_rows": int(candidate.sum()),
         "overlapping_envelope_rows": int(positive.sum()),
@@ -11210,6 +11264,46 @@ def _accumulate_static_replacement_evidence(
         "maximum_authority": float(authority[envelope].max())
         if bool(envelope.any())
         else 0.0,
+    }
+
+
+@torch.no_grad()
+def _rebase_v86_static_optical_ownership_state(
+    foliage,
+    volume_optimizer,
+) -> dict[str, float | int | str]:
+    """Migrate v86 without changing its realized render at the boundary.
+
+    The old handoff accumulator encoded an asymmetric lower-envelope
+    estimator.  Interpreting that value as an expected-persistence EMA would
+    immediately retire unrelated mass.  Preserve the already realized
+    opacity exactly as the v87 reference, clear only estimator state, and
+    remove stale positive-growth Adam moments for the two crown optical
+    owners.  Geometry, SH, opacity logits and all non-crown optimizer state
+    remain unchanged.
+    """
+    envelope = foliage.persistent_envelope_mask
+    detail = foliage.static_leaf_mask
+    realized = foliage.integrated_optical_mass().detach().clone()
+    previously_retired = foliage.handoff_retired_fraction[envelope].clone()
+    foliage.handoff_reference_mass[envelope] = realized[envelope]
+    foliage.handoff_retired_fraction[envelope] = 0
+    foliage.replacement_overlap_ema[envelope] = 0
+    foliage.replacement_observation_count[envelope] = 0
+    foliage.replacement_camera_signature[envelope] = 0
+    crown_rows = torch.nonzero(envelope | detail, as_tuple=False).reshape(-1)
+    _zero_volume_opacity_optimizer_rows(volume_optimizer, crown_rows)
+    return {
+        "contract": "v86_to_v87_render_exact_optical_ownership_rebase",
+        "envelope_rows": int(envelope.sum()),
+        "detail_rows": int(detail.sum()),
+        "previous_mean_retired_fraction": (
+            float(previously_retired.mean())
+            if len(previously_retired)
+            else 0.0
+        ),
+        "cleared_opacity_moment_rows": int(len(crown_rows)),
+        "realized_mass_change": 0.0,
     }
 
 
@@ -11907,6 +12001,44 @@ def _static_detail_ray_trainable(phase: str) -> bool:
     return str(phase) != "canonical_polish"
 
 
+def _static_ray_hit_opacity_gradient_scale(
+    reconstruction_target: str,
+    phase: str,
+) -> float:
+    """Anneal only ray-hit opacity creation after geometry is established.
+
+    A measured hit remains a valid depth/placement factor throughout the
+    trainable static phases, but ``-log(1-exp(-tau))`` has no finite optical
+    optimum: its opacity derivative always asks for more mass.  Keeping that
+    derivative at full strength during ownership cleanup made the ray factor
+    roughly ten times stronger than RGB and darkened the already covered
+    crown.  Free-space gradients and all geometry derivatives are deliberately
+    left at full strength by ``FoliageRayEvidence.interval_factor``.
+    """
+    if str(reconstruction_target) != "static":
+        return 1.0
+    return {
+        "canonical_bootstrap": 1.0,
+        "topology": 1.0,
+        "static_foliage": 0.75,
+        "dynamic_appearance": 0.35,
+        "ownership_cleanup": 0.10,
+        "canonical_polish": 0.0,
+    }.get(str(phase), 1.0)
+
+
+def _static_detail_positive_opacity_growth_scale(phase: str) -> float:
+    """Keep detail optical calibration continuous without late thickening."""
+    return {
+        "canonical_bootstrap": 1.0,
+        "topology": 1.0,
+        "static_foliage": 1.0,
+        "dynamic_appearance": 0.60,
+        "ownership_cleanup": 0.25,
+        "canonical_polish": 0.0,
+    }.get(str(phase), 1.0)
+
+
 def _static_detail_isolated_gradient_gates(
     geometry_gate: torch.Tensor | None,
     appearance_gate: torch.Tensor | None = None,
@@ -12253,13 +12385,17 @@ def _apply_static_optical_policy(
         "joint_polish_freeze": phase == "canonical_polish",
         "envelope_growth_rows_attenuated": 0,
         "envelope_positive_growth_attenuation": (
-            "stage3_canonical_geometry_ray_only__stage2_actual_local_"
-            "handoff_retired_fraction"
+            "stage3_canonical_geometry_ray_only__ray_hit_opacity_is_phase_"
+            "annealed_at_source__stage2_actual_local_handoff_retired_fraction"
         ),
         "envelope_high_order_sh_rows_frozen": 0,
         "mean_envelope_replacement_authority": 0.0,
         "static_detail_mass_trainable": _static_detail_stage_trainable(phase),
         "static_detail_ray_trainable": _static_detail_ray_trainable(phase),
+        "static_detail_positive_growth_scale": (
+            _static_detail_positive_opacity_growth_scale(phase)
+        ),
+        "static_detail_growth_rows_attenuated": 0,
         "skeleton_mass_trainable": phase != "canonical_polish",
         "opacity_growth_before_policy": {},
         "opacity_growth_removed_by_policy": {},
@@ -12433,6 +12569,18 @@ def _apply_static_optical_policy(
             gradient[growth] *= (
                 1.0 - attenuation[:, None].expand_as(gradient)[growth]
             )
+        detail_growth_scale = _static_detail_positive_opacity_growth_scale(
+            phase
+        )
+        detail_growth = detail[:, None] & (gradient < 0)
+        audit["static_detail_growth_rows_attenuated"] = int(
+            (
+                detail_growth.flatten(1).any(dim=1)
+                & (detail_growth_scale < 1.0)
+            ).sum()
+        )
+        if detail_growth_scale < 1.0:
+            gradient[detail_growth] *= detail_growth_scale
         removed = (gradient - gradient_before).clamp_min(0.0)
         for name, mask in role_masks.items():
             audit["opacity_growth_removed_by_policy"][name] = float(
@@ -12465,6 +12613,13 @@ def _apply_static_optical_policy(
                 - attenuation[:, None]
                 .expand_as(first_moment)[growth_momentum]
             )
+        detail = foliage.static_leaf_mask
+        detail_growth_momentum = detail[:, None] & (first_moment < 0)
+        detail_growth_scale = _static_detail_positive_opacity_growth_scale(
+            phase
+        )
+        if detail_growth_scale < 1.0:
+            first_moment[detail_growth_momentum] *= detail_growth_scale
     for parameter in (
         foliage.deformation_basis,
         foliage.dynamic_feature_basis,
@@ -14293,6 +14448,27 @@ def main():
                 f"moments for {int(detail.sum())} rows; feature values and "
                 "all non-detail optimizer state were preserved."
             )
+        if (
+            args.allow_trainer_repair_resume
+            and args.reconstruction_target == "static"
+            and resume.get("protocol")
+            == (
+                "cambridge_native_hybrid_teacher_v86_sequence_geometry_"
+                "optical_handoff"
+            )
+            and PROTOCOL
+            == (
+                "cambridge_native_hybrid_teacher_v87_static_optical_"
+                "ownership_calibration"
+            )
+        ):
+            ownership_rebase = _rebase_v86_static_optical_ownership_state(
+                foliage, volume_optimizer
+            )
+            print(
+                "Trainer repair rebased v86 optical ownership without a "
+                "render change: " + json.dumps(ownership_rebase, sort_keys=True)
+            )
         if args.allow_trainer_repair_resume:
             dynamic = foliage.dynamic_leaf_mask
             dynamic_opacity = foliage.opacities[dynamic]
@@ -14764,12 +14940,52 @@ def main():
             ),
             "authority_contract": (
                 "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
-                "distinct_view_persistent"
+                "distinct_view_static_persistence_expected_coverage_ema"
             ),
             "transition_contract": (
                 "reversible_integrated_optical_mass_reference"
             ),
+            "resume_evidence_contract": (
+                "v86_realized_mass_rebased_without_render_change__old_"
+                "asymmetric_lower_envelope_state_cleared"
+            ),
         },
+        "static_ray_optical_ownership": (
+            {
+                "contract": (
+                    "full_hit_geometry_derivative__phase_annealed_hit_"
+                    "opacity_derivative__full_free_space_derivative"
+                ),
+                "hit_opacity_gradient_scale_by_phase": {
+                    name: _static_ray_hit_opacity_gradient_scale(
+                        "static", name
+                    )
+                    for name in (
+                        "canonical_bootstrap",
+                        "topology",
+                        "static_foliage",
+                        "dynamic_appearance",
+                        "ownership_cleanup",
+                        "canonical_polish",
+                    )
+                },
+                "detail_positive_opacity_growth_scale_by_phase": {
+                    name: _static_detail_positive_opacity_growth_scale(name)
+                    for name in (
+                        "canonical_bootstrap",
+                        "topology",
+                        "static_foliage",
+                        "dynamic_appearance",
+                        "ownership_cleanup",
+                        "canonical_polish",
+                    )
+                },
+                "hit_likelihood_optical_optimum": "unbounded_without_anneal",
+                "late_owner": "joint_native_rgb_plus_negative_ray_cleanup",
+            }
+            if args.reconstruction_target == "static"
+            else None
+        ),
         "child_verification_lifecycle": {
             "grace_iterations": int(
                 args.child_verification_grace_iterations
@@ -14824,8 +15040,9 @@ def main():
                     "envelope_only_all_view_rigid_free_counterfactual_cleanup",
                 ],
                 "detail_training_signals": [
-                    "positive_evidence_sequence_ray_free_space",
-                    "positive_evidence_sequence_or_verified_consensus_ray_hit_interval",
+                    "positive_evidence_sequence_ray_free_space_full_strength",
+                    "positive_evidence_sequence_or_verified_consensus_ray_hit_"
+                    "interval_full_geometry_phase_annealed_opacity",
                     "exact_support_plus_soft_positive_evidence_sequence_"
                     "verified_canonical_rgb_geometry",
                     "exact_support_plus_soft_same_sequence_canonical_sh_appearance",
@@ -16412,7 +16629,9 @@ def main():
         "requested_stop_iteration": int(args.iterations),
     }
     static_replacement_audit = {
-        "contract": "persistent_distinct_view_real_ray_replacement_ema",
+        "contract": (
+            "persistent_distinct_view_real_ray_expected_coverage_ema"
+        ),
         "scheduled": False,
     }
     static_mass_handoff_audit = {
@@ -17837,6 +18056,11 @@ def main():
             foliage.opacities.square() * canonical_posterior_weight
         ).sum() / canonical_posterior_weight.sum().clamp_min(1)
         ray_loss = package.depth.new_zeros(())
+        ray_hit_opacity_gradient_scale = (
+            _static_ray_hit_opacity_gradient_scale(
+                args.reconstruction_target, phase
+            )
+        )
         ray_audit = {
             "rays": 0,
             "candidate_evaluations": 0,
@@ -17848,6 +18072,9 @@ def main():
             "unknown_rays": 0,
             "free": 0.0,
             "hit": 0.0,
+            "hit_opacity_gradient_scale": (
+                ray_hit_opacity_gradient_scale
+            ),
         }
         if (
             foliage_active
@@ -17877,6 +18104,9 @@ def main():
                     sample_update=ray_update,
                     canonical_candidate_mask=ray_free_candidate_mask,
                     canonical_hit_candidate_mask=ray_hit_candidate_mask,
+                    hit_opacity_gradient_scale=(
+                        ray_hit_opacity_gradient_scale
+                    ),
                 )
                 if args.reconstruction_target == "static":
                     # Consensus construction is independent of render phase.
@@ -18263,7 +18493,7 @@ def main():
         else:
             static_replacement_audit = {
                 "contract": (
-                    "persistent_distinct_view_real_ray_replacement_ema"
+                    "persistent_distinct_view_real_ray_expected_coverage_ema"
                     if static_replacement_lifecycle_enabled
                     else "persistent_lifecycle_disabled_by_zero_cadence_or_mass"
                 ),

@@ -479,6 +479,11 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "cambridge_native_hybrid_teacher_v86_sequence_geometry_optical_handoff"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v87_static_optical_ownership_"
+        "calibration"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():

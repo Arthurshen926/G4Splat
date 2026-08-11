@@ -975,6 +975,7 @@ class FoliageRayEvidence:
         sample_update: int = 0,
         canonical_candidate_mask: torch.Tensor | None = None,
         canonical_hit_candidate_mask: torch.Tensor | None = None,
+        hit_opacity_gradient_scale: float = 1.0,
     ):
         """Evaluate all nearby canonical Gaussians on each measured ray.
 
@@ -1007,6 +1008,9 @@ class FoliageRayEvidence:
         support metadata. Confirmed-free rays constrain every static branch
         visible in that camera.
         """
+        hit_opacity_gradient_scale = float(hit_opacity_gradient_scale)
+        if not 0.0 <= hit_opacity_gradient_scale <= 1.0:
+            raise ValueError("hit_opacity_gradient_scale must lie in [0,1]")
         self.interval_factor_calls += 1
         self._latest_uncovered_hit_proposals = None
         zero = foliage.xyz.new_zeros(())
@@ -1027,6 +1031,7 @@ class FoliageRayEvidence:
                 "free": 0.0,
                 "hit": 0.0,
                 "behind_mass": 0.0,
+                "hit_opacity_gradient_scale": hit_opacity_gradient_scale,
             }
         device, dtype = foliage.xyz.device, foliage.xyz.dtype
         pixels = self.pixels[selected].to(device=device, dtype=dtype)
@@ -1401,6 +1406,23 @@ class FoliageRayEvidence:
                 )
             ).clamp(0, 1 - 1e-6)
             local_tau = -torch.log1p(-local_alpha)
+            # Hit geometry remains fully differentiable in centre, scale and
+            # rotation, while late static phases may anneal only the opacity
+            # derivative of the unbounded existence likelihood.  Free-space
+            # and behind-interval mass keep the unmodified tau above, so this
+            # cannot hide a contradiction or weaken optical cleanup.
+            candidate_opacity = foliage.opacities[candidate_rows]
+            hit_opacity = candidate_opacity.detach() + (
+                hit_opacity_gradient_scale
+                * (candidate_opacity - candidate_opacity.detach())
+            )
+            local_alpha_hit = (
+                hit_opacity
+                * torch.exp(
+                    -0.5 * radial_mahalanobis.clamp_max(80)
+                )
+            ).clamp(0, 1 - 1e-6)
+            local_tau_hit = -torch.log1p(-local_alpha_hit)
             # A tree-labelled owner pixel is strong optical-existence
             # evidence even when its monocular metric depth is uncertain.
             # Build a second tau whose footprint/depth terms are constants:
@@ -1408,7 +1430,7 @@ class FoliageRayEvidence:
             # broad interval.  The confidence-weighted analytic tau below
             # remains the geometry posterior.
             local_alpha_optical = (
-                foliage.opacities[candidate_rows]
+                hit_opacity
                 * torch.exp(
                     -0.5 * radial_mahalanobis.detach().clamp_max(80)
                 )
@@ -1472,7 +1494,9 @@ class FoliageRayEvidence:
                 accumulate(local_tau * free_fraction, canonical_weight)
             )
             canonical_hit_tau_chunks.append(
-                accumulate(local_tau * hit_fraction, canonical_hit_weight)
+                accumulate(
+                    local_tau_hit * hit_fraction, canonical_hit_weight
+                )
             )
             canonical_hit_optical_tau_chunks.append(
                 accumulate(
@@ -1493,7 +1517,7 @@ class FoliageRayEvidence:
             )
             verified_canonical_hit_tau_chunks.append(
                 accumulate(
-                    local_tau * hit_fraction,
+                    local_tau_hit * hit_fraction,
                     verified_canonical_weight,
                 )
             )
@@ -1513,7 +1537,7 @@ class FoliageRayEvidence:
                 accumulate(local_tau * free_fraction, dynamic_weight)
             )
             dynamic_hit_tau_chunks.append(
-                accumulate(local_tau * hit_fraction, dynamic_weight)
+                accumulate(local_tau_hit * hit_fraction, dynamic_weight)
             )
             dynamic_hit_optical_tau_chunks.append(
                 accumulate(
@@ -1525,7 +1549,7 @@ class FoliageRayEvidence:
                 accumulate(local_tau * behind_fraction, dynamic_weight)
             )
             static_hit_tau_chunks.append(
-                accumulate(local_tau * hit_fraction, static_weight)
+                accumulate(local_tau_hit * hit_fraction, static_weight)
             )
             static_hit_optical_tau_chunks.append(
                 accumulate(
@@ -1852,6 +1876,7 @@ class FoliageRayEvidence:
             "hit": float(hit_loss.detach()),
             "hit_geometry": float(hit_geometry_loss.detach()),
             "hit_optical_existence": float(hit_optical_loss.detach()),
+            "hit_opacity_gradient_scale": hit_opacity_gradient_scale,
             "mean_confidence": float(weight.mean()),
             "hit_mean_confidence": (
                 float(weight[hit_mask].mean())

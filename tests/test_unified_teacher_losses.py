@@ -28,6 +28,7 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_OPTICAL_POLICY_CONTRACT,
     STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
     STATIC_OPTICAL_POLICY_STAGE3_FREEZE_PREDECESSOR_CONTRACT,
+    STATIC_OPTICAL_POLICY_V86_PREDECESSOR_CONTRACT,
     TRAINING_PROFILES,
     VOLUME_OPACITY_SETTLE_CONTRACT,
     _apply_training_profile_optimizer_defaults,
@@ -74,6 +75,7 @@ from scripts.train_unified_outdoor_teacher import (
     _apply_volume_opacity_settle_policy,
     _apply_static_optical_policy,
     _apply_static_ray_local_mass_handoff,
+    _rebase_v86_static_optical_ownership_state,
     _finalize_static_ray_local_mass_handoff,
     _apply_surface_scale_limits_preserve_optical_mass,
     _surface_screen_limit_rows,
@@ -98,6 +100,8 @@ from scripts.train_unified_outdoor_teacher import (
     _soft_surface_canopy_conflict,
     _static_detail_exclusive_topology_active,
     _static_detail_ray_trainable,
+    _static_detail_positive_opacity_growth_scale,
+    _static_ray_hit_opacity_gradient_scale,
     _static_detail_isolated_gradient_gates,
     _static_detail_evidence_sequence_view_indices,
     _static_volume_isolated_gradient_gates,
@@ -313,14 +317,56 @@ def test_detail_visibility_keeps_only_canonical_evidence_envelope_growth():
     )
 
     assert audit["envelope_positive_growth_attenuation"] == (
-        "stage3_canonical_geometry_ray_only__stage2_actual_local_"
-        "handoff_retired_fraction"
+        "stage3_canonical_geometry_ray_only__ray_hit_opacity_is_phase_"
+        "annealed_at_source__stage2_actual_local_handoff_retired_fraction"
     )
     assert audit["envelope_growth_rows_attenuated"] == 1
     assert foliage.opacity_logits.grad[0].item() == -0.75
     assert foliage.opacity_logits.grad[1].item() == 3.0
     assert moment[0].item() == -4.0
     assert moment[1].item() == 5.0
+
+
+def test_static_late_optical_creation_anneals_without_a_hard_gate():
+    assert _static_ray_hit_opacity_gradient_scale("static", "topology") == 1.0
+    assert _static_ray_hit_opacity_gradient_scale(
+        "static", "dynamic_appearance"
+    ) == 0.35
+    assert _static_ray_hit_opacity_gradient_scale(
+        "static", "ownership_cleanup"
+    ) == 0.10
+    assert _static_ray_hit_opacity_gradient_scale(
+        "conditioned", "ownership_cleanup"
+    ) == 1.0
+    assert _static_detail_positive_opacity_growth_scale(
+        "dynamic_appearance"
+    ) == 0.60
+    assert _static_detail_positive_opacity_growth_scale(
+        "ownership_cleanup"
+    ) == 0.25
+
+
+def test_ownership_cleanup_attenuates_detail_growth_but_keeps_cleanup():
+    foliage, optimizer, _ = _static_optical_policy_fixture(0.0)
+    foliage.persistent_envelope_mask.zero_()
+    foliage.static_leaf_mask.fill_(True)
+    foliage.opacity_logits.grad = torch.tensor([[-4.0], [3.0]])
+    optimizer.state[foliage.opacity_logits]["exp_avg"] = torch.tensor(
+        [[-8.0], [5.0]]
+    )
+
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "ownership_cleanup"
+    )
+
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad, torch.tensor([[-1.0], [3.0]])
+    )
+    torch.testing.assert_close(
+        optimizer.state[foliage.opacity_logits]["exp_avg"],
+        torch.tensor([[-2.0], [5.0]]),
+    )
+    assert audit["static_detail_growth_rows_attenuated"] == 1
 
 
 def test_detail_visibility_without_source_gradient_uses_safe_freeze():
@@ -389,6 +435,48 @@ def test_trainer_repair_migrates_static_optical_lifecycle_contract():
         stage3_freeze,
         current,
         allow_trainer_repair_migration=True,
+    )
+
+
+def test_trainer_repair_migrates_only_exact_v86_optical_ownership_contract():
+    saved = {
+        "reconstruction_target": "static",
+        "static_optical_policy_contract": (
+            STATIC_OPTICAL_POLICY_V86_PREDECESSOR_CONTRACT
+        ),
+        "static_ray_local_mass_handoff": {
+            "authority_contract": (
+                "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
+                "distinct_view_persistent"
+            )
+        },
+        "static_training_stages": {"version": "v86"},
+    }
+    current = {
+        "reconstruction_target": "static",
+        "static_optical_policy_contract": STATIC_OPTICAL_POLICY_CONTRACT,
+        "static_ray_local_mass_handoff": {
+            "authority_contract": (
+                "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
+                "distinct_view_static_persistence_expected_coverage_ema"
+            )
+        },
+        "static_ray_optical_ownership": {
+            "contract": (
+                "full_hit_geometry_derivative__phase_annealed_hit_"
+                "opacity_derivative__full_free_space_derivative"
+            )
+        },
+        "static_training_stages": {"version": "v87"},
+    }
+    assert _resume_training_contract_differences(saved, current)
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
+    unsafe = json.loads(json.dumps(saved))
+    unsafe["static_ray_local_mass_handoff"]["authority_contract"] = "other"
+    assert _resume_training_contract_differences(
+        unsafe, current, allow_trainer_repair_migration=True
     )
 
 
@@ -539,6 +627,68 @@ def test_real_ray_handoff_is_bounded_and_reversible():
     assert torch.allclose(
         foliage.integrated_optical_mass(), initial, rtol=1e-5
     )
+
+
+def test_v86_optical_rebase_is_render_exact_and_clears_only_crown_moments():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]),
+            "scales": torch.full((2, 3), 0.1),
+            "colors": torch.full((2, 3), 0.4),
+            "opacities": torch.tensor([[0.2], [0.1]]),
+            "quaternions": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+            ),
+            "layer_role": torch.zeros(2, dtype=torch.int8),
+            "static_detail": torch.tensor([False, True]),
+        }
+    )
+    foliage.handoff_retired_fraction[0] = 0.3
+    foliage.replacement_overlap_ema[0] = 0.8
+    foliage.replacement_observation_count[0] = 5
+    foliage.replacement_camera_signature[0] = 7
+    parameters_before = {
+        name: value.detach().clone()
+        for name, value in (
+            ("xyz", foliage.xyz),
+            ("scale", foliage.log_scales),
+            ("rotation", foliage.quaternions),
+            ("opacity", foliage.opacity_logits),
+            ("features", foliage.features),
+        )
+    }
+    mass_before = foliage.integrated_optical_mass().clone()
+    opacity_moment = torch.ones_like(foliage.opacity_logits)
+    optimizer = SimpleNamespace(
+        state={foliage.opacity_logits: {"exp_avg": opacity_moment}},
+        param_groups=[
+            {"name": "opacity", "params": [foliage.opacity_logits]}
+        ],
+    )
+
+    audit = _rebase_v86_static_optical_ownership_state(foliage, optimizer)
+
+    torch.testing.assert_close(foliage.integrated_optical_mass(), mass_before)
+    for name, value in parameters_before.items():
+        current = {
+            "xyz": foliage.xyz,
+            "scale": foliage.log_scales,
+            "rotation": foliage.quaternions,
+            "opacity": foliage.opacity_logits,
+            "features": foliage.features,
+        }[name]
+        assert torch.equal(current, value)
+    assert foliage.handoff_retired_fraction[0] == 0
+    assert foliage.replacement_overlap_ema[0] == 0
+    assert foliage.replacement_observation_count[0] == 0
+    assert foliage.replacement_camera_signature[0] == 0
+    torch.testing.assert_close(
+        foliage.handoff_reference_mass[0], mass_before[0]
+    )
+    torch.testing.assert_close(opacity_moment, torch.zeros_like(opacity_moment))
+    assert audit["realized_mass_change"] == 0.0
 
 
 def test_runtime_ray_birth_initial_mass_is_ray_local_conserved_and_reversible():
@@ -819,8 +969,8 @@ def test_replacement_evidence_ignores_unrelated_visible_views():
     assert audit["contradicted_candidate_rows"] == 0
 
     # The same local group/depth candidate with zero real pixel authority is
-    # explicit counter-evidence and therefore lowers the safe coverage
-    # envelope immediately.
+    # explicit counter-evidence, with the same EMA semantics as a positive
+    # observation rather than a one-way seasonal minimum.
     audit = _accumulate_static_replacement_evidence(
         foliage,
         torch.zeros(1),
@@ -830,13 +980,13 @@ def test_replacement_evidence_ignores_unrelated_visible_views():
         decay=0.95,
     )
     torch.testing.assert_close(
-        foliage.replacement_overlap_ema, torch.tensor([0.0])
+        foliage.replacement_overlap_ema, torch.tensor([0.76])
     )
     assert foliage.replacement_observation_count.item() == 2
     assert audit["contradicted_candidate_rows"] == 1
 
 
-def test_replacement_evidence_tracks_weakest_support_view():
+def test_replacement_evidence_tracks_expected_persistent_support():
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
         {
@@ -858,11 +1008,11 @@ def test_replacement_evidence_tracks_weakest_support_view():
             camera_id=camera_id,
             decay=0.95,
         )
-    # The weak view lowers safe retirement immediately; a later strong view
-    # can only recover it gradually, never turn max-camera coverage into a
-    # transparent hole in the weak view.
+    # Positive and negative support views have symmetric temporal semantics.
+    # This estimates persistence of a static representation instead of the
+    # least leafy seasonal snapshot.
     torch.testing.assert_close(
-        foliage.replacement_overlap_ema, torch.tensor([0.14])
+        foliage.replacement_overlap_ema, torch.tensor([0.862])
     )
     assert foliage.replacement_observation_count.item() == 3
 
@@ -5438,6 +5588,39 @@ def test_candidate_interval_factor_rewards_mass_inside_measured_hit():
     correct_loss.backward()
     assert correct.opacity_logits.grad is not None
     assert correct.opacity_logits.grad.abs().sum() > 0
+
+
+def test_candidate_interval_anneals_only_hit_opacity_not_geometry_or_free():
+    models = [_interval_foliage(3.05) for _ in range(3)]
+    scales = (0.0, 0.5, 1.0)
+    losses = []
+    audits = []
+    for model, scale in zip(models, scales):
+        evidence = _interval_evidence(1)
+        loss, audit = evidence.interval_factor(
+            _interval_camera(),
+            model,
+            hit_opacity_gradient_scale=scale,
+        )
+        loss.backward()
+        losses.append(loss.detach())
+        audits.append(audit)
+
+    # The forward likelihood and all geometric derivatives are identical.
+    torch.testing.assert_close(losses[0], losses[1])
+    torch.testing.assert_close(losses[0], losses[2])
+    torch.testing.assert_close(models[0].xyz.grad, models[2].xyz.grad)
+    torch.testing.assert_close(
+        models[0].log_scales.grad, models[2].log_scales.grad
+    )
+    # Only the hit opacity derivative interpolates. The full-strength
+    # pre-hit free-space derivative is the common offset at scale zero.
+    zero = models[0].opacity_logits.grad
+    half = models[1].opacity_logits.grad
+    full = models[2].opacity_logits.grad
+    torch.testing.assert_close(half, zero + 0.5 * (full - zero))
+    assert audits[0]["hit_opacity_gradient_scale"] == 0.0
+    assert audits[2]["hit_opacity_gradient_scale"] == 1.0
 
 
 def test_candidate_interval_factor_respects_static_stage_mask():
