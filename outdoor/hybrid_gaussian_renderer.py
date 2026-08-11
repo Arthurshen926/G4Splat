@@ -2207,6 +2207,202 @@ class VolumetricFoliageModel(nn.Module):
         }
 
     @torch.no_grad()
+    def materialize_static_detail_receivers(
+        self,
+        parent_rows: torch.Tensor,
+        *,
+        optical_mass_fraction: float = 0.05,
+        birth_iteration: int = -1,
+    ) -> dict[str, torch.Tensor | int | float]:
+        """Factor envelope cells into co-located envelope/detail owners.
+
+        This operation does not propose new geometry.  It creates exactly one
+        static-detail receiver at the same centre, covariance, rotation and
+        colour as each selected persistent envelope and partitions the
+        parent's optical depth between the two rows.  Consequently both the
+        integrated optical mass and the co-located forward transmittance are
+        unchanged at materialization time.  Subsequent real-camera residuals
+        may refine/split the detail row while the persistent hand-off retires
+        only the locally replaced envelope mass.
+
+        Only groups without any existing static-detail row are accepted.  A
+        repeated topology event therefore cannot concentrate more receivers
+        in an already represented cell.
+        """
+        parent_rows = torch.as_tensor(
+            parent_rows, device=self.xyz.device, dtype=torch.long
+        ).reshape(-1)
+        fraction = float(optical_mass_fraction)
+        if not 0.0 < fraction <= 0.10:
+            raise ValueError(
+                "Static-detail materialization mass fraction must lie in "
+                "(0, 0.1]"
+            )
+        if len(torch.unique(parent_rows)) != len(parent_rows):
+            raise ValueError("Static-detail materialization parents must be unique")
+        if len(parent_rows) and bool(
+            ((parent_rows < 0) | (parent_rows >= len(self))).any()
+        ):
+            raise ValueError("Static-detail materialization parent is out of range")
+        if not len(parent_rows):
+            return {
+                "materialized": 0,
+                "transferred_optical_mass": 0.0,
+                "mass_before": float(self.integrated_optical_mass().sum()),
+                "mass_after": float(self.integrated_optical_mass().sum()),
+                "_new_to_old": torch.arange(
+                    len(self), device=self.xyz.device
+                ),
+                "_new_start": len(self),
+                "_parent_rows": parent_rows,
+            }
+        if not bool(self.persistent_envelope_mask[parent_rows].all()):
+            raise ValueError(
+                "Static-detail receivers require persistent envelope parents"
+            )
+        parent_groups = self.replacement_group[parent_rows]
+        if bool((parent_groups < 0).any()):
+            raise ValueError(
+                "Static-detail receivers require persistent replacement groups"
+            )
+        if len(torch.unique(parent_groups)) != len(parent_groups):
+            raise ValueError(
+                "Only one static-detail receiver may be materialized per group"
+            )
+        detail_groups = self.replacement_group[
+            self.static_leaf_mask & (self.replacement_group >= 0)
+        ]
+        if len(detail_groups) and bool(
+            torch.isin(parent_groups, torch.unique(detail_groups)).any()
+        ):
+            raise ValueError(
+                "Static-detail materialization group already has a receiver"
+            )
+
+        old_count = len(self)
+        old_mass = self.integrated_optical_mass().detach()
+        parent_mass = old_mass[parent_rows]
+        parameter_values = {}
+        for name in (
+            "xyz",
+            "log_scales",
+            "quaternions",
+            "opacity_logits",
+            "features",
+            "deformation_basis",
+            "dynamic_feature_basis",
+            "dynamic_opacity_basis",
+        ):
+            value = getattr(self, name).detach().clone()
+            child = value[parent_rows].clone()
+            if name == "opacity_logits":
+                parent_alpha = value[parent_rows].sigmoid().clamp(
+                    1.0e-8, 1.0 - 1.0e-6
+                )
+                parent_tau = -torch.log1p(-parent_alpha)
+                retained_alpha = -torch.expm1(
+                    -(1.0 - fraction) * parent_tau
+                )
+                child_alpha = -torch.expm1(-fraction * parent_tau)
+                value[parent_rows] = torch.logit(
+                    retained_alpha.clamp(1.0e-8, 1.0 - 1.0e-6)
+                )
+                child = torch.logit(
+                    child_alpha.clamp(1.0e-8, 1.0 - 1.0e-6)
+                )
+            elif name in {
+                "deformation_basis",
+                "dynamic_feature_basis",
+                "dynamic_opacity_basis",
+            }:
+                child.zero_()
+            parameter_values[name] = torch.cat([value, child], dim=0)
+
+        metadata = {
+            name: torch.cat(
+                [
+                    getattr(self, name).clone(),
+                    getattr(self, name)[parent_rows].clone(),
+                ],
+                dim=0,
+            )
+            for name in self.metadata_names
+        }
+        child_rows = torch.arange(
+            old_count,
+            old_count + len(parent_rows),
+            device=self.xyz.device,
+            dtype=torch.long,
+        )
+        metadata["static_detail"][child_rows] = True
+        metadata["initialization_source"][child_rows] = 6
+        metadata["initialization_center"][child_rows] = self.xyz[
+            parent_rows
+        ].detach()
+        next_lineage = (
+            int(self.lineage_id.max()) + 1 if len(self.lineage_id) else 0
+        )
+        metadata["parent_lineage_id"][child_rows] = self.lineage_id[
+            parent_rows
+        ]
+        metadata["lineage_id"][child_rows] = torch.arange(
+            next_lineage,
+            next_lineage + len(parent_rows),
+            device=self.xyz.device,
+            dtype=torch.int64,
+        )
+        metadata["birth_iteration"][child_rows] = int(birth_iteration)
+        # This is an exact factorization of already verified geometry, not a
+        # displaced split proposal.  Preserve the parent's real evidence and
+        # verification tables rather than manufacturing or discarding them.
+        metadata["verification_state"][child_rows] = metadata[
+            "verification_state"
+        ][parent_rows]
+        for name in (
+            "replacement_overlap_ema",
+            "replacement_observation_count",
+            "replacement_camera_signature",
+            "handoff_retired_fraction",
+        ):
+            metadata[name][parent_rows] = 0
+            metadata[name][child_rows] = 0
+        child_mass = parent_mass * fraction
+        retained_mass = parent_mass - child_mass
+        metadata["handoff_reference_mass"][parent_rows] = retained_mass
+        metadata["handoff_reference_mass"][child_rows] = child_mass
+
+        new_to_old = torch.cat(
+            [
+                torch.arange(old_count, device=self.xyz.device),
+                parent_rows,
+            ]
+        )
+        mass_before = float(old_mass.sum())
+        self._replace(**parameter_values)
+        self._replace_buffers(**metadata)
+        realized_mass = self.integrated_optical_mass()
+        mass_after = float(realized_mass.sum())
+        tolerance = max(abs(mass_before), 1.0) * 2.0e-6
+        if abs(mass_after - mass_before) > tolerance:
+            raise RuntimeError(
+                "Static-detail receiver materialization changed integrated "
+                "optical mass"
+            )
+        return {
+            "contract": (
+                "co_located_same_covariance_same_color_optical_depth_"
+                "factorization"
+            ),
+            "materialized": int(len(parent_rows)),
+            "transferred_optical_mass": float(child_mass.sum()),
+            "mass_before": mass_before,
+            "mass_after": mass_after,
+            "_new_to_old": new_to_old,
+            "_new_start": old_count,
+            "_parent_rows": parent_rows,
+        }
+
+    @torch.no_grad()
     def split(
         self,
         indices: torch.Tensor,

@@ -685,6 +685,67 @@ def test_runtime_ray_birth_without_same_tree_envelope_remains_ownerless():
     assert event["replacement_group_association"]["assigned"] == 0
 
 
+def test_missing_static_detail_receiver_is_exact_mass_factorization():
+    payload, _ = fuse_sequence_evidence_into_static_leaves(_payload())
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    # Remove the existing group-1 detail to reproduce an envelope cell whose
+    # low-frequency owner has no local high-frequency receiver.
+    remove = foliage.static_leaf_mask & (foliage.replacement_group == 1)
+    foliage.prune(remove)
+    parent = torch.nonzero(
+        foliage.persistent_envelope_mask
+        & (foliage.replacement_group == 1),
+        as_tuple=False,
+    ).flatten()
+    assert len(parent) == 1
+    before_count = len(foliage)
+    before_mass = foliage.integrated_optical_mass().clone()
+    before_tau = -torch.log1p(-foliage.opacities[parent])
+    before_xyz = foliage.xyz[parent].clone()
+    before_scale = foliage.scales[parent].clone()
+    before_color = foliage.features[parent].clone()
+
+    event = foliage.materialize_static_detail_receivers(
+        parent,
+        optical_mass_fraction=0.05,
+        birth_iteration=123,
+    )
+    child = torch.tensor([before_count])
+    assert event["materialized"] == 1
+    assert len(foliage) == before_count + 1
+    assert bool(foliage.persistent_envelope_mask[parent])
+    assert bool(foliage.static_leaf_mask[child])
+    assert foliage.replacement_group[child] == foliage.replacement_group[parent]
+    torch.testing.assert_close(foliage.xyz[child], before_xyz)
+    torch.testing.assert_close(foliage.scales[child], before_scale)
+    torch.testing.assert_close(foliage.features[child], before_color)
+    after_tau = -torch.log1p(
+        -foliage.opacities[torch.cat([parent, child])]
+    )
+    torch.testing.assert_close(after_tau.sum(), before_tau.sum())
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().sum(), before_mass.sum()
+    )
+    assert foliage.birth_iteration[child] == 123
+    assert torch.equal(
+        foliage.support_camera_ids[child], foliage.support_camera_ids[parent]
+    )
+
+
+def test_static_detail_receiver_cannot_duplicate_existing_group():
+    payload, _ = fuse_sequence_evidence_into_static_leaves(_payload())
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    parent = torch.nonzero(
+        foliage.persistent_envelope_mask
+        & (foliage.replacement_group == 0),
+        as_tuple=False,
+    ).flatten()
+    with pytest.raises(ValueError, match="already has a receiver"):
+        foliage.materialize_static_detail_receivers(parent)
+
+
 def test_bounded_nearest_reference_rows_matches_full_cdist(monkeypatch):
     query = torch.tensor(
         [[0.1, 0.0, 0.0], [2.2, 0.0, 0.0], [5.0, 0.0, 0.0]]

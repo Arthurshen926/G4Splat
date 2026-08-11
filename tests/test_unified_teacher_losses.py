@@ -97,6 +97,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
     _static_spatial_uncertainty_active,
+    _select_missing_static_detail_receiver_parents,
     _persistent_envelope_global_cleanup_loss,
     _surface_capture_to_device,
     _surface_topology_active,
@@ -371,6 +372,75 @@ def test_trainer_repair_migrates_static_optical_lifecycle_contract():
         current,
         allow_trainer_repair_migration=True,
     )
+
+
+def test_trainer_repair_registers_mass_safe_detail_receiver_contract():
+    current = {
+        "static_detail_receiver_materialization": {
+            "birth_forward_contract": (
+                "co_located_same_covariance_same_color_tau_partition"
+            ),
+            "integrated_optical_mass_conserved": True,
+            "existing_detail_group_repeat_forbidden": True,
+        }
+    }
+    assert _resume_training_contract_differences({}, current) == {
+        "static_detail_receiver_materialization"
+    }
+    assert not _resume_training_contract_differences(
+        {}, current, allow_trainer_repair_migration=True
+    )
+
+
+def test_missing_detail_receiver_selection_is_one_per_unrepresented_group():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor(
+                [
+                    [0.0, 0.0, 2.0],
+                    [0.1, 0.0, 2.0],
+                    [1.0, 0.0, 2.0],
+                    [2.0, 0.0, 2.0],
+                ]
+            ),
+            "scales": torch.full((4, 3), 0.1),
+            "colors": torch.full((4, 3), 0.4),
+            "opacities": torch.full((4, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(
+                4, 1
+            ),
+            "layer_role": torch.zeros(4, dtype=torch.int8),
+            "static_detail": torch.tensor([False, False, False, True]),
+            "replacement_group": torch.tensor([0, 1, 2, 2]),
+            "tree_instance_id": torch.tensor([0, 0, 1, 2]),
+            "support_camera_ids": torch.tensor(
+                [[0, 1], [0, 1], [2, 3], [4, 5]], dtype=torch.int32
+            ),
+            "support_view_count": torch.full((4,), 2, dtype=torch.int16),
+            "support_sequence_count": torch.full(
+                (4,), 2, dtype=torch.int16
+            ),
+        }
+    )
+    # Runtime splits preserve replacement identity, so two live envelope rows
+    # may address the same physical group even though the seed contract starts
+    # with one contiguous owner per group.
+    foliage.replacement_group[1] = 0
+    stats = {
+        "contribution": torch.ones(4),
+        "gradient": torch.tensor([1.0, 4.0, 2.0, 100.0]),
+        "gradient_count": torch.ones(4),
+        "radius": torch.tensor([2.0, 3.0, 4.0, 20.0]),
+        "rigid": torch.zeros(4),
+    }
+    selected, audit = _select_missing_static_detail_receiver_parents(
+        foliage, stats, maximum_receivers=8
+    )
+    assert selected.tolist() == [1]
+    assert audit["unique_candidate_groups"] == 1
+    assert audit["selected"] == 1
 
 
 def test_real_ray_handoff_is_bounded_and_reversible():
@@ -1519,6 +1589,11 @@ def test_trainer_repair_resume_accepts_chart_only_python_change():
     )
     assert not _trainer_repair_hash_change_is_allowed(
         {"hybrid_renderer"}, enabled=True
+    )
+    assert _trainer_repair_hash_change_is_allowed(
+        {"trainer", "hybrid_renderer"},
+        enabled=True,
+        allow_hybrid_renderer_topology_extension=True,
     )
     assert not _trainer_repair_hash_change_is_allowed(
         {"chart_surface_model"}, enabled=False

@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v82_soft_sequence_appearance"
+    "cambridge_native_hybrid_teacher_v83_spatial_detail_receivers"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -707,7 +707,10 @@ def _validate_initialization_protocol(initialization: dict) -> None:
 
 
 def _trainer_repair_hash_change_is_allowed(
-    changed: set[str], *, enabled: bool
+    changed: set[str],
+    *,
+    enabled: bool,
+    allow_hybrid_renderer_topology_extension: bool = False,
 ) -> bool:
     """Authorize only model-state-compatible Python repair resumes.
 
@@ -716,28 +719,28 @@ def _trainer_repair_hash_change_is_allowed(
     change made the explicit repair flag unusable for exactly that case.
     CUDA, renderer and Gaussian-model changes remain excluded.
     """
+    allowed = {
+        "trainer",
+        "training_evidence",
+        "static_ray_birth",
+        "chart_surface_model",
+        # The public deployment compositor is hashed into the checkpoint for
+        # reproducible evaluation but is not called by the training loop.
+        "hybrid_teacher_api",
+        # The training-only uncertainty field has an explicit zero-init
+        # optimizer migration.
+        "appearance_uncertainty",
+    }
+    if allow_hybrid_renderer_topology_extension:
+        # v83 adds a topology-only, co-located optical-depth factorization
+        # method. It does not change the renderer forward/backward or any
+        # pre-existing tensor schema. Keep this outside the generic allowlist
+        # so arbitrary renderer changes remain resume-incompatible.
+        allowed.add("hybrid_renderer")
     return bool(
         enabled
         and changed
-        and changed.issubset(
-            {
-                "trainer",
-                "training_evidence",
-                "static_ray_birth",
-                "chart_surface_model",
-                # The public deployment compositor is hashed into the
-                # checkpoint for reproducible evaluation but is not called
-                # by the training loop.  Its static ray-arbitration repair
-                # therefore leaves every resumed optimizer/model tensor and
-                # training forward function unchanged.
-                "hybrid_teacher_api",
-                # v5 replaces the inert two-scalar static uncertainty with a
-                # training-only smooth field and explicitly migrates its one
-                # appended optimizer parameter. CUDA/image formation and all
-                # existing model tensors remain unchanged at the boundary.
-                "appearance_uncertainty",
-            }
-        )
+        and changed.issubset(allowed)
     )
 
 
@@ -1740,6 +1743,27 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--maximum-static-detail-materializations-per-event",
+        type=int,
+        default=2_048,
+        help=(
+            "Maximum visible, evidence-supported envelope cells without any "
+            "local detail owner that are factorized into co-located static-"
+            "detail receivers at one topology event. This spends ordinary "
+            "global volume capacity but creates no optical mass."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-materialization-mass-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "Fraction of a missing-detail envelope cell's optical depth "
+            "transferred to its co-located detail receiver. The operation "
+            "preserves total optical mass and the birth-time forward image."
+        ),
+    )
+    parser.add_argument(
         "--static-ray-birth-additive-mass-fraction-per-event",
         type=float,
         default=0.005,
@@ -2030,6 +2054,16 @@ def _parse_args():
     if args.maximum_static_ray_births_per_event <= 0:
         parser.error(
             "--maximum-static-ray-births-per-event must be positive"
+        )
+    if args.maximum_static_detail_materializations_per_event < 0:
+        parser.error(
+            "--maximum-static-detail-materializations-per-event must be "
+            "non-negative"
+        )
+    if not 0.0 < args.static_detail_materialization_mass_fraction <= 0.10:
+        parser.error(
+            "--static-detail-materialization-mass-fraction must lie in "
+            "(0,0.1]"
         )
     if not (
         0.0
@@ -4142,6 +4176,31 @@ def _resume_training_contract_differences(
         ):
             if key not in saved and key in current:
                 saved[key] = current[key]
+        current_receiver_materialization = current.get(
+            "static_detail_receiver_materialization"
+        )
+        if (
+            "static_detail_receiver_materialization" not in saved
+            and isinstance(current_receiver_materialization, dict)
+            and current_receiver_materialization.get("birth_forward_contract")
+            == "co_located_same_covariance_same_color_tau_partition"
+            and bool(
+                current_receiver_materialization.get(
+                    "integrated_optical_mass_conserved"
+                )
+            )
+            and bool(
+                current_receiver_materialization.get(
+                    "existing_detail_group_repeat_forbidden"
+                )
+            )
+        ):
+            # The checkpoint tensors remain byte-for-byte valid.  This only
+            # authorizes future topology events to factor envelope mass into
+            # local detail receivers under the existing global budget.
+            saved["static_detail_receiver_materialization"] = (
+                current_receiver_materialization
+            )
         if (
             saved.get("static_optical_policy_contract")
             in {
@@ -7048,6 +7107,29 @@ def _zero_volume_optimizer_rows(
                     value[local_rows] = 0
 
 
+@torch.no_grad()
+def _zero_volume_opacity_optimizer_rows(
+    optimizer, rows: torch.Tensor
+) -> None:
+    """Clear only Adam mass momentum after an exact optical repartition."""
+    rows = torch.as_tensor(rows, dtype=torch.long).reshape(-1)
+    if not len(rows):
+        return
+    for group in optimizer.param_groups:
+        if group.get("name") != "opacity":
+            continue
+        for parameter in group["params"]:
+            local_rows = rows.to(parameter.device)
+            state = optimizer.state.get(parameter, {})
+            for value in state.values():
+                if (
+                    torch.is_tensor(value)
+                    and value.ndim > 0
+                    and value.shape[0] == parameter.shape[0]
+                ):
+                    value[local_rows] = 0
+
+
 def _volume_stats(foliage) -> dict[str, torch.Tensor]:
     count = len(foliage)
     device = foliage.xyz.device
@@ -8712,6 +8794,138 @@ def _verification_debt_capacity_scale(
     # from permanently starving new, independently supported evidence.
     smooth = 1.0 - position * position * (3.0 - 2.0 * position)
     return minimum_scale + (1.0 - minimum_scale) * smooth
+
+
+@torch.no_grad()
+def _select_missing_static_detail_receiver_parents(
+    foliage,
+    stats: dict[str, torch.Tensor],
+    maximum_receivers: int,
+) -> tuple[torch.Tensor, dict[str, int | float | str]]:
+    """Select one visible envelope row per spatial group lacking detail.
+
+    This is coverage repair, not unconstrained densification.  Existing
+    detail groups are excluded before ranking, and a stable per-group rank
+    prevents a broad/repeated envelope lineage from receiving more than one
+    receiver in an event.  Residual, footprint, visibility, rigidity and
+    occupancy remain continuous priorities instead of pass/fail thresholds.
+    """
+    count = len(foliage)
+    device = foliage.xyz.device
+    maximum_receivers = max(int(maximum_receivers), 0)
+    empty = torch.empty(0, dtype=torch.long, device=device)
+    base_audit: dict[str, int | float | str] = {
+        "contract": (
+            "one_per_missing_replacement_group__continuous_real_render_"
+            "residual_priority"
+        ),
+        "persistent_envelope_rows": int(
+            foliage.persistent_envelope_mask.sum()
+        ),
+        "groups_with_any_static_detail": 0,
+        "missing_detail_envelope_rows": 0,
+        "visible_evidence_supported_candidates": 0,
+        "unique_candidate_groups": 0,
+        "selected": 0,
+        "score_minimum": 0.0,
+        "score_median": 0.0,
+        "score_maximum": 0.0,
+    }
+    if count == 0 or maximum_receivers == 0:
+        return empty, base_audit
+    required = {
+        "contribution",
+        "gradient",
+        "gradient_count",
+        "radius",
+        "rigid",
+    }
+    missing_stats = required - set(stats)
+    if missing_stats:
+        raise ValueError(
+            "Static-detail receiver selection lacks volume statistics: "
+            + ", ".join(sorted(missing_stats))
+        )
+    for name in required:
+        if len(stats[name]) != count:
+            raise ValueError(
+                f"Static-detail receiver statistic {name} is misaligned"
+            )
+
+    groups = foliage.replacement_group.long()
+    detail_groups = torch.unique(
+        groups[foliage.static_leaf_mask & (groups >= 0)]
+    )
+    envelope = foliage.persistent_envelope_mask & (groups >= 0)
+    missing_detail = envelope
+    if len(detail_groups):
+        missing_detail &= ~torch.isin(groups, detail_groups)
+    verification = getattr(
+        foliage,
+        "verification_state",
+        torch.full_like(foliage.layer_role, VERIFICATION_VERIFIED),
+    )
+    contribution = stats["contribution"].float().clamp_min(0.0)
+    visible_supported = (
+        missing_detail
+        & (verification == VERIFICATION_VERIFIED)
+        & (foliage.support_view_count > 0)
+        & (foliage.support_camera_ids >= 0).any(dim=1)
+        & (contribution > 0)
+    )
+    rows = torch.nonzero(visible_supported, as_tuple=False).flatten()
+    base_audit.update(
+        {
+            "groups_with_any_static_detail": int(len(detail_groups)),
+            "missing_detail_envelope_rows": int(missing_detail.sum()),
+            "visible_evidence_supported_candidates": int(len(rows)),
+        }
+    )
+    if not len(rows):
+        return empty, base_audit
+
+    gradient = (
+        stats["gradient"].float()
+        / stats["gradient_count"].float().clamp_min(1.0)
+    ).clamp_min(0.0)
+    radius = stats["radius"].float().clamp_min(0.0)
+    rigid_fraction = (
+        stats["rigid"].float() / contribution.clamp_min(1.0e-8)
+    ).clamp(0.0, 1.0)
+    occupancy = foliage.occupancy_probability.float().clamp(0.0, 1.0)
+    score = (
+        torch.log1p(1_000.0 * gradient)
+        + 0.35 * torch.log1p(radius)
+        + 0.10 * torch.log1p(contribution)
+        + 0.25 * occupancy
+        + 0.25 * (1.0 - rigid_fraction)
+    )
+    # A replacement group is the physical coverage cell.  Retain its best
+    # currently observed envelope row, then apply tree/spatial fairness across
+    # groups.  This closes the historical failure mode where 300k detail rows
+    # accumulated inside only ~14k groups.
+    local_rank = _within_group_rank(groups[rows], score[rows])
+    representatives = rows[local_rank == 0]
+    selected = _balanced_instance_topk(
+        representatives,
+        score,
+        foliage.tree_instance_id,
+        min(maximum_receivers, len(representatives)),
+        xyz=foliage.xyz,
+        spatial_cell_size=0.30,
+        lineage_family_id=groups,
+    )
+    selected_score = score[selected]
+    base_audit.update(
+        {
+            "unique_candidate_groups": int(len(representatives)),
+            "selected": int(len(selected)),
+            "score_minimum": float(selected_score.min()),
+            "score_median": float(selected_score.median()),
+            "score_maximum": float(selected_score.max()),
+        }
+    )
+    return selected, base_audit
 
 
 def _adapt_volume(
@@ -14085,6 +14299,31 @@ def main():
                 "same_global_budget_reallocated_not_added"
             ),
         },
+        "static_detail_receiver_materialization": {
+            "contract": (
+                "one_visible_evidence_supported_receiver_per_missing_"
+                "replacement_group"
+            ),
+            "maximum_per_event": int(
+                args.maximum_static_detail_materializations_per_event
+            ),
+            "initial_optical_mass_fraction": float(
+                args.static_detail_materialization_mass_fraction
+            ),
+            "birth_forward_contract": (
+                "co_located_same_covariance_same_color_tau_partition"
+            ),
+            "integrated_optical_mass_conserved": True,
+            "existing_detail_group_repeat_forbidden": True,
+            "selection": (
+                "continuous_real_render_residual_footprint_rigidity_"
+                "occupancy_priority_with_tree_spatial_fairness"
+            ),
+            "capacity_order": (
+                "missing_group_receiver_before_strict_ray_birth_and_"
+                "ordinary_detail_split"
+            ),
+        },
         "static_detail_canonical_ownership": {
             "enabled": bool(args.static_detail_canonical_ownership),
             "forward_visibility": "unconditional_static",
@@ -14846,6 +15085,11 @@ def main():
             trainer_repair = _trainer_repair_hash_change_is_allowed(
                 changed,
                 enabled=bool(args.allow_trainer_repair_resume),
+                allow_hybrid_renderer_topology_extension=bool(
+                    args.allow_trainer_repair_resume
+                    and PROTOCOL
+                    == "cambridge_native_hybrid_teacher_v83_spatial_detail_receivers"
+                ),
             )
             static_detail_isolated_repair = (
                 args.allow_static_detail_isolated_repair_resume
@@ -18455,6 +18699,79 @@ def main():
             and (step + 1) % args.volume_densify_every == 0
             and len(foliage)
         ):
+            # First create a local high-frequency receiver in every observed
+            # envelope cell that has none.  This is an exact optical-depth
+            # factorization (same centre/covariance/colour), so it cannot
+            # create a birth-time hole, fog layer or brightness jump.  It is
+            # deliberately scheduled before ordinary detail splits: otherwise
+            # the same ~14k represented groups repeatedly consume capacity
+            # while the remaining crown stays envelope-only forever.
+            receiver_audit = {
+                "contract": "inactive_outside_static_detail_stage",
+                "selected": 0,
+                "materialized": 0,
+            }
+            if (
+                args.reconstruction_target == "static"
+                and _static_detail_stage_trainable(phase)
+                and args.maximum_static_detail_materializations_per_event > 0
+            ):
+                receiver_parents, receiver_selection = (
+                    _select_missing_static_detail_receiver_parents(
+                        foliage,
+                        volume_stats,
+                        min(
+                            int(
+                                args.maximum_static_detail_materializations_per_event
+                            ),
+                            max(int(volume_budget) - len(foliage), 0),
+                        ),
+                    )
+                )
+                receiver_event = (
+                    foliage.materialize_static_detail_receivers(
+                        receiver_parents,
+                        optical_mass_fraction=(
+                            args.static_detail_materialization_mass_fraction
+                        ),
+                        birth_iteration=step + 1,
+                    )
+                )
+                receiver_mapping = receiver_event.pop("_new_to_old")
+                receiver_start = int(receiver_event.pop("_new_start"))
+                changed_parent_rows = receiver_event.pop("_parent_rows")
+                if receiver_event["materialized"]:
+                    volume_optimizer = _migrate_volume_optimizer(
+                        args,
+                        foliage,
+                        appearance,
+                        sky,
+                        volume_optimizer,
+                        receiver_mapping,
+                    )
+                    _zero_new_volume_optimizer_rows(
+                        volume_optimizer, receiver_start
+                    )
+                    _zero_volume_opacity_optimizer_rows(
+                        volume_optimizer, changed_parent_rows
+                    )
+                    volume_stats = _extend_volume_stats_for_births(
+                        volume_stats, len(foliage)
+                    )
+                receiver_audit = {
+                    **receiver_selection,
+                    **receiver_event,
+                    "configured_limit": int(
+                        args.maximum_static_detail_materializations_per_event
+                    ),
+                    "optical_mass_fraction": float(
+                        args.static_detail_materialization_mass_fraction
+                    ),
+                    "capacity_contract": (
+                        "global_volume_budget_before_ray_birth_and_ordinary_"
+                        "split"
+                    ),
+                }
             # Allocate newly confirmed uncovered rays before ordinary
             # residual/footprint splits.  The old order let existing broad
             # envelope lineages fill the global budget first and then called
@@ -18590,15 +18907,27 @@ def main():
                     volume_stats = _extend_volume_stats_for_births(
                         volume_stats, len(foliage)
                     )
+            configured_topology_scale = _volume_topology_ramp_scale(
+                step, args
+            )
+            receiver_growth = int(receiver_audit.get("materialized", 0))
+            remaining_event_growth = max(
+                int(args.maximum_volume_splits) - receiver_growth, 0
+            )
+            ordinary_topology_scale = min(
+                configured_topology_scale,
+                (
+                    remaining_event_growth
+                    / max(int(args.maximum_volume_splits), 1)
+                ),
+            )
             event = _adapt_volume(
                 args,
                 foliage,
                 volume_stats,
                 volume_budget=volume_budget,
                 phase=phase,
-                split_capacity_scale=_volume_topology_ramp_scale(
-                    step, args
-                ),
+                split_capacity_scale=ordinary_topology_scale,
                 camera_forward_lookup=camera_forward_lookup,
                 view_by_camera_id=view_by_camera_id,
                 geometry_evidence=geometry,
@@ -18630,6 +18959,17 @@ def main():
                         volume_optimizer, rollback_new_rows
                     )
             if args.reconstruction_target == "static":
+                event["static_detail_receiver_materialization"] = (
+                    {
+                        **receiver_audit,
+                        "remaining_ordinary_growth_limit": int(
+                            remaining_event_growth
+                        ),
+                        "ordinary_topology_scale_after_receiver": float(
+                            ordinary_topology_scale
+                        ),
+                    }
+                )
                 event["ray_driven_birth"] = {
                     **birth_audit,
                     **birth_event,
