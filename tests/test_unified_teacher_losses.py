@@ -97,6 +97,8 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_positive_evidence_sequence_gate,
     _static_detail_same_sequence_appearance_gate,
     _static_detail_same_sequence_optical_gate,
+    _static_detail_optical_regularizer_weight,
+    _static_detail_cleanup_gradient_gates,
     _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
     _static_spatial_uncertainty_active,
@@ -118,6 +120,7 @@ from scripts.train_unified_outdoor_teacher import (
     _volume_topology_authority,
     _verification_debt_capacity_scale,
     _update_volume_learning_rates,
+    _zero_volume_opacity_optimizer_rows,
     _write_rigid_stage_surface_handoff,
 )
 from outdoor.hybrid_gaussian_renderer import (
@@ -1351,6 +1354,83 @@ def test_static_detail_optical_owner_uses_positive_evidence_sequences():
         ),
         torch.tensor([False, False, False, True, False]),
     )
+
+
+def test_static_detail_direct_optical_priors_use_same_camera_permission():
+    class Foliage:
+        xyz = torch.zeros(5, 3)
+        static_leaf_mask = torch.tensor([False, True, True, True, False])
+        opacities = torch.full((5,), 0.5)
+
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = Foliage()
+    base = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5])
+    optical = torch.tensor([1.0, 1.0, 0.35, 0.0, 1.0])
+
+    routed = _static_detail_optical_regularizer_weight(
+        foliage, base, optical
+    )
+
+    torch.testing.assert_close(
+        routed, torch.tensor([0.9, 0.8, 0.245, 0.0, 0.5])
+    )
+    # The helper must not mutate the base posterior tensor reused by audits.
+    torch.testing.assert_close(base, torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5]))
+
+
+def test_static_detail_cleanup_uses_strict_geometry_and_soft_optical_gates():
+    class Foliage:
+        xyz = torch.zeros(5, 3)
+        static_leaf_mask = torch.tensor([False, True, True, True, False])
+        opacities = torch.full((5,), 0.5)
+
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = Foliage()
+    geometry = torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0])
+    optical = torch.tensor([1.0, 1.0, 0.35, 0.0, 1.0])
+
+    geometry_gate, appearance_gate, opacity_gate = (
+        _static_detail_cleanup_gradient_gates(
+            foliage, geometry, optical
+        )
+    )
+
+    torch.testing.assert_close(
+        geometry_gate, torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(appearance_gate, torch.zeros(5))
+    torch.testing.assert_close(
+        opacity_gate, torch.tensor([0.0, 1.0, 0.35, 0.0, 0.0])
+    )
+
+
+def test_v83_repair_clears_only_static_detail_opacity_adam_rows():
+    opacity = torch.nn.Parameter(torch.zeros(4, 1))
+    optimizer = torch.optim.Adam(
+        [{"params": [opacity], "name": "opacity"}], lr=1.0e-3
+    )
+    optimizer.state[opacity] = {
+        "step": torch.tensor(17.0),
+        "exp_avg": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+        "exp_avg_sq": torch.tensor([[5.0], [6.0], [7.0], [8.0]]),
+    }
+
+    _zero_volume_opacity_optimizer_rows(
+        optimizer, torch.tensor([1, 3])
+    )
+
+    state = optimizer.state[opacity]
+    torch.testing.assert_close(
+        state["exp_avg"], torch.tensor([[1.0], [0.0], [3.0], [0.0]])
+    )
+    torch.testing.assert_close(
+        state["exp_avg_sq"], torch.tensor([[5.0], [0.0], [7.0], [0.0]])
+    )
+    assert float(state["step"]) == 17.0
 
 
 def test_static_canonical_ownership_resume_migrates_only_new_contract():
