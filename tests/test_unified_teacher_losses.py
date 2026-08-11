@@ -104,6 +104,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_ray_hit_opacity_gradient_scale,
     _static_detail_isolated_gradient_gates,
     _static_detail_evidence_sequence_view_indices,
+    _static_replacement_evidence_view_indices,
     _static_volume_isolated_gradient_gates,
     _static_volume_intrinsic_color_inputs,
     _static_stage_rgb_gradient_gates,
@@ -477,6 +478,55 @@ def test_trainer_repair_migrates_only_exact_v86_optical_ownership_contract():
     unsafe["static_ray_local_mass_handoff"]["authority_contract"] = "other"
     assert _resume_training_contract_differences(
         unsafe, current, allow_trainer_repair_migration=True
+    )
+
+
+def test_trainer_repair_migrates_only_exact_v87_handoff_schedule_contract():
+    old_candidate = (
+        "verified_same_group_positive_evidence_sequence__seed_camera_table_"
+        "is_not_complete_visibility__primitive_center_cannot_veto_pixel_ray_"
+        "evidence"
+    )
+    new_candidate = (
+        "verified_same_group_real_support_or_verified_camera__only_groups_"
+        "with_live_verified_envelope__primitive_center_cannot_veto_pixel_"
+        "ray_evidence"
+    )
+    schedule_contract = (
+        "uniform_complete_epochs_over_real_support_or_verified_cameras_for_"
+        "verified_detail_with_live_verified_envelope_group"
+    )
+    saved = {
+        "reconstruction_target": "static",
+        "sampling_schedule_sha256": "old",
+        "static_ray_local_mass_handoff": {
+            "evidence_every": 50,
+            "candidate_contract": old_candidate,
+            "audit_camera_schedule": "broad_sequence_cycle",
+        },
+    }
+    current = {
+        "reconstruction_target": "static",
+        "sampling_schedule_sha256": "new",
+        "static_ray_local_mass_handoff": {
+            "evidence_every": 10,
+            "candidate_contract": new_candidate,
+            "audit_camera_schedule": {"contract": schedule_contract},
+        },
+    }
+    assert _resume_training_contract_differences(saved, current)
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
+    unsafe = json.loads(json.dumps(saved))
+    unsafe["static_ray_local_mass_handoff"]["candidate_contract"] = "other"
+    assert _resume_training_contract_differences(
+        unsafe, current, allow_trainer_repair_migration=True
+    )
+    wrong_cadence = json.loads(json.dumps(current))
+    wrong_cadence["static_ray_local_mass_handoff"]["evidence_every"] = 11
+    assert _resume_training_contract_differences(
+        saved, wrong_cadence, allow_trainer_repair_migration=True
     )
 
 
@@ -3414,6 +3464,31 @@ def test_static_color_schedule_repair_replaces_only_color_streams():
         np.testing.assert_array_equal(restored[name], saved[name])
 
 
+def test_static_replacement_schedule_repair_preserves_other_streams():
+    saved = {
+        "rgb": np.arange(8, dtype=np.int64),
+        "static_detail": np.arange(8, dtype=np.int64) + 10,
+    }
+    computed = {
+        **{name: value + 1 for name, value in saved.items()},
+        "static_replacement": np.arange(8, dtype=np.int64) + 20,
+    }
+    restored, preserved = _restore_resume_camera_schedules(
+        computed,
+        {"schedules": saved},
+        horizon=8,
+        allow_static_replacement_repair=True,
+    )
+    assert preserved == frozenset(saved)
+    np.testing.assert_array_equal(restored["rgb"], saved["rgb"])
+    np.testing.assert_array_equal(
+        restored["static_detail"], saved["static_detail"]
+    )
+    np.testing.assert_array_equal(
+        restored["static_replacement"], computed["static_replacement"]
+    )
+
+
 def test_resume_camera_schedule_rejects_wrong_horizon():
     with pytest.raises(RuntimeError, match="fixed horizon"):
         _restore_resume_camera_schedules(
@@ -6144,6 +6219,45 @@ def test_static_detail_color_schedule_expands_positive_evidence_sequences():
     # scheduled. Unverified, single-camera and non-detail rows add nothing.
     assert indices == [1, 2, 3, 4]
     assert sequences == {0, 1}
+
+
+def test_static_replacement_schedule_uses_only_paired_real_evidence_cameras():
+    class View:
+        def __init__(self, camera_id):
+            self.colmap_id = camera_id
+
+    class Foliage:
+        replacement_group = torch.tensor([7, 8, 7, 8, 9, -1])
+        persistent_envelope_mask = torch.tensor(
+            [True, True, False, False, False, False]
+        )
+        static_leaf_mask = torch.tensor(
+            [False, False, True, True, True, True]
+        )
+        verification_state = torch.tensor(
+            [1, 0, 1, 1, 1, 1], dtype=torch.int8
+        )
+        verified_camera_count = torch.tensor([0, 0, 2, 2, 2, 2])
+        verified_sequence_count = torch.tensor([0, 0, 2, 2, 2, 2])
+        support_camera_ids = torch.tensor(
+            [[-1], [-1], [1], [2], [3], [4]]
+        )
+        verified_camera_ids = torch.tensor(
+            [[-1], [-1], [5], [5], [5], [5]]
+        )
+
+    indices, camera_ids, paired_rows = (
+        _static_replacement_evidence_view_indices(
+            [View(value) for value in range(6)],
+            Foliage(),
+            [0, 1, 2, 3, 4, 5],
+        )
+    )
+    # Only group 7 has a verified envelope. Group 8's envelope is
+    # unverified, group 9 has no envelope, and the final detail is ownerless.
+    assert paired_rows == 1
+    assert camera_ids == {1, 5}
+    assert indices == [1, 5]
 
 
 def test_static_volume_intrinsic_color_normalizes_low_alpha_once():

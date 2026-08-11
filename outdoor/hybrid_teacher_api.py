@@ -135,6 +135,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v85_sequence_intrinsic_color_coverage",
     "cambridge_native_hybrid_teacher_v86_sequence_geometry_optical_handoff",
     "cambridge_native_hybrid_teacher_v87_static_optical_ownership_calibration",
+    "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule",
     "unified_outdoor_mixed_teacher_v1",
 }
 

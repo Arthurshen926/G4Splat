@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v87_static_optical_ownership_calibration"
+    "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -1082,7 +1082,7 @@ def _parse_args():
     parser.add_argument(
         "--static-replacement-evidence-every",
         type=int,
-        default=50,
+        default=10,
         help=(
             "Cadence for envelope-only/detail-only real-pixel replacement "
             "responsibility audits. Zero disables hand-off evidence."
@@ -4325,6 +4325,69 @@ def _static_detail_evidence_sequence_view_indices(
     return sorted(set(expanded)), evidence_sequences
 
 
+def _static_replacement_evidence_view_indices(
+    views,
+    foliage,
+    canopy_view_indices: list[int],
+) -> tuple[list[int], set[int], int]:
+    """Return real cameras that can measure a paired optical handoff.
+
+    The colour stream deliberately visits every canopy camera in a positive-
+    evidence *sequence*.  Replacement is different: it is a per-group
+    optical-mass transaction and is meaningful only in a camera that supplied
+    positive evidence for verified detail whose group still has a verified
+    envelope owner.  Reusing the colour schedule made almost every audit a
+    no-candidate render and left the handoff lifecycle effectively disabled.
+    """
+    groups = foliage.replacement_group.long()
+    valid_group = groups >= 0
+    verified_envelope = (
+        foliage.persistent_envelope_mask
+        & (foliage.verification_state == VERIFICATION_VERIFIED)
+        & valid_group
+    )
+    verified_detail = (
+        foliage.static_leaf_mask
+        & (foliage.verification_state == VERIFICATION_VERIFIED)
+        & (foliage.verified_camera_count >= 2)
+        & (foliage.verified_sequence_count >= 1)
+        & valid_group
+    )
+    paired_detail = torch.zeros_like(verified_detail)
+    if bool(verified_envelope.any()) and bool(verified_detail.any()):
+        maximum_group = int(groups[valid_group].max())
+        group_has_envelope = torch.zeros(
+            maximum_group + 1,
+            dtype=torch.bool,
+            device=groups.device,
+        )
+        group_has_envelope[groups[verified_envelope]] = True
+        paired_detail[verified_detail] = group_has_envelope[
+            groups[verified_detail]
+        ]
+
+    camera_ids: set[int] = set()
+    if bool(paired_detail.any()):
+        for name in ("support_camera_ids", "verified_camera_ids"):
+            table = getattr(foliage, name, None)
+            if not torch.is_tensor(table) or table.ndim != 2:
+                continue
+            camera_ids.update(
+                int(value)
+                for value in torch.unique(
+                    table[paired_detail].detach().cpu()
+                ).tolist()
+                if int(value) >= 0
+            )
+    canopy = set(int(index) for index in canopy_view_indices)
+    indices = sorted(
+        int(index)
+        for index, view in enumerate(views)
+        if index in canopy and int(view.colmap_id) in camera_ids
+    )
+    return indices, camera_ids, int(paired_detail.sum())
+
+
 def _restore_resume_camera_schedules(
     computed: dict[str, np.ndarray],
     resume: dict | None,
@@ -4332,6 +4395,7 @@ def _restore_resume_camera_schedules(
     horizon: int,
     allow_conditioned_repair: bool = False,
     allow_static_color_repair: bool = False,
+    allow_static_replacement_repair: bool = False,
 ) -> tuple[dict[str, np.ndarray], frozenset[str]]:
     """Restore immutable checkpoint schedules before hashing/consumption.
 
@@ -4358,6 +4422,8 @@ def _restore_resume_camera_schedules(
     if allow_static_color_repair:
         preserved.discard("static_detail")
         preserved.discard("static_volume")
+    if allow_static_replacement_repair:
+        preserved.discard("static_replacement")
     expected_shape = (int(horizon),)
     for name in sorted(preserved):
         if name not in saved:
@@ -4698,6 +4764,45 @@ def _resume_training_contract_differences(
             ):
                 if key in current:
                     saved[key] = current[key]
+        # v87 fixed the competing opacity derivatives but accidentally drove
+        # persistent handoff with the broad colour schedule.  Most selected
+        # cameras shared an acquisition sequence with detail yet were not a
+        # real support/verification witness for the paired group, so the
+        # native role audit almost always had zero candidates.  v88 changes
+        # only that read-only audit schedule; model/optimizer tensors, RGB,
+        # geometry, topology and colour schedules remain unchanged.
+        saved_handoff = saved.get("static_ray_local_mass_handoff")
+        current_handoff = current.get("static_ray_local_mass_handoff")
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_handoff, dict)
+            and isinstance(current_handoff, dict)
+            and int(saved_handoff.get("evidence_every", -1)) == 50
+            and int(current_handoff.get("evidence_every", -1)) == 10
+            and saved_handoff.get("candidate_contract")
+            == (
+                "verified_same_group_positive_evidence_sequence__seed_"
+                "camera_table_is_not_complete_visibility__primitive_center_"
+                "cannot_veto_pixel_ray_evidence"
+            )
+            and current_handoff.get("candidate_contract")
+            == (
+                "verified_same_group_real_support_or_verified_camera__"
+                "only_groups_with_live_verified_envelope__primitive_center_"
+                "cannot_veto_pixel_ray_evidence"
+            )
+            and isinstance(current_handoff.get("audit_camera_schedule"), dict)
+            and current_handoff["audit_camera_schedule"].get("contract")
+            == (
+                "uniform_complete_epochs_over_real_support_or_verified_"
+                "cameras_for_verified_detail_with_live_verified_envelope_group"
+            )
+        ):
+            saved["static_ray_local_mass_handoff"] = current_handoff
+            saved["sampling_schedule_sha256"] = current[
+                "sampling_schedule_sha256"
+            ]
         # v83 materialized detail receivers, but positive opacity/ray
         # permission remained exact-camera sparse while negative free-space
         # cleanup remained all-camera global.  That asymmetric evidence
@@ -14577,6 +14682,48 @@ def main():
         ),
         "schedule_sha256": _schedule_digest(static_detail_schedule),
     }
+    (
+        static_replacement_view_indices,
+        static_replacement_camera_ids,
+        static_replacement_paired_detail_rows,
+    ) = _static_replacement_evidence_view_indices(
+        views,
+        foliage,
+        all_canopy_view_indices,
+    )
+    static_replacement_schedule = (
+        _cycle_schedule(
+            static_replacement_view_indices,
+            args.phase_schedule_horizon,
+            args.seed + 6,
+        )
+        if static_replacement_view_indices
+        else np.full(args.phase_schedule_horizon, -1, dtype=np.int64)
+    )
+    static_replacement_schedule_audit = {
+        "contract": (
+            "uniform_complete_epochs_over_real_support_or_verified_"
+            "cameras_for_verified_detail_with_live_verified_envelope_group"
+        ),
+        "camera_count": int(len(static_replacement_view_indices)),
+        "positive_evidence_camera_count": int(
+            len(static_replacement_camera_ids)
+        ),
+        "paired_detail_row_count": int(
+            static_replacement_paired_detail_rows
+        ),
+        "schedule_sha256": _schedule_digest(static_replacement_schedule),
+        "scheduled_event_count": int(
+            args.phase_schedule_horizon
+            // max(int(args.static_replacement_evidence_every), 1)
+        ),
+        "complete_camera_epoch_capacity": bool(
+            len(static_replacement_view_indices) > 0
+            and args.phase_schedule_horizon
+            // max(int(args.static_replacement_evidence_every), 1)
+            >= len(static_replacement_view_indices)
+        ),
+    }
     multiview_role_stems = (
         {
             Path(name).stem
@@ -14822,6 +14969,18 @@ def main():
         and PROTOCOL
         == "cambridge_native_hybrid_teacher_v85_sequence_intrinsic_color_coverage"
     )
+    static_replacement_schedule_repair = bool(
+        resume is not None
+        and args.allow_trainer_repair_resume
+        and args.reconstruction_target == "static"
+        and resume.get("protocol")
+        == (
+            "cambridge_native_hybrid_teacher_v87_static_optical_"
+            "ownership_calibration"
+        )
+        and PROTOCOL
+        == "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule"
+    )
     camera_schedules, restored_schedule_names = (
         _restore_resume_camera_schedules(
             {
@@ -14830,6 +14989,7 @@ def main():
                 "geometry": geometry_schedule,
                 "topology": topology_schedule,
                 "static_detail": static_detail_schedule,
+                "static_replacement": static_replacement_schedule,
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
             },
@@ -14839,6 +14999,9 @@ def main():
                 args.allow_conditioned_schedule_repair_resume
             ),
             allow_static_color_repair=static_color_schedule_repair,
+            allow_static_replacement_repair=(
+                static_replacement_schedule_repair
+            ),
         )
     )
     rgb_schedule = camera_schedules["rgb"]
@@ -14846,6 +15009,7 @@ def main():
     geometry_schedule = camera_schedules["geometry"]
     topology_schedule = camera_schedules["topology"]
     static_detail_schedule = camera_schedules["static_detail"]
+    static_replacement_schedule = camera_schedules["static_replacement"]
     static_skeleton_schedule = camera_schedules["static_skeleton"]
     static_volume_schedule = camera_schedules["static_volume"]
     if resume is not None:
@@ -14880,6 +15044,7 @@ def main():
         geometry_schedule,
         topology_schedule,
         static_detail_schedule,
+        static_replacement_schedule,
         static_skeleton_schedule,
         static_volume_schedule,
     )
@@ -14930,14 +15095,11 @@ def main():
                 args.static_replacement_mass_fraction_per_event
             ),
             "candidate_contract": (
-                "verified_same_group_positive_evidence_sequence__seed_"
-                "camera_table_is_not_complete_visibility__primitive_center_"
+                "verified_same_group_real_support_or_verified_camera__"
+                "only_groups_with_live_verified_envelope__primitive_center_"
                 "cannot_veto_pixel_ray_evidence"
             ),
-            "audit_camera_schedule": (
-                "complete_cycle_over_verified_detail_positive_evidence_"
-                "sequence_cameras"
-            ),
+            "audit_camera_schedule": static_replacement_schedule_audit,
             "authority_contract": (
                 "native_t_before_alpha_pixel_coverage_depth_rigid_safe_"
                 "distinct_view_static_persistence_expected_coverage_ema"
@@ -16253,6 +16415,7 @@ def main():
             "geometry": geometry_schedule,
             "topology": topology_schedule,
             "static_detail": static_detail_schedule,
+            "static_replacement": static_replacement_schedule,
             "static_skeleton": static_skeleton_schedule,
             "static_volume": static_volume_schedule,
         }
@@ -16271,8 +16434,8 @@ def main():
             )
         if args.allow_trainer_repair_resume:
             print(
-                "Resuming with repaired static-detail colour camera "
-                "schedules; every unrelated schedule is identical."
+                "Resuming with an explicitly repaired static optical/colour "
+                "camera schedule; every unrelated schedule is identical."
             )
         else:
             print(
@@ -18447,7 +18610,7 @@ def main():
             # render, and the role-isolated audit remains read-only.
             replacement_view = views[
                 int(
-                    static_detail_schedule[
+                    static_replacement_schedule[
                         _periodic_schedule_index(
                             step,
                             args.static_replacement_evidence_every,
@@ -20566,6 +20729,7 @@ def main():
                         "geometry": geometry_schedule,
                         "topology": topology_schedule,
                         "static_detail": static_detail_schedule,
+                        "static_replacement": static_replacement_schedule,
                         "static_skeleton": static_skeleton_schedule,
                         "static_volume": static_volume_schedule,
                     },
@@ -20906,6 +21070,7 @@ def main():
                 "geometry": geometry_schedule,
                 "topology": topology_schedule,
                 "static_detail": static_detail_schedule,
+                "static_replacement": static_replacement_schedule,
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
             },
