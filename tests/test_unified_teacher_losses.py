@@ -15,9 +15,14 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT,
     STATIC_DETAIL_ISOLATED_CONTRACT,
     STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT,
+    STATIC_DETAIL_ISOLATED_V85_PREDECESSOR_CONTRACT,
+    STATIC_STAGE_RGB_ROLE_CONTRACT,
+    STATIC_STAGE_RGB_ROLE_V85_PREDECESSOR_CONTRACT,
     STATIC_VOLUME_ISOLATED_CONTRACT,
     STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT,
+    STATIC_VOLUME_ISOLATED_V85_PREDECESSOR_CONTRACT,
     STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR,
+    STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT,
     PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
     STATIC_OPTICAL_POLICY_CONTRACT,
@@ -103,6 +108,7 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_positive_evidence_sequence_gate,
     _static_detail_same_sequence_appearance_gate,
     _static_detail_same_sequence_optical_gate,
+    _static_detail_same_sequence_geometry_gate,
     _static_detail_optical_regularizer_weight,
     _static_detail_cleanup_gradient_gates,
     _static_detail_consensus_hit_gate,
@@ -1655,6 +1661,78 @@ def test_trainer_repair_migrates_v84_static_intrinsic_color_coverage():
     assert _resume_training_contract_differences(
         saved, unsafe, allow_trainer_repair_migration=True
     ) == expected
+
+
+def test_trainer_repair_migrates_v85_geometry_and_handoff_ownership():
+    old_candidate = (
+        "verified_same_group_exact_support_camera__primitive_center_"
+        "cannot_veto_pixel_ray_evidence"
+    )
+    new_candidate = (
+        "verified_same_group_positive_evidence_sequence__seed_camera_table_"
+        "is_not_complete_visibility__primitive_center_cannot_veto_pixel_"
+        "ray_evidence"
+    )
+    saved = {
+        "reconstruction_target": "static",
+        "static_training_stages": {
+            "rgb_role_contract": STATIC_STAGE_RGB_ROLE_V85_PREDECESSOR_CONTRACT
+        },
+        "static_detail_isolated_supervision": {
+            "contract": STATIC_DETAIL_ISOLATED_V85_PREDECESSOR_CONTRACT,
+            "every": 2,
+            "weight": 1.0,
+        },
+        "static_volume_isolated_supervision": {
+            "contract": STATIC_VOLUME_ISOLATED_V85_PREDECESSOR_CONTRACT,
+            "every": 4,
+            "weight": 0.75,
+        },
+        "static_detail_canonical_ownership": {
+            "geometry_topology_owner": (
+                "persisted_exact_support_cameras_and_verified_multiview"
+            )
+        },
+        "static_ray_local_mass_handoff": {
+            "candidate_contract": old_candidate
+        },
+        "static_detail_global_cleanup": {"contract": "v85"},
+        "parameter_loss_permission_matrix": {"static_leaf_sh": ["v85"]},
+    }
+    current = {
+        **saved,
+        "static_training_stages": {
+            "rgb_role_contract": STATIC_STAGE_RGB_ROLE_CONTRACT
+        },
+        "static_detail_isolated_supervision": {
+            "contract": STATIC_DETAIL_ISOLATED_CONTRACT,
+            "every": 2,
+            "weight": 1.0,
+        },
+        "static_volume_isolated_supervision": {
+            "contract": STATIC_VOLUME_ISOLATED_CONTRACT,
+            "every": 4,
+            "weight": 0.75,
+        },
+        "static_detail_canonical_ownership": {
+            "geometry_topology_owner": (
+                "verified_exact_support_plus_positive_evidence_sequence_"
+                "soft_geometry__topology_exact_support_only"
+            ),
+            "same_sequence_geometry_weight": (
+                STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT
+            ),
+        },
+        "static_ray_local_mass_handoff": {
+            "candidate_contract": new_candidate
+        },
+        "static_detail_global_cleanup": {"contract": "v86"},
+        "parameter_loss_permission_matrix": {"static_leaf_sh": ["v86"]},
+    }
+    assert _resume_training_contract_differences(saved, current)
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
 
 
 def test_trainer_repair_migrates_persistent_envelope_cleanup_contract():
@@ -5769,15 +5847,44 @@ def test_static_detail_ray_prefit_starts_in_bootstrap():
     assert not _static_detail_ray_trainable("canonical_polish")
 
 
-def test_static_detail_isolated_positive_rgb_parameters_are_support_owned():
+def test_static_detail_isolated_routes_geometry_but_not_sh_or_opacity():
     ownership = torch.tensor([1.0, 0.0, 1.0])
     appearance_permission = torch.tensor([1.0, 0.35, 1.0])
     geometry, appearance, opacity = _static_detail_isolated_gradient_gates(
         ownership, appearance_permission
     )
     assert geometry is ownership
-    assert appearance is appearance_permission
+    torch.testing.assert_close(appearance, torch.zeros_like(ownership))
     torch.testing.assert_close(opacity, torch.zeros_like(ownership))
+
+
+def test_static_detail_positive_sequence_gets_soft_geometry_not_topology():
+    class Foliage:
+        xyz = torch.zeros(3, 3)
+        static_leaf_mask = torch.ones(3, dtype=torch.bool)
+        support_camera_ids = torch.tensor([[0, -1], [1, -1], [2, -1]])
+        verified_camera_ids = torch.tensor([[3, -1], [4, -1], [5, -1]])
+        verification_state = torch.tensor(
+            [VERIFICATION_VERIFIED] * 3, dtype=torch.int8
+        )
+        verified_camera_count = torch.tensor([2, 2, 1], dtype=torch.int16)
+        verified_sequence_count = torch.ones(3, dtype=torch.int16)
+
+        def __len__(self):
+            return 3
+
+    # Cameras 0/1/3/4 are sequence 0; cameras 2/5 are sequence 1.
+    sequence_lookup = torch.tensor([0, 0, 1, 0, 0, 1], dtype=torch.int16)
+    exact = torch.tensor([1.0, 0.0, 0.0])
+    geometry = _static_detail_same_sequence_geometry_gate(
+        Foliage(), 1, sequence_lookup, exact
+    )
+    torch.testing.assert_close(
+        geometry,
+        torch.tensor(
+            [1.0, STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT, 0.0]
+        ),
+    )
 
 
 def test_static_volume_isolated_only_refines_verified_exact_detail():
@@ -6636,8 +6743,8 @@ def test_static_global_cleanup_routes_only_negative_geometry_optical_signal():
     assert audit["contract"] == STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
     assert audit["rigid_free_supported_pixels"] == 4
     assert audit["gradient_permissions"] == {
-        "static_detail_xyz_scale_rotation": True,
-        "static_detail_optical_mass": True,
+        "verified_exact_static_detail_xyz_scale_rotation": True,
+        "positive_evidence_sequence_static_detail_optical_mass": True,
         "static_detail_sh": False,
         "surface_sky_uncertainty": False,
         "topology_statistics": False,
