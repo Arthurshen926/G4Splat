@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v83_spatial_detail_receivers"
+    "cambridge_native_hybrid_teacher_v84_symmetric_sequence_optical_ownership"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -136,7 +136,7 @@ STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT = (
     "support_owned_static_detail_rgb_geometry__verified_cross_sequence_"
     "consensus_static_detail_optical_mass"
 )
-STATIC_STAGE_RGB_ROLE_CONTRACT = (
+STATIC_STAGE_RGB_ROLE_V83_PREDECESSOR_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_dc_only_no_positive_"
     "mass_growth__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
@@ -144,6 +144,16 @@ STATIC_STAGE_RGB_ROLE_CONTRACT = (
     "sequence_static_detail_sh__verified_"
     "multiview_only_high_bandwidth_refinement__verified_cross_"
     "sequence_consensus_static_detail_ray_optical_mass"
+)
+STATIC_STAGE_RGB_ROLE_CONTRACT = (
+    "stage2_envelope_rgb_geometry_mass__stage3_envelope_dc_only_no_positive_"
+    "mass_growth__ray_interval_and_global_counterfactual_retain_envelope_"
+    "geometry_mass__exact_support_camera_owned_static_detail_geometry_and_"
+    "topology__positive_optical_mass_and_free_space_use_symmetric_real_"
+    "evidence_sequences__same_sequence_static_detail_sh_and_optical_mass_"
+    "use_continuous_weights__verified_multiview_only_high_bandwidth_"
+    "refinement__verified_cross_sequence_consensus_static_detail_ray_"
+    "optical_mass"
 )
 STATIC_DETAIL_GLOBAL_CLEANUP_APPEARANCE_PREDECESSOR_CONTRACT = (
     "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
@@ -153,13 +163,21 @@ STATIC_DETAIL_GLOBAL_CLEANUP_APPEARANCE_PREDECESSOR_CONTRACT = (
     "positive_ray_geometry_and_optical_mass__all_real_canopy_views_route_"
     "sh_appearance_only__cleanup_never_drives_topology"
 )
-STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
+STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT = (
     "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
     "rigid_free_space_and_surface_better_counterfactuals_only_to_static_"
     "detail_geometry_and_optical_mass__support_sequences_route_positive_"
     "rgb_geometry_optical_mass_sh_and_topology__verified_cross_sequence_"
     "consensus_routes_positive_ray_geometry_and_optical_mass__cleanup_"
     "never_drives_topology"
+)
+STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
+    "static_detail_is_unconditionally_visible__rigid_free_space_and_surface_"
+    "better_counterfactuals_route_only_from_persisted_positive_evidence_"
+    "sequences_to_static_detail_geometry_and_optical_mass__the_same_"
+    "evidence_sequences_route_positive_rgb_and_ray_optical_mass__exact_"
+    "support_cameras_retain_geometry_and_topology__verified_cross_sequence_"
+    "consensus_remains_a_positive_ray_owner__cleanup_never_drives_topology"
 )
 PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT = (
     "persistent_envelope_is_unconditionally_visible__all_calibrated_views_"
@@ -975,6 +993,19 @@ def _parse_args():
             "Geometry, opacity, ray ownership and topology remain exact-"
             "camera/verified-evidence owned. Set to zero for the former "
             "strict exact-camera appearance ablation."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-same-sequence-optical-weight",
+        type=float,
+        default=0.35,
+        help=(
+            "Continuous opacity/RGB permission for cameras in a persisted "
+            "positive-evidence sequence of a static-detail primitive. Exact "
+            "support cameras retain weight one; geometry and topology remain "
+            "exact-camera/verified owned. This closes the former asymmetry "
+            "where any camera could delete a leaf but only one seed camera "
+            "could restore its optical coverage."
         ),
     )
     parser.add_argument(
@@ -2005,6 +2036,11 @@ def _parse_args():
             "--static-detail-same-sequence-appearance-weight must be in "
             "[0, 1]"
         )
+    if not 0.0 <= args.static_detail_same_sequence_optical_weight <= 1.0:
+        raise ValueError(
+            "--static-detail-same-sequence-optical-weight must be in "
+            "[0, 1]"
+        )
     if args.static_detail_isolated_every < 0:
         parser.error("--static-detail-isolated-every must be >= 0")
     if args.static_detail_isolated_weight < 0:
@@ -2927,6 +2963,57 @@ def _static_detail_support_sequence_audit_gate(
     return gate & foliage.static_leaf_mask
 
 
+def _static_detail_positive_evidence_sequence_gate(
+    foliage,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+    *,
+    support_chunk_size: int = 65_536,
+) -> torch.Tensor:
+    """Return sequences with persisted positive evidence for each detail.
+
+    ``support_camera_ids`` identifies the appearance seed/owner snapshot,
+    while ``verified_camera_ids`` records later real-ray positive witnesses.
+    Both are positive evidence.  A camera in neither set's acquisition
+    sequence cannot authoritatively create *or delete* that leaf: seasonal
+    foliage absence is not calibrated free space for a different traversal.
+    Forward visibility remains unconditional; this gate only routes future
+    training gradients.
+    """
+    gate = torch.zeros(
+        len(foliage), device=foliage.xyz.device, dtype=torch.bool
+    )
+    if (
+        camera_sequence_lookup is None
+        or camera_id < 0
+        or camera_id >= len(camera_sequence_lookup)
+        or int(camera_sequence_lookup[camera_id]) < 0
+    ):
+        return gate
+    if int(support_chunk_size) <= 0:
+        raise ValueError("support_chunk_size must be positive")
+    tables = []
+    for name in ("support_camera_ids", "verified_camera_ids"):
+        table = getattr(foliage, name, None)
+        if torch.is_tensor(table) and table.ndim == 2 and table.numel():
+            tables.append(table)
+    if not tables:
+        return gate
+    current_sequence = camera_sequence_lookup[camera_id]
+    for start in range(0, len(foliage), int(support_chunk_size)):
+        stop = min(start + int(support_chunk_size), len(foliage))
+        matched = gate[start:stop]
+        for table in tables:
+            chunk = table[start:stop]
+            valid = (chunk >= 0) & (chunk < len(camera_sequence_lookup))
+            safe = chunk.clamp(0, len(camera_sequence_lookup) - 1).long()
+            matched |= (
+                valid & (camera_sequence_lookup[safe] == current_sequence)
+            ).any(dim=1)
+        gate[start:stop] = matched
+    return gate & foliage.static_leaf_mask
+
+
 def _static_detail_same_sequence_appearance_gate(
     foliage,
     camera_id: int,
@@ -2934,6 +3021,7 @@ def _static_detail_same_sequence_appearance_gate(
     exact_ownership_gate: torch.Tensor,
     *,
     fallback_weight: float,
+    positive_evidence_sequence_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Give stable neighbouring cameras soft colour ownership only.
 
@@ -2960,11 +3048,21 @@ def _static_detail_same_sequence_appearance_gate(
     appearance = exact.clone()
     if weight <= 0.0 or not bool(foliage.static_leaf_mask.any()):
         return appearance
-    same_sequence = _static_detail_support_sequence_audit_gate(
-        foliage,
-        int(camera_id),
-        camera_sequence_lookup,
+    same_sequence = (
+        _static_detail_positive_evidence_sequence_gate(
+            foliage,
+            int(camera_id),
+            camera_sequence_lookup,
+        )
+        if positive_evidence_sequence_gate is None
+        else torch.as_tensor(
+            positive_evidence_sequence_gate,
+            device=foliage.xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
     )
+    if len(same_sequence) != len(foliage):
+        raise ValueError("positive evidence sequence gate must align with foliage")
     fallback = (
         same_sequence
         & foliage.static_leaf_mask
@@ -2972,6 +3070,56 @@ def _static_detail_same_sequence_appearance_gate(
     )
     appearance[fallback] = weight
     return appearance
+
+
+def _static_detail_same_sequence_optical_gate(
+    foliage,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+    exact_ownership_gate: torch.Tensor,
+    *,
+    fallback_weight: float,
+    positive_evidence_sequence_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Route positive optical coverage symmetrically with leaf evidence.
+
+    Exact support cameras retain unit authority. Other cameras from a
+    persisted positive-evidence sequence receive a continuous opacity weight,
+    enough to restore multi-view crown coverage without granting them
+    geometry or topology ownership. Cameras from unrelated traversals receive
+    neither positive optical gradients nor negative cleanup authority.
+    """
+    weight = float(fallback_weight)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("same-sequence optical weight must be in [0, 1]")
+    exact = torch.as_tensor(
+        exact_ownership_gate,
+        device=foliage.xyz.device,
+        dtype=foliage.xyz.dtype,
+    ).reshape(-1)
+    if len(exact) != len(foliage):
+        raise ValueError("exact ownership gate must align with foliage")
+    optical = exact.clone()
+    if weight <= 0.0 or not bool(foliage.static_leaf_mask.any()):
+        return optical
+    same_sequence = (
+        _static_detail_positive_evidence_sequence_gate(
+            foliage,
+            int(camera_id),
+            camera_sequence_lookup,
+        )
+        if positive_evidence_sequence_gate is None
+        else torch.as_tensor(
+            positive_evidence_sequence_gate,
+            device=foliage.xyz.device,
+            dtype=torch.bool,
+        ).reshape(-1)
+    )
+    if len(same_sequence) != len(foliage):
+        raise ValueError("positive evidence sequence gate must align with foliage")
+    fallback = same_sequence & foliage.static_leaf_mask & (exact <= 0)
+    optical[fallback] = weight
+    return optical
 
 
 def _static_detail_consensus_hit_gate(foliage) -> torch.Tensor:
@@ -4332,6 +4480,54 @@ def _resume_training_contract_differences(
                 "static_training_stages",
                 "static_detail_isolated_supervision",
                 "static_volume_isolated_supervision",
+                "static_detail_canonical_ownership",
+                "parameter_loss_permission_matrix",
+            ):
+                if key in current:
+                    saved[key] = current[key]
+        # v83 materialized detail receivers, but positive opacity/ray
+        # permission remained exact-camera sparse while negative free-space
+        # cleanup remained all-camera global.  That asymmetric evidence
+        # contract necessarily drives seasonal foliage toward transparency.
+        # v84 changes only future gradient routing: checkpoint tensors,
+        # optimizer moments, schedules, evidence tables and CUDA image
+        # formation remain identical at the resume boundary.
+        saved_ownership = saved.get("static_detail_canonical_ownership")
+        current_ownership = current.get(
+            "static_detail_canonical_ownership"
+        )
+        saved_cleanup = saved.get("static_detail_global_cleanup")
+        current_cleanup = current.get("static_detail_global_cleanup")
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_ownership, dict)
+            and isinstance(current_ownership, dict)
+            and saved_ownership.get("geometry_mass_topology_owner")
+            == "persisted_exact_support_cameras_and_verified_multiview"
+            and current_ownership.get("geometry_topology_owner")
+            == "persisted_exact_support_cameras_and_verified_multiview"
+            and current_ownership.get("optical_mass_owner")
+            == (
+                "exact_support_camera_weight1_plus_positive_evidence_"
+                "sequence_soft_weight"
+            )
+            and float(
+                current_ownership.get(
+                    "same_sequence_optical_weight", -1.0
+                )
+            )
+            == 0.35
+            and isinstance(saved_cleanup, dict)
+            and isinstance(current_cleanup, dict)
+            and saved_cleanup.get("contract")
+            == STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT
+            and current_cleanup.get("contract")
+            == STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
+        ):
+            for key in (
+                "static_training_stages",
+                "static_detail_global_cleanup",
                 "static_detail_canonical_ownership",
                 "parameter_loss_permission_matrix",
             ):
@@ -11493,14 +11689,13 @@ def _static_ray_candidate_masks(
     if getattr(args, "reconstruction_target", None) != "static":
         return free_mask, hit_mask
     detail = foliage.static_leaf_mask
-    free_mask = free_mask | detail
     if _static_detail_ray_trainable(phase):
         hit_mask = hit_mask | detail
     else:
         hit_mask = hit_mask & ~detail
     if getattr(args, "static_detail_canonical_ownership", True):
-        support_owned = (
-            _static_detail_canonical_ownership_gate(
+        evidence_sequence_owned = (
+            _static_detail_positive_evidence_sequence_gate(
                 foliage,
                 int(camera_id),
                 camera_sequence_lookup,
@@ -11512,12 +11707,18 @@ def _static_ray_candidate_masks(
         # two-sequence consensus is additionally a global positive-hit owner
         # of the single static map. This closes the former loop
         # ``permission miss -> uncovered hit -> 2048 more low-mass births``.
-        detail_permission = (
-            support_owned | _static_detail_consensus_hit_gate(foliage)
+        detail_permission = evidence_sequence_owned | (
+            _static_detail_consensus_hit_gate(foliage)
         )
+        # The same positive-evidence sequences own both hit and free-space
+        # evidence.  The former all-camera free mask let an unrelated season
+        # delete a leaf that only its seed camera was allowed to restore.
+        free_mask = (free_mask & ~detail) | (detail & detail_permission)
         hit_mask = hit_mask & (
             ~foliage.static_leaf_mask | detail_permission
         )
+    else:
+        free_mask = free_mask | detail
     return free_mask, hit_mask
 
 
@@ -14139,13 +14340,14 @@ def main():
                     "envelope_only_all_view_rigid_free_counterfactual_cleanup",
                 ],
                 "detail_training_signals": [
-                    "all_view_ray_free_space",
-                    "support_or_verified_consensus_ray_hit_interval",
+                    "positive_evidence_sequence_ray_free_space",
+                    "positive_evidence_sequence_or_verified_consensus_ray_hit_interval",
                     "exact_support_verified_canonical_rgb_geometry",
                     "exact_support_plus_soft_same_sequence_detail_sh_appearance",
+                    "exact_support_plus_soft_positive_evidence_sequence_optical_mass",
                     "exact_support_verified_surface_plus_detail_geometry",
                     "surface_plus_detail_isolated_screen_gradient",
-                    "all_view_rigid_free_counterfactual_cleanup",
+                    "positive_evidence_sequence_rigid_free_counterfactual_cleanup",
                     "robust_multiview_color",
                     "ray_local_optical_depth_conserving_replacement",
                 ],
@@ -14233,7 +14435,10 @@ def main():
                 args.static_detail_global_counterfactual_weight
             ),
             "counterfactual_weight_is_independent": True,
-            "camera_schedule": "uniform_authoritative_rgb_epoch",
+            "camera_schedule": (
+                "uniform_authoritative_rgb_epoch_with_per_primitive_"
+                "positive_evidence_sequence_permission"
+            ),
             "forward_roles": ["surface", "static_detail"],
             "gradient_owners": [
                 "static_detail_xyz_scale_rotation",
@@ -14363,7 +14568,7 @@ def main():
         "static_detail_canonical_ownership": {
             "enabled": bool(args.static_detail_canonical_ownership),
             "forward_visibility": "unconditional_static",
-            "geometry_mass_topology_owner": (
+            "geometry_topology_owner": (
                 "persisted_exact_support_cameras_and_verified_multiview"
             ),
             "appearance_owner": (
@@ -14373,20 +14578,30 @@ def main():
             "same_sequence_appearance_weight": float(
                 args.static_detail_same_sequence_appearance_weight
             ),
+            "optical_mass_owner": (
+                "exact_support_camera_weight1_plus_positive_evidence_"
+                "sequence_soft_weight"
+            ),
+            "same_sequence_optical_weight": float(
+                args.static_detail_same_sequence_optical_weight
+            ),
             "positive_ray_owner": (
-                "persisted_support_or_verified_two_sequence_consensus"
+                "persisted_positive_evidence_sequences_or_verified_two_"
+                "sequence_consensus"
             ),
             "owned_signals": [
                 "canonical_rgb",
                 "canonical_high_frequency",
                 "detail_isolated_rgb_high_frequency",
-                "support_or_verified_consensus_positive_ray_hit_interval",
+                "positive_evidence_sequence_or_verified_consensus_positive_"
+                "ray_hit_interval",
                 "screen_gradient_topology",
             ],
             "noncanonical_views": (
-                "render_plus_global_negative_geometry_optical_cleanup__"
-                "verified_consensus_positive_ray_only__same_sequence_"
-                "appearance_only__no_positive_geometry_mass_or_topology"
+                "render_unconditionally__positive_and_negative_optical_"
+                "evidence_are_symmetric_within_persisted_evidence_"
+                "sequences__same_sequence_soft_appearance_and_mass__no_"
+                "positive_geometry_or_topology"
             ),
         },
         "parameter_loss_permission_matrix": {
@@ -14414,18 +14629,19 @@ def main():
                 "stage3_all_view_canopy_rgb_dc_only",
             ],
             "static_leaf_xyz_scale": [
-                "all_view_ray_free_space",
-                "support_or_verified_consensus_ray_hit",
+                "positive_evidence_sequence_ray_free_space",
+                "positive_evidence_sequence_or_verified_consensus_ray_hit",
                 "verified_exact_support_canonical_rgb",
                 "verified_exact_support_detail_isolated_rgb_high_frequency",
-                "all_view_rigid_free_counterfactual_cleanup",
+                "positive_evidence_sequence_rigid_free_counterfactual_cleanup",
             ],
             "static_leaf_optical_mass": [
-                "all_view_ray_free_space",
-                "support_or_verified_consensus_ray_hit",
-                "exact_support_canonical_rgb_dc_mass",
+                "positive_evidence_sequence_ray_free_space",
+                "positive_evidence_sequence_or_verified_consensus_ray_hit",
+                "exact_support_plus_soft_positive_evidence_sequence_"
+                "canonical_rgb_dc_mass",
                 "rigid_spill",
-                "all_view_rigid_free_counterfactual_cleanup",
+                "positive_evidence_sequence_rigid_free_counterfactual_cleanup",
             ],
             "static_leaf_sh": [
                 "robust_canonical_rgb",
@@ -15946,7 +16162,9 @@ def main():
             static_training_gate = torch.ones_like(foliage.opacities)
             static_training_gate[foliage.static_leaf_mask] = 0.0
         static_detail_gradient_gate = None
+        static_detail_positive_evidence_sequence_gate = None
         static_detail_appearance_gradient_gate = None
+        static_detail_optical_gradient_gate = None
         static_detail_refinement_gradient_gate = None
         static_detail_ownership_audit = {
             "enabled": False,
@@ -15961,8 +16179,12 @@ def main():
                 "exact_support_plus_soft_same_acquisition_sequence"
             ),
             "soft_same_sequence_appearance_rows": 0,
+            "soft_same_sequence_optical_rows": 0,
             "same_sequence_appearance_weight": float(
                 args.static_detail_same_sequence_appearance_weight
+            ),
+            "same_sequence_optical_weight": float(
+                args.static_detail_same_sequence_optical_weight
             ),
             "refinement_rows": 0,
             "same_sequence_non_support_rows": 0,
@@ -15980,6 +16202,13 @@ def main():
                     camera_sequence_lookup,
                 )
             )
+            static_detail_positive_evidence_sequence_gate = (
+                _static_detail_positive_evidence_sequence_gate(
+                    foliage,
+                    int(view.colmap_id),
+                    camera_sequence_lookup,
+                )
+            )
             static_detail_appearance_gradient_gate = (
                 _static_detail_same_sequence_appearance_gate(
                     foliage,
@@ -15988,6 +16217,23 @@ def main():
                     static_detail_gradient_gate,
                     fallback_weight=(
                         args.static_detail_same_sequence_appearance_weight
+                    ),
+                    positive_evidence_sequence_gate=(
+                        static_detail_positive_evidence_sequence_gate
+                    ),
+                )
+            )
+            static_detail_optical_gradient_gate = (
+                _static_detail_same_sequence_optical_gate(
+                    foliage,
+                    int(view.colmap_id),
+                    camera_sequence_lookup,
+                    static_detail_gradient_gate,
+                    fallback_weight=(
+                        args.static_detail_same_sequence_optical_weight
+                    ),
+                    positive_evidence_sequence_gate=(
+                        static_detail_positive_evidence_sequence_gate
                     ),
                 )
             )
@@ -16037,8 +16283,18 @@ def main():
                         & ~owned_detail
                     ).sum()
                 ),
+                "soft_same_sequence_optical_rows": int(
+                    (
+                        foliage.static_leaf_mask
+                        & (static_detail_optical_gradient_gate > 0)
+                        & ~owned_detail
+                    ).sum()
+                ),
                 "same_sequence_appearance_weight": float(
                     args.static_detail_same_sequence_appearance_weight
+                ),
+                "same_sequence_optical_weight": float(
+                    args.static_detail_same_sequence_optical_weight
                 ),
                 "global_negative_signals": (
                     "free_rigid_counterfactual_cleanup"
@@ -16058,6 +16314,18 @@ def main():
                 detail_stage_active=static_detail_active,
                 appearance_gate=static_detail_appearance_gradient_gate,
             )
+            if (
+                static_detail_active
+                and static_detail_optical_gradient_gate is not None
+            ):
+                # Stage 3 freezes broad envelope RGB-opacity growth, but
+                # positive-evidence sequence cameras must be able to restore
+                # local detail coverage. Geometry/topology remain governed by
+                # the stricter verified exact-owner gate below.
+                detail = foliage.static_leaf_mask
+                canonical_volume_opacity_gate[detail] = (
+                    static_detail_optical_gradient_gate[detail]
+                )
             if (
                 static_detail_active
                 and static_detail_refinement_gradient_gate is not None
@@ -16670,6 +16938,8 @@ def main():
                 "surface_sky_uncertainty": False,
                 "topology_statistics": False,
             },
+            "evidence_sequence_rows": 0,
+            "unrelated_sequence_rows_blocked": 0,
         }
         static_detail_global_cleanup_scheduled = bool(
             args.reconstruction_target == "static"
@@ -16684,15 +16954,24 @@ def main():
             and bool(foliage.static_leaf_mask.any())
         )
         if static_detail_global_cleanup_scheduled:
-            # Positive appearance/hit evidence remains support-sequence
-            # owned.  This second, detail-only pass grants every calibrated
-            # camera only the negative permissions that a deployable static
-            # object must obey: do not occupy rigid/sky free space and do not
-            # obscure an existing surface that explains the same RGB ray
-            # better.  Surface and SH values participate in the forward
-            # comparison but are read-only; the package is intentionally
-            # excluded from all densification statistics below.
-            detail_gate = foliage.static_leaf_mask.to(
+            # A missing leaf in an unrelated traversal is seasonal absence,
+            # not calibrated free space for this primitive. Route negative
+            # cleanup through exactly the same persisted positive-evidence
+            # sequences that may restore optical coverage. Surface and SH
+            # values participate in the forward comparison but are read-only;
+            # this package remains excluded from densification statistics.
+            detail_rows = foliage.static_leaf_mask
+            if args.static_detail_canonical_ownership:
+                cleanup_rows = (
+                    _static_detail_positive_evidence_sequence_gate(
+                        foliage,
+                        int(view.colmap_id),
+                        camera_sequence_lookup,
+                    )
+                )
+            else:
+                cleanup_rows = detail_rows
+            detail_gate = cleanup_rows.to(
                 dtype=foliage.opacities.dtype
             )
             no_appearance_gradient = torch.zeros_like(
@@ -16736,6 +17015,12 @@ def main():
                 temperature=args.counterfactual_transparency_temperature,
             )
             static_detail_global_cleanup_audit["scheduled"] = True
+            static_detail_global_cleanup_audit[
+                "evidence_sequence_rows"
+            ] = int(cleanup_rows.sum())
+            static_detail_global_cleanup_audit[
+                "unrelated_sequence_rows_blocked"
+            ] = int((detail_rows & ~cleanup_rows).sum())
         persistent_envelope_global_cleanup_package = None
         persistent_envelope_global_cleanup = canonical.new_zeros(())
         persistent_envelope_global_cleanup_audit: dict[str, object] = {

@@ -12,6 +12,7 @@ from scripts.train_unified_outdoor_teacher import (
     SURFACE_SCREEN_TOPOLOGY_CONTRACT,
     SURFACE_OWNERSHIP_REPAIR_TARGET,
     STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+    STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT,
     STATIC_DETAIL_ISOLATED_CONTRACT,
     PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
@@ -93,7 +94,9 @@ from scripts.train_unified_outdoor_teacher import (
     _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
+    _static_detail_positive_evidence_sequence_gate,
     _static_detail_same_sequence_appearance_gate,
+    _static_detail_same_sequence_optical_gate,
     _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
     _static_spatial_uncertainty_active,
@@ -1297,6 +1300,59 @@ def test_static_detail_appearance_softly_uses_same_sequence_cameras():
     )
 
 
+def test_static_detail_optical_owner_uses_positive_evidence_sequences():
+    class Foliage:
+        xyz = torch.zeros(5, 3)
+        static_leaf_mask = torch.tensor([False, True, True, True, True])
+        support_camera_ids = torch.tensor(
+            [
+                [-1, -1],
+                [0, -1],
+                [1, -1],
+                [-1, -1],
+                [2, -1],
+            ],
+            dtype=torch.int32,
+        )
+        verified_camera_ids = torch.tensor(
+            [
+                [-1, -1],
+                [-1, -1],
+                [-1, -1],
+                [3, -1],
+                [-1, -1],
+            ],
+            dtype=torch.int32,
+        )
+
+        def __len__(self):
+            return 5
+
+    foliage = Foliage()
+    lookup = torch.tensor([0, 0, 1, 2], dtype=torch.int16)
+    exact = _static_detail_canonical_ownership_gate(foliage, 0, lookup)
+    sequence = _static_detail_positive_evidence_sequence_gate(
+        foliage, 0, lookup
+    )
+    optical = _static_detail_same_sequence_optical_gate(
+        foliage, 0, lookup, exact, fallback_weight=0.35
+    )
+    assert torch.equal(
+        sequence, torch.tensor([False, True, True, False, False])
+    )
+    torch.testing.assert_close(
+        optical, torch.tensor([1.0, 1.0, 0.35, 0.0, 0.0])
+    )
+    # A later verified camera is positive evidence even when it is not an
+    # appearance seed/support camera.
+    assert torch.equal(
+        _static_detail_positive_evidence_sequence_gate(
+            foliage, 3, lookup
+        ),
+        torch.tensor([False, False, False, True, False]),
+    )
+
+
 def test_static_canonical_ownership_resume_migrates_only_new_contract():
     saved = {"reconstruction_target": "static"}
     ownership = {
@@ -1386,6 +1442,72 @@ def test_trainer_repair_migrates_static_global_negative_permission_contract():
         current,
         allow_trainer_repair_migration=True,
     )
+
+
+def test_trainer_repair_migrates_v83_symmetric_sequence_optical_contract():
+    saved = {
+        "reconstruction_target": "static",
+        "static_training_stages": {"detail_training_signals": ["old"]},
+        "static_detail_global_cleanup": {
+            "contract": STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT,
+            "weight": 0.25,
+        },
+        "static_detail_canonical_ownership": {
+            "geometry_mass_topology_owner": (
+                "persisted_exact_support_cameras_and_verified_multiview"
+            )
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["exact_camera_only"]
+        },
+    }
+    current = {
+        **saved,
+        "static_training_stages": {
+            "detail_training_signals": ["symmetric_sequence_optical"]
+        },
+        "static_detail_global_cleanup": {
+            "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+            "weight": 0.25,
+        },
+        "static_detail_canonical_ownership": {
+            "geometry_topology_owner": (
+                "persisted_exact_support_cameras_and_verified_multiview"
+            ),
+            "optical_mass_owner": (
+                "exact_support_camera_weight1_plus_positive_evidence_"
+                "sequence_soft_weight"
+            ),
+            "same_sequence_optical_weight": 0.35,
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["symmetric_sequence_optical"]
+        },
+    }
+    assert _resume_training_contract_differences(saved, current) == {
+        "static_training_stages",
+        "static_detail_global_cleanup",
+        "static_detail_canonical_ownership",
+        "parameter_loss_permission_matrix",
+    }
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
+    changed = {
+        **current,
+        "static_detail_canonical_ownership": {
+            **current["static_detail_canonical_ownership"],
+            "same_sequence_optical_weight": 0.5,
+        },
+    }
+    assert _resume_training_contract_differences(
+        saved, changed, allow_trainer_repair_migration=True
+    ) == {
+        "static_training_stages",
+        "static_detail_global_cleanup",
+        "static_detail_canonical_ownership",
+        "parameter_loss_permission_matrix",
+    }
 
 
 def test_trainer_repair_migrates_persistent_envelope_cleanup_contract():
@@ -5571,7 +5693,7 @@ def test_periodic_camera_schedule_consumes_a_contiguous_evidence_epoch():
         _periodic_schedule_index(0, 0)
 
 
-def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
+def test_static_ray_prefit_uses_symmetric_positive_and_free_evidence():
     class Foliage:
         xyz = torch.zeros(4, 3)
         static_leaf_mask = torch.tensor([False, True, True, True])
@@ -5610,7 +5732,10 @@ def test_static_ray_prefit_has_owned_positive_hits_and_global_free_space():
         camera_id=0,
         camera_sequence_lookup=lookup,
     )
-    assert torch.equal(free, torch.tensor([True, True, True, True]))
+    # Unrelated-sequence absence cannot delete an unverified detail that the
+    # same view is not allowed to restore. Verified two-sequence consensus is
+    # still a global analytic-ray owner.
+    assert torch.equal(free, torch.tensor([True, True, True, False]))
     # Row two belongs to another sequence but is already verified by two
     # sequences, so it is a positive analytic-ray owner of the static map.
     # The otherwise identical unverified row three remains support-owned.

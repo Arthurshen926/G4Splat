@@ -131,6 +131,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v81_ray_owned_envelope_repair",
     "cambridge_native_hybrid_teacher_v82_soft_sequence_appearance",
     "cambridge_native_hybrid_teacher_v83_spatial_detail_receivers",
+    "cambridge_native_hybrid_teacher_v84_symmetric_sequence_optical_ownership",
     "unified_outdoor_mixed_teacher_v1",
 }
 
