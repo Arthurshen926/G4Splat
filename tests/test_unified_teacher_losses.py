@@ -14,6 +14,10 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
     STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT,
     STATIC_DETAIL_ISOLATED_CONTRACT,
+    STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT,
+    STATIC_VOLUME_ISOLATED_CONTRACT,
+    STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT,
+    STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR,
     PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
     STATIC_OPTICAL_POLICY_CONTRACT,
@@ -90,7 +94,9 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_exclusive_topology_active,
     _static_detail_ray_trainable,
     _static_detail_isolated_gradient_gates,
+    _static_detail_evidence_sequence_view_indices,
     _static_volume_isolated_gradient_gates,
+    _static_volume_intrinsic_color_inputs,
     _static_stage_rgb_gradient_gates,
     _static_ray_candidate_masks,
     _static_detail_canonical_ownership_gate,
@@ -1590,6 +1596,67 @@ def test_trainer_repair_migrates_v83_symmetric_sequence_optical_contract():
     }
 
 
+def test_trainer_repair_migrates_v84_static_intrinsic_color_coverage():
+    saved = {
+        "reconstruction_target": "static",
+        "sampling_schedule_sha256": "old",
+        "static_training_stages": {"detail_training_signals": ["old"]},
+        "static_detail_isolated_supervision": {
+            "contract": STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT,
+            "every": 2,
+            "weight": 1.0,
+        },
+        "static_volume_isolated_supervision": {
+            "contract": STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT,
+            "every": 8,
+            "weight": 0.35,
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_sh": ["sparse_seed_cameras"]
+        },
+    }
+    current = {
+        **saved,
+        "sampling_schedule_sha256": "new",
+        "static_training_stages": {
+            "detail_training_signals": ["positive_sequence_intrinsic_color"]
+        },
+        "static_detail_isolated_supervision": {
+            "contract": STATIC_DETAIL_ISOLATED_CONTRACT,
+            "every": 2,
+            "weight": 1.0,
+        },
+        "static_volume_isolated_supervision": {
+            "contract": STATIC_VOLUME_ISOLATED_CONTRACT,
+            "every": 4,
+            "weight": 0.75,
+            "intrinsic_alpha_floor": (
+                STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR
+            ),
+        },
+        "parameter_loss_permission_matrix": {
+            "static_leaf_sh": ["positive_sequence_intrinsic_color"]
+        },
+    }
+    expected = {
+        "sampling_schedule_sha256",
+        "static_training_stages",
+        "static_detail_isolated_supervision",
+        "static_volume_isolated_supervision",
+        "parameter_loss_permission_matrix",
+    }
+    assert _resume_training_contract_differences(saved, current) == expected
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
+
+    unsafe = json.loads(json.dumps(current))
+    unsafe["static_volume_isolated_supervision"]["weight"] = 1.5
+    assert _resume_training_contract_differences(
+        saved, unsafe, allow_trainer_repair_migration=True
+    ) == expected
+
+
 def test_trainer_repair_migrates_persistent_envelope_cleanup_contract():
     saved = {
         "reconstruction_target": "static",
@@ -3081,6 +3148,41 @@ def test_explicit_conditioned_schedule_repair_preserves_other_streams():
         restored["conditioned"], computed["conditioned"]
     )
     for name in set(names) - {"conditioned"}:
+        np.testing.assert_array_equal(restored[name], saved[name])
+
+
+def test_static_color_schedule_repair_replaces_only_color_streams():
+    names = (
+        "rgb",
+        "conditioned",
+        "geometry",
+        "topology",
+        "static_detail",
+        "static_skeleton",
+        "static_volume",
+    )
+    saved = {
+        name: np.arange(8, dtype=np.int64) + 10 * index
+        for index, name in enumerate(names)
+    }
+    computed = {name: value + 1 for name, value in saved.items()}
+
+    restored, preserved = _restore_resume_camera_schedules(
+        computed,
+        {"schedules": saved},
+        horizon=8,
+        allow_static_color_repair=True,
+    )
+
+    assert "static_detail" not in preserved
+    assert "static_volume" not in preserved
+    np.testing.assert_array_equal(
+        restored["static_detail"], computed["static_detail"]
+    )
+    np.testing.assert_array_equal(
+        restored["static_volume"], computed["static_volume"]
+    )
+    for name in set(names) - {"static_detail", "static_volume"}:
         np.testing.assert_array_equal(restored[name], saved[name])
 
 
@@ -5709,6 +5811,75 @@ def test_static_volume_isolated_only_refines_verified_exact_detail():
     torch.testing.assert_close(geometry, expected)
     torch.testing.assert_close(appearance, expected_appearance)
     torch.testing.assert_close(opacity, torch.zeros_like(expected))
+
+
+def test_static_detail_color_schedule_expands_positive_evidence_sequences():
+    class View:
+        def __init__(self, camera_id):
+            self.colmap_id = camera_id
+
+    class Foliage:
+        static_leaf_mask = torch.tensor([True, True, True, False])
+        verification_state = torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_UNVERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        )
+        verified_camera_count = torch.tensor([2, 2, 1, 3])
+        verified_sequence_count = torch.tensor([1, 1, 1, 2])
+        support_camera_ids = torch.tensor(
+            [[1, -1], [5, -1], [5, -1], [5, -1]]
+        )
+        verified_camera_ids = torch.tensor(
+            [[3, -1], [5, -1], [5, -1], [5, -1]]
+        )
+
+    views = [View(camera_id) for camera_id in range(6)]
+    # Cameras 1/2 are sequence 0, 3/4 sequence 1, and 5 sequence 2.
+    lookup = torch.tensor([-1, 0, 0, 1, 1, 2], dtype=torch.int64)
+
+    indices, sequences = _static_detail_evidence_sequence_view_indices(
+        views,
+        Foliage(),
+        lookup,
+        [1, 2, 3, 4, 5],
+    )
+
+    # Only row zero is verified multiview static detail. Its sparse camera
+    # table names 1 and 3, but every canopy camera in those sequences must be
+    # scheduled. Unverified, single-camera and non-detail rows add nothing.
+    assert indices == [1, 2, 3, 4]
+    assert sequences == {0, 1}
+
+
+def test_static_volume_intrinsic_color_normalizes_low_alpha_once():
+    background = torch.ones(3)
+    alpha = torch.tensor([[[0.10, 0.005, 0.0025]]])
+    color = torch.tensor(
+        [[[0.2, 0.4, 0.6]], [[0.3, 0.5, 0.7]], [[0.4, 0.6, 0.8]]],
+        requires_grad=True,
+    )
+    render = color * alpha + (1.0 - alpha) * background[:, None, None]
+    intrinsic, weight = _static_volume_intrinsic_color_inputs(
+        render,
+        alpha,
+        background,
+        torch.ones(1, 3),
+    )
+
+    torch.testing.assert_close(intrinsic[:, :, :2], color[:, :, :2])
+    torch.testing.assert_close(weight, torch.tensor([[1.0, 1.0, 0.5]]))
+    intrinsic.sum().backward()
+    # At and above the representation cull scale, normalized colour receives
+    # an alpha-independent unit gradient instead of the old alpha^2 decay.
+    torch.testing.assert_close(
+        color.grad[:, :, :2], torch.ones_like(color.grad[:, :, :2])
+    )
+    assert STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR == 0.005
 
 
 def test_static_stage3_rgb_routes_envelope_only_to_appearance():

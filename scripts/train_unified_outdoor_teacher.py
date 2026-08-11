@@ -87,7 +87,7 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v84_symmetric_sequence_optical_ownership"
+    "cambridge_native_hybrid_teacher_v85_sequence_intrinsic_color_coverage"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -122,7 +122,7 @@ STATIC_DETAIL_ISOLATED_APPEARANCE_PREDECESSOR_CONTRACT = (
     "may_receive_optical_mass__sh_appearance_uses_all_real_canopy_views__"
     "persistent_envelope_cannot_occlude_its_training_signal"
 )
-STATIC_DETAIL_ISOLATED_CONTRACT = (
+STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT = (
     "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
     "and_screen_gradient_only_to_verified_multiview_static_detail__"
     "unverified_rows_retain_exact_owner_dc_mass_and_ray_training__geometry_"
@@ -130,6 +130,25 @@ STATIC_DETAIL_ISOLATED_CONTRACT = (
     "soft_same_sequence_support__opacity_is_read_only__"
     "persistent_envelope_cannot_occlude_its_training_signal"
 )
+STATIC_DETAIL_ISOLATED_CONTRACT = (
+    "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
+    "and_screen_gradient_only_to_verified_multiview_static_detail__"
+    "unverified_rows_retain_exact_owner_dc_mass_and_ray_training__geometry_"
+    "and_topology_remain_exact_support_camera_owned__sh_appearance_uses_"
+    "full_positive_evidence_sequence_support__opacity_is_read_only__"
+    "positive_evidence_sequence_camera_epochs_include_nonseed_views__"
+    "persistent_envelope_cannot_occlude_its_training_signal"
+)
+STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT = (
+    "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
+    "support__geometry_sh_screen_bandwidth_only__opacity_read_only"
+)
+STATIC_VOLUME_ISOLATED_CONTRACT = (
+    "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
+    "support__full_positive_evidence_sequence_sh__exact_geometry_and_"
+    "screen_bandwidth__opacity_read_only__alpha_normalized_color_floor005"
+)
+STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR = 0.005
 STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_sh_only__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
@@ -1584,7 +1603,7 @@ def _parse_args():
     parser.add_argument(
         "--static-volume-isolated-every",
         type=int,
-        default=8,
+        default=4,
         help=(
             "Render a true volume-only intrinsic-colour counterfactual at "
             "this cadence. It routes canopy RGB/edge/screen-bandwidth only "
@@ -1594,7 +1613,7 @@ def _parse_args():
     parser.add_argument(
         "--static-volume-isolated-weight",
         type=float,
-        default=0.35,
+        default=0.75,
     )
     parser.add_argument(
         "--static-detail-global-cleanup-every",
@@ -4188,12 +4207,67 @@ def _schedule_digest(*schedules: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _static_detail_evidence_sequence_view_indices(
+    views,
+    foliage,
+    camera_sequence_lookup: torch.Tensor,
+    canopy_view_indices: list[int],
+) -> tuple[list[int], set[int]]:
+    """Expand colour supervision to every real view in a positive sequence.
+
+    Persisted support/verified camera tables are deliberately sparse
+    primitive metadata, not a complete list of cameras that may observe a
+    static crown.  Using those camera IDs directly as an RGB schedule left
+    ordinary neighbouring views (including Cambridge 00412) unable to teach
+    leaf colour even though their acquisition sequence supplied positive
+    geometric evidence.  This helper expands only the *camera schedule*.
+    Per-row geometry/topology and opacity gates remain unchanged; the
+    renderer still grants SH gradients only to a detail row whose own
+    support/verified table contains the current sequence.
+    """
+    if not torch.is_tensor(camera_sequence_lookup):
+        raise TypeError("camera_sequence_lookup must be a tensor")
+    lookup = camera_sequence_lookup.detach().cpu().reshape(-1)
+    verified_detail = (
+        foliage.static_leaf_mask
+        & (foliage.verification_state == VERIFICATION_VERIFIED)
+        & (foliage.verified_camera_count >= 2)
+        & (foliage.verified_sequence_count >= 1)
+    )
+    evidence_sequences: set[int] = set()
+    if bool(verified_detail.any()):
+        for name in ("support_camera_ids", "verified_camera_ids"):
+            table = getattr(foliage, name, None)
+            if not torch.is_tensor(table) or table.ndim != 2:
+                continue
+            camera_ids = table[verified_detail].detach().cpu().reshape(-1)
+            valid = (camera_ids >= 0) & (camera_ids < len(lookup))
+            if not bool(valid.any()):
+                continue
+            sequence_values = lookup[camera_ids[valid].long()]
+            evidence_sequences.update(
+                int(value)
+                for value in torch.unique(sequence_values).tolist()
+                if int(value) >= 0
+            )
+    expanded = []
+    for index in canopy_view_indices:
+        camera_id = int(views[int(index)].colmap_id)
+        if (
+            0 <= camera_id < len(lookup)
+            and int(lookup[camera_id]) in evidence_sequences
+        ):
+            expanded.append(int(index))
+    return sorted(set(expanded)), evidence_sequences
+
+
 def _restore_resume_camera_schedules(
     computed: dict[str, np.ndarray],
     resume: dict | None,
     *,
     horizon: int,
     allow_conditioned_repair: bool = False,
+    allow_static_color_repair: bool = False,
 ) -> tuple[dict[str, np.ndarray], frozenset[str]]:
     """Restore immutable checkpoint schedules before hashing/consumption.
 
@@ -4217,6 +4291,9 @@ def _restore_resume_camera_schedules(
     preserved = set(schedules)
     if allow_conditioned_repair:
         preserved.discard("conditioned")
+    if allow_static_color_repair:
+        preserved.discard("static_detail")
+        preserved.discard("static_volume")
     expected_shape = (int(horizon),)
     for name in sorted(preserved):
         if name not in saved:
@@ -4605,6 +4682,55 @@ def _resume_training_contract_differences(
             ):
                 if key in current:
                     saved[key] = current[key]
+        # v84 repaired optical existence but kept isolated colour tied to the
+        # sparse seed-camera table and attenuated low-alpha intrinsic colour
+        # twice. v85 changes only future SH supervision and the two dedicated
+        # colour-camera schedules. Geometry/topology/opacity owners, model
+        # tensors, optimizer tensors, ray evidence and native CUDA image
+        # formation are unchanged at the resume boundary.
+        saved_detail = saved.get("static_detail_isolated_supervision")
+        current_detail = current.get("static_detail_isolated_supervision")
+        saved_volume = saved.get("static_volume_isolated_supervision")
+        current_volume = current.get("static_volume_isolated_supervision")
+        if (
+            saved.get("reconstruction_target") == "static"
+            and current.get("reconstruction_target") == "static"
+            and isinstance(saved_detail, dict)
+            and isinstance(current_detail, dict)
+            and saved_detail.get("contract")
+            == STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT
+            and current_detail.get("contract")
+            == STATIC_DETAIL_ISOLATED_CONTRACT
+            and int(saved_detail.get("every", -1)) == 2
+            and float(saved_detail.get("weight", -1.0)) == 1.0
+            and int(current_detail.get("every", -1)) == 2
+            and float(current_detail.get("weight", -1.0)) == 1.0
+            and isinstance(saved_volume, dict)
+            and isinstance(current_volume, dict)
+            and saved_volume.get("contract")
+            == STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT
+            and current_volume.get("contract")
+            == STATIC_VOLUME_ISOLATED_CONTRACT
+            and int(saved_volume.get("every", -1)) == 8
+            and float(saved_volume.get("weight", -1.0)) == 0.35
+            and int(current_volume.get("every", -1)) == 4
+            and float(current_volume.get("weight", -1.0)) == 0.75
+            and float(
+                current_volume.get("intrinsic_alpha_floor", -1.0)
+            )
+            == STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR
+        ):
+            for key in (
+                "static_training_stages",
+                "static_detail_isolated_supervision",
+                "static_volume_isolated_supervision",
+                "parameter_loss_permission_matrix",
+            ):
+                if key in current:
+                    saved[key] = current[key]
+            saved["sampling_schedule_sha256"] = current[
+                "sampling_schedule_sha256"
+            ]
         current_static_uncertainty = current.get(
             "static_spatial_uncertainty"
         )
@@ -6148,8 +6274,8 @@ def _static_detail_global_cleanup_loss(
         "counterfactual_weight": float(counterfactual_weight),
         "counterfactual": counterfactual_audit,
         "gradient_permissions": {
-            "static_detail_xyz_scale_rotation": True,
-            "static_detail_optical_mass": True,
+            "verified_exact_static_detail_xyz_scale_rotation": True,
+            "positive_evidence_sequence_static_detail_optical_mass": True,
             "static_detail_sh": False,
             "surface_sky_uncertainty": False,
             "topology_statistics": False,
@@ -11738,6 +11864,38 @@ def _static_stage_rgb_gradient_gates(
     return geometry, appearance, opacity
 
 
+def _static_volume_intrinsic_color_inputs(
+    render: torch.Tensor,
+    alpha: torch.Tensor,
+    background: torch.Tensor,
+    semantic_weight: torch.Tensor,
+    *,
+    alpha_floor: float = STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return an alpha-normalized colour target and stable support weight.
+
+    Opacity is read-only in this stream.  Dividing premultiplied emission by
+    detached alpha therefore teaches SH colour without creating optical
+    mass.  The old 0.02 denominator plus a second alpha/0.05 weight made the
+    colour gradient roughly quadratic for a newly born low-opacity leaf—the
+    exact self-lock this counterfactual is meant to break.  Here every pixel
+    above the representation's 0.005 opacity-cull scale receives a normalized
+    colour gradient; smaller contributions fade continuously to zero.
+    """
+    floor = float(alpha_floor)
+    if floor <= 0.0:
+        raise ValueError("intrinsic-colour alpha floor must be positive")
+    if alpha.ndim != 3 or alpha.shape[0] != 1:
+        raise ValueError("volume alpha must have shape [1, H, W]")
+    detached_alpha = alpha.detach()
+    emission = render - (1.0 - alpha) * background[:, None, None]
+    intrinsic = (
+        emission / detached_alpha.clamp_min(floor)
+    ).clamp(0.0, 1.0)
+    support = (detached_alpha[0] / floor).clamp(0.0, 1.0)
+    return intrinsic, semantic_weight * support
+
+
 def _static_ray_candidate_masks(
     args,
     foliage,
@@ -13990,6 +14148,7 @@ def main():
         foliage.static_leaf_mask
         & (foliage.verification_state == VERIFICATION_VERIFIED)
         & (foliage.verified_camera_count >= 2)
+        & (foliage.verified_sequence_count >= 1)
     )
     detail_support_camera_ids = {
         int(camera_id)
@@ -13999,7 +14158,7 @@ def main():
         if int(camera_id) >= 0
     }
     canopy_view_index_set = set(all_canopy_view_indices)
-    static_detail_view_indices = sorted(
+    exact_detail_view_indices = sorted(
         {
             view_index_by_camera_id[camera_id]
             for camera_id in detail_support_camera_ids
@@ -14007,11 +14166,21 @@ def main():
             and view_index_by_camera_id[camera_id] in canopy_view_index_set
         }
     )
+    (
+        static_color_evidence_view_indices,
+        static_color_evidence_sequences,
+    ) = _static_detail_evidence_sequence_view_indices(
+        views,
+        foliage,
+        camera_sequence_lookup,
+        all_canopy_view_indices,
+    )
+    static_detail_view_indices = static_color_evidence_view_indices
     if not static_detail_view_indices:
-        static_detail_view_indices = (
-            all_canopy_view_indices
-            if all_canopy_view_indices
-            else list(range(len(views)))
+        static_detail_view_indices = exact_detail_view_indices
+    if not static_detail_view_indices:
+        static_detail_view_indices = all_canopy_view_indices or list(
+            range(len(views))
         )
     static_detail_schedule = _cycle_schedule(
         static_detail_view_indices,
@@ -14020,11 +14189,17 @@ def main():
     )
     static_detail_schedule_audit = {
         "contract": (
-            "uniform_complete_epochs_over_verified_static_detail_exact_"
-            "support_cameras__geometry_and_sh_exact_camera_owned__opacity_"
-            "read_only_in_isolated_stream"
+            "uniform_complete_epochs_over_all_canopy_cameras_in_verified_"
+            "positive_evidence_sequences__geometry_exact_camera_owned__"
+            "sh_full_positive_sequence_owned__opacity_read_only"
         ),
         "exact_support_camera_count": int(len(detail_support_camera_ids)),
+        "exact_support_canopy_camera_count": int(
+            len(exact_detail_view_indices)
+        ),
+        "positive_evidence_sequence_count": int(
+            len(static_color_evidence_sequences)
+        ),
         "camera_count": int(len(static_detail_view_indices)),
         "canopy_fraction_minimum": (
             static_detail_canopy_fraction_minimum
@@ -14089,17 +14264,11 @@ def main():
             "multiview_tree_role_posterior"
         ],
     }
-    # The volume-isolated stream owns only verified detail bandwidth. Cycle
-    # exact support cameras; envelope and skeleton retain independent low-pass
-    # and role-isolated lifecycles and never receive this objective.
-    static_volume_camera_ids = set(detail_support_camera_ids)
-    static_volume_view_indices = sorted(
-        {
-            view_index_by_camera_id[camera_id]
-            for camera_id in static_volume_camera_ids
-            if camera_id in view_index_by_camera_id
-        }
-    )
+    # The volume-isolated stream owns only verified detail colour/bandwidth.
+    # It uses the same positive-evidence-sequence view set as detail-isolated
+    # RGB so non-seed neighbouring cameras can actually teach SH. Per-row
+    # gates below still keep geometry/topology exact and opacity read-only.
+    static_volume_view_indices = list(static_detail_view_indices)
     static_volume_schedule = (
         _cycle_schedule(
             static_volume_view_indices,
@@ -14111,12 +14280,15 @@ def main():
     )
     static_volume_schedule_audit = {
         "contract": (
-            "uniform_complete_epochs_over_verified_static_detail_exact_"
-            "support_cameras__detail_only_intrinsic_rgb_high_bandwidth"
+            "uniform_complete_epochs_over_all_canopy_cameras_in_verified_"
+            "positive_evidence_sequences__detail_only_intrinsic_rgb"
         ),
         "camera_count": int(len(static_volume_view_indices)),
         "verified_detail_support_camera_count": int(
             len(detail_support_camera_ids)
+        ),
+        "positive_evidence_sequence_count": int(
+            len(static_color_evidence_sequences)
         ),
         "schedule_sha256": _schedule_digest(static_volume_schedule),
     }
@@ -14266,6 +14438,18 @@ def main():
     topology_schedule = _cycle_schedule(
         boundary_indices, args.phase_schedule_horizon, args.seed + 3
     )
+    static_color_schedule_repair = bool(
+        resume is not None
+        and args.allow_trainer_repair_resume
+        and args.reconstruction_target == "static"
+        and resume.get("protocol")
+        == (
+            "cambridge_native_hybrid_teacher_v84_symmetric_sequence_"
+            "optical_ownership"
+        )
+        and PROTOCOL
+        == "cambridge_native_hybrid_teacher_v85_sequence_intrinsic_color_coverage"
+    )
     camera_schedules, restored_schedule_names = (
         _restore_resume_camera_schedules(
             {
@@ -14282,6 +14466,7 @@ def main():
             allow_conditioned_repair=(
                 args.allow_conditioned_schedule_repair_resume
             ),
+            allow_static_color_repair=static_color_schedule_repair,
         )
     )
     rgb_schedule = camera_schedules["rgb"]
@@ -14444,7 +14629,8 @@ def main():
                     "positive_evidence_sequence_ray_free_space",
                     "positive_evidence_sequence_or_verified_consensus_ray_hit_interval",
                     "exact_support_verified_canonical_rgb_geometry",
-                    "exact_support_plus_soft_same_sequence_detail_sh_appearance",
+                    "exact_support_plus_soft_same_sequence_canonical_sh_appearance",
+                    "full_positive_evidence_sequence_isolated_sh_appearance",
                     "exact_support_plus_soft_positive_evidence_sequence_optical_mass",
                     "exact_support_verified_surface_plus_detail_geometry",
                     "surface_plus_detail_isolated_screen_gradient",
@@ -14470,7 +14656,7 @@ def main():
             "gradient_owners": [
                 "verified_exact_support_static_detail_xyz_scale_rotation",
                 "verified_exact_support_static_detail_geometry_rgb",
-                "verified_soft_same_sequence_static_detail_sh_rgb",
+                "verified_full_positive_evidence_sequence_static_detail_sh_rgb",
                 "verified_consensus_static_detail_ray_optical_mass",
                 "verified_exact_support_static_detail_sh",
                 "verified_exact_support_static_detail_means2d_topology",
@@ -14507,17 +14693,16 @@ def main():
             ],
         },
         "static_volume_isolated_supervision": {
-            "contract": (
-                "volume_only_intrinsic_rgb_on_real_canopy_and_detached_"
-                "projected_support__geometry_sh_screen_bandwidth_only__"
-                "opacity_read_only"
-            ),
+            "contract": STATIC_VOLUME_ISOLATED_CONTRACT,
             "every": int(args.static_volume_isolated_every),
             "weight": float(args.static_volume_isolated_weight),
+            "intrinsic_alpha_floor": float(
+                STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR
+            ),
             "view_schedule": static_volume_schedule_audit,
             "gradient_owners": [
                 "verified_exact_support_static_detail_xyz_scale_rotation",
-                "verified_soft_same_sequence_static_detail_sh",
+                "verified_full_positive_evidence_sequence_static_detail_sh",
                 "verified_exact_support_static_detail_means2d_topology",
             ],
             "excluded_owners": [
@@ -14749,8 +14934,8 @@ def main():
             "static_leaf_sh": [
                 "robust_canonical_rgb",
                 "verified_exact_plus_soft_same_sequence_high_frequency",
-                "verified_exact_plus_soft_same_sequence_detail_isolated_"
-                "rgb_high_frequency",
+                "verified_full_positive_evidence_sequence_detail_isolated_"
+                "rgb_high_frequency_intrinsic_color",
             ],
             "uncertainty": ["photometric_likelihood_only"],
         },
@@ -15617,14 +15802,16 @@ def main():
     if resume is not None and resume["schedule_hash"] != schedule_hash:
         saved_schedules = resume.get("schedules", {})
         if args.allow_trainer_repair_resume:
-            unchanged_schedule_names = (
+            unchanged_schedule_names = [
                 "rgb",
                 "conditioned",
                 "geometry",
                 "topology",
                 "static_skeleton",
                 "static_volume",
-            )
+            ]
+            if static_color_schedule_repair:
+                unchanged_schedule_names.remove("static_volume")
         elif args.allow_conditioned_schedule_repair_resume:
             unchanged_schedule_names = (
                 "rgb",
@@ -15660,8 +15847,8 @@ def main():
             )
         if args.allow_trainer_repair_resume:
             print(
-                "Resuming with the support-owned static-detail camera "
-                "schedule; every non-detail schedule is identical."
+                "Resuming with repaired static-detail colour camera "
+                "schedules; every unrelated schedule is identical."
             )
         else:
             print(
@@ -16689,9 +16876,11 @@ def main():
                     int(static_detail_isolated_view.colmap_id),
                     camera_sequence_lookup,
                     static_detail_isolated_ownership_gate,
-                    fallback_weight=(
-                        args.static_detail_same_sequence_appearance_weight
-                    ),
+                    # This pass changes SH only. A camera in a persisted
+                    # positive-evidence sequence is a full colour witness;
+                    # the conservative 0.35 canonical mixture weight is not
+                    # compounded into this role-isolated intrinsic signal.
+                    fallback_weight=1.0,
                 )
             )
             static_detail_isolated_qualified_rows = int(
@@ -16935,9 +17124,7 @@ def main():
                     int(static_volume_isolated_view.colmap_id),
                     camera_sequence_lookup,
                     static_volume_ownership_gate,
-                    fallback_weight=(
-                        args.static_detail_same_sequence_appearance_weight
-                    ),
+                    fallback_weight=1.0,
                 )
                 if static_volume_ownership_gate is not None
                 else None
@@ -16984,19 +17171,15 @@ def main():
             isolated_alpha = (
                 static_volume_isolated_package.volume_alpha
             )
-            isolated_emission = (
-                static_volume_isolated_package.render
-                - (1.0 - isolated_alpha)
-                * background[:, None, None]
-            )
-            isolated_intrinsic_rgb = (
-                isolated_emission
-                / isolated_alpha.detach().clamp_min(0.02)
-            ).clamp(0.0, 1.0)
-            static_volume_isolated_weight = (
+            (
+                isolated_intrinsic_rgb,
+                static_volume_isolated_weight,
+            ) = _static_volume_intrinsic_color_inputs(
+                static_volume_isolated_package.render,
+                isolated_alpha,
+                background,
                 static_volume_isolated_task["p_canopy"]
-                * static_volume_isolated_task["w_rgb"]
-                * (isolated_alpha[0].detach() / 0.05).clamp(0.0, 1.0)
+                * static_volume_isolated_task["w_rgb"],
             )
             static_volume_isolated_pixels = int(
                 (static_volume_isolated_weight > 0).sum()

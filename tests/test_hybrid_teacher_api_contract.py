@@ -471,6 +471,10 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "topology_capacity"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v85_sequence_intrinsic_color_coverage"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():
