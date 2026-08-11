@@ -4201,6 +4201,42 @@ def _resume_training_contract_differences(
             saved["static_detail_receiver_materialization"] = (
                 current_receiver_materialization
             )
+        saved_static_fusion = saved.get("static_fusion")
+        current_static_fusion = current.get("static_fusion")
+        static_fusion_identity_fields = (
+            "contract",
+            "input_dynamic_rows",
+            "associated_dynamic_rows",
+            "camera_sequence_metadata_source",
+            "camera_sequence_metadata_count",
+            "canonical_sequence_policy",
+            "canonical_mode_voxel_size",
+            "maximum_modes_per_group",
+            "minimum_supporting_views",
+            "minimum_supporting_sequences",
+            "voxel_size",
+            "output_static_rows",
+        )
+        if (
+            isinstance(saved_static_fusion, dict)
+            and isinstance(current_static_fusion, dict)
+            and saved.get("initialization_manifest_sha256")
+            == current.get("initialization_manifest_sha256")
+            and saved.get("foliage_seed_sha256")
+            == current.get("foliage_seed_sha256")
+            and all(
+                saved_static_fusion.get(key)
+                == current_static_fusion.get(key)
+                for key in static_fusion_identity_fields
+            )
+        ):
+            # On resume the fused seed payload is audit-only: the exact
+            # foliage tensors are restored from the checkpoint. Parallel CPU
+            # reductions can change sub-ulp aggregate mass diagnostics even
+            # when the immutable seed, camera set and fusion configuration
+            # are identical. Compare those identity fields above, then retain
+            # the saved audit rather than rejecting a valid model resume.
+            current["static_fusion"] = saved_static_fusion
         if (
             saved.get("static_optical_policy_contract")
             in {

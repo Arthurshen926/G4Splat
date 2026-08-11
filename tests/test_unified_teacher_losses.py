@@ -392,6 +392,52 @@ def test_trainer_repair_registers_mass_safe_detail_receiver_contract():
     )
 
 
+def test_trainer_repair_ignores_only_static_fusion_reduction_roundoff():
+    identity = {
+        "contract": "static-fusion-v1",
+        "input_dynamic_rows": 12,
+        "associated_dynamic_rows": 10,
+        "camera_sequence_metadata_source": "fixed_camera_contract",
+        "camera_sequence_metadata_count": 4,
+        "canonical_sequence_policy": "per_tree",
+        "canonical_mode_voxel_size": 0.08,
+        "maximum_modes_per_group": 2,
+        "minimum_supporting_views": 2,
+        "minimum_supporting_sequences": 2,
+        "voxel_size": 0.15,
+        "output_static_rows": 8,
+    }
+    saved = {
+        "initialization_manifest_sha256": "manifest",
+        "foliage_seed_sha256": "seed",
+        "static_fusion": {
+            **identity,
+            "initial_mass_transferred_detail_mass": 0.1000000001,
+        },
+    }
+    current = {
+        "initialization_manifest_sha256": "manifest",
+        "foliage_seed_sha256": "seed",
+        "static_fusion": {
+            **identity,
+            "initial_mass_transferred_detail_mass": 0.1000000002,
+        },
+    }
+    assert _resume_training_contract_differences(saved, current) == {
+        "static_fusion"
+    }
+    assert not _resume_training_contract_differences(
+        saved, current, allow_trainer_repair_migration=True
+    )
+    changed_identity = json.loads(json.dumps(current))
+    changed_identity["static_fusion"]["output_static_rows"] = 9
+    assert _resume_training_contract_differences(
+        saved,
+        changed_identity,
+        allow_trainer_repair_migration=True,
+    ) == {"static_fusion"}
+
+
 def test_missing_detail_receiver_selection_is_one_per_unrepresented_group():
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
