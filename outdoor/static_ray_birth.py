@@ -345,8 +345,10 @@ class StaticRayBirthAccumulator:
             {
             "contract": (
                 "uncovered_hit_ray_voxel_consensus_across_independent_"
-                "cameras_and_sequences"
+                "cameras_and_configured_sequence_support"
             ),
+            "minimum_cameras": int(minimum_cameras),
+            "minimum_sequences": int(minimum_sequences),
             "pending_cells": len(self.cells) + len(self.visual_hull_cells),
             "pending_midpoint_cells": len(self.cells),
             "pending_visual_hull_cells": len(self.visual_hull_cells),

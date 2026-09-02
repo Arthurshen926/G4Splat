@@ -26,6 +26,11 @@ from outdoor.inverse_depth import (  # noqa: E402
     fuse_inverse_depth_directory,
 )
 from outdoor.mast3r_track_graph import validate_track_gate  # noqa: E402
+from outdoor.moge3_evidence import (  # noqa: E402
+    load_index as load_moge3_index,
+    load_runtime_cache as load_moge3_runtime_cache,
+    sha256_file as moge3_sha256_file,
+)
 from outdoor.projected_role_posterior import (  # noqa: E402
     build_projected_rigid_conflict_posterior,
 )
@@ -120,7 +125,38 @@ def main() -> None:
             "projected rigid posterior; geometry support is RGB independent."
         ),
     )
-    parser.add_argument("--dav2-root", type=Path)
+    monocular = parser.add_mutually_exclusive_group()
+    monocular.add_argument(
+        "--moge3-root",
+        type=Path,
+        help=(
+            "Content-addressed MoGe3 exact-K cache directory (containing "
+            "moge3_index.json) or index path."
+        ),
+    )
+    monocular.add_argument(
+        "--dav2-root",
+        type=Path,
+        help="Explicit legacy-only DAV2 ordinal cache; never auto-selected.",
+    )
+    parser.add_argument(
+        "--moge3-chart-base",
+        type=Path,
+        help=(
+            "Optional source-separated MoGe3/MAtCha Chart-base archive. "
+            "It is registered as an alternative and never overwrites the "
+            "immutable original chart_geometry artifact."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-runtime-cache",
+        type=Path,
+        help=(
+            "Content-addressed compact mmap runtime_index.json for the "
+            "selected MoGe3 cache. This prevents per-step decompression of "
+            "the 149 GB full-resolution evidence archives."
+        ),
+    )
     parser.add_argument(
         "--sfm-coverage-sparse",
         type=Path,
@@ -427,6 +463,34 @@ def main() -> None:
         "chart_confidence_and_alignment_residual",
         coordinate_frame="matcha_normalized_world",
     )
+    if args.moge3_chart_base is not None:
+        if args.moge3_root is None:
+            raise RuntimeError(
+                "A MoGe3 Chart base requires the same store to register "
+                "moge3_index"
+            )
+        moge3_chart_base = args.moge3_chart_base.expanduser().resolve()
+        _optional(
+            builder,
+            "moge3_chart_base",
+            "moge3_matcha_chart_base",
+            moge3_chart_base,
+            (
+                "source-separated direct and confidence-adaptive metric "
+                "camera-z bases; original MAtCha Chart remains immutable"
+            ),
+            "refinement_normal_boundary_and_matcha_agreement",
+            coordinate_frame="cambridge_fixed_camera_depth",
+        )
+        _optional(
+            builder,
+            "moge3_chart_base_summary",
+            "moge3_matcha_chart_base",
+            moge3_chart_base.with_suffix(".json"),
+            "Chart-base calibration, content hashes and support audit",
+            "documented_in_summary",
+            coordinate_frame="metadata",
+        )
     _optional(
         builder,
         "chart_cameras",
@@ -541,6 +605,79 @@ def main() -> None:
         coordinate_frame="inverse_cambridge_fixed_camera_depth",
     )
 
+    if args.moge3_root is not None:
+        moge3_root = args.moge3_root.expanduser().resolve()
+        moge3_index = (
+            moge3_root / "moge3_index.json"
+            if moge3_root.is_dir()
+            else moge3_root
+        )
+        # ``build_index`` already decoded and validated every array before it
+        # froze the per-view content hashes. Re-hash every immutable archive
+        # here, but do not decompress ~1,500 payloads a second time: identical
+        # file SHA means the previously validated metadata/arrays are
+        # identical. Runtime loading still validates each consumed payload.
+        moge3_payload = load_moge3_index(
+            moge3_index,
+            verify_views=True,
+            verify_payloads=False,
+        )
+        expected_order = [
+            Path(record["image_name"]).stem
+            for record in json.loads(scene_contract.read_text(encoding="utf-8"))[
+                "records"
+            ]
+        ]
+        if moge3_payload["camera_order"] != expected_order:
+            raise RuntimeError(
+                "MoGe3 exact-K cache does not cover the fixed scene contract "
+                "in authoritative camera order"
+            )
+        builder.add_file(
+            "moge3_index",
+            "moge3_v3_metric_exact_k",
+            moge3_index,
+            measurement=(
+                "metric camera-z depth, direct/depth-derived normals, "
+                "refinement stability and exact-K pointmaps"
+            ),
+            coordinate_frame="cambridge_fixed_exact_K_camera",
+            covariance="per_pixel_refinement_log_depth_stability",
+            semantic_role="canopy_front_hit_hole_and_rigid_auxiliary",
+            validity=(
+                "model mask, finite positive depth, exact image/camera hash "
+                "and content-addressed all-view index"
+            ),
+        )
+        if args.moge3_runtime_cache is not None:
+            runtime_index = args.moge3_runtime_cache.expanduser().resolve()
+            runtime = load_moge3_runtime_cache(
+                runtime_index,
+                expected_source_index_sha256=moge3_sha256_file(moge3_index),
+                verify_arrays=True,
+            )
+            if runtime["camera_order"] != expected_order:
+                raise RuntimeError(
+                    "MoGe3 runtime cache camera order does not match scene"
+                )
+            builder.add_file(
+                "moge3_runtime_cache",
+                "moge3_compact_mmap_runtime",
+                runtime_index,
+                measurement=(
+                    "640x360 depth, normals, refinement confidence and "
+                    "validity backed by content-addressed mmap arrays"
+                ),
+                coordinate_frame="cambridge_fixed_exact_K_camera_raster",
+                covariance="per_pixel_refinement_log_depth_stability",
+                semantic_role="runtime_acceleration_only_same_moge3_evidence",
+                validity="all mmap arrays hashed and source index exact",
+            )
+    elif args.moge3_runtime_cache is not None:
+        raise RuntimeError(
+            "A MoGe3 runtime cache requires --moge3-root"
+        )
+
     if args.dav2_root is not None:
         dav2 = args.dav2_root.expanduser().resolve()
         requested = {
@@ -592,19 +729,7 @@ def main() -> None:
                 validity="real_view_semantic_gate",
             )
     manifest = builder.write()
-    # Keep the negative/limited dependency audit grep-able. The manifest
-    # itself already hashes the optional track archive and its raw sources.
-    sfm_coverage = args.sfm_coverage_sparse is not None
-    manifest["forbidden_inputs_audit"] = {
-        "points3D_bin_read": sfm_coverage,
-        "colmap_tracks_read": sfm_coverage,
-        "colmap_camera_or_pose_authority": False,
-        "colmap_dense_geometry_authority": False,
-        "sfm_track_usage_mode": "coverage_only" if sfm_coverage else "disabled",
-        "historical_gaussian_initialization": False,
-    }
-    # Re-write through the builder is not possible after hashing; keep the
-    # negative audit as an adjacent signed-by-artifact sidecar.
+    # Mirror the now hash-bound manifest audit for quick shell inspection.
     (output / "forbidden_inputs_audit.json").write_text(
         json.dumps(manifest["forbidden_inputs_audit"], indent=2) + "\n"
     )

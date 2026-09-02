@@ -2,8 +2,9 @@
 
 Structural primitives retain the exact perspective-correct 2DGS ray/surfel
 projection. Foliage uses a true three-axis 3D EWA footprint. Both families
-emit into one CUDA tile list, share one center-depth radix sort, and are
-interleaved in the same front-to-back pixel loop.
+emit into one CUDA tile list. Volume keys use their EWA centre depth while a
+surfel key uses its perspective-correct ray intersection at each tile centre;
+both are then interleaved in the same front-to-back pixel loop.
 """
 
 from __future__ import annotations
@@ -23,8 +24,130 @@ LAYER_DYNAMIC_LEAF = 2
 VERIFICATION_UNVERIFIED = 0
 VERIFICATION_VERIFIED = 1
 VERIFICATION_REJECTED = 2
+# A real observation and a globally deployable static primitive are different
+# facts.  Keep them distinct from the proposal lifecycle: a one-camera seed is
+# measured but not persistent, while a co-located receiver is only an exact
+# optical factorization until real renders verify the new detail owner.
+VERIFICATION_MEASURED_SINGLE = 3
+VERIFICATION_FACTORIZED_RECEIVER = 4
+PROPOSAL_NONE = 0
+PROPOSAL_SPLIT = 1
+PROPOSAL_RAY_BIRTH = 2
 DYNAMIC_TEMPORAL_FALLBACK_MAX = 0.35
 EXACT_RAY_RENDER_MAX_DEPTH_TO_TANGENT_RATIO = 4.0
+# A topology mutation must approximate the parent's extinction field before
+# any subsequent optimization.  Splitting one local axis into two symmetric
+# components with child sigma ``s`` and offset ``d`` preserves the first two
+# moments when ``s**2 + d**2 == 1``.  The 0.8/0.6 pair is also a close
+# pointwise approximation after optical-depth mass is divided between the
+# children (about 4.5% relative L2 error for a binary split and 6.5% for a
+# two-axis quaternary split).  The former 0.5/0.35 quaternary layout had about
+# 84% error and a 2.45x extinction hotspot at the parent centre.
+ADAPTIVE_SPLIT_CHILD_SCALE_FRACTION = 0.8
+ADAPTIVE_SPLIT_CHILD_OFFSET_FRACTION = 0.6
+
+
+def resolved_static_owner_mask(foliage) -> torch.Tensor:
+    """Return resolved static rows safe for local lifecycle transactions."""
+
+    required = ("verification_state", "proposal_kind", "dynamic_leaf_mask")
+    missing = [name for name in required if not hasattr(foliage, name)]
+    if missing:
+        raise RuntimeError(
+            "Resolved static owner metadata is missing: " + ", ".join(missing)
+        )
+    return (
+        ~foliage.dynamic_leaf_mask
+        & (foliage.verification_state == VERIFICATION_VERIFIED)
+        & (foliage.proposal_kind == PROPOSAL_NONE)
+    )
+
+
+def persistent_static_evidence_mask(foliage) -> torch.Tensor:
+    """Return resolved rows backed by at least two real render cameras.
+
+    ``VERIFICATION_VERIFIED`` used to mean both "accepted seed" and
+    "persistent multiview map element".  That ambiguity let one-camera detail
+    acquire whole-sequence opacity/SH and deployment authority.  This helper
+    is the sole durable-authority predicate shared by training and inference.
+    This is whole-image/cross-camera authority.  Local envelope lifecycle
+    transactions use :func:`resolved_static_owner_mask` instead, because a
+    fused low-frequency scaffold may be valid for an exact ray without being
+    allowed to authorize global completion.  Missing metadata fails closed.
+    """
+
+    required = (
+        "verification_state",
+        "verified_camera_count",
+        "verified_sequence_count",
+        "proposal_kind",
+        "dynamic_leaf_mask",
+    )
+    missing = [name for name in required if not hasattr(foliage, name)]
+    if missing:
+        raise RuntimeError(
+            "Persistent static evidence metadata is missing: "
+            + ", ".join(missing)
+        )
+    return (
+        resolved_static_owner_mask(foliage)
+        & (foliage.verified_camera_count >= 2)
+        & (foliage.verified_sequence_count >= 1)
+    )
+
+
+def static_detail_forward_visibility_gate(
+    foliage,
+    camera_id: int,
+    *,
+    include_pending_exact: bool,
+) -> torch.Tensor:
+    """Expose static detail only where its evidence tier is valid.
+
+    Persistent detail belongs to the global static map.  A one-camera seed or
+    factorized receiver, or pending proposal is visible only in an exact
+    candidate camera during training, so it can collect witnesses without
+    becoming global speckle.  Factorization is exact only at the mutation
+    instant; subsequent parent updates mean it is not durable deployment
+    evidence.  Rejected rows are never visible.  Envelope and skeleton rows
+    are unchanged.
+    """
+
+    gate = torch.ones(
+        len(foliage), device=foliage.xyz.device, dtype=foliage.xyz.dtype
+    )
+    detail = foliage.static_leaf_mask
+    if not bool(detail.any()):
+        return gate
+    persistent = persistent_static_evidence_mask(foliage) & detail
+    exact = torch.zeros_like(detail)
+    support = getattr(foliage, "support_camera_ids", None)
+    if (
+        torch.is_tensor(support)
+        and support.ndim == 2
+        and support.shape[0] == len(foliage)
+        and support.shape[1] > 0
+        and int(camera_id) >= 0
+    ):
+        exact = (support == int(camera_id)).any(dim=1)
+    state = foliage.verification_state
+    measured = (
+        (state == VERIFICATION_MEASURED_SINGLE)
+        | (
+            (state == VERIFICATION_VERIFIED)
+            & (foliage.verified_camera_count < 2)
+        )
+    )
+    factorized = state == VERIFICATION_FACTORIZED_RECEIVER
+    pending = (
+        (state == VERIFICATION_UNVERIFIED)
+        & (foliage.proposal_kind != PROPOSAL_NONE)
+    )
+    visible_detail = persistent | (measured & exact)
+    if include_pending_exact:
+        visible_detail |= (pending | factorized) & exact
+    gate[detail] = visible_detail[detail].to(gate.dtype)
+    return gate
 
 
 def _identity_with_gradient_gate(
@@ -895,6 +1018,12 @@ class HybridRenderOutput:
     volume_alpha: torch.Tensor | None = None
     surface_depth: torch.Tensor | None = None
     volume_depth: torch.Tensor | None = None
+    # Conditional volume-only optical alpha before and inside an optional
+    # detached per-pixel target-depth interval.  Unlike ``volume_alpha``,
+    # these channels are not attenuated by surfaces or by volumes outside the
+    # selected interval.
+    volume_prehit_alpha: torch.Tensor | None = None
+    volume_hit_interval_alpha: torch.Tensor | None = None
     surface_means2d: torch.Tensor | None = None
     volume_means2d: torch.Tensor | None = None
     volume_replacement: torch.Tensor | None = None
@@ -1048,6 +1177,14 @@ class VolumetricFoliageModel(nn.Module):
         self.register_buffer(
             "handoff_retired_fraction", torch.empty(0, device=device)
         )
+        # Immutable per-row optical-mass calibration for late static-detail
+        # refinement.  Unlike ``handoff_reference_mass`` this value is not
+        # rebased after every optimizer step: it is the trust-region anchor
+        # that prevents an asymmetric sequence of valid residuals from
+        # silently retiring the whole canonical crown.
+        self.register_buffer(
+            "opacity_settle_reference_mass", torch.empty(0, device=device)
+        )
         # Topology provenance and child verification are independent from
         # inherited support-camera *candidates*.  A displaced child cannot
         # claim the parent's UV/depth/evidence row as fresh proof.
@@ -1057,6 +1194,128 @@ class VolumetricFoliageModel(nn.Module):
         self.register_buffer(
             "parent_lineage_id",
             torch.empty(0, dtype=torch.int64, device=device),
+        )
+        # An ancestry edge and an unresolved topology transaction are
+        # different identities.  ``parent_lineage_id`` is provenance shared
+        # by splits, ray births and exact receiver factorisations; it must
+        # never be used as an atomic rollback key.  Only children created by
+        # one replace-and-split mutation receive the same proposal family.
+        self.register_buffer(
+            "proposal_kind",
+            torch.empty(0, dtype=torch.int8, device=device),
+        )
+        self.register_buffer(
+            "split_proposal_family_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        # Parent rollback state is sparse per unresolved split transaction,
+        # not dense per live Gaussian.  Production support-camera tables can
+        # be 105 columns wide; duplicating one parent record into every child
+        # and allocating that shape for all ~2M rows wastes >1 GiB of GPU
+        # memory.  Family ids are monotonic, so this compact table remains
+        # stable across row pruning/reordering and is checkpointed separately.
+        self.register_buffer(
+            "split_parent_snapshot_family_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        # Minimal verified-parent snapshot needed for an evidence-exact
+        # rollback.  Candidate support tables are not proof and therefore
+        # cannot be copied into the verified ledger after a failed split.
+        self.register_buffer(
+            "proposal_parent_verification_state",
+            torch.empty(0, dtype=torch.int8, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_verified_camera_ids",
+            torch.empty(0, 0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_verified_camera_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_verified_sequence_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_evidence_primitive_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_candidate_evidence_primitive_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_parent_lineage_id",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_support_camera_ids",
+            torch.empty(0, 0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_support_view_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_support_sequence_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_free_space_violation_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_unknown_view_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_birth_iteration",
+            torch.empty(0, dtype=torch.int32, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_initialization_center",
+            torch.empty(0, 3, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_scale_ceiling",
+            torch.empty(0, 3, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_position_covariance",
+            torch.empty(0, 3, 3, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_occupancy_probability",
+            torch.empty(0, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_replacement_overlap_ema",
+            torch.empty(0, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_replacement_observation_count",
+            torch.empty(0, dtype=torch.int16, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_replacement_camera_signature",
+            torch.empty(0, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_handoff_reference_mass",
+            torch.empty(0, device=device),
+        )
+        self.register_buffer(
+            "proposal_parent_handoff_retired_fraction",
+            torch.empty(0, device=device),
+        )
+        self.register_buffer(
+            "next_split_proposal_family_id",
+            torch.zeros((), dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "next_lineage_id",
+            torch.zeros((), dtype=torch.int64, device=device),
         )
         self.register_buffer(
             "birth_iteration",
@@ -1555,11 +1814,27 @@ class VolumetricFoliageModel(nn.Module):
             "handoff_retired_fraction": payload.get(
                 "handoff_retired_fraction", torch.zeros(count)
             ).to(device=device, dtype=dtype),
+            "opacity_settle_reference_mass": payload.get(
+                "opacity_settle_reference_mass", torch.zeros(count)
+            ).to(device=device, dtype=dtype),
             "lineage_id": payload.get(
                 "lineage_id", torch.arange(count, dtype=torch.int64)
             ).to(device=device, dtype=torch.int64),
             "parent_lineage_id": payload.get(
                 "parent_lineage_id",
+                torch.full((count,), -1, dtype=torch.int64),
+            ).to(device=device, dtype=torch.int64),
+            # Legacy states cannot recover transaction identity from ancestry:
+            # ray births and receiver factorisations used the same parent
+            # field as real splits.  Fail closed by importing no unresolved
+            # family.  Formal family rollback therefore starts only from a
+            # clean state produced by this implementation.
+            "proposal_kind": payload.get(
+                "proposal_kind",
+                torch.full((count,), PROPOSAL_NONE, dtype=torch.int8),
+            ).to(device=device, dtype=torch.int8),
+            "split_proposal_family_id": payload.get(
+                "split_proposal_family_id",
                 torch.full((count,), -1, dtype=torch.int64),
             ).to(device=device, dtype=torch.int64),
             "birth_iteration": payload.get(
@@ -1678,6 +1953,50 @@ class VolumetricFoliageModel(nn.Module):
                 )
         metadata["replacement_group"] = replacement_group
         self._replace_buffers(**metadata)
+        self._load_split_parent_snapshots(
+            payload.get("split_parent_snapshots")
+        )
+        supplied_next_family = payload.get("next_split_proposal_family_id")
+        family = metadata["split_proposal_family_id"]
+        highest_family = max(
+            int(family.max()) if len(family) else -1,
+            int(self.split_parent_snapshot_family_id.max())
+            if len(self.split_parent_snapshot_family_id)
+            else -1,
+        )
+        if supplied_next_family is None:
+            next_family = highest_family + 1
+        else:
+            next_family = int(torch.as_tensor(supplied_next_family).item())
+        if next_family <= highest_family:
+            raise RuntimeError(
+                "next split proposal family id does not exceed live families"
+            )
+        self.next_split_proposal_family_id.fill_(next_family)
+        lineage_sources = (
+            metadata["lineage_id"],
+            metadata["parent_lineage_id"],
+            self.proposal_parent_parent_lineage_id,
+        )
+        highest_lineage = max(
+            (
+                int(value[value >= 0].max())
+                for value in lineage_sources
+                if bool((value >= 0).any())
+            ),
+            default=-1,
+        )
+        supplied_next_lineage = payload.get("next_lineage_id")
+        next_lineage = (
+            highest_lineage + 1
+            if supplied_next_lineage is None
+            else int(torch.as_tensor(supplied_next_lineage).item())
+        )
+        if next_lineage <= highest_lineage:
+            raise RuntimeError(
+                "next lineage id does not exceed live/provenance lineage ids"
+            )
+        self.next_lineage_id.fill_(next_lineage)
         return int(len(xyz))
 
     def _replace(self, **values: torch.Tensor) -> None:
@@ -1689,6 +2008,209 @@ class VolumetricFoliageModel(nn.Module):
             setattr(self, name, value)
         if {"replacement_group", "layer_role", "static_detail"} & set(values):
             self._replacement_pair_cache = None
+
+    @torch.no_grad()
+    def _reset_split_parent_snapshots(self) -> None:
+        """Create an empty sparse transaction table with live field widths."""
+        self.split_parent_snapshot_family_id = self.lineage_id.new_empty((0,))
+        for name in self.split_parent_snapshot_names:
+            live_name = name.removeprefix("proposal_parent_")
+            live = getattr(self, live_name)
+            setattr(
+                self,
+                name,
+                live.new_empty((0,) + tuple(live.shape[1:])),
+            )
+
+    @torch.no_grad()
+    def _load_split_parent_snapshots(self, payload: dict | None) -> None:
+        """Restore one exact parent record per unresolved split family."""
+        live_families = torch.unique(
+            self.split_proposal_family_id[
+                self.proposal_kind == PROPOSAL_SPLIT
+            ],
+            sorted=True,
+        )
+        if payload is None:
+            self._reset_split_parent_snapshots()
+            if len(live_families):
+                raise RuntimeError(
+                    "Unresolved split families lack sparse parent snapshots"
+                )
+            return
+        required = {"family_id", *self.split_parent_snapshot_names}
+        missing = required - set(payload)
+        if missing:
+            raise RuntimeError(
+                "Sparse split snapshot is incomplete: "
+                + ", ".join(sorted(missing))
+            )
+        family_ids = torch.as_tensor(
+            payload["family_id"],
+            device=self.xyz.device,
+            dtype=torch.int64,
+        ).reshape(-1)
+        if len(family_ids) and bool(
+            (family_ids[1:] <= family_ids[:-1]).any()
+        ):
+            raise RuntimeError(
+                "Sparse split snapshot family ids must be strictly increasing"
+            )
+        self.split_parent_snapshot_family_id = family_ids
+        for name in self.split_parent_snapshot_names:
+            live_name = name.removeprefix("proposal_parent_")
+            live = getattr(self, live_name)
+            value = torch.as_tensor(
+                payload[name], device=live.device, dtype=live.dtype
+            )
+            expected = (len(family_ids),) + tuple(live.shape[1:])
+            if tuple(value.shape) != expected:
+                raise RuntimeError(
+                    f"Sparse split snapshot {name} has shape "
+                    f"{tuple(value.shape)}, expected {expected}"
+                )
+            setattr(self, name, value)
+        if not torch.equal(family_ids, live_families):
+            raise RuntimeError(
+                "Sparse split snapshots do not exactly match live families"
+            )
+
+    @torch.no_grad()
+    def _append_split_parent_snapshots(
+        self,
+        parent_rows: torch.Tensor,
+        family_ids: torch.Tensor,
+    ) -> None:
+        """Append one parent state per new monotonic split transaction."""
+        parent_rows = torch.as_tensor(
+            parent_rows, device=self.xyz.device, dtype=torch.long
+        ).reshape(-1)
+        family_ids = torch.as_tensor(
+            family_ids, device=self.xyz.device, dtype=torch.int64
+        ).reshape(-1)
+        if len(parent_rows) != len(family_ids):
+            raise ValueError("Split parent snapshot rows/families differ")
+        if not len(parent_rows):
+            return
+        if bool((family_ids[1:] <= family_ids[:-1]).any()):
+            raise RuntimeError("New split family ids are not strictly increasing")
+        existing = self.split_parent_snapshot_family_id
+        if len(existing) and int(family_ids[0]) <= int(existing[-1]):
+            raise RuntimeError("Split family id would reuse transaction history")
+        self.split_parent_snapshot_family_id = torch.cat(
+            [existing, family_ids], dim=0
+        )
+        for name in self.split_parent_snapshot_names:
+            live_name = name.removeprefix("proposal_parent_")
+            snapshot = getattr(self, name)
+            parent_value = getattr(self, live_name)[parent_rows].detach().clone()
+            setattr(self, name, torch.cat([snapshot, parent_value], dim=0))
+
+    @torch.no_grad()
+    def split_parent_snapshot_indices(
+        self, family_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Resolve family ids to compact snapshot rows, failing closed."""
+        family_ids = torch.as_tensor(
+            family_ids, device=self.xyz.device, dtype=torch.int64
+        ).reshape(-1)
+        table = self.split_parent_snapshot_family_id
+        positions = torch.searchsorted(table, family_ids)
+        valid = positions < len(table)
+        if bool(valid.any()):
+            matched = torch.zeros_like(valid)
+            matched[valid] = table[positions[valid]] == family_ids[valid]
+            valid &= matched
+        if not bool(valid.all()):
+            missing = family_ids[~valid]
+            raise RuntimeError(
+                "Split family has no exact parent snapshot: "
+                f"{missing[:8].tolist()}"
+            )
+        return positions
+
+    @torch.no_grad()
+    def validate_split_transaction_state(self) -> dict[str, int]:
+        """Require a bijection between live split families and snapshots."""
+        split_row = self.proposal_kind == PROPOSAL_SPLIT
+        malformed = split_row != (self.split_proposal_family_id >= 0)
+        if bool(malformed.any()):
+            raise RuntimeError(
+                "Split proposal kind/family metadata is inconsistent"
+            )
+        live_family, family_size = torch.unique(
+            self.split_proposal_family_id[split_row],
+            sorted=True,
+            return_counts=True,
+        )
+        snapshot_family = self.split_parent_snapshot_family_id
+        if not torch.equal(live_family, snapshot_family):
+            missing = live_family[
+                ~torch.isin(live_family, snapshot_family)
+            ]
+            extra = snapshot_family[
+                ~torch.isin(snapshot_family, live_family)
+            ]
+            raise RuntimeError(
+                "Live split families and exact parent snapshots diverged: "
+                f"missing={missing[:8].tolist()}, extra={extra[:8].tolist()}"
+            )
+        invalid_size = (family_size != 2) & (family_size != 4)
+        if bool(invalid_size.any()):
+            raise RuntimeError(
+                "Split proposal family cardinality is not 2 or 4: "
+                f"{live_family[invalid_size][:8].tolist()}"
+            )
+        return {
+            "live_families": int(len(live_family)),
+            "snapshot_families": int(len(snapshot_family)),
+            "split_rows": int(split_row.sum()),
+        }
+
+    @torch.no_grad()
+    def remove_split_parent_snapshots(
+        self, family_ids: torch.Tensor
+    ) -> None:
+        """Release resolved transaction records without touching row order."""
+        family_ids = torch.unique(
+            torch.as_tensor(
+                family_ids, device=self.xyz.device, dtype=torch.int64
+            ).reshape(-1),
+            sorted=True,
+        )
+        if not len(family_ids):
+            return
+        # Resolve first so an unknown/stale id cannot silently succeed.
+        self.split_parent_snapshot_indices(family_ids)
+        keep = ~torch.isin(self.split_parent_snapshot_family_id, family_ids)
+        self.split_parent_snapshot_family_id = (
+            self.split_parent_snapshot_family_id[keep]
+        )
+        for name in self.split_parent_snapshot_names:
+            setattr(self, name, getattr(self, name)[keep])
+
+    @torch.no_grad()
+    def _allocate_lineage_ids(self, count: int) -> torch.Tensor:
+        """Allocate globally monotonic row identities.
+
+        Live-row maxima are not an allocator: pruning the newest row would
+        otherwise make its identity reusable while ancestry tables still
+        refer to it.  Skipped ids are harmless, reuse is not.
+        """
+        count = int(count)
+        if count < 0:
+            raise ValueError("lineage allocation count cannot be negative")
+        first = int(self.next_lineage_id.item())
+        if first < 0:
+            raise RuntimeError("next lineage id is negative")
+        result = torch.arange(
+            first,
+            first + count,
+            device=self.xyz.device,
+            dtype=torch.int64,
+        )
+        self.next_lineage_id.fill_(first + count)
+        return result
 
     def replacement_pair_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return cached sparse envelope/detail pairs for local hand-off."""
@@ -1804,7 +2326,7 @@ class VolumetricFoliageModel(nn.Module):
         target_rows = torch.nonzero(target, as_tuple=False).flatten()
         owners = self.persistent_envelope_mask & (
             self.replacement_group >= 0
-        )
+        ) & resolved_static_owner_mask(self)
         if not len(target_rows) or not bool(owners.any()):
             return {
                 "contract": "nearest_same_tree_group_then_view_ray_overlap",
@@ -1884,6 +2406,41 @@ class VolumetricFoliageModel(nn.Module):
         return audit
 
     @property
+    def split_parent_snapshot_names(self) -> tuple[str, ...]:
+        return (
+            "proposal_parent_xyz",
+            "proposal_parent_log_scales",
+            "proposal_parent_quaternions",
+            "proposal_parent_opacity_logits",
+            "proposal_parent_features",
+            "proposal_parent_deformation_basis",
+            "proposal_parent_dynamic_feature_basis",
+            "proposal_parent_dynamic_opacity_basis",
+            "proposal_parent_verification_state",
+            "proposal_parent_verified_camera_ids",
+            "proposal_parent_verified_camera_count",
+            "proposal_parent_verified_sequence_count",
+            "proposal_parent_evidence_primitive_id",
+            "proposal_parent_candidate_evidence_primitive_id",
+            "proposal_parent_parent_lineage_id",
+            "proposal_parent_support_camera_ids",
+            "proposal_parent_support_view_count",
+            "proposal_parent_support_sequence_count",
+            "proposal_parent_free_space_violation_count",
+            "proposal_parent_unknown_view_count",
+            "proposal_parent_birth_iteration",
+            "proposal_parent_initialization_center",
+            "proposal_parent_scale_ceiling",
+            "proposal_parent_position_covariance",
+            "proposal_parent_occupancy_probability",
+            "proposal_parent_replacement_overlap_ema",
+            "proposal_parent_replacement_observation_count",
+            "proposal_parent_replacement_camera_signature",
+            "proposal_parent_handoff_reference_mass",
+            "proposal_parent_handoff_retired_fraction",
+        )
+
+    @property
     def metadata_names(self) -> tuple[str, ...]:
         return (
             "primitive_role",
@@ -1915,8 +2472,11 @@ class VolumetricFoliageModel(nn.Module):
             "replacement_camera_signature",
             "handoff_reference_mass",
             "handoff_retired_fraction",
+            "opacity_settle_reference_mass",
             "lineage_id",
             "parent_lineage_id",
+            "proposal_kind",
+            "split_proposal_family_id",
             "birth_iteration",
             "verification_state",
             "verified_camera_ids",
@@ -1964,12 +2524,17 @@ class VolumetricFoliageModel(nn.Module):
             elif name == "deformation_basis":
                 clone.normal_(0.0, 0.002, generator=generator)
             parameter_values[name] = torch.cat([value, clone], dim=0)
+        new_lineage_ids = self._allocate_lineage_ids(len(indices))
         metadata = {}
         for name in self.metadata_names:
             value = getattr(self, name)
             clone = value[indices].clone()
             if name == "layer_role":
                 clone.fill_(LAYER_DYNAMIC_LEAF)
+            elif name == "lineage_id":
+                clone = new_lineage_ids
+            elif name == "parent_lineage_id":
+                clone = self.lineage_id[indices].clone()
             elif name == "scale_ceiling":
                 clone *= float(scale_factor)
             elif name == "static_detail":
@@ -1988,6 +2553,41 @@ class VolumetricFoliageModel(nn.Module):
                 # A sequence-conditioned residual must not claim that same
                 # independent existence observation.
                 clone.fill_(-1)
+            elif name == "proposal_kind":
+                clone.fill_(PROPOSAL_NONE)
+            elif name == "split_proposal_family_id":
+                clone.fill_(-1)
+            elif name in {
+                "proposal_parent_verification_state",
+                "proposal_parent_verified_camera_ids",
+                "proposal_parent_evidence_primitive_id",
+                "proposal_parent_candidate_evidence_primitive_id",
+                "proposal_parent_parent_lineage_id",
+                "proposal_parent_support_camera_ids",
+                "proposal_parent_free_space_violation_count",
+                "proposal_parent_unknown_view_count",
+                "proposal_parent_birth_iteration",
+                "proposal_parent_replacement_observation_count",
+                "proposal_parent_replacement_camera_signature",
+            }:
+                clone.fill_(-1)
+            elif name in {
+                "proposal_parent_verified_camera_count",
+                "proposal_parent_verified_sequence_count",
+                "proposal_parent_support_view_count",
+                "proposal_parent_support_sequence_count",
+            }:
+                clone.zero_()
+            elif name in {
+                "proposal_parent_initialization_center",
+                "proposal_parent_scale_ceiling",
+                "proposal_parent_position_covariance",
+                "proposal_parent_occupancy_probability",
+                "proposal_parent_replacement_overlap_ema",
+                "proposal_parent_handoff_reference_mass",
+                "proposal_parent_handoff_retired_fraction",
+            }:
+                clone.fill_(float("nan"))
             metadata[name] = torch.cat([value, clone], dim=0)
         self._replace(**parameter_values)
         self._replace_buffers(**metadata)
@@ -2003,7 +2603,7 @@ class VolumetricFoliageModel(nn.Module):
         support_sequence_count: torch.Tensor | None = None,
         initial_scale: float = 0.04,
         initial_opacity: float = 0.04,
-        birth_iteration: int = -1,
+        birth_iteration: int = 0,
     ) -> dict[str, torch.Tensor | int]:
         """Append cross-sequence uncovered-hit consensus as static leaves."""
         centers = torch.as_tensor(
@@ -2019,6 +2619,10 @@ class VolumetricFoliageModel(nn.Module):
             }
         if not len(self):
             raise RuntimeError("Static ray births require a foliage scaffold")
+        if int(birth_iteration) < 0:
+            raise ValueError(
+                "Static ray births require a non-negative lifecycle iteration"
+            )
         if initial_scale <= 0 or not 0 < initial_opacity < 1:
             raise ValueError("Static ray birth scale/opacity is invalid")
         if colors is not None:
@@ -2085,6 +2689,7 @@ class VolumetricFoliageModel(nn.Module):
             }:
                 child.zero_()
             parameter_values[name] = torch.cat([value, child], dim=0)
+        new_lineage_ids = self._allocate_lineage_ids(len(centers))
         metadata = {}
         for name in self.metadata_names:
             value = getattr(self, name)
@@ -2101,19 +2706,44 @@ class VolumetricFoliageModel(nn.Module):
             }:
                 child.fill_(-1)
             elif name == "lineage_id":
-                next_lineage = (
-                    int(self.lineage_id.max()) + 1
-                    if len(self.lineage_id)
-                    else 0
-                )
-                child = torch.arange(
-                    next_lineage,
-                    next_lineage + len(centers),
-                    device=self.xyz.device,
-                    dtype=torch.int64,
-                )
+                child = new_lineage_ids
             elif name == "parent_lineage_id":
                 child = self.lineage_id[parent].clone()
+            elif name == "proposal_kind":
+                child.fill_(PROPOSAL_RAY_BIRTH)
+            elif name == "split_proposal_family_id":
+                child.fill_(-1)
+            elif name in {
+                "proposal_parent_verification_state",
+                "proposal_parent_verified_camera_ids",
+                "proposal_parent_evidence_primitive_id",
+                "proposal_parent_candidate_evidence_primitive_id",
+                "proposal_parent_parent_lineage_id",
+                "proposal_parent_support_camera_ids",
+                "proposal_parent_free_space_violation_count",
+                "proposal_parent_unknown_view_count",
+                "proposal_parent_birth_iteration",
+                "proposal_parent_replacement_observation_count",
+                "proposal_parent_replacement_camera_signature",
+            }:
+                child.fill_(-1)
+            elif name in {
+                "proposal_parent_verified_camera_count",
+                "proposal_parent_verified_sequence_count",
+                "proposal_parent_support_view_count",
+                "proposal_parent_support_sequence_count",
+            }:
+                child.zero_()
+            elif name in {
+                "proposal_parent_initialization_center",
+                "proposal_parent_scale_ceiling",
+                "proposal_parent_position_covariance",
+                "proposal_parent_occupancy_probability",
+                "proposal_parent_replacement_overlap_ema",
+                "proposal_parent_handoff_reference_mass",
+                "proposal_parent_handoff_retired_fraction",
+            }:
+                child.fill_(float("nan"))
             elif name == "birth_iteration":
                 child.fill_(int(birth_iteration))
             elif name == "verification_state":
@@ -2212,7 +2842,7 @@ class VolumetricFoliageModel(nn.Module):
         parent_rows: torch.Tensor,
         *,
         optical_mass_fraction: float = 0.05,
-        birth_iteration: int = -1,
+        birth_iteration: int = 0,
     ) -> dict[str, torch.Tensor | int | float]:
         """Factor envelope cells into co-located envelope/detail owners.
 
@@ -2259,6 +2889,16 @@ class VolumetricFoliageModel(nn.Module):
         if not bool(self.persistent_envelope_mask[parent_rows].all()):
             raise ValueError(
                 "Static-detail receivers require persistent envelope parents"
+            )
+        if bool((self.proposal_kind[parent_rows] != PROPOSAL_NONE).any()):
+            raise ValueError(
+                "Static-detail receivers require resolved proposal owners"
+            )
+        persistent_parent = resolved_static_owner_mask(self)[parent_rows]
+        if not bool(persistent_parent.all()):
+            raise ValueError(
+                "Static-detail receivers require resolved envelope "
+                "parents"
             )
         parent_groups = self.replacement_group[parent_rows]
         if bool((parent_groups < 0).any()):
@@ -2339,30 +2979,32 @@ class VolumetricFoliageModel(nn.Module):
         metadata["initialization_center"][child_rows] = self.xyz[
             parent_rows
         ].detach()
-        next_lineage = (
-            int(self.lineage_id.max()) + 1 if len(self.lineage_id) else 0
-        )
+        new_lineage_ids = self._allocate_lineage_ids(len(parent_rows))
         metadata["parent_lineage_id"][child_rows] = self.lineage_id[
             parent_rows
         ]
-        metadata["lineage_id"][child_rows] = torch.arange(
-            next_lineage,
-            next_lineage + len(parent_rows),
-            device=self.xyz.device,
-            dtype=torch.int64,
-        )
+        metadata["proposal_kind"][child_rows] = PROPOSAL_NONE
+        metadata["split_proposal_family_id"][child_rows] = -1
+        metadata["lineage_id"][child_rows] = new_lineage_ids
         metadata["birth_iteration"][child_rows] = int(birth_iteration)
-        # This is an exact factorization of already verified geometry, not a
-        # displaced split proposal.  Preserve the parent's real evidence and
-        # verification tables rather than manufacturing or discarding them.
-        metadata["verification_state"][child_rows] = metadata[
-            "verification_state"
-        ][parent_rows]
+        # This is an exact optical factorization, not proof that the new detail
+        # role has itself been seen.  Keep the parent's support cameras as
+        # candidate witness rays but start a distinct read-only receiver tier.
+        # Only two real contributing renders may promote it to persistent.
+        metadata["verification_state"][child_rows] = (
+            VERIFICATION_FACTORIZED_RECEIVER
+        )
+        metadata["verified_camera_ids"][child_rows] = -1
+        metadata["verified_camera_count"][child_rows] = 0
+        metadata["verified_sequence_count"][child_rows] = 0
+        if parameter_values["features"].shape[1] > 1:
+            parameter_values["features"][child_rows, 1:] = 0
         for name in (
             "replacement_overlap_ema",
             "replacement_observation_count",
             "replacement_camera_signature",
             "handoff_retired_fraction",
+            "opacity_settle_reference_mass",
         ):
             metadata[name][parent_rows] = 0
             metadata[name][child_rows] = 0
@@ -2407,9 +3049,9 @@ class VolumetricFoliageModel(nn.Module):
         self,
         indices: torch.Tensor,
         *,
-        shrink: float = math.sqrt(2.0),
+        shrink: float = 1.0 / ADAPTIVE_SPLIT_CHILD_SCALE_FRACTION,
         allow_static_skeleton: bool = False,
-        birth_iteration: int = -1,
+        birth_iteration: int = 0,
     ) -> dict[str, int]:
         """Replace selected volumes with two role-preserving children."""
         indices = torch.as_tensor(
@@ -2432,7 +3074,7 @@ class VolumetricFoliageModel(nn.Module):
         shrink_override: float | None = None,
         allow_static_skeleton: bool = False,
         split_plane_normals: torch.Tensor | None = None,
-        birth_iteration: int = -1,
+        birth_iteration: int = 0,
     ) -> dict[str, int]:
         """Replace selected volumes with adaptive role-preserving children."""
         remove = torch.zeros(
@@ -2458,34 +3100,67 @@ class VolumetricFoliageModel(nn.Module):
         shrink_override: float | None = None,
         allow_static_skeleton: bool = False,
         split_plane_normals: torch.Tensor | None = None,
-        birth_iteration: int = -1,
+        birth_iteration: int = 0,
+        transaction_remove: torch.Tensor | None = None,
     ) -> dict[str, int]:
         """Replace broad volumes with two or four oriented children.
 
         A fixed binary split consumes one topology event even when a
         primitive is many times wider than the requested screen bandwidth.
-        Four children tile the parent's two dominant local axes and reduce
-        its projected scale by two in one mutation.  ``child_count - 1`` is
-        the true model-growth cost and callers budget that cost explicitly.
+        Four children tile the parent's two dominant local axes.
+        ``child_count - 1`` is the true model-growth cost and callers budget
+        that cost explicitly.
 
-        The default geometric shrink is ``sqrt(child_count)``.  Each child
-        therefore has ``1 / child_count`` of the parent's projected
-        cross-section and retains the parent optical depth, preserving
-        integrated optical mass.  Exact-camera renderer bases may additionally
-        supply one camera-plane normal per parent.  Those rows are subdivided
-        only in that image plane: their uncertain depth extent and posterior
-        covariance are not falsely tightened by an optical-bandwidth update.
-        ``shrink_override`` exists only for the legacy binary public method.
+        A split is required to be a near-render-preserving representation
+        change, not an opportunity to create high-frequency optical mass.
+        Each divided axis therefore uses the moment-preserving 0.8-sigma
+        child scale and 0.6-sigma centre offset.  Child optical depths are
+        derived from the actual post-split cross-section, so integrated mass
+        is exact even for anisotropic parents.  Unsplit axes and the metric
+        posterior covariance remain unchanged: topology alone is not new
+        geometric evidence.  Exact-camera bases may additionally supply one
+        camera-plane normal to choose depth-neutral tangent axes.
+        ``shrink_override`` exists only for the legacy binary public method;
+        its matching offset is derived from the same moment constraint.
         """
         remove = torch.as_tensor(
             remove, device=self.xyz.device, dtype=torch.bool
         ).reshape(-1)
         if remove.shape != (len(self),):
             raise ValueError("replace-and-split remove mask shape mismatch")
+        if transaction_remove is None:
+            transaction_remove = torch.zeros_like(remove)
+        else:
+            transaction_remove = torch.as_tensor(
+                transaction_remove,
+                device=self.xyz.device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            if transaction_remove.shape != (len(self),):
+                raise ValueError(
+                    "transaction remove mask shape mismatch"
+                )
+        if bool((transaction_remove & ~remove).any()):
+            raise ValueError(
+                "transaction removal must be a subset of requested removal"
+            )
+        valid_transaction_row = (
+            (self.proposal_kind == PROPOSAL_SPLIT)
+            & (self.split_proposal_family_id >= 0)
+        )
+        if bool((transaction_remove & ~valid_transaction_row).any()):
+            raise RuntimeError(
+                "Only unresolved split siblings may bypass role protection"
+            )
         # A canopy contradiction is not allowed to delete the independent
-        # trunk/branch owner. Static rows can still be selected explicitly as
-        # split parents when ``allow_static_skeleton`` is enabled.
-        remove = remove & ~self.static_skeleton_mask
+        # trunk/branch owner.  Atomic rollback is different: once the exact
+        # parent has been restored, the other siblings must be removed even
+        # when they carry the skeleton role.  Otherwise the snapshot is
+        # committed as resolved while three orphan siblings survive.
+        remove = (
+            (remove & ~self.static_skeleton_mask)
+            | transaction_remove
+        )
         indices = torch.as_tensor(
             indices, device=self.xyz.device, dtype=torch.long
         ).reshape(-1)
@@ -2500,6 +3175,10 @@ class VolumetricFoliageModel(nn.Module):
             raise ValueError("adaptive split parents must be unique")
         if bool(((child_counts != 2) & (child_counts != 4)).any()):
             raise ValueError("adaptive volume splits support 2 or 4 children")
+        if int(birth_iteration) < 0:
+            raise ValueError(
+                "Adaptive splits require a non-negative lifecycle iteration"
+            )
         if indices.numel() and bool(remove[indices].any()):
             raise ValueError(
                 "replace-and-split parents cannot also be retired"
@@ -2526,6 +3205,15 @@ class VolumetricFoliageModel(nn.Module):
             indices = indices[retained]
             child_counts = child_counts[retained]
             parent_plane_normals = parent_plane_normals[retained]
+        if indices.numel():
+            unresolved_parent = (
+                (self.proposal_kind[indices] != PROPOSAL_NONE)
+                | (self.split_proposal_family_id[indices] >= 0)
+            )
+            if bool(unresolved_parent.any()):
+                raise RuntimeError(
+                    "Cannot recursively split an unresolved proposal family"
+                )
         if not indices.numel():
             kept = torch.nonzero(~remove, as_tuple=False).flatten()
             pruned = int(remove.sum())
@@ -2551,6 +3239,7 @@ class VolumetricFoliageModel(nn.Module):
                         for name in self.metadata_names
                     }
                 )
+            self.validate_split_transaction_state()
             return {
                 "split_parents": 0,
                 "children": 0,
@@ -2586,17 +3275,30 @@ class VolumetricFoliageModel(nn.Module):
             )
             - child_start
         )
-        child_local = torch.zeros(
-            int(child_counts.sum()),
-            3,
-            device=self.xyz.device,
-            dtype=scales.dtype,
-        )
         child_axis_order = axis_order[child_parent]
         child_scales = scales[child_parent]
         first_axis = child_axis_order[:, 0]
         second_axis = child_axis_order[:, 1]
         is_four = child_counts[child_parent] == 4
+        parent_axis_shrink = (
+            torch.full_like(
+                child_counts,
+                float(shrink_override),
+                dtype=scales.dtype,
+            )
+            if shrink_override is not None
+            else torch.full_like(
+                child_counts,
+                1.0 / ADAPTIVE_SPLIT_CHILD_SCALE_FRACTION,
+                dtype=scales.dtype,
+            )
+        )
+        if bool((parent_axis_shrink <= 1.0).any()):
+            raise ValueError("adaptive split shrink must be greater than one")
+        child_shrink = parent_axis_shrink[child_parent]
+        child_offset_fraction = torch.sqrt(
+            (1.0 - child_shrink.reciprocal().square()).clamp_min(0.0)
+        )
         first_sign = torch.where(
             is_four,
             torch.where(child_slot < 2, -1.0, 1.0),
@@ -2611,22 +3313,6 @@ class VolumetricFoliageModel(nn.Module):
             ),
             0.0,
         ).to(scales.dtype)
-        first_offset = (
-            0.35
-            * child_scales.gather(1, first_axis[:, None])[:, 0]
-            * first_sign
-        )
-        second_offset = (
-            0.35
-            * child_scales.gather(1, second_axis[:, None])[:, 0]
-            * second_sign
-        )
-        child_local.scatter_(
-            1, first_axis[:, None], first_offset[:, None]
-        )
-        child_local.scatter_add_(
-            1, second_axis[:, None], second_offset[:, None]
-        )
         quaternion = self.normalized_quaternions.detach()[indices]
         w, x, y, z = quaternion.unbind(-1)
         rotation = torch.stack(
@@ -2666,27 +3352,49 @@ class VolumetricFoliageModel(nn.Module):
             child_axis_order = axis_order[child_parent]
             first_axis = child_axis_order[:, 0]
             second_axis = child_axis_order[:, 1]
-            # ``child_local`` was initially assembled in geometric
-            # longest-axis order. Rebuild it after substituting the calibrated
-            # image-plane order; otherwise a quaternary optical split can
-            # project both nominal axes onto the same line.
-            child_local.zero_()
-            first_offset = (
-                0.35
-                * child_scales.gather(1, first_axis[:, None])[:, 0]
-                * first_sign
-            )
-            second_offset = (
-                0.35
-                * child_scales.gather(1, second_axis[:, None])[:, 0]
-                * second_sign
-            )
-            child_local.scatter_(
-                1, first_axis[:, None], first_offset[:, None]
-            )
-            child_local.scatter_add_(
-                1, second_axis[:, None], second_offset[:, None]
-            )
+        third_axis = child_axis_order[:, 2]
+        third_sign = torch.where(
+            (child_slot == 0) | (child_slot == 3),
+            -1.0,
+            1.0,
+        ).to(scales.dtype)
+        child_local = torch.zeros(
+            int(child_counts.sum()),
+            3,
+            device=self.xyz.device,
+            dtype=scales.dtype,
+        )
+        first_offset = (
+            child_offset_fraction
+            * child_scales.gather(1, first_axis[:, None])[:, 0]
+            * first_sign
+        )
+        second_offset = (
+            child_offset_fraction
+            * child_scales.gather(1, second_axis[:, None])[:, 0]
+            * second_sign
+        )
+        # A generic four-way split uses a regular tetrahedral sign pattern.
+        # Together with the 0.8/0.6 scale/offset pair this preserves the full
+        # three-dimensional mean and covariance, so no viewing direction is
+        # privileged.  Exact-camera children remain in the calibrated image
+        # plane and leave their uncertain depth extent untouched.
+        tetrahedral_child = is_four & ~optical_plane_parent[child_parent]
+        third_offset = (
+            child_offset_fraction
+            * child_scales.gather(1, third_axis[:, None])[:, 0]
+            * third_sign
+            * tetrahedral_child.to(scales.dtype)
+        )
+        child_local.scatter_(
+            1, first_axis[:, None], first_offset[:, None]
+        )
+        child_local.scatter_add_(
+            1, second_axis[:, None], second_offset[:, None]
+        )
+        child_local.scatter_add_(
+            1, third_axis[:, None], third_offset[:, None]
+        )
         child_rotation = rotation[child_parent]
         offset = torch.bmm(
             child_rotation, child_local[:, :, None]
@@ -2708,24 +3416,9 @@ class VolumetricFoliageModel(nn.Module):
                 desired_length / projected_length.clamp_min(1e-8)
             )
             offset[optical_plane_child] = projected
-        parent_shrink = (
-            torch.full_like(
-                child_counts,
-                float(shrink_override),
-                dtype=scales.dtype,
-            )
-            if shrink_override is not None
-            else child_counts.to(scales.dtype).sqrt()
-        )
-        child_shrink = parent_shrink[child_parent]
         child_axis_shrink = torch.full_like(child_scales, 1.0)
-        first_axis_shrink = torch.where(
-            optical_plane_child,
-            torch.full_like(child_shrink, 2.0),
-            child_shrink,
-        )
         child_axis_shrink.scatter_(
-            1, first_axis[:, None], first_axis_shrink[:, None]
+            1, first_axis[:, None], child_shrink[:, None]
         )
         child_axis_shrink.scatter_(
             1,
@@ -2736,12 +3429,39 @@ class VolumetricFoliageModel(nn.Module):
                 torch.ones_like(child_shrink),
             )[:, None],
         )
-        # A geometric split contracts all three axes.  An exact-ray optical
-        # split contracts only one (binary) or two (quaternary) image-plane
-        # axes and preserves its depth extent.
-        child_axis_shrink[~optical_plane_child] = child_shrink[
-            ~optical_plane_child, None
-        ]
+        child_axis_shrink.scatter_(
+            1,
+            third_axis[:, None],
+            torch.where(
+                tetrahedral_child,
+                child_shrink,
+                torch.ones_like(child_shrink),
+            )[:, None],
+        )
+        # Only axes which receive distinct child centres are contracted.
+        # Tightening an unsplit axis narrows the field without adding spatial
+        # samples there and was the main source of split-induced pinpoints.
+        child_scale_values = child_scales / child_axis_shrink
+        parent_area = projected_gaussian_cross_section(scales)[child_parent]
+        child_area = projected_gaussian_cross_section(child_scale_values)
+        if bool(optical_plane_child.any()):
+            # For a calibrated camera-plane split the conserved field is the
+            # owner's tangent-plane extinction, not the maximum cross-section
+            # of a deliberately retained uncertain depth axis.
+            parent_plane_area = (
+                child_scales.gather(1, first_axis[:, None])[:, 0]
+                * child_scales.gather(1, second_axis[:, None])[:, 0]
+            )
+            child_plane_area = (
+                child_scale_values.gather(1, first_axis[:, None])[:, 0]
+                * child_scale_values.gather(1, second_axis[:, None])[:, 0]
+            )
+            parent_area = torch.where(
+                optical_plane_child, parent_plane_area, parent_area
+            )
+            child_area = torch.where(
+                optical_plane_child, child_plane_area, child_area
+            )
         parameter_values = {}
         for name in (
             "xyz",
@@ -2762,16 +3482,19 @@ class VolumetricFoliageModel(nn.Module):
             elif name == "log_scales":
                 child -= child_axis_shrink.log()
             elif name == "opacity_logits":
-                # Preserve integrated projected optical depth, not only the
-                # transmittance of hypothetical coincident children. Each
-                # child has 1/shrink^2 of the parent's projected area, so its
-                # optical depth carries shrink^2/N of the parent.
+                # Preserve integrated projected optical depth using the
+                # *actual* anisotropic child area.  Assuming area=1/shrink^2
+                # was only valid for a three-axis contraction and coupled a
+                # representation split to an artificial peak-alpha copy.
                 parent_alpha = child.sigmoid().clamp(1e-6, 1 - 1e-6)
                 parent_tau = -torch.log1p(-parent_alpha)
                 child_tau = (
                     parent_tau
-                    * child_shrink[:, None].square()
-                    / child_counts[child_parent, None].to(parent_tau.dtype)
+                    * parent_area[:, None]
+                    / (
+                        child_counts[child_parent, None].to(parent_tau.dtype)
+                        * child_area[:, None].clamp_min(1.0e-12)
+                    )
                 )
                 opacity = -torch.expm1(-child_tau)
                 child = torch.logit(opacity.clamp(1e-6, 1 - 1e-6))
@@ -2791,11 +3514,10 @@ class VolumetricFoliageModel(nn.Module):
         child_start = int(keep.sum())
         child_xyz = parameter_values["xyz"][child_start:]
         metadata["initialization_center"][child_start:] = child_xyz.detach()
-        geometric_child = ~optical_plane_child
-        child_covariance = metadata["position_covariance"][child_start:]
-        child_covariance[geometric_child] /= (
-            child_shrink[geometric_child].square()[:, None, None]
-        )
+        # A split creates no new ray or depth measurement.  Preserve the
+        # metric posterior until real child-centre observations update it;
+        # dividing covariance by the split factor manufactured confidence
+        # and made recursive descendants progressively over-authoritative.
         metadata["scale_ceiling"][child_start:] /= child_axis_shrink
         # The support/observation tables below are retained only as candidate
         # owner rays for re-verification.  They are not proof at the displaced
@@ -2805,17 +3527,23 @@ class VolumetricFoliageModel(nn.Module):
         parent_lineage = self.lineage_id[indices].repeat_interleave(
             child_counts
         )
-        next_lineage = (
-            int(self.lineage_id.max()) + 1 if len(self.lineage_id) else 0
-        )
         child_total = int(child_counts.sum())
         metadata["parent_lineage_id"][child_rows] = parent_lineage
-        metadata["lineage_id"][child_rows] = torch.arange(
-            next_lineage,
-            next_lineage + child_total,
+        metadata["lineage_id"][child_rows] = self._allocate_lineage_ids(
+            child_total
+        )
+        first_family = int(self.next_split_proposal_family_id.item())
+        family_ids = torch.arange(
+            first_family,
+            first_family + len(indices),
             device=self.xyz.device,
             dtype=torch.int64,
         )
+        metadata["proposal_kind"][child_rows] = PROPOSAL_SPLIT
+        metadata["split_proposal_family_id"][child_rows] = (
+            family_ids.repeat_interleave(child_counts)
+        )
+        self._append_split_parent_snapshots(indices, family_ids)
         metadata["birth_iteration"][child_rows] = int(birth_iteration)
         metadata["verification_state"][child_rows] = (
             VERIFICATION_UNVERIFIED
@@ -2834,6 +3562,10 @@ class VolumetricFoliageModel(nn.Module):
         metadata["replacement_camera_signature"][child_rows] = 0
         metadata["replacement_overlap_ema"][child_rows] = 0
         metadata["replacement_observation_count"][child_rows] = 0
+        # A split child must earn its own post-verification optical anchor.
+        # Copying the parent's anchor into every child would multiply the
+        # allowed family mass by the child count.
+        metadata["opacity_settle_reference_mass"][child_rows] = 0
         parameter_values["features"][child_rows, 1:] = 0
         # Reference mass follows the actual conserved child mass rather than
         # duplicating the parent's scalar once per child.
@@ -2883,6 +3615,10 @@ class VolumetricFoliageModel(nn.Module):
         )
         self._replace(**parameter_values)
         self._replace_buffers(**metadata)
+        self.next_split_proposal_family_id.fill_(
+            first_family + len(indices)
+        )
+        self.validate_split_transaction_state()
         return {
             "split_parents": int(indices.numel()),
             "children": int(child_counts.sum()),
@@ -2932,12 +3668,35 @@ class VolumetricFoliageModel(nn.Module):
                 for name in self.metadata_names
             }
         )
+        if self.proposal_parent_verified_camera_ids.shape[1:] != (
+            self.verified_camera_ids.shape[1:]
+        ):
+            raise RuntimeError(
+                "Parent verified-camera snapshot width does not match live table"
+            )
+        if self.proposal_parent_support_camera_ids.shape[1:] != (
+            self.support_camera_ids.shape[1:]
+        ):
+            raise RuntimeError(
+                "Parent support-camera snapshot width does not match live table"
+            )
         return count, new_to_old
 
     def capture(self) -> dict:
         return {
             "sh_degree": self.sh_degree,
             "dynamic_rank": self.dynamic_rank,
+            "next_split_proposal_family_id": (
+                self.next_split_proposal_family_id.detach()
+            ),
+            "next_lineage_id": self.next_lineage_id.detach(),
+            "split_parent_snapshots": {
+                "family_id": self.split_parent_snapshot_family_id.detach(),
+                **{
+                    name: getattr(self, name).detach()
+                    for name in self.split_parent_snapshot_names
+                },
+            },
             "xyz": self.xyz.detach(),
             "log_scales": self.log_scales.detach(),
             "quaternions": self.quaternions.detach(),
@@ -3052,8 +3811,15 @@ class VolumetricFoliageModel(nn.Module):
                 )
             ),
             "handoff_retired_fraction": torch.zeros(count),
+            "opacity_settle_reference_mass": torch.zeros(count),
             "lineage_id": torch.arange(count, dtype=torch.int64),
             "parent_lineage_id": torch.full(
+                (count,), -1, dtype=torch.int64
+            ),
+            "proposal_kind": torch.full(
+                (count,), PROPOSAL_NONE, dtype=torch.int8
+            ),
+            "split_proposal_family_id": torch.full(
                 (count,), -1, dtype=torch.int64
             ),
             "birth_iteration": torch.full(
@@ -3093,6 +3859,51 @@ class VolumetricFoliageModel(nn.Module):
                 for name in self.metadata_names
             }
         )
+        self._load_split_parent_snapshots(
+            payload.get("split_parent_snapshots")
+        )
+        supplied_next_family = payload.get("next_split_proposal_family_id")
+        highest_family = max(
+            int(self.split_proposal_family_id.max())
+            if len(self.split_proposal_family_id)
+            else -1,
+            int(self.split_parent_snapshot_family_id.max())
+            if len(self.split_parent_snapshot_family_id)
+            else -1,
+        )
+        if supplied_next_family is None:
+            next_family = highest_family + 1
+        else:
+            next_family = int(torch.as_tensor(supplied_next_family).item())
+        if next_family <= highest_family:
+            raise RuntimeError(
+                "next split proposal family id does not exceed live families"
+            )
+        self.next_split_proposal_family_id.fill_(next_family)
+        lineage_sources = (
+            self.lineage_id,
+            self.parent_lineage_id,
+            self.proposal_parent_parent_lineage_id,
+        )
+        highest_lineage = max(
+            (
+                int(value[value >= 0].max())
+                for value in lineage_sources
+                if bool((value >= 0).any())
+            ),
+            default=-1,
+        )
+        supplied_next_lineage = payload.get("next_lineage_id")
+        next_lineage = (
+            highest_lineage + 1
+            if supplied_next_lineage is None
+            else int(torch.as_tensor(supplied_next_lineage).item())
+        )
+        if next_lineage <= highest_lineage:
+            raise RuntimeError(
+                "next lineage id does not exceed live/provenance lineage ids"
+            )
+        self.next_lineage_id.fill_(next_lineage)
 
 
 def render_hybrid(
@@ -3107,6 +3918,7 @@ def render_hybrid(
     surface_gate: torch.Tensor | None = None,
     surface_gate_indices: torch.Tensor | None = None,
     surface_gate_atlas: torch.Tensor | None = None,
+    volume_depth_query_bounds: torch.Tensor | None = None,
     audit_fields: torch.Tensor | None = None,
     temporal_code: torch.Tensor | None = None,
     include_dynamic: bool = False,
@@ -3230,6 +4042,27 @@ def render_hybrid(
         surface_gate_atlas = surface_means.new_empty((0, 0, 0))
     if surface_gate_indices.shape != (structural_count,):
         raise ValueError("surface_gate_indices must match structural count")
+    if volume_depth_query_bounds is not None:
+        volume_depth_query_bounds = torch.as_tensor(
+            volume_depth_query_bounds,
+            device=surface_means.device,
+            dtype=surface_means.dtype,
+        )
+        expected_query_shape = (
+            2,
+            int(camera.image_height),
+            int(camera.image_width),
+        )
+        if tuple(volume_depth_query_bounds.shape) != expected_query_shape:
+            raise ValueError(
+                "volume_depth_query_bounds must have shape "
+                f"{expected_query_shape}"
+            )
+        # MoGe depth and uncertainty are evidence, never an escape gradient
+        # through which the renderer may move its supervision interval.
+        volume_depth_query_bounds = (
+            volume_depth_query_bounds.detach().contiguous()
+        )
     geometry_gradient_gate = (
         volume_gradient_gate
         if volume_geometry_gradient_gate is None
@@ -3635,6 +4468,7 @@ def render_hybrid(
         opacities,
         surface_gate_indices=surface_gate_indices,
         surface_gate_atlas=surface_gate_atlas,
+        depth_query_bounds=volume_depth_query_bounds,
         audit_fields=audit_fields,
     )
     radii = _restore_sparse_volume_rows(
@@ -3667,6 +4501,8 @@ def render_hybrid(
     volume_depth = torch.nan_to_num(
         allmap[10:11] / volume_alpha.clamp_min(1e-8), 0.0, 0.0
     )
+    volume_prehit_alpha = allmap[11:12]
+    volume_hit_interval_alpha = allmap[12:13]
     return HybridRenderOutput(
         render=rgb,
         alpha=alpha_chw,
@@ -3689,6 +4525,8 @@ def render_hybrid(
         volume_alpha=volume_alpha,
         surface_depth=surface_depth,
         volume_depth=volume_depth,
+        volume_prehit_alpha=volume_prehit_alpha,
+        volume_hit_interval_alpha=volume_hit_interval_alpha,
         surface_means2d=surface_means2D,
         volume_means2d=volume_means2D,
         volume_replacement=replacement_per_row_full,

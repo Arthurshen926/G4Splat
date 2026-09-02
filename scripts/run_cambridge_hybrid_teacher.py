@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +37,12 @@ from outdoor.projected_role_posterior import (  # noqa: E402
     PROJECTED_RIGID_POSTERIOR_VERSION,
 )
 from outdoor.lazy_scene import rgb_source_contract  # noqa: E402
+from outdoor.moge3_chart_base import (  # noqa: E402
+    MOGE3_CHART_BASE_VERSION,
+)
+from outdoor.moge3_evidence import (  # noqa: E402
+    load_runtime_cache as load_moge3_runtime_cache,
+)
 from outdoor.role_aware_initialization import (  # noqa: E402
     INITIALIZATION_VERSION,
     RIGID_CALIBRATED_INITIALIZATION_VERSION,
@@ -49,13 +57,18 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v50-static-detail-birth-first-"
+    "cambridge-native-hybrid-teacher-mainline-v53-moge3-chart-normal-"
+    "static-"
+    "canopy-static-detail-birth-first-"
     "track-skeleton-confidence-positive-tree-view-budget-"
     "local-negative-permission-"
     "topology-stable-polish-native-rigid-depth-"
     "calibrated-continuous-all-camera-posterior-cross-sequence-pointmap-"
     "static-role-posterior-mask-soft-arbitration-atlas-residual-"
     "verification-debt-sequence-metric-depth"
+)
+UNIFIED_TEACHER_PROTOCOL = (
+    "cambridge_native_hybrid_teacher_v113_moge3_thin_hit_interval"
 )
 STAGES = (
     "prepare_cameras",
@@ -99,7 +112,9 @@ PROFILES = {
             6000,
             12000,
             18000,
+            21000,
             24000,
+            27000,
             30000,
         ),
         "track_stride": 5,
@@ -188,10 +203,10 @@ PROFILES = {
         "mature_handoff_surface_policy": "atlas_residual",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
         "maximum_rigid_completion_seeds": 20_000,
-        # Owner rows are sparse, but accelerating opacity alone makes an
-        # opaque low-frequency layer before colour/topology can catch up.
-        # The measured v80 500->1k collapse falsified that shortcut.
-        "volume_opacity_lr": 4.0e-3,
+        # The validated scene-canonical v20-v23 continuations use 2e-3.
+        # Raising only opacity to 4e-3 makes the sparse owner schedule form a
+        # low-frequency optical wall before colour/topology can catch up.
+        "volume_opacity_lr": 2.0e-3,
     },
     "fast": {
         "iterations": 12_000,
@@ -245,7 +260,7 @@ PROFILES = {
         "mature_handoff_surface_policy": "atlas_residual",
         "surface_retirement_optical_mass_fraction_per_event": 0.0025,
         "maximum_rigid_completion_seeds": 10_000,
-        "volume_opacity_lr": 4.0e-3,
+        "volume_opacity_lr": 2.0e-3,
     },
     "rigid": {
         "iterations": 24_000,
@@ -285,6 +300,29 @@ PROFILES = {
     },
 }
 
+# New-branch production profile.  Keep the already exercised v108 optimizer
+# schedule while removing every DAV2 seed/witness path.  MoGe3 enters through
+# its own exact-K evidence fields; it is never aliased to the legacy ordinal
+# ``mono_depth`` slot.
+PROFILES["moge3_static_quality"] = {
+    **PROFILES["quality"],
+    "maximum_dav2_rigid_seeds": 0,
+    "dav2_rigid_selected_views": 0,
+    "use_temporal_dav2_witnesses": False,
+    "use_sequence_metric_depth": False,
+    "monocular_geometry_source": "moge3",
+    # Explicitly opt the MoGe3 branch into target-depth conditional optical
+    # supervision.  The trainer defaults remain disabled so an evidence-free
+    # or legacy profile cannot silently change its objective.
+    "moge3_canopy_optical_weight": 0.20,
+    "moge3_canopy_optical_every": 2,
+    "moge3_canopy_prehit_weight": 0.25,
+    "moge3_canopy_maximum_birth_proposals": 256,
+    "moge3_rigid_depth_weight": 0.04,
+    "moge3_rigid_normal_weight": 0.02,
+    "chart_base_source": "moge3_adaptive",
+}
+
 
 def _trainer_implementation_hashes() -> dict[str, str]:
     surfel_root = REPO_ROOT / "2d-gaussian-splatting"
@@ -303,12 +341,26 @@ def _trainer_implementation_hashes() -> dict[str, str]:
         "mask_lookup": REPO_ROOT / "matcha/cambridge_masks.py",
         "training_evidence": REPO_ROOT
         / "outdoor/training_evidence.py",
+        "moge3_evidence": REPO_ROOT / "outdoor/moge3_evidence.py",
         "hybrid_teacher_api": REPO_ROOT
         / "outdoor/hybrid_teacher_api.py",
         "hybrid_renderer": REPO_ROOT
         / "outdoor/hybrid_gaussian_renderer.py",
         "static_foliage": REPO_ROOT / "outdoor/static_foliage.py",
+        "role_aware_initialization": REPO_ROOT
+        / "outdoor/role_aware_initialization.py",
+        "foliage_geometry": REPO_ROOT / "outdoor/foliage_geometry.py",
         "static_ray_birth": REPO_ROOT / "outdoor/static_ray_birth.py",
+        "projected_role_posterior": REPO_ROOT
+        / "outdoor/projected_role_posterior.py",
+        "directional_sky": REPO_ROOT / "outdoor/directional_sky.py",
+        "foliage_view_graph": REPO_ROOT
+        / "outdoor/foliage_view_graph.py",
+        "evidence_store": REPO_ROOT / "outdoor/evidence_store.py",
+        "runtime_provenance": REPO_ROOT
+        / "outdoor/runtime_provenance.py",
+        "surfel_arguments": surfel_root / "arguments/__init__.py",
+        "loss_utils": surfel_root / "utils/loss_utils.py",
         "mixed_forward_cuda": surfel_root
         / "submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu",
         "mixed_backward_cuda": surfel_root
@@ -316,8 +368,59 @@ def _trainer_implementation_hashes() -> dict[str, str]:
             "submodules/diff-surfel-rasterization/"
             "cuda_rasterizer/mixed_backward.cu"
         ),
+        "mixed_cuda_config": surfel_root
+        / "submodules/diff-surfel-rasterization/cuda_rasterizer/config.h",
+        "mixed_rasterizer_impl_cuda": surfel_root
+        / (
+            "submodules/diff-surfel-rasterization/"
+            "cuda_rasterizer/rasterizer_impl.cu"
+        ),
     }
-    return {name: sha256_file(path) for name, path in paths.items()}
+    hashes = {name: sha256_file(path) for name, path in paths.items()}
+    hashes.update(
+        {
+            "mixed_extension_source_tree": _source_tree_sha256(
+                surfel_root / "submodules/diff-surfel-rasterization"
+            ),
+            "mixed_extension_binary": _loaded_module_binary_sha256(
+                "diff_surfel_rasterization._C"
+            ),
+            "simple_knn_source_tree": _source_tree_sha256(
+                surfel_root / "submodules/simple-knn"
+            ),
+            "simple_knn_binary": _loaded_module_binary_sha256(
+                "simple_knn._C"
+            ),
+        }
+    )
+    return hashes
+
+
+def _source_tree_sha256(root: Path) -> str:
+    root = root.resolve()
+    suffixes = {".cu", ".cuh", ".h", ".hpp", ".cpp", ".py"}
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in suffixes
+        and "build" not in path.relative_to(root).parts
+        and "__pycache__" not in path.relative_to(root).parts
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return digest.hexdigest()
+
+
+def _loaded_module_binary_sha256(module_name: str) -> str:
+    module = importlib.import_module(module_name)
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        raise RuntimeError(f"Loaded module {module_name} has no binary origin")
+    return sha256_file(Path(origin).resolve())
 
 
 def _teacher_result_is_current(
@@ -338,8 +441,15 @@ def _teacher_result_is_current(
     surface_warmstart_manifest: Path | None = None,
     mature_handoff_surface_policy: str = "joint",
     maximum_rigid_completion_seeds: int = 20_000,
-    volume_opacity_lr: float = 4.0e-3,
+    volume_opacity_lr: float = 2.0e-3,
     surface_retirement_optical_mass_fraction_per_event: float = 0.0025,
+    moge3_canopy_optical_weight: float = 0.0,
+    moge3_canopy_optical_every: int = 0,
+    moge3_canopy_prehit_weight: float = 0.25,
+    moge3_canopy_maximum_birth_proposals: int = 256,
+    moge3_rigid_depth_weight: float = 0.0,
+    moge3_rigid_normal_weight: float = 0.0,
+    chart_base_source: str = "matcha",
 ) -> bool:
     """Accept a completed Teacher only when every causal input still matches."""
     if (surface_warmstart_ply is None) != (
@@ -352,6 +462,21 @@ def _teacher_result_is_current(
         return False
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("protocol") == UNIFIED_TEACHER_PROTOCOL:
+            finalization_path = result_path.parent / "finalization_state.json"
+            finalization = json.loads(
+                finalization_path.read_text(encoding="utf-8")
+            )
+            if not (
+                finalization.get("status") == "complete"
+                and finalization.get("protocol") == result.get("protocol")
+                and int(finalization.get("iteration", -1)) == int(iterations)
+                and Path(finalization.get("result", "")).resolve()
+                == result_path.resolve()
+                and finalization.get("result_sha256")
+                == sha256_file(result_path)
+            ):
+                return False
         manifest_path = initialization / "initialization_manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         contract = result["training_contract"]
@@ -427,6 +552,50 @@ def _teacher_result_is_current(
                     surface_retirement_optical_mass_fraction_per_event
                 ),
             )
+            and contract.get("chart_atlas", {}).get("base_source")
+            == str(chart_base_source)
+            and np.isclose(
+                float(
+                    contract.get("moge3_rigid_depth", {}).get(
+                        "weight", np.nan
+                    )
+                ),
+                float(moge3_rigid_depth_weight),
+            )
+            and np.isclose(
+                float(
+                    contract.get("moge3_rigid_normal", {}).get(
+                        "weight", np.nan
+                    )
+                ),
+                float(moge3_rigid_normal_weight),
+            )
+            and np.isclose(
+                float(
+                    contract.get("moge3_canopy_optical", {}).get(
+                        "weight", np.nan
+                    )
+                ),
+                float(moge3_canopy_optical_weight),
+            )
+            and int(
+                contract.get("moge3_canopy_optical", {}).get("every", -1)
+            )
+            == int(moge3_canopy_optical_every)
+            and np.isclose(
+                float(
+                    contract.get("moge3_canopy_optical", {}).get(
+                        "prehit_weight", np.nan
+                    )
+                ),
+                float(moge3_canopy_prehit_weight),
+            )
+            and int(
+                contract.get("moge3_canopy_optical", {}).get(
+                    "maximum_birth_proposals_per_view", -1
+                )
+            )
+            == int(moge3_canopy_maximum_birth_proposals)
             and contract.get("initialization_version")
             == manifest.get("version")
             and contract.get("initialization_manifest_sha256")
@@ -448,6 +617,37 @@ def _teacher_result_is_current(
     except (
         FileNotFoundError,
         KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
+def _teacher_finalization_is_recoverable(
+    teacher_directory: Path,
+    *,
+    iterations: int,
+) -> bool:
+    """Recognize only a provenance-closed interrupted finalization."""
+
+    sidecar_path = teacher_directory / "finalization_state.json"
+    checkpoint = teacher_directory / "hybrid_teacher_checkpoint.pth"
+    if not sidecar_path.is_file() or not checkpoint.is_file():
+        return False
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        return bool(
+            sidecar.get("status") == "in_progress"
+            and sidecar.get("protocol") == UNIFIED_TEACHER_PROTOCOL
+            and int(sidecar.get("iteration", -1)) == int(iterations)
+            and Path(sidecar.get("checkpoint", "")).resolve()
+            == checkpoint.resolve()
+            and sidecar.get("checkpoint_sha256")
+            == sha256_file(checkpoint)
+        )
+    except (
+        FileNotFoundError,
         TypeError,
         ValueError,
         json.JSONDecodeError,
@@ -574,6 +774,22 @@ def _args() -> argparse.Namespace:
     )
     parser.add_argument("--dav2-root", type=Path)
     parser.add_argument(
+        "--moge3-root",
+        type=Path,
+        help=(
+            "Precomputed exact-K MoGe3 cache directory or moge3_index.json. "
+            "Generate it in the independent MoGe3 environment first."
+        ),
+    )
+    parser.add_argument(
+        "--monocular-geometry-source",
+        choices=("moge3", "none", "dav2_legacy"),
+        help=(
+            "Source contract. Defaults to the selected profile; the new "
+            "moge3_static_quality profile is metric MoGe3 only."
+        ),
+    )
+    parser.add_argument(
         "--rgb-images",
         type=Path,
         help=(
@@ -591,7 +807,9 @@ def _args() -> argparse.Namespace:
             "auto-discovered when this option is omitted."
         ),
     )
-    parser.add_argument("--profile", choices=tuple(PROFILES), default="quality")
+    parser.add_argument(
+        "--profile", choices=tuple(PROFILES), default="moge3_static_quality"
+    )
     parser.add_argument("--iterations", type=int)
     parser.add_argument(
         "--rigid-iterations",
@@ -622,7 +840,37 @@ def _args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-trainer-repair-resume", action="store_true"
     )
+    parser.add_argument(
+        "--allow-v105-late-optical-convergence-resume",
+        action="store_true",
+        help=(
+            "Deprecated historical option. The v106 exact-support camera "
+            "authority repair requires a clean initialization and rejects "
+            "v104/v105 training-state migration."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v107-global-negative-cleanup-resume",
+        action="store_true",
+        help=(
+            "Allow only the content-addressed v106 18k checkpoint to enter "
+            "the v107 all-canonical strict-negative cleanup experiment."
+        ),
+    )
     args = parser.parse_args()
+    if args.allow_v105_late_optical_convergence_resume:
+        parser.error(
+            "v106 cannot resume v104/v105 state after changing canonical "
+            "camera authority; use a new output directory and clean init"
+        )
+    if (
+        args.allow_v107_global_negative_cleanup_resume
+        and args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "The narrow v107 migration cannot be combined with the broad "
+            "trainer-repair flag"
+        )
     if args.iterations is None:
         args.iterations = PROFILES[args.profile]["iterations"]
     if args.rigid_iterations is None:
@@ -669,6 +917,21 @@ def _args() -> argparse.Namespace:
         parser.error(
             "--volume-densify-until-iteration must be in [1, --iterations]"
         )
+    if args.monocular_geometry_source is None:
+        args.monocular_geometry_source = PROFILES[args.profile].get(
+            "monocular_geometry_source", "dav2_legacy"
+        )
+    if args.monocular_geometry_source == "moge3":
+        if args.dav2_root is not None:
+            parser.error("MoGe3 production mode cannot accept --dav2-root")
+    elif args.monocular_geometry_source == "dav2_legacy":
+        if args.moge3_root is not None:
+            parser.error("Legacy DAV2 mode cannot accept --moge3-root")
+    else:
+        if args.moge3_root is not None or args.dav2_root is not None:
+            parser.error(
+                "--monocular-geometry-source none cannot accept a monocular cache"
+            )
     return args
 
 
@@ -813,6 +1076,13 @@ def _teacher_command(
     maximum_rigid_completion_seeds: int = 20_000,
     volume_opacity_lr: float | None = None,
     surface_retirement_optical_mass_fraction_per_event: float = 0.0025,
+    moge3_canopy_optical_weight: float = 0.0,
+    moge3_canopy_optical_every: int = 0,
+    moge3_canopy_prehit_weight: float = 0.25,
+    moge3_canopy_maximum_birth_proposals: int = 256,
+    moge3_rigid_depth_weight: float = 0.0,
+    moge3_rigid_normal_weight: float = 0.0,
+    chart_base_source: str = "matcha",
 ) -> list[str]:
     if (surface_warmstart_ply is None) != (
         surface_warmstart_manifest is None
@@ -839,8 +1109,16 @@ def _teacher_command(
         str(int(iterations)),
         "--training-profile",
         str(training_profile),
+        "--chart-base-source",
+        str(chart_base_source),
         "--reconstruction-target",
         "static",
+        "--static-canonical-sequence-policy",
+        "scene",
+        "--static-canonical-snapshot-frames",
+        "75",
+        "76",
+        "77",
         "--geometry-gradient-ratio",
         str(float(geometry_gradient_ratio)),
         # Retain the archive for an explicit localization-geometry ablation,
@@ -930,8 +1208,60 @@ def _teacher_command(
         command.extend(
             ["--volume-opacity-lr", str(float(volume_opacity_lr))]
         )
+    if float(moge3_canopy_optical_weight) > 0.0:
+        if int(moge3_canopy_optical_every) <= 0:
+            raise ValueError(
+                "Positive MoGe3 canopy optical weight requires a cadence"
+            )
+        if int(moge3_canopy_maximum_birth_proposals) <= 0:
+            raise ValueError(
+                "MoGe3 canopy birth proposal cap must be positive"
+            )
+        command.extend(
+            [
+                "--moge3-canopy-optical-weight",
+                str(float(moge3_canopy_optical_weight)),
+                "--moge3-canopy-optical-every",
+                str(int(moge3_canopy_optical_every)),
+                "--moge3-canopy-prehit-weight",
+                str(float(moge3_canopy_prehit_weight)),
+                "--moge3-canopy-maximum-birth-proposals",
+                str(int(moge3_canopy_maximum_birth_proposals)),
+            ]
+        )
+    if float(moge3_rigid_depth_weight) > 0.0:
+        command.extend(
+            [
+                "--moge3-rigid-depth-weight",
+                str(float(moge3_rigid_depth_weight)),
+            ]
+        )
+    if float(moge3_rigid_normal_weight) > 0.0:
+        command.extend(
+            [
+                "--moge3-rigid-normal-weight",
+                str(float(moge3_rigid_normal_weight)),
+            ]
+        )
     if rgb_images is not None:
         command.extend(["--images", str(rgb_images)])
+    if training_profile in {
+        "static_handoff_quality",
+        "static_handoff_fast",
+    }:
+        # Canonical facade leakage is an optical-existence/depth-order
+        # problem, not permission to retire the structural layer.  The
+        # trainer resolves the shared start to the first fixed-topology
+        # iteration; these validated settlement weights therefore cannot
+        # create an early low-frequency opacity wall.
+        command.extend(
+            [
+                "--canonical-occlusion-completion-weight",
+                "1.0",
+                "--canonical-occlusion-order-weight",
+                "0.1",
+            ]
+        )
     if training_profile == "hybrid_rigid_stage1":
         command.extend(
             [
@@ -999,7 +1329,32 @@ def _find_frontend(args: argparse.Namespace) -> Path:
 
 def _write_manifest(path: Path, payload: dict) -> None:
     payload["updated_at_unix"] = time.time()
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        path, json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _atomic_write_text(path: Path, value: str, *, encoding: str) -> None:
+    """Durably replace a small run contract without exposing partial JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        with temporary.open("w", encoding=encoding) as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def main() -> None:
@@ -1024,6 +1379,7 @@ def main() -> None:
             "scene": args.scene,
             "camera_source": args.camera_source,
             "geometry_source": args.geometry_source,
+            "monocular_geometry_source": args.monocular_geometry_source,
             "final_model": args.final_model,
             "student_enabled": False,
             "stages": {},
@@ -1035,6 +1391,8 @@ def main() -> None:
     # reusing artifacts.
     manifest["version"] = PIPELINE_VERSION
     manifest["geometry_source"] = args.geometry_source
+    manifest["monocular_geometry_source"] = args.monocular_geometry_source
+    manifest["final_model"] = args.final_model
     selected = STAGES if args.stage == "all" else (args.stage,)
     python = sys.executable
     env = dict(os.environ)
@@ -1072,7 +1430,8 @@ def main() -> None:
                 "Camera/chart preparation is incomplete: "
                 + ", ".join(map(str, missing))
             )
-        frontend_ref.write_text(
+        _atomic_write_text(
+            frontend_ref,
             json.dumps(
                 {
                     "frontend": str(frontend),
@@ -1085,7 +1444,8 @@ def main() -> None:
                 },
                 indent=2,
             )
-            + "\n"
+            + "\n",
+            encoding="utf-8",
         )
         manifest["stages"]["prepare_cameras"] = {
             "status": "complete",
@@ -1093,6 +1453,9 @@ def main() -> None:
             "frontend": str(frontend),
         }
         _write_manifest(manifest_path, manifest)
+        if args.stage == "prepare_cameras":
+            print(json.dumps(manifest, indent=2))
+            return
     if not frontend_ref.is_file():
         raise FileNotFoundError(
             f"Run prepare_cameras first; missing {frontend_ref}"
@@ -1306,6 +1669,9 @@ def main() -> None:
             "gate": gate,
         }
         _write_manifest(manifest_path, manifest)
+        if args.stage == "build_mast3r_tracks":
+            print(json.dumps(manifest, indent=2))
+            return
 
     if "build_charts" in selected:
         required = [
@@ -1330,45 +1696,148 @@ def main() -> None:
             "exact_k_runtime_unprojection": True,
         }
         _write_manifest(manifest_path, manifest)
+        if args.stage == "build_charts":
+            print(json.dumps(manifest, indent=2))
+            return
 
     # The base Evidence Store is immutable. Independent-traversal pointmap
     # posteriors form a derived, content-addressed store so a missing artifact
     # can never silently regain full metric authority during training.
     base_evidence = run / "evidence"
     if "build_evidence" in selected:
+        moge3_root = (
+            args.moge3_root.expanduser().resolve()
+            if args.moge3_root is not None
+            else None
+        )
         dav2_root = (
             args.dav2_root.expanduser().resolve()
             if args.dav2_root is not None
             else None
         )
-        packed_candidates = (
-            dataset / "depth_anything_vitl_fp16.pt",
-            dataset.parent / "depth_anything_vitl_fp16.pt",
+        if args.monocular_geometry_source == "moge3" and moge3_root is None:
+            raise RuntimeError(
+                "moge3_static_quality requires --moge3-root. Precompute all "
+                "fixed database views with scripts/build_moge3_evidence.py "
+                "in the independent MoGe3 Python 3.10+ environment."
+            )
+        if args.monocular_geometry_source == "dav2_legacy" and dav2_root is None:
+            raise RuntimeError(
+                "Legacy DAV2 is never auto-discovered; pass --dav2-root "
+                "explicitly or choose --monocular-geometry-source none."
+            )
+        chart_base_source = str(
+            profile.get("chart_base_source", "matcha")
         )
-        packed_dav2 = next(
-            (path for path in packed_candidates if path.is_file()),
-            packed_candidates[0],
-        )
-        if dav2_root is None and packed_dav2.is_file():
-            dav2_root = run / "dav2_real_views"
-            dav2_manifest = dav2_root / "dav2_cache_manifest.json"
-            if not dav2_manifest.is_file():
+        moge3_chart_base = run / "geometry/moge3_chart_base_v1.npz"
+        moge3_runtime_cache = run / "geometry/moge3_runtime_640"
+        moge3_runtime_index = moge3_runtime_cache / "runtime_index.json"
+        if chart_base_source != "matcha":
+            if moge3_root is None:
+                raise RuntimeError(
+                    f"Chart base {chart_base_source!r} requires MoGe3"
+                )
+            moge3_index = (
+                moge3_root / "moge3_index.json"
+                if moge3_root.is_dir()
+                else moge3_root
+            )
+            if not moge3_index.is_file():
+                raise FileNotFoundError(moge3_index)
+            chart_base_summary = moge3_chart_base.with_suffix(".json")
+            expected_chart_base_hashes = {
+                "charts_data": sha256_file(mast3r / "charts_data.npz"),
+                "chart_cameras": sha256_file(mast3r / "cameras.json"),
+                "moge3_index": sha256_file(moge3_index),
+                "tree_mask_pickle": sha256_file(tree_mask),
+            }
+            rebuild_chart_base = not (
+                moge3_chart_base.is_file()
+                and chart_base_summary.is_file()
+            )
+            if not rebuild_chart_base:
+                try:
+                    summary = json.loads(chart_base_summary.read_text())
+                    rebuild_chart_base = (
+                        summary.get("schema_version")
+                        != MOGE3_CHART_BASE_VERSION
+                        or summary.get("input_hashes")
+                        != expected_chart_base_hashes
+                        or summary.get("output_sha256")
+                        != sha256_file(moge3_chart_base)
+                    )
+                except (OSError, ValueError, KeyError):
+                    rebuild_chart_base = True
+            if rebuild_chart_base:
                 _run(
                     [
                         python,
-                        str(
-                            REPO_ROOT
-                            / "scripts/unpack_dav2_real_view_cache.py"
-                        ),
-                        "--packed-cache",
-                        str(packed_dav2),
+                        str(REPO_ROOT / "scripts/build_moge3_chart_base.py"),
+                        "--charts-data",
+                        str(mast3r / "charts_data.npz"),
+                        "--chart-cameras",
+                        str(mast3r / "cameras.json"),
+                        "--moge3-index",
+                        str(moge3_index),
+                        "--dataset",
+                        str(dataset),
+                        "--tree-mask-pickle",
+                        str(tree_mask),
                         "--output",
-                        str(dav2_root),
+                        str(moge3_chart_base),
                     ],
                     env=env,
-                    log=run / "logs/unpack_dav2.log",
+                    log=run / "logs/build_moge3_chart_base.log",
                     dry_run=args.dry_run,
                 )
+            rebuild_runtime_cache = not moge3_runtime_index.is_file()
+            if not rebuild_runtime_cache:
+                try:
+                    runtime = load_moge3_runtime_cache(
+                        moge3_runtime_index,
+                        expected_source_index_sha256=sha256_file(
+                            moge3_index
+                        ),
+                        verify_arrays=False,
+                    )
+                    rebuild_runtime_cache = (
+                        runtime["raster_shape"] != (360, 640)
+                        or runtime["camera_order"]
+                        != list(
+                            json.loads(
+                                moge3_index.read_text(encoding="utf-8")
+                            )["camera_order"]
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    rebuild_runtime_cache = True
+            if rebuild_runtime_cache:
+                command = [
+                    python,
+                    str(
+                        REPO_ROOT / "scripts/build_moge3_runtime_cache.py"
+                    ),
+                    "--moge3-index",
+                    str(moge3_index),
+                    "--output",
+                    str(moge3_runtime_cache),
+                    "--width",
+                    "640",
+                    "--height",
+                    "360",
+                    "--workers",
+                    "8",
+                ]
+                if moge3_runtime_cache.exists():
+                    command.append("--replace")
+                _run(
+                    command,
+                    env=env,
+                    log=run / "logs/build_moge3_runtime_cache.log",
+                    dry_run=args.dry_run,
+                )
+            if args.dry_run:
+                return
         rebuild_evidence = not (
             base_evidence / "evidence_manifest.json"
         ).is_file()
@@ -1398,8 +1867,55 @@ def main() -> None:
                     None,
                 )
                 if (
+                    moge3_root is not None
+                    and "moge3_index" not in artifact_names
+                ):
+                    rebuild_evidence = True
+                chart_base_artifact = next(
+                    (
+                        item
+                        for item in current_store.get("artifacts", [])
+                        if item["name"] == "moge3_chart_base"
+                    ),
+                    None,
+                )
+                if chart_base_source != "matcha" and (
+                    chart_base_artifact is None
+                    or chart_base_artifact.get("sha256")
+                    != sha256_file(moge3_chart_base)
+                ):
+                    rebuild_evidence = True
+                runtime_cache_artifact = next(
+                    (
+                        item
+                        for item in current_store.get("artifacts", [])
+                        if item["name"] == "moge3_runtime_cache"
+                    ),
+                    None,
+                )
+                if chart_base_source != "matcha" and (
+                    runtime_cache_artifact is None
+                    or runtime_cache_artifact.get("sha256")
+                    != sha256_file(moge3_runtime_index)
+                ):
+                    rebuild_evidence = True
+                if chart_base_source == "matcha" and (
+                    chart_base_artifact is not None
+                ):
+                    rebuild_evidence = True
+                if (
                     dav2_root is not None
                     and "dav2_index" not in artifact_names
+                ):
+                    rebuild_evidence = True
+                if (
+                    args.monocular_geometry_source != "moge3"
+                    and "moge3_index" in artifact_names
+                ):
+                    rebuild_evidence = True
+                if (
+                    args.monocular_geometry_source != "dav2_legacy"
+                    and "dav2_index" in artifact_names
                 ):
                     rebuild_evidence = True
                 if (
@@ -1519,6 +2035,15 @@ def main() -> None:
                 command.append("--replace")
             if dav2_root is not None:
                 command.extend(["--dav2-root", str(dav2_root)])
+            if moge3_root is not None:
+                command.extend(["--moge3-root", str(moge3_root)])
+            if chart_base_source != "matcha":
+                command.extend(
+                    ["--moge3-chart-base", str(moge3_chart_base)]
+                )
+                command.extend(
+                    ["--moge3-runtime-cache", str(moge3_runtime_index)]
+                )
             if args.geometry_source == MAST3R_PRIMARY_SFM_COVERAGE:
                 command.extend(
                     ["--sfm-coverage-sparse", str(dataset / "sparse/0")]
@@ -1567,6 +2092,8 @@ def main() -> None:
             "evidence_hash": store["evidence_hash"],
             "base_evidence_hash": base_store["evidence_hash"],
             "pointmap_cross_sequence_posterior": True,
+            "monocular_geometry_source": args.monocular_geometry_source,
+            "moge3_exact_k": args.monocular_geometry_source == "moge3",
             "all_camera_projected_rigid_posterior": {
                 "schema_version": PROJECTED_RIGID_POSTERIOR_VERSION,
                 "rgb_root": str(training_rgb_root),
@@ -1596,6 +2123,10 @@ def main() -> None:
             raise RuntimeError(
                 "Pointmap posterior store/base evidence hash mismatch"
             )
+
+    if args.stage == "build_evidence":
+        print(json.dumps(manifest, indent=2))
+        return
 
     base_initialization = run / "initialization"
     use_temporal_dav2_witnesses = bool(
@@ -1978,6 +2509,10 @@ def main() -> None:
             initialization.name + "_sequence_metric_depth"
         )
 
+    if args.stage == "initialize_teacher":
+        print(json.dumps(manifest, indent=2))
+        return
+
     teacher = run / "teacher"
     if "train_teacher" in selected:
         physical_gpu = _gpu(args.gpu, args.minimum_free_gpu_memory_mib)
@@ -2020,6 +2555,15 @@ def main() -> None:
                 surface_densify_until_iteration=int(
                     profile["rigid_pretrain_densify_until_iteration"]
                 ),
+                moge3_rigid_depth_weight=float(
+                    profile.get("moge3_rigid_depth_weight", 0.0)
+                ),
+                moge3_rigid_normal_weight=float(
+                    profile.get("moge3_rigid_normal_weight", 0.0)
+                ),
+                chart_base_source=str(
+                    profile.get("chart_base_source", "matcha")
+                ),
             )
             if rigid_result.is_file() and not rigid_result_current:
                 raise RuntimeError(
@@ -2058,6 +2602,15 @@ def main() -> None:
                         profile["rigid_pretrain_densify_until_iteration"]
                     ),
                     rgb_images=rgb_images,
+                    moge3_rigid_depth_weight=float(
+                        profile.get("moge3_rigid_depth_weight", 0.0)
+                    ),
+                    moge3_rigid_normal_weight=float(
+                        profile.get("moge3_rigid_normal_weight", 0.0)
+                    ),
+                    chart_base_source=str(
+                        profile.get("chart_base_source", "matcha")
+                    ),
                 )
                 rigid_checkpoint = (
                     rigid_teacher / "hybrid_teacher_checkpoint.pth"
@@ -2435,8 +2988,37 @@ def main() -> None:
                     "surface_retirement_optical_mass_fraction_per_event"
                 ]
             ),
+            moge3_canopy_optical_weight=float(
+                profile.get("moge3_canopy_optical_weight", 0.0)
+            ),
+            moge3_canopy_optical_every=int(
+                profile.get("moge3_canopy_optical_every", 0)
+            ),
+            moge3_canopy_prehit_weight=float(
+                profile.get("moge3_canopy_prehit_weight", 0.25)
+            ),
+            moge3_canopy_maximum_birth_proposals=int(
+                profile.get("moge3_canopy_maximum_birth_proposals", 256)
+            ),
+            moge3_rigid_depth_weight=float(
+                profile.get("moge3_rigid_depth_weight", 0.0)
+            ),
+            moge3_rigid_normal_weight=float(
+                profile.get("moge3_rigid_normal_weight", 0.0)
+            ),
+            chart_base_source=str(
+                profile.get("chart_base_source", "matcha")
+            ),
         )
-        if result.is_file() and not result_current:
+        finalization_recoverable = _teacher_finalization_is_recoverable(
+            teacher,
+            iterations=int(args.iterations),
+        )
+        if (
+            result.is_file()
+            and not result_current
+            and not finalization_recoverable
+        ):
             raise RuntimeError(
                 "Existing Teacher result is stale relative to the current "
                 "evidence, initialization, implementation, or state file. "
@@ -2497,11 +3079,46 @@ def main() -> None:
                         "surface_retirement_optical_mass_fraction_per_event"
                     ]
                 ),
+                moge3_canopy_optical_weight=float(
+                    profile.get("moge3_canopy_optical_weight", 0.0)
+                ),
+                moge3_canopy_optical_every=int(
+                    profile.get("moge3_canopy_optical_every", 0)
+                ),
+                moge3_canopy_prehit_weight=float(
+                    profile.get("moge3_canopy_prehit_weight", 0.25)
+                ),
+                moge3_canopy_maximum_birth_proposals=int(
+                    profile.get(
+                        "moge3_canopy_maximum_birth_proposals", 256
+                    )
+                ),
+                moge3_rigid_depth_weight=float(
+                    profile.get("moge3_rigid_depth_weight", 0.0)
+                ),
+                moge3_rigid_normal_weight=float(
+                    profile.get("moge3_rigid_normal_weight", 0.0)
+                ),
+                chart_base_source=str(
+                    profile.get("chart_base_source", "matcha")
+                ),
             )
             checkpoint = teacher / "hybrid_teacher_checkpoint.pth"
             if checkpoint.is_file():
                 command.extend(["--resume", str(checkpoint)])
-                if args.allow_trainer_repair_resume:
+                if finalization_recoverable:
+                    # This is an exact same-implementation final checkpoint;
+                    # only idempotent export/evaluation is rerun.
+                    pass
+                elif args.allow_v105_late_optical_convergence_resume:
+                    command.append(
+                        "--allow-v105-late-optical-convergence-resume"
+                    )
+                elif args.allow_v107_global_negative_cleanup_resume:
+                    command.append(
+                        "--allow-v107-global-negative-cleanup-resume"
+                    )
+                elif args.allow_trainer_repair_resume:
                     command.append("--allow-trainer-repair-resume")
                 else:
                     command.append("--allow-performance-resume")
@@ -2536,6 +3153,10 @@ def main() -> None:
             "teacher_state": trained["teacher_state"],
         }
         _write_manifest(manifest_path, manifest)
+
+    if args.stage == "train_teacher":
+        print(json.dumps(manifest, indent=2))
+        return
 
     evaluation = run / "evaluation/full_train_fit"
     if "evaluate_teacher" in selected:
@@ -2749,6 +3370,10 @@ def main() -> None:
         }
         _write_manifest(manifest_path, manifest)
 
+    if args.stage == "evaluate_teacher":
+        print(json.dumps(manifest, indent=2))
+        return
+
     if "export_geometry" in selected:
         trained = json.loads((teacher / "result.json").read_text())
         store = load_evidence_store(evidence)
@@ -2784,7 +3409,11 @@ def main() -> None:
             },
         }
         export_path = export / "assets.json"
-        export_path.write_text(json.dumps(payload, indent=2) + "\n")
+        _atomic_write_text(
+            export_path,
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
         manifest["stages"]["export_geometry"] = {
             "status": "complete",
             "assets": str(export_path),

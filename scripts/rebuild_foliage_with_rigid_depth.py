@@ -16,6 +16,7 @@ SURFEL_ROOT = REPO_ROOT / "2d-gaussian-splatting"
 sys.path[:0] = [str(REPO_ROOT), str(SURFEL_ROOT)]
 
 from outdoor.evidence_store import load_evidence_store  # noqa: E402
+from outdoor.moge3_evidence import atomic_write_json  # noqa: E402
 from outdoor.role_aware_initialization import (  # noqa: E402
     RIGID_CALIBRATED_INITIALIZATION_VERSION,
     build_foliage_seed,
@@ -240,7 +241,7 @@ def main() -> None:
             args.rigid_calibration_resolution_scale
         ),
         "role": (
-            "metric_dav2_alignment_and_rigid_occlusion_only__"
+            "chart_metric_alignment_and_rigid_occlusion_only__"
             "not_renderer_parameter_initialization"
         ),
     }
@@ -323,9 +324,7 @@ def main() -> None:
         "runtime_provenance": runtime_provenance,
     }
     manifest_path = output / "initialization_manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(manifest_path, manifest)
     print(
         json.dumps(
             {
@@ -333,7 +332,10 @@ def main() -> None:
                 "output": str(output),
                 "surface_seed_sha256": sha256_file(surface_path),
                 "foliage_seed_sha256": sha256_file(foliage_path),
-                "dav2_depth_alignment": foliage.get(
+                "moge3_exact_k_front_hit": foliage.get(
+                    "moge3_exact_k_front_hit"
+                ),
+                "legacy_dav2_depth_alignment": foliage.get(
                     "dav2_depth_alignment"
                 ),
                 "dense_ray_budget": foliage.get("dense_ray_budget"),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import hashlib
 from pathlib import Path
@@ -18,6 +19,17 @@ from outdoor.evidence_store import (
 )
 from outdoor.inverse_depth import INVERSE_DEPTH_FUSION_VERSION
 from outdoor.mast3r_track_graph import TRACK_GRAPH_VERSION
+from outdoor.moge3_evidence import (
+    load_index as load_moge3_index,
+    load_runtime_cache as load_moge3_runtime_cache,
+    load_view as load_moge3_view,
+    sha256_file as moge3_sha256_file,
+)
+from outdoor.moge3_chart_base import (
+    MOGE3_CHART_BASE_SOURCES,
+    load_chart_base,
+    load_chart_base_metadata,
+)
 from outdoor.role_aware_initialization import (
     SINGLE_SEQUENCE_POINTMAP_PRECISION,
     _load_mast3r_pointmap_geometry,
@@ -1151,14 +1163,33 @@ class FoliageRayEvidence:
         exact_static = static_detail_mask & (
             support_camera_ids == int(view.colmap_id)
         ).any(dim=1) & canonical_candidate_mask
+        verification_state = getattr(foliage, "verification_state", None)
+        verified_camera_count = getattr(
+            foliage, "verified_camera_count", None
+        )
+        verified_sequence_count = getattr(
+            foliage, "verified_sequence_count", None
+        )
+        if (
+            verification_state is None
+            or verified_camera_count is None
+            or verified_sequence_count is None
+        ):
+            persistent_verified = torch.zeros_like(dynamic_mask)
+        else:
+            persistent_verified = (
+                verification_state == 1
+            ) & torch.where(
+                static_detail_mask,
+                (verified_camera_count >= 2)
+                & (verified_sequence_count >= 1),
+                foliage.support_sequence_count >= 2,
+            )
         verified_canonical = (
             ~dynamic_mask
             & ~exact_static
             & canonical_hit_candidate_mask
-            & (
-                (foliage.support_sequence_count >= 2)
-                | (foliage.split_generation > 0)
-            )
+            & persistent_verified
         )
         candidate_pool = torch.nonzero(
             ((~dynamic_mask) & canonical_candidate_mask)
@@ -1198,7 +1229,21 @@ class FoliageRayEvidence:
         # Candidate lookup is intentionally detached.  It is a sparse
         # acceleration structure, not part of the objective; the selected
         # Gaussian parameters below remain fully differentiable.
-        lookup_chunk = 64
+        # Bound the dense ray-by-candidate scratch matrix, not merely the ray
+        # count.  At v99/20k the canonical pool had about 900k rows, so the
+        # historical fixed chunk of 64 produced several simultaneous 208 MiB
+        # matrices and OOMed even though only 96 candidates per ray survive.
+        # Chunking rays is mathematically exact because top-k still sees the
+        # complete candidate pool for every ray.
+        maximum_lookup_matrix_elements = 4_000_000
+        lookup_chunk = min(
+            64,
+            max(
+                1,
+                maximum_lookup_matrix_elements
+                // max(int(len(candidate_pool)), 1),
+            ),
+        )
         if len(candidate_pool):
             with torch.no_grad():
                 lookup_displacement = (
@@ -1247,11 +1292,11 @@ class FoliageRayEvidence:
                     lookup_norm2[None] - along.square()
                 ).clamp_min(0)
                 lookup_score = radial2 / lookup_scale2[None]
-                lookup_score = torch.where(
-                    along > 0,
-                    lookup_score,
-                    torch.full_like(lookup_score, float("inf")),
-                )
+                # Candidate lookup is detached, so masking in place is safe
+                # and avoids a second full ray-by-pool output plus the
+                # full_like input that caused the observed 208 MiB request.
+                lookup_score.masked_fill_(along <= 0, float("inf"))
+                del along, radial2
                 candidate_limit = min(
                     max(int(maximum_candidates_per_ray), 1),
                     len(candidate_pool),
@@ -1842,6 +1887,11 @@ class FoliageRayEvidence:
                 exact_static_candidate_evaluations
             ),
             "rays_with_candidates": rays_with_candidates,
+            "lookup_ray_chunk": int(lookup_chunk),
+            "lookup_candidate_pool": int(len(candidate_pool)),
+            "lookup_matrix_element_budget": int(
+                maximum_lookup_matrix_elements
+            ),
             "confirmed_free_rays": int(
                 confirmed_free_mask.sum()
             ),
@@ -2044,7 +2094,17 @@ def _rigid_global_track_mask(archive) -> np.ndarray:
 class OutdoorGeometryEvidence:
     """Keep every geometry source separate at loss construction time."""
 
-    def __init__(self, evidence_store: Path):
+    def __init__(
+        self,
+        evidence_store: Path,
+        *,
+        chart_base_source: str = "matcha",
+    ):
+        if chart_base_source not in MOGE3_CHART_BASE_SOURCES:
+            raise ValueError(
+                f"Unsupported Chart base source: {chart_base_source!r}"
+            )
+        self.chart_base_source = str(chart_base_source)
         self.store = load_evidence_store(evidence_store, verify_hashes=False)
         chart_path = artifact_path(
             self.store, "chart_geometry", required=False
@@ -2053,6 +2113,8 @@ class OutdoorGeometryEvidence:
             self.store, "chart_cameras", required=False
         )
         self.chart = None
+        self.moge3_chart_base_metadata: dict = {}
+        self.moge3_chart_scale_audit: dict = {}
         self.chart_scale_factor = 1.0
         self.frame_by_stem: dict[str, int] = {}
         self.pointmap_records: dict[str, dict] = {}
@@ -2117,6 +2179,39 @@ class OutdoorGeometryEvidence:
             )
             for index, value in enumerate(cameras["filepaths"]):
                 self.frame_by_stem[Path(value).stem] = index
+            chart_base_path = artifact_path(
+                self.store, "moge3_chart_base", required=False
+            )
+            if chart_base_path is not None:
+                chart_contract = load_chart_base_metadata(
+                    chart_base_path,
+                    expected_names=cameras["filepaths"],
+                )
+                self.moge3_chart_base_metadata = dict(
+                    chart_contract["metadata"]
+                )
+                self.moge3_chart_scale_audit = dict(
+                    self.moge3_chart_base_metadata.get(
+                        "scale_calibration", {}
+                    )
+                )
+                chart_scale = self.moge3_chart_scale_audit.get(
+                    "metric_to_cambridge_scale"
+                )
+                chart_sigma = self.moge3_chart_scale_audit.get(
+                    "global_log_scale_sigma"
+                )
+                if (
+                    chart_scale is None
+                    or not np.isfinite(float(chart_scale))
+                    or float(chart_scale) <= 0.0
+                    or chart_sigma is None
+                    or not np.isfinite(float(chart_sigma))
+                    or float(chart_sigma) < 0.0
+                ):
+                    raise RuntimeError(
+                        "MoGe3 Chart evidence has no valid scene-scale contract"
+                    )
             consensus_path = artifact_path(
                 self.store,
                 "chart_crossview_consensus",
@@ -2192,6 +2287,25 @@ class OutdoorGeometryEvidence:
                 self.chart["crossview_support"] = support
                 self.chart["crossview_confirmed"] = confirmed
                 self.chart["consensus_depth_override_applied"] = False
+            if self.chart_base_source != "matcha":
+                if chart_base_path is None:
+                    raise RuntimeError(
+                        f"Chart base {self.chart_base_source!r} requires the "
+                        "moge3_chart_base evidence artifact"
+                    )
+                base = load_chart_base(
+                    chart_base_path,
+                    source=self.chart_base_source,
+                    expected_names=cameras["filepaths"],
+                )
+                if base["depth"].shape != self.chart["depth"].shape:
+                    raise RuntimeError(
+                        "MoGe3 Chart base shape does not match MAtCha"
+                    )
+                self.chart["depth"] = base["depth"]
+                self.chart["reference_mask"] &= base["validity"]
+                self.chart["precision"] *= base["precision"]
+                self.chart["moge3_base_metadata"] = base["metadata"]
         pointmap_index_path = artifact_path(
             self.store, "mast3r_pointmap_index", required=False
         )
@@ -2272,6 +2386,50 @@ class OutdoorGeometryEvidence:
         dav2_index_path = artifact_path(
             self.store, "dav2_index", required=False
         )
+        moge3_index_path = artifact_path(
+            self.store, "moge3_index", required=False
+        )
+        moge3_runtime_cache_path = artifact_path(
+            self.store, "moge3_runtime_cache", required=False
+        )
+        self.moge3_records: dict[str, dict] = {}
+        self.moge3_runtime_cache: dict | None = None
+        self.moge3_metric_to_cambridge_scale: float | None = None
+        # Loading raw metric fields before the scene gauge is bound would
+        # silently mix coordinate systems. Placeholder foliage used by the
+        # causal rigid pretrain intentionally leaves this disabled.
+        self.moge3_runtime_enabled = False
+        self._verified_moge3_stems: set[str] = set()
+        self._moge3_cache: OrderedDict[str, dict[str, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._moge3_cache_maximum_views = 4
+        if moge3_index_path is not None:
+            moge3_index = load_moge3_index(
+                moge3_index_path, verify_views=False
+            )
+            self.moge3_records = {
+                str(stem): dict(record)
+                for stem, record in moge3_index["records"].items()
+            }
+            if moge3_runtime_cache_path is not None:
+                self.moge3_runtime_cache = load_moge3_runtime_cache(
+                    moge3_runtime_cache_path,
+                    expected_source_index_sha256=moge3_sha256_file(
+                        moge3_index_path
+                    ),
+                    verify_arrays=True,
+                )
+                if self.moge3_runtime_cache["camera_order"] != list(
+                    moge3_index["camera_order"]
+                ):
+                    raise RuntimeError(
+                        "MoGe3 runtime cache camera order changed"
+                    )
+        elif moge3_runtime_cache_path is not None:
+            raise RuntimeError(
+                "MoGe3 runtime cache cannot exist without moge3_index"
+            )
         self.dav2_records: dict[str, Path] = {}
         if dav2_index_path is not None:
             payload = json.loads(
@@ -2423,12 +2581,21 @@ class OutdoorGeometryEvidence:
             "mast3r_pointmap_native_factor": 0,
             "plane": 0,
             "inverse_depth": 0,
+            "moge3": 0,
             "dav2": 0,
             "track_factor": 0,
             "track_observation_factor": 0,
             "structure_factor": 0,
         }
         self.preflight = self._metric_preflight()
+
+    def configure_moge3_metric_scale(self, value: float) -> None:
+        """Bind raw MoGe metric depth to the initialized Cambridge gauge."""
+        scale = float(value)
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("MoGe3 metric-to-Cambridge scale must be positive")
+        self.moge3_metric_to_cambridge_scale = scale
+        self.moge3_runtime_enabled = True
 
     def chart_native_factor(
         self,
@@ -3282,6 +3449,7 @@ class OutdoorGeometryEvidence:
             sorted(
                 set(self.frame_by_stem)
                 | set(self.pointmap_records)
+                | set(self.moge3_records)
                 | set(self.dav2_records)
             )
         )
@@ -3289,7 +3457,11 @@ class OutdoorGeometryEvidence:
     @property
     def metric_view_stems(self) -> tuple[str, ...]:
         return tuple(
-            sorted(set(self.frame_by_stem) | set(self.pointmap_records))
+            sorted(
+                set(self.frame_by_stem)
+                | set(self.pointmap_records)
+                | set(self.moge3_records)
+            )
         )
 
     @property
@@ -3467,6 +3639,113 @@ class OutdoorGeometryEvidence:
                         mode=mode,
                     )
                 self.consumed["inverse_depth"] += 1
+        moge3_record = self.moge3_records.get(stem)
+        if moge3_record is not None and self.moge3_runtime_enabled:
+            if self.moge3_metric_to_cambridge_scale is None:
+                raise AssertionError("Enabled MoGe3 runtime lacks its scene scale")
+            if self.moge3_runtime_cache is not None:
+                position = self.moge3_runtime_cache["camera_index"].get(stem)
+                if position is None:
+                    raise RuntimeError(
+                        f"MoGe3 runtime cache lacks camera {stem}"
+                    )
+                moge3 = {
+                    name: value[position]
+                    for name, value in self.moge3_runtime_cache[
+                        "arrays"
+                    ].items()
+                }
+                valid = moge3["valid_mask"].astype(bool)
+            else:
+                moge3_path = Path(moge3_record["path"])
+                if stem not in self._verified_moge3_stems:
+                    if not moge3_path.is_file():
+                        raise FileNotFoundError(moge3_path)
+                    if moge3_path.stat().st_size != int(
+                        moge3_record["bytes"]
+                    ):
+                        raise RuntimeError(
+                            f"MoGe3 evidence size changed: {moge3_path}"
+                        )
+                    if moge3_sha256_file(moge3_path) != moge3_record["sha256"]:
+                        raise RuntimeError(
+                            f"MoGe3 evidence content changed: {moge3_path}"
+                        )
+                    self._verified_moge3_stems.add(stem)
+                moge3 = self._moge3_cache.pop(stem, None)
+                if moge3 is None:
+                    complete_view = load_moge3_view(moge3_path)
+                    retained_fields = {
+                        "depth_m",
+                        "normal_direct_camera",
+                        "normal_depth_exact_k_camera",
+                        "valid_mask",
+                        "depth_normal_valid_mask",
+                        "refinement_valid_mask",
+                        "refinement_log_depth_std",
+                        "refinement_final_delta_log_depth",
+                    }
+                    moge3 = {
+                        name: complete_view[name]
+                        for name in retained_fields
+                    }
+                self._moge3_cache[stem] = moge3
+                while len(self._moge3_cache) > int(
+                    self._moge3_cache_maximum_views
+                ):
+                    self._moge3_cache.popitem(last=False)
+                valid = (
+                    moge3["valid_mask"].astype(bool)
+                    & moge3["refinement_valid_mask"].astype(bool)
+                )
+            result["moge3_depth_m"] = self._tensor(
+                moge3["depth_m"]
+                * float(self.moge3_metric_to_cambridge_scale),
+                device=device,
+                shape=shape,
+            )
+            result["moge3_valid_mask"] = self._tensor(
+                valid.astype(np.float32),
+                device=device,
+                shape=shape,
+                mode="nearest",
+            )
+            result["moge3_depth_normal_valid_mask"] = self._tensor(
+                (
+                    valid
+                    & moge3["depth_normal_valid_mask"].astype(bool)
+                ).astype(np.float32),
+                device=device,
+                shape=shape,
+                mode="nearest",
+            )
+            result["moge3_refinement_log_depth_std"] = self._tensor(
+                moge3["refinement_log_depth_std"],
+                device=device,
+                shape=shape,
+            )
+            result["moge3_refinement_final_delta_log_depth"] = self._tensor(
+                moge3["refinement_final_delta_log_depth"],
+                device=device,
+                shape=shape,
+            )
+            direct_normal = self._tensor(
+                moge3["normal_direct_camera"],
+                device=device,
+                shape=shape,
+            )
+            depth_normal = self._tensor(
+                moge3["normal_depth_exact_k_camera"],
+                device=device,
+                shape=shape,
+            )
+            result["moge3_normal_direct_camera"] = F.normalize(
+                direct_normal, dim=0, eps=1e-6
+            )
+            result["moge3_normal_depth_exact_k_camera"] = F.normalize(
+                depth_normal, dim=0, eps=1e-6
+            )
+            self.consumed["moge3"] += 1
         dav2_path = self.dav2_records.get(stem)
         if dav2_path is not None and dav2_path.is_file():
             result["mono_depth"] = self._tensor(
@@ -3488,12 +3767,29 @@ class OutdoorGeometryEvidence:
         posterior_pixels = int(pointmap_posterior.get("pixels", 0))
         return {
             "available_geometry_views": len(self.frame_by_stem),
+            "chart_base_source": self.chart_base_source,
             "active_metric_chart_views": (
                 int(self.chart["active"].sum())
                 if self.chart is not None
                 else 0
             ),
             "available_dav2_views": len(self.dav2_records),
+            "available_moge3_views": len(self.moge3_records),
+            "moge3_runtime_enabled": bool(self.moge3_runtime_enabled),
+            "moge3_compact_runtime_cache": bool(
+                self.moge3_runtime_cache is not None
+            ),
+            "moge3_metric_to_cambridge_scale": (
+                self.moge3_metric_to_cambridge_scale
+            ),
+            "moge3_chart_scale_available": bool(
+                self.moge3_chart_scale_audit
+            ),
+            "moge3_chart_metric_to_cambridge_scale": (
+                self.moge3_chart_scale_audit.get(
+                    "metric_to_cambridge_scale"
+                )
+            ),
             "track_observation_camera_count": len(
                 self.track_observations
             ),

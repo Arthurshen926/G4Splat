@@ -19,11 +19,13 @@ sys.path[:0] = [str(REPO_ROOT), str(SURFEL_ROOT)]
 
 from arguments import ModelParams  # noqa: E402
 from outdoor.hybrid_teacher_api import (  # noqa: E402
+    STATIC_DEPTH_ORDERED_LAYER_POLICY,
     load_hybrid_teacher,
     resolve_deployment_optical_contract,
     teacher_branch_validity,
 )
 from outdoor.evidence_store import sha256_file  # noqa: E402
+from outdoor.foliage_view_graph import sequence_id  # noqa: E402
 from outdoor.lazy_scene import LazyScene, rgb_source_contract  # noqa: E402
 from outdoor.scene_contract import validate_disjoint_contracts  # noqa: E402
 from matcha.cambridge_masks import CambridgeMaskLookup  # noqa: E402
@@ -118,6 +120,11 @@ def _semantic_protocol_regions(
             static_keep & tree_boundary_inside,
         ),
         "tree_boundary_outside_static": _protocol_metrics(
+            prediction,
+            target,
+            static_keep & tree_boundary_outside,
+        ),
+        "rigid_tree_interface_hard": _protocol_metrics(
             prediction,
             target,
             static_keep & tree_boundary_outside,
@@ -522,6 +529,47 @@ def _mean_high_frequency(rows, mode, region):
             "laplacian_mae",
         )
     } | {"evaluated_view_count": len(values)}
+
+
+def _protocol_aggregate_for_rows(rows, modes, *, historical: bool = False):
+    """Aggregate one explicitly selected view population.
+
+    Scene-canonical foliage has positive RGB authority in one acquisition.
+    Keeping row selection outside the metric makes it impossible for an
+    all-view average to silently relabel noncanonical tree pixels as ground
+    truth for that static snapshot.
+    """
+    regions = (
+        "raw",
+        "dynamic_valid",
+        "static_valid",
+        "non_tree_static",
+        "tree_static",
+        "tree_boundary_inside_static",
+        "tree_boundary_outside_static",
+        "rigid_tree_interface_hard",
+    )
+    selected = rows
+    if historical:
+        selected = [
+            {
+                **row,
+                **{
+                    mode: {
+                        "protocol": row[mode]["historical_uint8_protocol"]
+                    }
+                    for mode in modes
+                },
+            }
+            for row in rows
+        ]
+    return {
+        mode: {
+            region: _mean_protocol(selected, mode, region)
+            for region in regions
+        }
+        for mode in modes
+    }
 
 
 def _conditioned_visit_counts(
@@ -1154,6 +1202,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-mixed-pixel-depth-repair",
+        action="store_true",
+        help=(
+            "Explicitly render the exact v95 state with the v96 native "
+            "mixed-rasterizer pixel-depth ordering repair. This is a "
+            "labelled zero-training causal diagnostic, not an equivalent "
+            "implementation migration."
+        ),
+    )
+    parser.add_argument(
         "--exact-ray-render-aspect-limit",
         type=float,
         default=4.0,
@@ -1171,6 +1229,7 @@ def main() -> None:
             "disabled",
             "ray_normalized_two_pass",
             "ray_normalized_surface_evidence_three_pass",
+            "static_depth_ordered_surface_volume_two_pass",
         ),
         default=None,
         help=(
@@ -1181,7 +1240,10 @@ def main() -> None:
             "ray_normalized_two_pass treats envelope/detail as mutually "
             "exclusive static per-ray explanations; the three-pass variant "
             "also restores strong foreground rigid-surface evidence without "
-            "using a semantic mask."
+            "using a semantic mask; static_depth_ordered_surface_volume_"
+            "two_pass composes isolated rigid and foliage layers from their "
+            "per-pixel metric depths and is a labelled diagnostic, not the "
+            "checkpoint deployment default."
         ),
     )
     parser.add_argument(
@@ -1245,6 +1307,9 @@ def main() -> None:
         allow_static_optical_handoff_repair=(
             args.allow_static_optical_handoff_repair
         ),
+        allow_mixed_pixel_depth_repair=(
+            args.allow_mixed_pixel_depth_repair
+        ),
     )
     optical_compositing_contract = resolve_deployment_optical_contract(
         teacher.state,
@@ -1304,6 +1369,16 @@ def main() -> None:
         ),
     )
     training_profile = str(teacher.state.get("training_profile", "unknown"))
+    static_scene_canonical_contract = teacher.state.get(
+        "training_contract", {}
+    ).get("static_scene_canonical_rgb")
+    scene_canonical_sequence = (
+        str(static_scene_canonical_contract.get("canonical_sequence"))
+        if isinstance(static_scene_canonical_contract, dict)
+        and static_scene_canonical_contract.get("canonical_sequence")
+        is not None
+        else None
+    )
     branch_validity = teacher_branch_validity(teacher.state)
     evaluation_mode = _resolve_evaluation_mode(
         args.evaluation_mode,
@@ -1476,6 +1551,14 @@ def main() -> None:
             row = {
                 "index": index,
                 "image_name": str(view.image_name),
+                "sequence_id": sequence_id(str(view.image_name)),
+                "tree_rgb_authority": (
+                    "authoritative_scene_canonical"
+                    if scene_canonical_sequence is None
+                    or sequence_id(str(view.image_name))
+                    == scene_canonical_sequence
+                    else "unknown_noncanonical_diagnostic_only"
+                ),
                 "conditioned_training_visits": int(
                     conditioned_visit_counts[index]
                 ),
@@ -1532,6 +1615,9 @@ def main() -> None:
                         "tree_boundary_outside_static": int(
                             boundary_outside_static.sum()
                         ),
+                        "rigid_tree_interface_hard": int(
+                            boundary_outside_static.sum()
+                        ),
                     },
                 )
                 row[name]["protocol"] = {
@@ -1558,6 +1644,11 @@ def main() -> None:
                         boundary_inside_static,
                     ),
                     "tree_boundary_outside_static": _protocol_metrics(
+                        prediction,
+                        target,
+                        boundary_outside_static,
+                    ),
+                    "rigid_tree_interface_hard": _protocol_metrics(
                         prediction,
                         target,
                         boundary_outside_static,
@@ -1597,6 +1688,11 @@ def main() -> None:
                         historical_target,
                         boundary_outside_static,
                     ),
+                    "rigid_tree_interface_hard": _protocol_metrics(
+                        historical_prediction,
+                        historical_target,
+                        boundary_outside_static,
+                    ),
                 }
                 row[name]["high_frequency"] = {
                     "raw": _high_frequency_metrics(
@@ -1623,6 +1719,13 @@ def main() -> None:
                         )
                     ),
                     "tree_boundary_outside_static": (
+                        _high_frequency_metrics(
+                            prediction,
+                            target,
+                            boundary_outside_static,
+                        )
+                    ),
+                    "rigid_tree_interface_hard": (
                         _high_frequency_metrics(
                             prediction,
                             target,
@@ -1723,50 +1826,81 @@ def main() -> None:
         }
         for mode in modes
     }
-    protocol_aggregate = {
-        mode: {
-            region: _mean_protocol(rows, mode, region)
-            for region in (
-                "raw",
-                "dynamic_valid",
-                "static_valid",
-                "non_tree_static",
-                "tree_static",
-                "tree_boundary_inside_static",
-                "tree_boundary_outside_static",
-            )
-        }
-        for mode in modes
-    }
-    historical_uint8_protocol_aggregate = {
-        mode: {
-            region: _mean_protocol(
-                [
-                    {
-                        **row,
-                        mode: {
-                            "protocol": row[mode][
-                                "historical_uint8_protocol"
-                            ]
-                        },
+    protocol_aggregate = _protocol_aggregate_for_rows(rows, modes)
+    historical_uint8_protocol_aggregate = _protocol_aggregate_for_rows(
+        rows, modes, historical=True
+    )
+    authoritative_canopy_rows = [
+        row
+        for row in rows
+        if scene_canonical_sequence is None
+        or row["sequence_id"] == scene_canonical_sequence
+    ]
+    scene_canonical_sequence_aggregate = None
+    if scene_canonical_sequence is not None:
+        authoritative_rows = authoritative_canopy_rows
+        noncanonical_rows = [
+            row
+            for row in rows
+            if row["sequence_id"] != scene_canonical_sequence
+        ]
+        scene_canonical_sequence_aggregate = {
+            "canonical_sequence": scene_canonical_sequence,
+            "authoritative_view_count": len(authoritative_rows),
+            "noncanonical_unknown_view_count": len(noncanonical_rows),
+            "tree_authority_contract": (
+                "tree_and_tree_boundary_metrics_are_authoritative_only_on_"
+                "the_scene_canonical_sequence__noncanonical_tree_regions_"
+                "remain_unknown_diagnostics_and_are_never_training_or_"
+                "quality_gates"
+            ),
+            "float": {
+                "authoritative_canonical": (
+                    _protocol_aggregate_for_rows(
+                        authoritative_rows, modes
+                    )
+                ),
+                "all_view_rigid_non_tree": {
+                    mode: {
+                        region: protocol_aggregate[mode][region]
+                        for region in (
+                            "raw",
+                            "static_valid",
+                            "non_tree_static",
+                        )
                     }
-                    for row in rows
-                ],
-                mode,
-                region,
-            )
-            for region in (
-                "raw",
-                "dynamic_valid",
-                "static_valid",
-                "non_tree_static",
-                "tree_static",
-                "tree_boundary_inside_static",
-                "tree_boundary_outside_static",
-            )
+                    for mode in modes
+                },
+                "noncanonical_tree_unknown_diagnostic": (
+                    _protocol_aggregate_for_rows(noncanonical_rows, modes)
+                ),
+            },
+            "historical_uint8": {
+                "authoritative_canonical": (
+                    _protocol_aggregate_for_rows(
+                        authoritative_rows, modes, historical=True
+                    )
+                ),
+                "all_view_rigid_non_tree": {
+                    mode: {
+                        region: historical_uint8_protocol_aggregate[mode][
+                            region
+                        ]
+                        for region in (
+                            "raw",
+                            "static_valid",
+                            "non_tree_static",
+                        )
+                    }
+                    for mode in modes
+                },
+                "noncanonical_tree_unknown_diagnostic": (
+                    _protocol_aggregate_for_rows(
+                        noncanonical_rows, modes, historical=True
+                    )
+                ),
+            },
         }
-        for mode in modes
-    }
     counterfactual_labels = sorted(
         {
             label
@@ -1791,6 +1925,7 @@ def main() -> None:
                     "tree_static",
                     "tree_boundary_inside_static",
                     "tree_boundary_outside_static",
+                    "rigid_tree_interface_hard",
                 )
             }
             for raster_protocol in (
@@ -1810,6 +1945,7 @@ def main() -> None:
                 "tree_static",
                 "tree_boundary_inside_static",
                 "tree_boundary_outside_static",
+                "rigid_tree_interface_hard",
             )
         }
         for mode in modes
@@ -1832,6 +1968,7 @@ def main() -> None:
                 "tree_static",
                 "tree_boundary_inside_static",
                 "tree_boundary_outside_static",
+                "rigid_tree_interface_hard",
             )
         }
         if "conditioned" in modes
@@ -1937,6 +2074,10 @@ def main() -> None:
         ),
         "canopy_quality_valid": bool(
             branch_validity["canonical_canopy"]
+            and len(authoritative_canopy_rows) > 0
+        ),
+        "authoritative_canopy_view_count": len(
+            authoritative_canopy_rows
         ),
         "optical_compositing_protocol": {
             **optical_compositing_contract,
@@ -1953,6 +2094,7 @@ def main() -> None:
                 in {
                     "ray_normalized_two_pass",
                     "ray_normalized_surface_evidence_three_pass",
+                    STATIC_DEPTH_ORDERED_LAYER_POLICY,
                 }
             ),
             "ground_truth_routing": False,
@@ -1963,6 +2105,7 @@ def main() -> None:
                 else {
                     "ray_normalized_two_pass": 2,
                     "ray_normalized_surface_evidence_three_pass": 3,
+                    STATIC_DEPTH_ORDERED_LAYER_POLICY: 2,
                 }.get(optical_replacement_policy, 1)
             ),
             "symmetric_optical_responsibility_prior": (
@@ -1980,6 +2123,9 @@ def main() -> None:
         "protocol_aggregate": protocol_aggregate,
         "historical_uint8_protocol_aggregate": (
             historical_uint8_protocol_aggregate
+        ),
+        "scene_canonical_sequence_aggregate": (
+            scene_canonical_sequence_aggregate
         ),
         "layer_counterfactual_protocol_aggregate": (
             layer_counterfactual_protocol_aggregate
@@ -2021,18 +2167,26 @@ def main() -> None:
             "purpose": "smear_and_edge_fidelity_diagnostic",
         },
         "mixed_depth_order_protocol": {
-            "tile_sort_key": "primitive_center_camera_depth",
+            "tile_candidate_prefilter": (
+                "primitive_center_camera_depth_for_volume_stream_and_"
+                "surface_batch_scan_only"
+            ),
             "surface_pixel_depth": (
-                "perspective_correct_ray_surfel_intersection_after_sort"
+                "perspective_correct_ray_surfel_intersection_before_"
+                "cross_type_composition"
             ),
             "volume_pixel_depth": "gaussian_center_camera_depth",
-            "known_residual_approximation": (
-                "a_large_oblique_surface_footprint_can_cross_volume_center_"
-                "depth_within_one_tile"
+            "cross_type_composition_order": (
+                "exact_lexicographic_pixel_depth_then_primitive_id"
             ),
+            "surface_selection": (
+                "unbounded_total_capacity_exact_topk_batches"
+            ),
+            "surface_batch_capacity": 256,
+            "surface_batch_capacity_changes_semantics": False,
             "diagnostic": "per_view.*.projected_footprint",
             "large_radius_pixels": 24.0,
-            "claim_of_exact_per_pixel_cross_type_order": False,
+            "claim_of_exact_per_pixel_cross_type_order": True,
         },
         "conditioned_trained_view_protocol_aggregate": (
             conditioned_trained_protocol_aggregate
@@ -2044,15 +2198,44 @@ def main() -> None:
                 f"protocol_aggregate.{primary_mode}.non_tree_static"
                 if localization_query
                 else (
-                    "historical_uint8_protocol_aggregate.canonical."
-                    "static_valid"
-                    if evaluation_mode in {"hybrid", "canonical"}
+                    "scene_canonical_sequence_aggregate.historical_uint8."
+                    f"authoritative_canonical.{primary_mode}.static_valid"
+                    if scene_canonical_sequence is not None
+                    and evaluation_mode in {"hybrid", "canonical"}
                     else (
-                        "historical_uint8_protocol_aggregate.rigid."
-                        "non_tree_static"
+                        "historical_uint8_protocol_aggregate.canonical."
+                        "static_valid"
+                        if evaluation_mode in {"hybrid", "canonical"}
+                        else (
+                            "historical_uint8_protocol_aggregate.rigid."
+                            "non_tree_static"
+                        )
                     )
                 )
             ),
+            "scene_canonical_primary_fields": (
+                {
+                    "authoritative_tree": (
+                        "scene_canonical_sequence_aggregate."
+                        "historical_uint8.authoritative_canonical."
+                        f"{primary_mode}.tree_static"
+                    ),
+                    "authoritative_tree_boundary_inside": (
+                        "scene_canonical_sequence_aggregate."
+                        "historical_uint8.authoritative_canonical."
+                        f"{primary_mode}.tree_boundary_inside_static"
+                    ),
+                    "all_view_non_tree": (
+                        "scene_canonical_sequence_aggregate."
+                        "historical_uint8.all_view_rigid_non_tree."
+                        f"{primary_mode}.non_tree_static"
+                    ),
+                }
+                if scene_canonical_sequence is not None
+                else None
+            ),
+            "noncanonical_tree_training_gate": False,
+            "noncanonical_tree_quality_gate": False,
             "diagnostic_only_field": "aggregate",
             "in_memory_float_protocol_field": "protocol_aggregate",
             "historical_png_protocol_field": (
@@ -2071,7 +2254,12 @@ def main() -> None:
                 "regions": [
                     "tree_boundary_inside_static",
                     "tree_boundary_outside_static",
+                    "rigid_tree_interface_hard",
                 ],
+                "rigid_tree_interface_semantics": (
+                    "semantic_rigid_proxy_immediately_outside_tree_mask__"
+                    "not_a_building_instance_ground_truth_mask"
+                ),
                 "radius": (
                     "max(2, round(min(image_height,image_width)*0.015))"
                 ),
@@ -2180,6 +2368,7 @@ def main() -> None:
                 "aggregate",
                 "aggregate_semantics",
                 "protocol_aggregate",
+                "scene_canonical_sequence_aggregate",
                 "metric_protocol",
             )
         }

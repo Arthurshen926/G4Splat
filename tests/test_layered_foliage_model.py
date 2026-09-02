@@ -95,6 +95,7 @@ def test_adaptive_quaternary_split_spends_three_net_growth_slots():
     model.initialize_from_volume_state(_payload())
     parent_scale = model.scales[0].clone()
     parent_opacity = model.opacities[0].clone()
+    parent_mass = model.integrated_optical_mass()[0].clone()
 
     report = model.split_adaptive(
         torch.tensor([0]),
@@ -108,11 +109,13 @@ def test_adaptive_quaternary_split_spends_three_net_growth_slots():
     assert len(model) == 7
     torch.testing.assert_close(
         model.scales[-4:],
-        parent_scale[None].repeat(4, 1) / 2.0,
+        parent_scale[None].repeat(4, 1)
+        * 0.8,
     )
+    assert bool((model.opacities[-4:] < parent_opacity).all())
     torch.testing.assert_close(
-        model.opacities[-4:],
-        parent_opacity.repeat(4),
+        model.integrated_optical_mass()[-4:].sum(),
+        parent_mass,
     )
     assert len(torch.unique(model.xyz[-4:], dim=0)) == 4
 
@@ -156,7 +159,7 @@ def test_exact_ray_split_refines_camera_plane_without_tightening_depth():
     assert report["camera_plane_parents"] == 1
     torch.testing.assert_close(
         model.scales,
-        torch.tensor([[0.05, 0.10, 0.30]]).repeat(4, 1),
+        torch.tensor([[0.08, 0.16, 0.30]]).repeat(4, 1),
     )
     torch.testing.assert_close(
         model.position_covariance,

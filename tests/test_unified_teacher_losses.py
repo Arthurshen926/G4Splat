@@ -8,10 +8,18 @@ import pytest
 import torch
 
 from scripts.train_unified_outdoor_teacher import (
+    CANONICAL_OCCLUSION_ACTIVATION_CONTRACT,
+    CANONICAL_OCCLUSION_DIRECTIONAL_COMPLETION_CONTRACT,
+    CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+    CANONICAL_OCCLUSION_ORDER_CONTRACT,
+    MOGE3_CANOPY_OPTICAL_CONTRACT,
     DYNAMIC_LIFECYCLE_REPAIR_TARGET,
     SURFACE_SCREEN_TOPOLOGY_CONTRACT,
     SURFACE_OWNERSHIP_REPAIR_TARGET,
     STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+    STATIC_DETAIL_GLOBAL_CLEANUP_V102_PREDECESSOR_CONTRACT,
+    STATIC_DETAIL_GLOBAL_CLEANUP_V106_PREDECESSOR_CONTRACT,
+    STATIC_DETAIL_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT,
     STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT,
     STATIC_DETAIL_ISOLATED_CONTRACT,
     STATIC_DETAIL_ISOLATED_V84_PREDECESSOR_CONTRACT,
@@ -24,6 +32,7 @@ from scripts.train_unified_outdoor_teacher import (
     STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR,
     STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT,
     PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
+    PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT,
     STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT,
     STATIC_OPTICAL_POLICY_CONTRACT,
     STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT,
@@ -37,7 +46,9 @@ from scripts.train_unified_outdoor_teacher import (
     _accumulate_volume_stats,
     _adaptive_geometry_scale,
     _assert_pointmap_posterior_contract,
+    _assert_clean_training_output,
     _backward_conditioned_foliage,
+    _backward_canonical_with_foliage_supplement,
     _dynamic_enabled,
     _dynamic_opacity_ceiling,
     _foliage_enabled,
@@ -53,6 +64,8 @@ from scripts.train_unified_outdoor_teacher import (
     _bounded_surface_retirement_fractions,
     _canopy_topology_signal,
     _checkpoint_due,
+    _save_checkpoint,
+    _write_json_atomic,
     _confirmed_contradiction_fraction,
     _complete_evidence_epoch_batch_size,
     _continued_surface_iteration,
@@ -60,6 +73,18 @@ from scripts.train_unified_outdoor_teacher import (
     _conditioned_base_gradient_gate,
     _conditioned_photo_losses,
     _counterfactual_volume_transparency_loss,
+    _canonical_occlusion_completion_loss,
+    _canonical_occlusion_completion_owner_mask,
+    _canonical_occlusion_order_loss,
+    _moge3_canopy_optical_loss,
+    _moge3_canopy_hit_owner_mask,
+    _moge3_depth_query_bounds,
+    _moge3_uncovered_hit_proposals,
+    _configure_moge3_runtime,
+    _cap_canonical_occlusion_order_gradient_responsibility,
+    _canonical_occlusion_schedule_active,
+    _canonical_static_unknown_protection_mask,
+    _enforce_canonical_occlusion_order_trust_region,
     _evidence_adaptive_role_quotas,
     _extend_volume_stats_for_births,
     _geometry_losses,
@@ -70,9 +95,13 @@ from scripts.train_unified_outdoor_teacher import (
     _masked_clamp_max_,
     _masked_ssim_loss,
     _parameter_loss_gradient_audit,
+    _persistent_static_evidence_mask,
     _periodic_schedule_index,
     _apply_volume_role_gradients,
     _apply_volume_opacity_settle_policy,
+    _apply_static_detail_opacity_settle_policy,
+    _static_detail_optical_trust_groups,
+    _enforce_static_detail_optical_mass_trust_region,
     _apply_static_optical_policy,
     _apply_static_ray_local_mass_handoff,
     _rebase_v86_static_optical_ownership_state,
@@ -90,11 +119,14 @@ from scripts.train_unified_outdoor_teacher import (
     _resolve_cpu_intraop_threads,
     _resume_conditioned_visit_counts,
     _restore_resume_camera_schedules,
+    _restore_expired_factorized_receiver_mass,
+    _restore_cuda_rng_states,
     _refresh_split_child_owner_colors,
     _retain_checkpoint_snapshot,
     _rollback_failed_split_families,
     _rigid_completion_seed_indices,
     _rigid_residual_patch_loss,
+    _oriented_multiscale_high_frequency_loss,
     _resume_training_contract_differences,
     _restore_volume_optimizer_state,
     _soft_surface_canopy_conflict,
@@ -118,6 +150,8 @@ from scripts.train_unified_outdoor_teacher import (
     _static_detail_cleanup_gradient_gates,
     _static_detail_consensus_hit_gate,
     _static_detail_global_cleanup_loss,
+    _static_detail_global_negative_owner_mask,
+    _static_scene_rgb_ownership,
     _static_spatial_uncertainty_active,
     _select_missing_static_detail_receiver_parents,
     _persistent_envelope_global_cleanup_loss,
@@ -136,15 +170,25 @@ from scripts.train_unified_outdoor_teacher import (
     _volume_topology_active,
     _volume_topology_authority,
     _verification_debt_capacity_scale,
+    _verification_debt_mask,
     _update_volume_learning_rates,
     _zero_volume_opacity_optimizer_rows,
+    _enforce_static_detail_sh_trust_region,
     _write_rigid_stage_surface_handoff,
 )
 from outdoor.hybrid_gaussian_renderer import (
     LAYER_DYNAMIC_LEAF,
+    PROPOSAL_NONE,
+    PROPOSAL_RAY_BIRTH,
+    PROPOSAL_SPLIT,
     VERIFICATION_UNVERIFIED,
     VERIFICATION_VERIFIED,
+    VERIFICATION_MEASURED_SINGLE,
+    VERIFICATION_FACTORIZED_RECEIVER,
+    VERIFICATION_REJECTED,
     VolumetricFoliageModel,
+    projected_gaussian_cross_section,
+    static_detail_forward_visibility_gate,
 )
 from outdoor.training_evidence import (
     FoliageRayEvidence,
@@ -245,6 +289,14 @@ def _static_optical_policy_fixture(authority: float):
         dynamic_opacity_basis=torch.nn.Parameter(torch.zeros(2, 1)),
         persistent_envelope_mask=torch.tensor([True, True]),
         static_leaf_mask=torch.tensor([False, False]),
+        dynamic_leaf_mask=torch.tensor([False, False]),
+        static_skeleton_mask=torch.tensor([False, False]),
+        verification_state=torch.full(
+            (2,), VERIFICATION_VERIFIED, dtype=torch.int8
+        ),
+        verified_camera_count=torch.full((2,), 2, dtype=torch.int16),
+        verified_sequence_count=torch.ones(2, dtype=torch.int16),
+        proposal_kind=torch.full((2,), PROPOSAL_NONE, dtype=torch.int8),
         replacement_observation_count=torch.tensor([3, 3]),
         replacement_overlap_ema=torch.full((2,), float(authority)),
         handoff_retired_fraction=torch.full((2,), float(authority)),
@@ -282,7 +334,7 @@ def test_local_static_replacement_attenuates_only_authorized_growth():
     )
 
 
-def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
+def test_unverified_child_growth_requires_exact_owner_ray_factor():
     foliage, optimizer, moment = _static_optical_policy_fixture(1.0)
     foliage.verification_state = torch.tensor(
         [VERIFICATION_UNVERIFIED, VERIFICATION_VERIFIED],
@@ -291,15 +343,24 @@ def test_unverified_envelope_child_cannot_be_retired_or_growth_attenuated():
     audit = _apply_static_optical_policy(
         foliage, optimizer, "topology"
     )
-    assert foliage.opacity_logits.grad[0].item() == -2.0
+    assert foliage.opacity_logits.grad[0].item() == 0.0
     torch.testing.assert_close(
         foliage.opacity_logits.grad[1],
         torch.tensor([-0.15]),
     )
-    assert audit["opacity_growth_removed_by_policy"][
-        "unverified_child"
-    ] == 0.0
-    assert moment[0].item() == -4.0
+    assert audit["unverified_growth_rows_blocked"] == 1
+    assert audit["unverified_growth_magnitude_blocked"] == pytest.approx(2.0)
+    assert moment[0].item() == 0.0
+
+    foliage.opacity_logits.grad = torch.tensor([[-2.0], [-3.0]])
+    audit = _apply_static_optical_policy(
+        foliage,
+        optimizer,
+        "topology",
+        exact_owner_ray_opacity_gradient=torch.tensor([[-0.75], [0.0]]),
+    )
+    assert foliage.opacity_logits.grad[0].item() == pytest.approx(-0.75)
+    assert audit["unverified_growth_magnitude_blocked"] == pytest.approx(1.25)
 
 
 def test_detail_visibility_keeps_only_canonical_evidence_envelope_growth():
@@ -318,14 +379,46 @@ def test_detail_visibility_keeps_only_canonical_evidence_envelope_growth():
     )
 
     assert audit["envelope_positive_growth_attenuation"] == (
-        "stage3_canonical_geometry_ray_only__ray_hit_opacity_is_phase_"
-        "annealed_at_source__stage2_actual_local_handoff_retired_fraction"
+        "stage3_canonical_geometry_ray_plus_bounded_occlusion_deficit__"
+        "ray_hit_opacity_is_phase_annealed_at_source__stage2_actual_"
+        "local_handoff_retired_fraction"
     )
     assert audit["envelope_growth_rows_attenuated"] == 1
     assert foliage.opacity_logits.grad[0].item() == -0.75
     assert foliage.opacity_logits.grad[1].item() == 3.0
     assert moment[0].item() == -4.0
     assert moment[1].item() == 5.0
+
+
+def test_detail_stage_preserves_source_separated_occlusion_growth_only():
+    foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
+    foliage.opacity_logits.grad = torch.tensor([[-2.0], [3.0]])
+    canonical_evidence = torch.tensor([[-0.75], [0.5]])
+    canonical_occlusion = torch.tensor([[-0.50], [0.0]])
+
+    audit = _apply_static_optical_policy(
+        foliage,
+        optimizer,
+        "static_foliage",
+        canonical_evidence_opacity_gradient=canonical_evidence,
+        canonical_occlusion_opacity_gradient=canonical_occlusion,
+    )
+
+    # The remaining -0.75 on row zero came from unrestricted canopy RGB and
+    # is removed. Ray evidence plus bounded coverage evidence survive.
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad,
+        torch.tensor([[-1.25], [3.0]]),
+    )
+    assert audit["canonical_occlusion_growth"][
+        "persistent_envelope"
+    ]["rows"] == 1
+    assert audit["canonical_occlusion_growth"][
+        "persistent_envelope"
+    ]["magnitude"] == pytest.approx(0.5)
+    # A currently authorized positive source keeps the retained Adam growth
+    # moment alive; noncanonical iterations will clear it again.
+    assert moment[0].item() == -4.0
 
 
 def test_static_late_optical_creation_anneals_without_a_hard_gate():
@@ -341,13 +434,16 @@ def test_static_late_optical_creation_anneals_without_a_hard_gate():
     ) == 1.0
     assert _static_detail_positive_opacity_growth_scale(
         "dynamic_appearance"
-    ) == 0.60
+    ) == 1.0
     assert _static_detail_positive_opacity_growth_scale(
         "ownership_cleanup"
-    ) == 0.25
+    ) == 1.0
+    assert _static_ray_hit_opacity_gradient_scale(
+        "static", "canonical_polish"
+    ) == 0.10
 
 
-def test_ownership_cleanup_attenuates_detail_growth_but_keeps_cleanup():
+def test_ownership_cleanup_keeps_single_source_detail_growth_and_cleanup():
     foliage, optimizer, _ = _static_optical_policy_fixture(0.0)
     foliage.persistent_envelope_mask.zero_()
     foliage.static_leaf_mask.fill_(True)
@@ -361,13 +457,163 @@ def test_ownership_cleanup_attenuates_detail_growth_but_keeps_cleanup():
     )
 
     torch.testing.assert_close(
-        foliage.opacity_logits.grad, torch.tensor([[-1.0], [3.0]])
+        foliage.opacity_logits.grad, torch.tensor([[-4.0], [3.0]])
     )
     torch.testing.assert_close(
         optimizer.state[foliage.opacity_logits]["exp_avg"],
-        torch.tensor([[-2.0], [5.0]]),
+        torch.tensor([[-8.0], [5.0]]),
     )
-    assert audit["static_detail_growth_rows_attenuated"] == 1
+    assert audit["static_detail_growth_rows_attenuated"] == 0
+
+
+def test_canonical_polish_freezes_geometry_but_keeps_detail_dc_mass_calibration():
+    foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
+    foliage.persistent_envelope_mask = torch.tensor([True, False])
+    foliage.static_leaf_mask = torch.tensor([False, True])
+    foliage.static_skeleton_mask = torch.zeros(2, dtype=torch.bool)
+    foliage.dynamic_leaf_mask = torch.zeros(2, dtype=torch.bool)
+    foliage.xyz.grad = torch.full_like(foliage.xyz, 2.0)
+    foliage.log_scales.grad = torch.full_like(foliage.log_scales, 3.0)
+    foliage.quaternions.grad = torch.full_like(foliage.quaternions, 4.0)
+
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "canonical_polish"
+    )
+
+    torch.testing.assert_close(foliage.xyz.grad[0], torch.zeros(3))
+    torch.testing.assert_close(foliage.xyz.grad[1], torch.zeros(3))
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad,
+        torch.tensor([[0.0], [-3.0]]),
+    )
+    torch.testing.assert_close(moment, torch.tensor([[0.0], [-5.0]]))
+    assert not audit["joint_polish_freeze"]
+    assert audit["static_detail_mass_trainable"]
+    assert audit["static_detail_ray_trainable"]
+
+
+def test_canonical_polish_freezes_persistent_detail_high_order_sh_and_moments():
+    foliage, optimizer, _ = _static_optical_policy_fixture(0.0)
+    foliage.persistent_envelope_mask = torch.tensor([False, False])
+    foliage.static_leaf_mask = torch.tensor([True, True])
+    foliage.features = torch.nn.Parameter(torch.zeros(2, 3, 3))
+    foliage.features.grad = torch.ones_like(foliage.features)
+    first = torch.ones_like(foliage.features)
+    second = torch.ones_like(foliage.features)
+    optimizer.state[foliage.features] = {
+        "exp_avg": first,
+        "exp_avg_sq": second,
+    }
+
+    audit = _apply_static_optical_policy(
+        foliage, optimizer, "canonical_polish"
+    )
+
+    torch.testing.assert_close(
+        foliage.features.grad[:, 0], torch.ones(2, 3)
+    )
+    torch.testing.assert_close(
+        foliage.features.grad[:, 1:], torch.zeros(2, 2, 3)
+    )
+    torch.testing.assert_close(first[:, 1:], torch.zeros(2, 2, 3))
+    torch.testing.assert_close(second[:, 1:], torch.zeros(2, 2, 3))
+    assert audit["persistent_detail_high_order_sh_rows_frozen"] == 2
+
+
+def test_canonical_polish_preserves_only_source_separated_envelope_cleanup():
+    foliage, optimizer, moment = _static_optical_policy_fixture(0.0)
+    cleanup = torch.tensor([[0.75], [0.0]])
+
+    audit = _apply_static_optical_policy(
+        foliage,
+        optimizer,
+        "canonical_polish",
+        persistent_envelope_cleanup_opacity_gradient=cleanup,
+    )
+
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad, torch.tensor([[0.75], [0.0]])
+    )
+    torch.testing.assert_close(moment, torch.zeros_like(moment))
+    assert audit["persistent_envelope_cleanup_polish_exception"]
+
+
+def test_noncanonical_tree_union_is_unknown_but_rigid_outside_survives():
+    background = torch.ones(3, 3)
+    canopy = torch.full((3, 3), 0.5)
+    observed = torch.zeros(3, 3)
+    observed[0, 0] = 1.0
+    alpha = torch.zeros(1, 3, 3, requires_grad=True)
+    with torch.no_grad():
+        alpha[0, 2, 2] = 1.0e-5
+
+    routed_background, routed_canopy, unknown, is_canonical = (
+        _static_scene_rgb_ownership(
+            background,
+            canopy,
+            observed,
+            alpha,
+            reconstruction_target="static",
+            canonical_sequence_policy="scene",
+            canonical_sequence="seq0",
+            view_sequence="seq1",
+            dilation_pixels=0,
+        )
+    )
+
+    assert not is_canonical
+    assert unknown[0, 0].item() == 1.0
+    assert unknown[2, 2].item() == 1.0
+    assert routed_background[1, 1].item() == 1.0
+    assert routed_background[0, 0].item() == 0.0
+    assert routed_background[2, 2].item() == 0.0
+    torch.testing.assert_close(routed_canopy, torch.zeros_like(canopy))
+    assert not unknown.requires_grad
+
+
+def test_canonical_tree_rgb_weights_are_not_uncertainty_downweighted():
+    background = torch.rand(2, 2)
+    canopy = torch.rand(2, 2)
+    routed_background, routed_canopy, unknown, is_canonical = (
+        _static_scene_rgb_ownership(
+            background,
+            canopy,
+            torch.ones(2, 2),
+            torch.ones(1, 2, 2),
+            reconstruction_target="static",
+            canonical_sequence_policy="scene",
+            canonical_sequence="seq0",
+            view_sequence="seq0",
+        )
+    )
+    assert is_canonical
+    assert routed_background is background
+    assert routed_canopy is canopy
+    torch.testing.assert_close(unknown, torch.zeros_like(unknown))
+
+
+def test_same_sequence_outside_anchor_frames_keeps_tree_rgb_authority():
+    background = torch.ones(2, 2)
+    canopy = torch.ones(2, 2)
+    routed_background, routed_canopy, unknown, is_canonical = (
+        _static_scene_rgb_ownership(
+            background,
+            canopy,
+            torch.ones(2, 2),
+            torch.zeros(1, 2, 2),
+            reconstruction_target="static",
+            canonical_sequence_policy="scene",
+            canonical_sequence="seq0",
+            view_sequence="seq0",
+            view_is_canonical_snapshot=False,
+            dilation_pixels=0,
+        )
+    )
+
+    assert is_canonical
+    torch.testing.assert_close(unknown, torch.zeros_like(unknown))
+    assert routed_background is background
+    assert routed_canopy is canopy
 
 
 def test_detail_visibility_without_source_gradient_uses_safe_freeze():
@@ -405,6 +651,482 @@ def test_static_detail_stage_freezes_envelope_high_order_sh_only():
     torch.testing.assert_close(feature_moment[:, 1:], torch.zeros(2, 2, 3))
 
 
+def test_static_detail_visibility_is_evidence_tiered_end_to_end():
+    class Foliage(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = Foliage(
+        xyz=torch.zeros(6, 3),
+        dynamic_leaf_mask=torch.zeros(6, dtype=torch.bool),
+        static_leaf_mask=torch.tensor([False, True, True, True, True, True]),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_FACTORIZED_RECEIVER,
+                VERIFICATION_UNVERIFIED,
+                VERIFICATION_REJECTED,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([2, 2, 1, 0, 0, 0]),
+        verified_sequence_count=torch.tensor([1, 1, 1, 0, 0, 0]),
+        proposal_kind=torch.tensor(
+            [
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_RAY_BIRTH,
+                PROPOSAL_NONE,
+            ],
+            dtype=torch.int8,
+        ),
+        support_camera_ids=torch.tensor(
+            [[-1], [1], [7], [7], [7], [7]], dtype=torch.int32
+        ),
+    )
+
+    deployment = static_detail_forward_visibility_gate(
+        foliage, 7, include_pending_exact=False
+    )
+    training = static_detail_forward_visibility_gate(
+        foliage, 7, include_pending_exact=True
+    )
+    other_camera = static_detail_forward_visibility_gate(
+        foliage, 8, include_pending_exact=False
+    )
+
+    torch.testing.assert_close(
+        deployment, torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        training, torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+    )
+    torch.testing.assert_close(
+        other_camera, torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    )
+
+
+def test_static_detail_opacity_settle_closes_gradient_and_adam_growth():
+    opacity = torch.nn.Parameter(torch.zeros(3, 1))
+    opacity.grad = torch.tensor([[-1.0], [-2.0], [3.0]])
+    first_moment = torch.tensor([[-1.0], [-4.0], [5.0]])
+    foliage = SimpleNamespace(
+        opacity_logits=opacity,
+        static_leaf_mask=torch.tensor([False, True, True]),
+    )
+    optimizer = SimpleNamespace(
+        state={opacity: {"exp_avg": first_moment}}
+    )
+    args = SimpleNamespace(
+        volume_opacity_settle_policy="retirement_only",
+        volume_opacity_settle_start_iteration=10,
+        volume_opacity_retirement_until_iteration=20,
+    )
+
+    audit = _apply_static_detail_opacity_settle_policy(
+        foliage, optimizer, step=10, args=args
+    )
+    torch.testing.assert_close(
+        opacity.grad, torch.tensor([[-1.0], [0.0], [3.0]])
+    )
+    torch.testing.assert_close(
+        first_moment, torch.tensor([[-1.0], [0.0], [5.0]])
+    )
+    assert audit["growth_rows_suppressed"] == 1
+
+    opacity.grad = torch.tensor([[-1.0], [2.0], [-3.0]])
+    first_moment.copy_(torch.tensor([[-1.0], [2.0], [-3.0]]))
+    audit = _apply_static_detail_opacity_settle_policy(
+        foliage, optimizer, step=20, args=args
+    )
+    torch.testing.assert_close(
+        opacity.grad, torch.tensor([[-1.0], [0.0], [0.0]])
+    )
+    torch.testing.assert_close(
+        first_moment, torch.tensor([[-1.0], [0.0], [0.0]])
+    )
+    assert audit["effective_policy"] == "freeze"
+
+
+def _optical_trust_foliage():
+    rows = 5
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.stack(
+                [torch.tensor([float(i), 0.0, 2.0]) for i in range(rows)]
+            ),
+            "scales": torch.full((rows, 3), 0.1),
+            "colors": torch.full((rows, 3), 0.4),
+            "opacities": torch.full((rows, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(
+                rows, 1
+            ),
+            "layer_role": torch.zeros(rows, dtype=torch.int8),
+            "static_detail": torch.ones(rows, dtype=torch.bool),
+            "verification_state": torch.tensor(
+                [VERIFICATION_VERIFIED] * 4 + [VERIFICATION_MEASURED_SINGLE],
+                dtype=torch.int8,
+            ),
+            "verified_camera_count": torch.tensor(
+                [2, 2, 2, 2, 1], dtype=torch.int16
+            ),
+            "verified_sequence_count": torch.ones(rows, dtype=torch.int16),
+            "proposal_kind": torch.full(
+                (rows,), PROPOSAL_NONE, dtype=torch.int8
+            ),
+        }
+    )
+    return foliage
+
+
+def test_canonical_completion_uses_exact_detail_or_envelope_not_both():
+    rows = 4
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor(
+                [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0],
+                 [0.0, 0.0, 2.0], [2.0, 0.0, 2.0]]
+            ),
+            "scales": torch.full((rows, 3), 0.1),
+            "colors": torch.full((rows, 3), 0.4),
+            "opacities": torch.full((rows, 1), 0.2),
+            "quaternions": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]]
+            ).repeat(rows, 1),
+            "layer_role": torch.zeros(rows, dtype=torch.int8),
+            "static_detail": torch.tensor([False, False, True, True]),
+            "replacement_group": torch.tensor([0, 1, 0, 1]),
+            "support_camera_ids": torch.tensor(
+                [[-1], [-1], [7], [8]], dtype=torch.int32
+            ),
+            "verification_state": torch.full(
+                (rows,), VERIFICATION_VERIFIED, dtype=torch.int8
+            ),
+            "verified_camera_count": torch.full(
+                (rows,), 2, dtype=torch.int16
+            ),
+            "verified_sequence_count": torch.ones(
+                rows, dtype=torch.int16
+            ),
+            "proposal_kind": torch.full(
+                (rows,), PROPOSAL_NONE, dtype=torch.int8
+            ),
+        }
+    )
+    owner = _canonical_occlusion_completion_owner_mask(
+        foliage,
+        camera_id=7,
+        camera_sequence_lookup=torch.zeros(9, dtype=torch.int32),
+    )
+
+    # Exact detail row 2 replaces envelope row 0 in group 0. Envelope row 1
+    # remains the fallback for group 1; non-owner detail row 3 stays frozen.
+    torch.testing.assert_close(
+        owner,
+        torch.tensor([False, True, True, False]),
+    )
+
+
+def test_static_detail_optical_trust_is_bidirectional_and_owner_bounded():
+    foliage = _optical_trust_foliage()
+    reference = foliage.integrated_optical_mass().detach().clone()
+    foliage.opacity_settle_reference_mass.copy_(reference)
+    # Put two rows at each boundary without changing their reference.
+    area = projected_gaussian_cross_section(foliage.scales.detach())
+    target = reference.clone()
+    target[:2] *= 0.80
+    target[2:4] *= 1.20
+    alpha = -torch.expm1(-target / area)
+    with torch.no_grad():
+        foliage.opacity_logits.copy_(torch.logit(alpha)[:, None])
+    foliage.opacity_logits.grad = torch.tensor(
+        [[1.0], [-1.0], [-1.0], [1.0], [-1.0]]
+    )
+    first_moment = foliage.opacity_logits.grad.detach().clone()
+    optimizer = SimpleNamespace(
+        state={foliage.opacity_logits: {"exp_avg": first_moment}}
+    )
+    args = SimpleNamespace(
+        volume_opacity_settle_policy="evidence_trust_region",
+        volume_opacity_settle_start_iteration=10,
+        volume_opacity_retirement_until_iteration=20,
+        static_detail_optical_trust_lower=0.85,
+        static_detail_optical_trust_upper=1.15,
+        static_detail_optical_trust_voxel_size=0.10,
+    )
+
+    audit = _apply_static_detail_opacity_settle_policy(
+        foliage, optimizer, step=10, args=args
+    )
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad,
+        torch.tensor([[0.0], [-1.0], [0.0], [1.0], [0.0]]),
+    )
+    torch.testing.assert_close(
+        first_moment,
+        torch.tensor([[0.0], [-1.0], [0.0], [1.0], [0.0]]),
+    )
+    assert audit["outward_retirement_rows_suppressed"] == 1
+    assert audit["outward_growth_rows_suppressed"] == 1
+    assert audit["frozen_rows"] == 1
+
+    projection = _enforce_static_detail_optical_mass_trust_region(
+        foliage, optimizer, args
+    )
+    realized = foliage.integrated_optical_mass().detach()
+    torch.testing.assert_close(realized[:2], reference[:2] * 0.80)
+    torch.testing.assert_close(realized[2:4], reference[2:4] * 1.15)
+    assert projection["projected_up_rows"] == 0
+    assert projection["projected_down_rows"] == 2
+    assert projection["singleton_groups_without_lower_floor"] == 4
+    assert projection["maximum_group_rows"] == 1
+
+
+def test_static_detail_optical_trust_allows_only_exact_measured_cleanup():
+    foliage = _optical_trust_foliage()
+    foliage.opacity_settle_reference_mass.copy_(
+        foliage.integrated_optical_mass().detach()
+    )
+    foliage.opacity_logits.grad = torch.tensor(
+        [[0.0], [0.0], [0.0], [0.0], [-3.0]]
+    )
+    first_moment = foliage.opacity_logits.grad.detach().clone()
+    optimizer = SimpleNamespace(
+        state={foliage.opacity_logits: {"exp_avg": first_moment}}
+    )
+    args = SimpleNamespace(
+        volume_opacity_settle_policy="evidence_trust_region",
+        volume_opacity_settle_start_iteration=10,
+        volume_opacity_retirement_until_iteration=20,
+        static_detail_optical_trust_lower=0.85,
+        static_detail_optical_trust_upper=1.15,
+        static_detail_optical_trust_voxel_size=0.10,
+    )
+    exact_cleanup = torch.zeros_like(foliage.opacity_logits)
+    exact_cleanup[-1] = 2.0
+
+    audit = _apply_static_detail_opacity_settle_policy(
+        foliage,
+        optimizer,
+        step=10,
+        args=args,
+        exact_measured_cleanup_gradient=exact_cleanup,
+    )
+
+    assert float(foliage.opacity_logits.grad[-1]) == 2.0
+    assert float(first_moment[-1]) == 0.0
+    assert audit["measured_single_cleanup_retirement_rows"] == 1
+    assert audit["frozen_rows"] == 0
+
+
+def test_static_detail_optical_trust_allows_local_mass_redistribution():
+    foliage = _optical_trust_foliage()
+    # Rows 0/1 share one immutable 10cm cell. Row 0 is contradicted and may
+    # fall below its own old 85% floor because row 1 preserves local coverage.
+    foliage.initialization_center[1] = foliage.initialization_center[0]
+    reference = foliage.integrated_optical_mass().detach().clone()
+    foliage.opacity_settle_reference_mass.copy_(reference)
+    area = projected_gaussian_cross_section(foliage.scales.detach())
+    target = reference.clone()
+    target[0] *= 0.70
+    target[1] *= 1.10
+    alpha = -torch.expm1(-target / area)
+    with torch.no_grad():
+        foliage.opacity_logits.copy_(torch.logit(alpha)[:, None])
+    optimizer = SimpleNamespace(state={foliage.opacity_logits: {}})
+    args = SimpleNamespace(
+        static_detail_optical_trust_lower=0.85,
+        static_detail_optical_trust_upper=1.15,
+        static_detail_optical_trust_voxel_size=0.10,
+    )
+
+    audit = _enforce_static_detail_optical_mass_trust_region(
+        foliage, optimizer, args
+    )
+    realized = foliage.integrated_optical_mass().detach()
+    torch.testing.assert_close(realized[:2], target[:2])
+    assert realized[0] < 0.85 * reference[0]
+    assert audit["rows_below_individual_lower_after"] == 1
+    assert audit["group_count"] == 3
+
+
+def test_static_detail_optical_trust_never_restores_underfilled_group():
+    foliage = _optical_trust_foliage()
+    foliage.initialization_center[1] = foliage.initialization_center[0]
+    reference = foliage.integrated_optical_mass().detach().clone()
+    foliage.opacity_settle_reference_mass.copy_(reference)
+    area = projected_gaussian_cross_section(foliage.scales.detach())
+    target = reference.clone()
+    target[:2] *= 0.40
+    alpha = -torch.expm1(-target / area)
+    with torch.no_grad():
+        foliage.opacity_logits.copy_(torch.logit(alpha)[:, None])
+    optimizer = SimpleNamespace(state={foliage.opacity_logits: {}})
+    args = SimpleNamespace(
+        static_detail_optical_trust_lower=0.85,
+        static_detail_optical_trust_upper=1.15,
+        static_detail_optical_trust_voxel_size=0.10,
+    )
+
+    audit = _enforce_static_detail_optical_mass_trust_region(
+        foliage, optimizer, args
+    )
+
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().detach()[:2], target[:2]
+    )
+    assert audit["groups_below_lower_before"] == 1
+    assert audit["projected_up_rows"] == 0
+    assert audit["mass_after"] <= audit["mass_before"]
+
+
+def test_static_detail_optical_trust_shards_dense_cells_and_never_builds_giant_groups():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    rows = 70
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.zeros(rows, 3),
+            "scales": torch.full((rows, 3), 0.1),
+            "colors": torch.full((rows, 3), 0.4),
+            "opacities": torch.full((rows, 1), 0.2),
+            "quaternions": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]]
+            ).repeat(rows, 1),
+            "layer_role": torch.zeros(rows, dtype=torch.int8),
+            "static_detail": torch.ones(rows, dtype=torch.bool),
+            "verification_state": torch.full(
+                (rows,), VERIFICATION_VERIFIED, dtype=torch.int8
+            ),
+            "verified_camera_count": torch.full(
+                (rows,), 2, dtype=torch.int16
+            ),
+            "verified_sequence_count": torch.ones(
+                rows, dtype=torch.int16
+            ),
+            "proposal_kind": torch.full(
+                (rows,), PROPOSAL_NONE, dtype=torch.int8
+            ),
+        }
+    )
+    owned = torch.ones(rows, dtype=torch.bool)
+    _, groups, group_count = _static_detail_optical_trust_groups(
+        foliage, owned, 0.10, maximum_group_size=32
+    )
+    counts = torch.bincount(groups, minlength=group_count)
+    assert group_count == 3
+    assert int(counts.max()) <= 32
+    assert int(counts.min()) >= 2
+
+
+def test_static_detail_sh_trust_is_persistent_only_and_adam_safe():
+    features = torch.nn.Parameter(torch.zeros(3, 3, 3))
+    with torch.no_grad():
+        features[1, 1:] = 4.0
+        features[2, 1:] = 3.0
+    first_moment = torch.ones_like(features)
+    second_moment = torch.ones_like(features)
+    foliage = SimpleNamespace(
+        features=features,
+        static_leaf_mask=torch.tensor([False, True, True]),
+        dynamic_leaf_mask=torch.zeros(3, dtype=torch.bool),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([2, 2, 1]),
+        verified_sequence_count=torch.ones(3, dtype=torch.int16),
+        proposal_kind=torch.full((3,), PROPOSAL_NONE, dtype=torch.int8),
+    )
+    optimizer = SimpleNamespace(
+        state={
+            features: {
+                "exp_avg": first_moment,
+                "exp_avg_sq": second_moment,
+            }
+        }
+    )
+
+    audit = _enforce_static_detail_sh_trust_region(
+        foliage, optimizer, maximum_high_order_norm=1.0
+    )
+
+    assert float(features[1, 1:].flatten().norm()) == pytest.approx(1.0)
+    torch.testing.assert_close(features[2, 1:], torch.zeros(2, 3))
+    torch.testing.assert_close(first_moment[1:, 1:], torch.zeros(2, 2, 3))
+    torch.testing.assert_close(second_moment[1:, 1:], torch.zeros(2, 2, 3))
+    assert audit["projected_rows"] == 1
+    assert audit["nonpersistent_rows_zeroed"] == 1
+
+
+def test_oriented_multiscale_high_frequency_penalizes_blur_and_wrong_direction():
+    target = torch.zeros(3, 16, 16)
+    target[:, :, 8:] = 1.0
+    perpendicular = torch.zeros_like(target)
+    perpendicular[:, 8:, :] = 1.0
+    blurred = torch.nn.functional.avg_pool2d(
+        target[None], 5, stride=1, padding=2
+    )[0]
+    weight = torch.ones(16, 16)
+
+    identical = _oriented_multiscale_high_frequency_loss(
+        target, target, weight
+    )
+    blur_loss = _oriented_multiscale_high_frequency_loss(
+        blurred, target, weight
+    )
+    direction_loss = _oriented_multiscale_high_frequency_loss(
+        perpendicular, target, weight
+    )
+    masked = _oriented_multiscale_high_frequency_loss(
+        perpendicular, target, torch.zeros_like(weight)
+    )
+
+    assert float(identical) == pytest.approx(0.0, abs=1.0e-7)
+    assert float(blur_loss) > 0
+    assert float(direction_loss) > float(blur_loss)
+    assert float(masked) == pytest.approx(0.0, abs=1.0e-7)
+
+
+def test_oriented_multiscale_high_frequency_has_finite_flat_pixel_backward():
+    # The forward loss can be finite even when d sqrt(gx^2 + gy^2) is NaN at
+    # gx=gy=0.  Exercise both a fully flat image and the flat regions around a
+    # real edge, because the latter is the production foliage failure mode.
+    weight = torch.ones(16, 16)
+    flat = torch.full((3, 16, 16), 0.4, requires_grad=True)
+    flat_target = torch.full_like(flat, 0.6)
+    flat_loss = _oriented_multiscale_high_frequency_loss(
+        flat, flat_target, weight
+    )
+    flat_loss.backward()
+    assert torch.isfinite(flat_loss)
+    assert flat.grad is not None
+    assert torch.isfinite(flat.grad).all()
+
+    edge = torch.zeros(3, 16, 16, requires_grad=True)
+    edge_target = torch.zeros_like(edge)
+    edge_target[:, :, 8:] = 1.0
+    edge_loss = _oriented_multiscale_high_frequency_loss(
+        edge, edge_target, weight
+    )
+    edge_loss.backward()
+    assert torch.isfinite(edge_loss)
+    assert edge.grad is not None
+    assert torch.isfinite(edge.grad).all()
+
+
 def test_trainer_repair_migrates_static_optical_lifecycle_contract():
     saved = {
         "reconstruction_target": "static",
@@ -437,6 +1159,189 @@ def test_trainer_repair_migrates_static_optical_lifecycle_contract():
         current,
         allow_trainer_repair_migration=True,
     )
+
+
+def test_resume_weight_ablation_changes_only_canonical_occlusion_weights():
+    completion = {
+        "contract": "bounded_scene_canonical_completion",
+        "weight": 0.25,
+        "maximum_optical_scale": 4.0,
+        "gradient_owner": "volume_opacity_only",
+    }
+    order = {
+        "contract": "bounded_scene_canonical_order",
+        "weight": 0.0,
+        "clearance": 0.03,
+        "gradient_owner": "volume_xyz_only",
+    }
+    saved = {
+        "reconstruction_target": "static",
+        "canonical_occlusion_completion": completion,
+        "canonical_occlusion_order": order,
+    }
+    current = {
+        **saved,
+        "canonical_occlusion_completion": {
+            **completion,
+            "weight": 1.0,
+        },
+        "canonical_occlusion_order": {
+            **order,
+            "weight": 0.1,
+        },
+    }
+
+    assert _resume_training_contract_differences(saved, current) == {
+        "canonical_occlusion_completion",
+        "canonical_occlusion_order",
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_canonical_occlusion_weight_ablation=True,
+    )
+
+    changed_owner = {
+        **current,
+        "canonical_occlusion_completion": {
+            **current["canonical_occlusion_completion"],
+            "gradient_owner": "volume_and_surface_opacity",
+        },
+    }
+    with pytest.raises(
+        RuntimeError,
+        match="may change only.*completion/order weights",
+    ):
+        _resume_training_contract_differences(
+            saved,
+            changed_owner,
+            allow_canonical_occlusion_weight_ablation=True,
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="finite non-negative completion/order weights",
+    ):
+        _resume_training_contract_differences(
+            saved,
+            {
+                **current,
+                "canonical_occlusion_completion": {
+                    **current["canonical_occlusion_completion"],
+                    "weight": float("nan"),
+                },
+            },
+            allow_canonical_occlusion_weight_ablation=True,
+        )
+
+    changed_order_owner = {
+        **current,
+        "canonical_occlusion_order": {
+            **current["canonical_occlusion_order"],
+            "gradient_owner": "volume_and_surface_xyz",
+        },
+    }
+    with pytest.raises(
+        RuntimeError,
+        match="may change only.*completion/order weights",
+    ):
+        _resume_training_contract_differences(
+            saved,
+            changed_order_owner,
+            allow_canonical_occlusion_weight_ablation=True,
+        )
+
+
+def test_trainer_repair_refuses_legacy_visibility_floor_to_intrinsic_v95():
+    saved_completion = {
+        "contract": CANONICAL_OCCLUSION_DIRECTIONAL_COMPLETION_CONTRACT,
+        "weight": 1.0,
+        "maximum_optical_scale": 4.0,
+        "advantage_margin": 0.005,
+        "advantage_temperature": 0.02,
+        "positive_pixel_authority": "scene_canonical_only",
+        "gradient_owner": "volume_opacity_only",
+        "stage3_envelope_permission": (
+            "source_separated_bounded_coverage_gradient_only"
+        ),
+        "surface_in_front_policy": (
+            "audit_geometry_order_conflict_without_opacity_gradient"
+        ),
+    }
+    current_completion = {
+        **saved_completion,
+        "contract": CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+        "surface_leakage_tolerance": 0.03,
+        "start_iteration": 18_000,
+        "activation_contract": CANONICAL_OCCLUSION_ACTIVATION_CONTRACT,
+        "surface_in_front_policy": (
+            "strictly_zero_completion_gradient__separate_order_loss_"
+            "owns_local_geometry__topology_owns_missing_optical_existence"
+        ),
+        "volume_source": "surface_zero_intrinsic_envelope_only_layer",
+        "forward_population_authority": (
+            "resolved_verified_envelope_equals_live_opacity_owner"
+        ),
+    }
+    saved = {"canonical_occlusion_completion": saved_completion}
+    current = {"canonical_occlusion_completion": current_completion}
+
+    assert _resume_training_contract_differences(saved, current) == {
+        "canonical_occlusion_completion"
+    }
+    assert _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    ) == {"canonical_occlusion_completion"}
+
+
+def test_trainer_repair_adds_only_exact_post_topology_activation():
+    current = {
+        "canonical_occlusion_completion": {
+            "contract": CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+            "weight": 1.0,
+            "surface_leakage_tolerance": 0.03,
+            "start_iteration": 18_000,
+            "activation_contract": CANONICAL_OCCLUSION_ACTIVATION_CONTRACT,
+        },
+        "canonical_occlusion_order": {
+            "contract": CANONICAL_OCCLUSION_ORDER_CONTRACT,
+            "weight": 0.1,
+            "start_iteration": 18_000,
+            "activation_contract": CANONICAL_OCCLUSION_ACTIVATION_CONTRACT,
+        },
+    }
+    saved = {
+        field: {
+            key: value
+            for key, value in loss.items()
+            if key not in {"start_iteration", "activation_contract"}
+        }
+        for field, loss in current.items()
+    }
+    assert _resume_training_contract_differences(saved, current) == {
+        "canonical_occlusion_completion",
+        "canonical_occlusion_order",
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_trainer_repair_migration=True,
+    )
+
+    changed = {
+        **current,
+        "canonical_occlusion_order": {
+            **current["canonical_occlusion_order"],
+            "weight": 0.2,
+        },
+    }
+    assert _resume_training_contract_differences(
+        saved,
+        changed,
+        allow_trainer_repair_migration=True,
+    ) == {"canonical_occlusion_order"}
 
 
 def test_trainer_repair_migrates_only_exact_v86_optical_ownership_contract():
@@ -479,6 +1384,72 @@ def test_trainer_repair_migrates_only_exact_v86_optical_ownership_contract():
     assert _resume_training_contract_differences(
         unsafe, current, allow_trainer_repair_migration=True
     )
+
+
+def test_v103_migrates_only_local_optical_redistribution_contracts():
+    old_settle_contract = (
+        "static_persistent_detail_uses_immutable_evidence_mass_anchor_and_"
+        "symmetric_bidirectional_adam_updates_inside_a_per_row_trust_region__"
+        "outward_gradient_and_momentum_are_closed_and_post_adam_mass_is_hard_"
+        "projected__nonpersistent_detail_is_frozen__legacy_conditioned_mode_"
+        "may_retain_bounded_retirement_only"
+    )
+    saved = {
+        "volume_opacity_settle": {
+            "contract": old_settle_contract,
+            "policy": "evidence_trust_region",
+            "start_iteration": 18_000,
+            "retirement_until_iteration": 25_500,
+            "static_detail_optical_trust_lower": 0.85,
+            "static_detail_optical_trust_upper": 1.15,
+            "trainable_after_settle": "old",
+        },
+        "static_detail_global_cleanup": {
+            "contract": STATIC_DETAIL_GLOBAL_CLEANUP_V102_PREDECESSOR_CONTRACT,
+            "every": 2,
+            "weight": 0.25,
+            "counterfactual_weight": 1.0,
+            "camera_schedule": "old",
+        },
+        "static_training_stages": {"joint_polish": "old"},
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["old"]
+        },
+        "static_optical_policy_contract": "old",
+        "unrelated": "exact",
+    }
+    current = {
+        **saved,
+        "volume_opacity_settle": {
+            **saved["volume_opacity_settle"],
+            "contract": VOLUME_OPACITY_SETTLE_CONTRACT,
+            "static_detail_optical_trust_voxel_size": 0.10,
+            "trainable_after_settle": "new",
+        },
+        "static_detail_global_cleanup": {
+            **saved["static_detail_global_cleanup"],
+            "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+            "camera_schedule": "dedicated",
+        },
+        "static_training_stages": {"joint_polish": "new"},
+        "parameter_loss_permission_matrix": {
+            "static_leaf_optical_mass": ["new"]
+        },
+        "static_optical_policy_contract": STATIC_OPTICAL_POLICY_CONTRACT,
+    }
+    assert _resume_training_contract_differences(saved, current)
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_v103_local_optical_redistribution_migration=True,
+    )
+    unsafe = json.loads(json.dumps(current))
+    unsafe["unrelated"] = "changed"
+    assert _resume_training_contract_differences(
+        saved,
+        unsafe,
+        allow_v103_local_optical_redistribution_migration=True,
+    ) == {"unrelated"}
 
 
 def test_trainer_repair_migrates_only_exact_v87_handoff_schedule_contract():
@@ -643,6 +1614,55 @@ def test_missing_detail_receiver_selection_is_one_per_unrepresented_group():
     assert selected.tolist() == [1]
     assert audit["unique_candidate_groups"] == 1
     assert audit["selected"] == 1
+
+    selected, audit = _select_missing_static_detail_receiver_parents(
+        foliage,
+        stats,
+        maximum_receivers=8,
+        eligible_camera_ids=[0],
+    )
+    assert selected.numel() == 0
+    assert audit["unpromotable_support_rows_excluded"] == 2
+
+
+def test_expired_factorized_receiver_restores_parent_mass_before_removal():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+            "replacement_group": torch.tensor([0]),
+            "support_camera_ids": torch.tensor([[7, 8]], dtype=torch.int32),
+        }
+    )
+    mass_before = foliage.integrated_optical_mass().sum().clone()
+    event = foliage.materialize_static_detail_receivers(
+        torch.tensor([0]), birth_iteration=100
+    )
+    child = int(event["_new_start"])
+    expired = torch.zeros(len(foliage), dtype=torch.bool)
+    expired[child] = True
+    remove = expired.clone()
+
+    parent_rows, audit = _restore_expired_factorized_receiver_mass(
+        foliage, expired, remove
+    )
+    foliage.prune(remove)
+
+    assert parent_rows.tolist() == [0]
+    assert audit["restored_parent_rows"] == 1
+    assert audit["orphaned_rows"] == 0
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass().sum(),
+        mass_before,
+        rtol=2e-5,
+        atol=1e-8,
+    )
 
 
 def test_real_ray_handoff_is_bounded_and_reversible():
@@ -946,6 +1966,41 @@ def test_unverified_envelope_is_ineligible_for_mass_handoff():
     )
 
 
+def test_unresolved_split_keeps_parent_handoff_state_atomically_frozen():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    optimizer = SimpleNamespace(state={})
+    foliage.replacement_overlap_ema.fill_(1.0)
+    foliage.replacement_observation_count.fill_(3)
+    _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.10
+    )
+    mass = foliage.integrated_optical_mass().clone()
+    retired = foliage.handoff_retired_fraction.clone()
+    foliage.proposal_kind.fill_(PROPOSAL_SPLIT)
+    foliage.split_proposal_family_id.fill_(7)
+    foliage.replacement_overlap_ema.zero_()
+
+    audit = _apply_static_ray_local_mass_handoff(
+        foliage, optimizer, maximum_fraction_per_event=0.10
+    )
+
+    assert audit["changed_rows"] == 0
+    assert audit["repaired_ineligible_rows"] == 0
+    torch.testing.assert_close(foliage.integrated_optical_mass(), mass)
+    torch.testing.assert_close(foliage.handoff_retired_fraction, retired)
+
+
 def test_replacement_readiness_counts_distinct_cameras_only():
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
@@ -1109,6 +2164,57 @@ def test_post_step_handoff_preserves_new_unretired_mass():
     )
     assert audit["scheduled_after_optimizer_step"] is True
     assert foliage.integrated_optical_mass().item() > initial.item() * 0.9
+
+
+def test_post_step_handoff_is_frozen_during_canonical_polish():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+            "scales": torch.full((1, 3), 0.1),
+            "colors": torch.full((1, 3), 0.4),
+            "opacities": torch.full((1, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "layer_role": torch.tensor([0], dtype=torch.int8),
+        }
+    )
+    foliage.replacement_overlap_ema.fill_(1.0)
+    foliage.replacement_observation_count.fill_(3)
+    optimizer = SimpleNamespace(state={})
+    mass_before = foliage.integrated_optical_mass().clone()
+
+    audit = _finalize_static_ray_local_mass_handoff(
+        foliage,
+        optimizer,
+        scheduled=True,
+        maximum_fraction_per_event=0.10,
+        allow_mass_transfer=False,
+    )
+
+    torch.testing.assert_close(
+        foliage.integrated_optical_mass(), mass_before
+    )
+    assert audit["mass_transfer_frozen"] is True
+    assert audit["changed_rows"] == 0
+
+
+def test_occlusion_order_gradient_responsibility_is_bounded_per_pixel():
+    gradient = torch.arange(1, 31, dtype=torch.float32).reshape(10, 3)
+    capped, audit = _cap_canonical_occlusion_order_gradient_responsibility(
+        gradient,
+        supported_pixels=1,
+        maximum_rows_per_pixel=3,
+    )
+
+    assert int((capped.norm(dim=1) > 0).sum()) == 3
+    assert audit["gradient_rows_before_responsibility_cap"] == 10
+    assert audit["maximum_gradient_rows"] == 3
+    assert audit["responsibility_cap_rows_blocked"] == 7
+    # The helper may only remove complete row gradients, never alter a kept
+    # vector or synthesize a new one.
+    kept = capped.norm(dim=1) > 0
+    torch.testing.assert_close(capped[kept], gradient[kept])
 
 
 def test_static_child_reverification_refreshes_dc_from_distinct_real_views():
@@ -1458,6 +2564,7 @@ def test_volume_stats_ownership_gate_routes_means2d_only_to_detail_rows():
 def test_static_detail_gradients_are_owned_by_exact_support_cameras():
     class Foliage:
         xyz = torch.zeros(4, 3)
+        dynamic_leaf_mask = torch.zeros(4, dtype=torch.bool)
         static_leaf_mask = torch.tensor([False, True, True, True])
         support_camera_ids = torch.tensor(
             [[-1, -1], [0, -1], [1, -1], [0, 1]], dtype=torch.int32
@@ -1481,6 +2588,20 @@ def test_static_detail_appearance_softly_uses_same_sequence_cameras():
     class Foliage:
         xyz = torch.zeros(5, 3)
         static_leaf_mask = torch.tensor([False, True, True, True, True])
+        dynamic_leaf_mask = torch.zeros(5, dtype=torch.bool)
+        verification_state = torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+            ],
+            dtype=torch.int8,
+        )
+        verified_camera_count = torch.tensor([2, 1, 2, 2, 1])
+        verified_sequence_count = torch.ones(5, dtype=torch.int16)
+        proposal_kind = torch.full((5,), PROPOSAL_NONE, dtype=torch.int8)
         support_camera_ids = torch.tensor(
             [
                 [-1, -1],
@@ -1519,6 +2640,20 @@ def test_static_detail_optical_owner_uses_positive_evidence_sequences():
     class Foliage:
         xyz = torch.zeros(5, 3)
         static_leaf_mask = torch.tensor([False, True, True, True, True])
+        dynamic_leaf_mask = torch.zeros(5, dtype=torch.bool)
+        verification_state = torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        )
+        verified_camera_count = torch.tensor([2, 1, 2, 2, 2])
+        verified_sequence_count = torch.ones(5, dtype=torch.int16)
+        proposal_kind = torch.full((5,), PROPOSAL_NONE, dtype=torch.int8)
         support_camera_ids = torch.tensor(
             [
                 [-1, -1],
@@ -1566,6 +2701,12 @@ def test_static_detail_optical_owner_uses_positive_evidence_sequences():
         ),
         torch.tensor([False, False, False, True, False]),
     )
+    # A persisted verification witness is also an exact camera owner. This
+    # must not be broadened to the rest of its sequence.
+    assert torch.equal(
+        _static_detail_canonical_ownership_gate(foliage, 3, lookup),
+        torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0]),
+    )
 
 
 def test_static_detail_direct_optical_priors_use_same_camera_permission():
@@ -1592,7 +2733,7 @@ def test_static_detail_direct_optical_priors_use_same_camera_permission():
     torch.testing.assert_close(base, torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5]))
 
 
-def test_static_detail_cleanup_uses_strict_geometry_and_soft_optical_gates():
+def test_static_detail_cleanup_keeps_geometry_read_only_and_uses_optical_gate():
     class Foliage:
         xyz = torch.zeros(5, 3)
         static_leaf_mask = torch.tensor([False, True, True, True, False])
@@ -1612,7 +2753,7 @@ def test_static_detail_cleanup_uses_strict_geometry_and_soft_optical_gates():
     )
 
     torch.testing.assert_close(
-        geometry_gate, torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
+        geometry_gate, torch.zeros(5)
     )
     torch.testing.assert_close(appearance_gate, torch.zeros(5))
     torch.testing.assert_close(
@@ -1734,6 +2875,80 @@ def test_trainer_repair_migrates_static_global_negative_permission_contract():
         current,
         allow_trainer_repair_migration=True,
     )
+
+
+def test_v100_migrates_only_exact_front_clipped_cleanup_contracts():
+    detail = {
+        "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+        "every": 2,
+        "weight": 0.25,
+        "forward_roles": ["surface_zero_static_detail_intrinsic"],
+        "rigid_depth_permission": "strict_front",
+        "behind_surface_policy": "zero_cleanup_gradient",
+    }
+    envelope = {
+        "contract": PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
+        "every": 2,
+        "weight": 0.125,
+        "forward_roles": [
+            "surface_zero_resolved_persistent_envelope_intrinsic"
+        ],
+        "rigid_depth_permission": "strict_front",
+        "behind_surface_policy": "zero_cleanup_gradient",
+    }
+    current = {
+        "invariant": "unchanged",
+        "static_detail_global_cleanup": detail,
+        "persistent_envelope_global_cleanup": envelope,
+    }
+    saved_detail = dict(detail)
+    saved_detail["contract"] = (
+        STATIC_DETAIL_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT
+    )
+    saved_detail["forward_roles"] = ["surface", "static_detail"]
+    saved_detail.pop("rigid_depth_permission")
+    saved_detail.pop("behind_surface_policy")
+    saved_envelope = dict(envelope)
+    saved_envelope["contract"] = (
+        PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT
+    )
+    saved_envelope["forward_roles"] = [
+        "surface",
+        "persistent_envelope",
+    ]
+    saved_envelope.pop("rigid_depth_permission")
+    saved_envelope.pop("behind_surface_policy")
+    saved = {
+        "invariant": "unchanged",
+        "static_detail_global_cleanup": saved_detail,
+        "persistent_envelope_global_cleanup": saved_envelope,
+    }
+    assert _resume_training_contract_differences(saved, current) == {
+        "static_detail_global_cleanup",
+        "persistent_envelope_global_cleanup",
+    }
+    assert not _resume_training_contract_differences(
+        saved,
+        current,
+        allow_v100_front_clipped_cleanup_migration=True,
+    )
+    assert _resume_training_contract_differences(
+        {**saved, "invariant": "changed"},
+        current,
+        allow_v100_front_clipped_cleanup_migration=True,
+    ) == {"invariant"}
+    with pytest.raises(RuntimeError, match="predecessor contract mismatch"):
+        _resume_training_contract_differences(
+            {
+                **saved,
+                "static_detail_global_cleanup": {
+                    **saved_detail,
+                    "weight": 0.5,
+                },
+            },
+            current,
+            allow_v100_front_clipped_cleanup_migration=True,
+        )
 
 
 def test_trainer_repair_migrates_v83_symmetric_sequence_optical_contract():
@@ -2375,6 +3590,28 @@ def test_parameter_loss_audit_reports_role_specific_mass_direction():
     assert mass["detail"]["decrease_entries"] == 1
 
 
+def test_parameter_loss_audit_skips_before_unbounded_dense_gradients():
+    foliage = SimpleNamespace(
+        xyz=torch.zeros(2, 3, requires_grad=True),
+        log_scales=torch.zeros(2, 3, requires_grad=True),
+        opacity_logits=torch.zeros(2, 1, requires_grad=True),
+        features=torch.zeros(2, 1, 3, requires_grad=True),
+        static_skeleton_mask=torch.tensor([False, False]),
+        persistent_envelope_mask=torch.tensor([True, False]),
+        static_leaf_mask=torch.tensor([False, True]),
+    )
+    loss = foliage.opacity_logits.sum()
+
+    audit = _parameter_loss_gradient_audit(
+        foliage, {"ray_free_hit": loss}, maximum_rows=1
+    )
+
+    assert audit["skipped"]
+    assert audit["foliage_rows"] == 2
+    assert audit["maximum_rows"] == 1
+    assert audit["losses"] == {}
+
+
 def test_static_volume_topology_ramp_uses_foliage_not_disabled_dynamic_start():
     args = SimpleNamespace(
         volume_topology_ramp_iterations=100,
@@ -2410,6 +3647,100 @@ def test_retained_checkpoint_snapshot_survives_rolling_replace(tmp_path):
     replacement.replace(rolling)
     assert rolling.read_bytes() == b"iteration-13000"
     assert snapshot.read_bytes() == b"iteration-12000"
+
+
+def test_atomic_checkpoint_keeps_one_valid_previous_generation(tmp_path):
+    rolling = tmp_path / "hybrid_teacher_checkpoint.pth"
+    _save_checkpoint(rolling, {"iteration": 10, "value": torch.arange(4)})
+    _save_checkpoint(rolling, {"iteration": 20, "value": torch.arange(5)})
+
+    previous = rolling.with_suffix(rolling.suffix + ".previous")
+    assert torch.load(rolling)["iteration"] == 20
+    assert torch.load(previous)["iteration"] == 10
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_atomic_json_never_leaves_a_fixed_shared_tmp_name(tmp_path):
+    destination = tmp_path / "state.json"
+    _write_json_atomic(destination, {"generation": 1})
+    _write_json_atomic(destination, {"generation": 2})
+
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "generation": 2
+    }
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_clean_output_allows_only_live_supervisor_control_files(
+    tmp_path, monkeypatch
+):
+    run = (tmp_path / "run").resolve()
+    run.mkdir()
+    command = ("/python", "/repo/train.py", "-m", str(run))
+    command_hash = hashlib.sha256(
+        json.dumps(
+            list(command),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    paths = {
+        "lock_file": run / ".training_supervisor.lock",
+        "heartbeat_file": run / "training_supervisor_heartbeat.json",
+        "contract_file": run / "training_supervisor_contract.json",
+        "supervisor_log": run / "training_supervisor.log",
+        "training_log": run / "training.log",
+    }
+    paths["supervisor_log"].write_text("")
+    paths["training_log"].write_text("")
+    paths["lock_file"].write_text(
+        json.dumps(
+            {"supervisor_pid": 456, "command_sha256": command_hash}
+        )
+    )
+    paths["heartbeat_file"].write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "training_pid": 123,
+                "supervisor_pid": 456,
+                "command_sha256": command_hash,
+            }
+        )
+    )
+    paths["contract_file"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_dir": str(run),
+                "base_command": list(command),
+                "command_sha256": command_hash,
+                **{key: str(value) for key, value in paths.items()},
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "G4SPLAT_DETACHED_SUPERVISOR_CONTRACT",
+        str(paths["contract_file"]),
+    )
+
+    _assert_clean_training_output(
+        run,
+        resume_requested=False,
+        current_command=command,
+        process_id=123,
+        parent_process_id=456,
+    )
+    (run / "old-result.json").write_text("{}")
+    with pytest.raises(FileExistsError, match="Refusing non-empty output"):
+        _assert_clean_training_output(
+            run,
+            resume_requested=False,
+            current_command=command,
+            process_id=123,
+            parent_process_id=456,
+        )
 
 
 def test_early_checkpoint_cadence_bounds_pre_milestone_loss():
@@ -3518,6 +4849,26 @@ def test_volume_topology_stops_before_canonical_polish_settle():
     assert not _volume_topology_active(12_000, args, "ownership_cleanup")
 
 
+def test_canonical_occlusion_starts_strictly_after_volume_topology():
+    args = SimpleNamespace(canonical_occlusion_start_iteration=12_000)
+    assert not _canonical_occlusion_schedule_active(11_998, args)
+    assert not _canonical_occlusion_schedule_active(11_999, args)
+    assert _canonical_occlusion_schedule_active(12_000, args)
+
+
+def test_canonical_occlusion_has_dedicated_cadence_and_stops_before_polish():
+    args = SimpleNamespace(
+        canonical_occlusion_start_iteration=18_000,
+        canonical_occlusion_until_iteration=25_500,
+        canonical_occlusion_every=4,
+    )
+    assert not _canonical_occlusion_schedule_active(17_999, args)
+    assert _canonical_occlusion_schedule_active(18_003, args)
+    assert not _canonical_occlusion_schedule_active(18_004, args)
+    assert _canonical_occlusion_schedule_active(25_499, args)
+    assert not _canonical_occlusion_schedule_active(25_503, args)
+
+
 def test_conditioned_branch_keeps_training_during_topology_settle():
     horizon = 12_000
     profile = "hybrid_handoff_quality"
@@ -3527,7 +4878,7 @@ def test_conditioned_branch_keeps_training_during_topology_settle():
 
 
 def test_static_spatial_uncertainty_does_not_enable_temporal_branch():
-    assert _static_spatial_uncertainty_active(
+    assert not _static_spatial_uncertainty_active(
         "static", foliage_active=True, static_detail_active=True
     )
     assert not _static_spatial_uncertainty_active(
@@ -4365,6 +5716,32 @@ def test_conditioned_backward_preserves_independent_screen_gradient_leaf():
     assert volume_means2d.grad[:, :2].tolist() == [[3.0, 3.0]]
 
 
+def test_canonical_backward_frees_shared_graph_after_foliage_supplement():
+    class Foliage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.opacity_logits = torch.nn.Parameter(torch.tensor([[2.0]]))
+
+    foliage = Foliage()
+    surface = torch.nn.Parameter(torch.tensor([[3.0]]))
+    shared = surface * foliage.opacity_logits
+    canonical_loss = shared.sum()
+    supplement = foliage.opacity_logits.square().sum()
+
+    canonical_opacity = _backward_canonical_with_foliage_supplement(
+        canonical_loss,
+        supplement,
+        foliage,
+        foliage_active=True,
+    )
+
+    torch.testing.assert_close(surface.grad, torch.tensor([[2.0]]))
+    torch.testing.assert_close(
+        foliage.opacity_logits.grad, torch.tensor([[7.0]])
+    )
+    torch.testing.assert_close(canonical_opacity, torch.tensor([[3.0]]))
+
+
 def test_fallback_opacity_can_retire_but_cannot_establish_occupancy():
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
@@ -4812,6 +6189,109 @@ def test_geometry_losses_do_not_propagate_invalid_evidence():
     assert all(torch.isfinite(torch.tensor(value)) for value in values.values())
     loss.backward()
     assert torch.isfinite(depth.grad).all()
+
+
+def test_moge3_metric_depth_fills_only_unowned_rigid_pixels():
+    depth = torch.full((1, 2, 2), 4.0, requires_grad=True)
+    package = SimpleNamespace(
+        depth=depth,
+        normal_world=torch.zeros(3, 2, 2),
+    )
+    evidence = {
+        "moge3_depth_m": torch.full((1, 2, 2), 2.0),
+        "moge3_valid_mask": torch.ones(1, 2, 2),
+        "moge3_refinement_log_depth_std": torch.zeros(1, 2, 2),
+        "moge3_refinement_final_delta_log_depth": torch.zeros(1, 2, 2),
+    }
+    args = SimpleNamespace(
+        geometry_weight=0.12,
+        plane_weight=0.10,
+        normal_weight=0.04,
+        ordinal_weight=0.015,
+        moge3_rigid_depth_weight=0.04,
+    )
+    loss, values = _geometry_losses(
+        package, evidence, torch.ones(2, 2), args
+    )
+    assert values["moge3_rigid_depth"] > 0
+    assert values["moge3_rigid_depth_pixels"] == 4
+    loss.backward()
+    assert depth.grad.abs().sum() > 0
+
+    owned_depth = torch.full((1, 2, 2), 4.0, requires_grad=True)
+    owned_package = SimpleNamespace(
+        depth=owned_depth,
+        normal_world=torch.zeros(3, 2, 2),
+    )
+    evidence.update(
+        {
+            "source_bitmask": torch.full(
+                (1, 2, 2), 2, dtype=torch.uint8
+            ),
+            "rho_mean": torch.full((1, 2, 2), 0.5),
+            "rho_variance": torch.full((1, 2, 2), 0.01),
+            "support_view_count": torch.ones(1, 2, 2),
+        }
+    )
+    _, owned_values = _geometry_losses(
+        owned_package, evidence, torch.ones(2, 2), args
+    )
+    assert owned_values["moge3_rigid_depth_pixels"] == 0
+    assert owned_values["moge3_rigid_depth"] == 0.0
+
+
+def test_moge3_normal_is_camera_exact_confidence_weighted_and_owner_isolated():
+    depth = torch.full((1, 2, 2), 2.0, requires_grad=True)
+    predicted = torch.tensor(
+        [
+            [[0.7071068, 0.7071068], [0.7071068, 0.7071068]],
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[0.7071068, 0.7071068], [0.7071068, 0.7071068]],
+        ],
+        requires_grad=True,
+    )
+    package = SimpleNamespace(depth=depth, normal_world=predicted)
+    target = torch.zeros(3, 2, 2)
+    target[2] = 1.0
+    evidence = {
+        "moge3_depth_m": torch.full((1, 2, 2), 2.0),
+        "moge3_valid_mask": torch.ones(1, 2, 2),
+        "moge3_refinement_log_depth_std": torch.zeros(1, 2, 2),
+        "moge3_refinement_final_delta_log_depth": torch.zeros(1, 2, 2),
+        "moge3_normal_direct_camera": target.clone(),
+        "moge3_normal_depth_exact_k_camera": target.clone(),
+        "moge3_depth_normal_valid_mask": torch.ones(1, 2, 2),
+        "source_bitmask": torch.tensor(
+            [[[2, 0], [0, 0]]], dtype=torch.uint8
+        ),
+        "rho_mean": torch.tensor([[[0.5, 0.0], [0.0, 0.0]]]),
+        "rho_variance": torch.tensor([[[0.01, 0.0], [0.0, 0.0]]]),
+        "support_view_count": torch.tensor(
+            [[[1.0, 0.0], [0.0, 0.0]]]
+        ),
+    }
+    args = SimpleNamespace(
+        geometry_weight=0.12,
+        plane_weight=0.10,
+        normal_weight=0.04,
+        ordinal_weight=0.015,
+        moge3_rigid_depth_weight=0.0,
+        moge3_rigid_normal_weight=0.02,
+    )
+    loss, values = _geometry_losses(
+        package,
+        evidence,
+        torch.ones(2, 2),
+        args,
+        world_from_camera_rotation=torch.eye(3),
+    )
+    assert values["moge3_rigid_normal"] > 0.0
+    assert values["moge3_rigid_normal_pixels"] == 3
+    assert values["moge3_rigid_normal_mean_precision"] == pytest.approx(1.0)
+    loss.backward()
+    assert predicted.grad[:, 0, 0].abs().sum() == 0
+    assert predicted.grad[:, 0, 1].abs().sum() > 0
+    assert depth.grad.abs().sum() == 0
 
 
 def test_projected_occluded_rigid_factor_updates_depth_and_coverage_not_rgb():
@@ -5388,6 +6868,49 @@ def test_split_child_color_refresh_uses_owner_and_static_multiview_rgb():
     torch.testing.assert_close(dc_rgb[1], torch.tensor([0.5, 0.0, 0.5]))
     assert audit["dynamic_refreshed_children"] == 1
     assert audit["canonical_refreshed_children"] == 1
+
+
+def test_static_child_color_refresh_blocks_noncanonical_sequence_rgb():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([0], dtype=torch.int8),
+        "observation_camera_ids": torch.tensor(
+            [[7, 8, 9]], dtype=torch.int32
+        ),
+        "observation_uv": torch.full((1, 3, 2), 0.5),
+        "observation_depth": torch.full((1, 3), 2.0),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    cameras = {
+        7: _solid_refresh_camera(7, [1.0, 0.0, 0.0]),
+        8: _solid_refresh_camera(8, [0.0, 0.0, 1.0]),
+        9: _solid_refresh_camera(9, [0.0, 1.0, 0.0]),
+    }
+    cameras[7].image_name = "seq1__frame00001"
+    cameras[8].image_name = "seq2__frame00001"
+    cameras[9].image_name = "seq1__frame00002"
+
+    audit = _refresh_split_child_owner_colors(
+        foliage,
+        child_start=0,
+        owner_camera_ids=torch.tensor([-1]),
+        view_by_camera_id=cameras,
+        canonical_rgb_sequence="seq1",
+    )
+
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.tensor([0.5, 0.5, 0.0]))
+    assert audit["canonical_refreshed_children"] == 1
+    assert audit["owner_camera_count"] == 2
+    assert audit["canonical_rgb_sequence"] == "seq1"
+    assert audit["noncanonical_rgb_camera_count_blocked"] == 1
+    assert audit["noncanonical_rgb_children_blocked"] == 1
 
 
 def test_static_child_color_refresh_rejects_depth_inconsistent_view():
@@ -6102,18 +7625,25 @@ def test_static_detail_ray_prefit_starts_in_bootstrap():
     assert _static_detail_ray_trainable("canonical_bootstrap")
     assert _static_detail_ray_trainable("topology")
     assert _static_detail_ray_trainable("static_foliage")
-    assert not _static_detail_ray_trainable("canonical_polish")
+    assert _static_detail_ray_trainable("canonical_polish")
 
 
-def test_static_detail_isolated_routes_geometry_but_not_sh_or_opacity():
+def test_static_detail_isolated_routes_geometry_and_owned_opacity_not_sh():
     ownership = torch.tensor([1.0, 0.0, 1.0])
     appearance_permission = torch.tensor([1.0, 0.35, 1.0])
+    optical_permission = torch.tensor([1.0, 0.35, 0.0])
     geometry, appearance, opacity = _static_detail_isolated_gradient_gates(
-        ownership, appearance_permission
+        ownership, appearance_permission, optical_permission
     )
     assert geometry is ownership
     torch.testing.assert_close(appearance, torch.zeros_like(ownership))
-    torch.testing.assert_close(opacity, torch.zeros_like(ownership))
+    torch.testing.assert_close(opacity, optical_permission)
+
+
+def test_static_detail_isolated_requires_explicit_optical_owner():
+    ownership = torch.tensor([1.0])
+    with np.testing.assert_raises_regex(ValueError, "explicit optical gate"):
+        _static_detail_isolated_gradient_gates(ownership, ownership)
 
 
 def test_static_detail_positive_sequence_gets_soft_geometry_not_topology():
@@ -6127,6 +7657,8 @@ def test_static_detail_positive_sequence_gets_soft_geometry_not_topology():
         )
         verified_camera_count = torch.tensor([2, 2, 1], dtype=torch.int16)
         verified_sequence_count = torch.ones(3, dtype=torch.int16)
+        proposal_kind = torch.full((3,), PROPOSAL_NONE, dtype=torch.int8)
+        dynamic_leaf_mask = torch.zeros(3, dtype=torch.bool)
 
         def __len__(self):
             return 3
@@ -6160,6 +7692,7 @@ def test_static_volume_isolated_only_refines_verified_exact_detail():
             ],
             dtype=torch.int8,
         )
+        proposal_kind = torch.full((5,), PROPOSAL_NONE, dtype=torch.int8)
         verified_camera_count = torch.tensor([2, 2, 2, 2, 1])
         verified_sequence_count = torch.ones(5, dtype=torch.int16)
 
@@ -6185,6 +7718,7 @@ def test_static_detail_color_schedule_expands_positive_evidence_sequences():
 
     class Foliage:
         static_leaf_mask = torch.tensor([True, True, True, False])
+        dynamic_leaf_mask = torch.zeros(4, dtype=torch.bool)
         verification_state = torch.tensor(
             [
                 VERIFICATION_VERIFIED,
@@ -6194,6 +7728,7 @@ def test_static_detail_color_schedule_expands_positive_evidence_sequences():
             ],
             dtype=torch.int8,
         )
+        proposal_kind = torch.full((4,), PROPOSAL_NONE, dtype=torch.int8)
         verified_camera_count = torch.tensor([2, 2, 1, 3])
         verified_sequence_count = torch.tensor([1, 1, 1, 2])
         support_camera_ids = torch.tensor(
@@ -6234,11 +7769,13 @@ def test_static_replacement_schedule_uses_only_paired_real_evidence_cameras():
         static_leaf_mask = torch.tensor(
             [False, False, True, True, True, True]
         )
+        dynamic_leaf_mask = torch.zeros(6, dtype=torch.bool)
         verification_state = torch.tensor(
             [1, 0, 1, 1, 1, 1], dtype=torch.int8
         )
-        verified_camera_count = torch.tensor([0, 0, 2, 2, 2, 2])
-        verified_sequence_count = torch.tensor([0, 0, 2, 2, 2, 2])
+        verified_camera_count = torch.tensor([2, 0, 2, 2, 2, 2])
+        verified_sequence_count = torch.tensor([1, 0, 2, 2, 2, 2])
+        proposal_kind = torch.full((6,), PROPOSAL_NONE, dtype=torch.int8)
         support_camera_ids = torch.tensor(
             [[-1], [-1], [1], [2], [3], [4]]
         )
@@ -6250,13 +7787,15 @@ def test_static_replacement_schedule_uses_only_paired_real_evidence_cameras():
         _static_replacement_evidence_view_indices(
             [View(value) for value in range(6)],
             Foliage(),
-            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3, 4],
         )
     )
     # Only group 7 has a verified envelope. Group 8's envelope is
     # unverified, group 9 has no envelope, and the final detail is ownerless.
     assert paired_rows == 1
     assert camera_ids == {1, 5}
+    # Exact camera five remains scheduled even though the coarse global
+    # canopy filter omitted it; the row-level witness is the stronger fact.
     assert indices == [1, 5]
 
 
@@ -6351,12 +7890,12 @@ def test_periodic_camera_schedule_consumes_a_contiguous_evidence_epoch():
 def test_static_ray_prefit_uses_symmetric_positive_and_free_evidence():
     class Foliage:
         xyz = torch.zeros(4, 3)
+        dynamic_leaf_mask = torch.zeros(4, dtype=torch.bool)
         static_leaf_mask = torch.tensor([False, True, True, True])
         support_camera_ids = torch.tensor(
             [[-1, -1], [0, -1], [1, 2], [1, 2]], dtype=torch.int32
         )
-        # Appearance ownership stays in one canonical snapshot even when a
-        # child later accumulates true cross-sequence geometric witnesses.
+        verified_camera_ids = torch.full((4, 2), -1, dtype=torch.int32)
         support_sequence_count = torch.tensor([2, 1, 1, 1])
         verified_camera_count = torch.tensor([2, 1, 2, 2])
         verified_sequence_count = torch.tensor([2, 1, 2, 2])
@@ -6369,6 +7908,7 @@ def test_static_ray_prefit_uses_symmetric_positive_and_free_evidence():
             ],
             dtype=torch.int8,
         )
+        proposal_kind = torch.full((4,), PROPOSAL_NONE, dtype=torch.int8)
 
         def __len__(self):
             return 4
@@ -6387,14 +7927,11 @@ def test_static_ray_prefit_uses_symmetric_positive_and_free_evidence():
         camera_id=0,
         camera_sequence_lookup=lookup,
     )
-    # Unrelated-sequence absence cannot delete an unverified detail that the
-    # same view is not allowed to restore. Verified two-sequence consensus is
-    # still a global analytic-ray owner.
-    assert torch.equal(free, torch.tensor([True, True, True, False]))
-    # Row two belongs to another sequence but is already verified by two
-    # sequences, so it is a positive analytic-ray owner of the static map.
-    # The otherwise identical unverified row three remains support-owned.
-    assert torch.equal(hit, torch.tensor([True, True, True, False]))
+    # A global verification count is not a visibility table. Camera zero may
+    # alter only its exact row-one support; rows two/three belong to cameras
+    # one/two and remain read-only in this view.
+    assert torch.equal(free, torch.tensor([True, True, False, False]))
+    assert torch.equal(hit, torch.tensor([True, True, False, False]))
     assert torch.equal(
         _static_detail_consensus_hit_gate(Foliage()),
         torch.tensor([False, False, True, False]),
@@ -6412,6 +7949,42 @@ def test_static_ray_prefit_uses_symmetric_positive_and_free_evidence():
     # topology.  This prevents the first evidence epoch from being consumed
     # while hidden detail remains frozen.
     assert torch.equal(bootstrap_hit, hit)
+
+    noncanonical_free, noncanonical_hit = _static_ray_candidate_masks(
+        args,
+        Foliage(),
+        active,
+        phase="canonical_polish",
+        camera_id=1,
+        camera_sequence_lookup=lookup,
+        canonical_sequence_index=0,
+    )
+    # The persistent envelope remains cross-sequence calibrated, but a
+    # different traversal can neither create nor delete canonical leaf
+    # detail—even for a row with multi-sequence consensus metadata.
+    assert torch.equal(
+        noncanonical_free, torch.tensor([True, False, False, False])
+    )
+    assert torch.equal(
+        noncanonical_hit, torch.tensor([True, False, False, False])
+    )
+
+    nonsnapshot_free, nonsnapshot_hit = _static_ray_candidate_masks(
+        args,
+        Foliage(),
+        active,
+        phase="canonical_polish",
+        camera_id=0,
+        camera_sequence_lookup=lookup,
+        canonical_sequence_index=0,
+        canonical_snapshot_camera_ids={2},
+    )
+    assert torch.equal(
+        nonsnapshot_free, torch.tensor([True, False, False, False])
+    )
+    assert torch.equal(
+        nonsnapshot_hit, torch.tensor([True, False, False, False])
+    )
 
 
 def test_verification_debt_capacity_is_continuous_and_shared():
@@ -6435,6 +8008,52 @@ def test_verification_debt_capacity_is_continuous_and_shared():
         _verification_debt_capacity_scale(
             0.1, soft_fraction=0.2, hard_fraction=0.1
         )
+
+
+def test_verification_debt_counts_receivers_and_unresolved_transactions():
+    class DebtFixture(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = DebtFixture(
+        xyz=torch.zeros(6, 3),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_UNVERIFIED,
+                VERIFICATION_FACTORIZED_RECEIVER,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_REJECTED,
+            ],
+            dtype=torch.int8,
+        ),
+        proposal_kind=torch.tensor(
+            [
+                PROPOSAL_NONE,
+                PROPOSAL_RAY_BIRTH,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_SPLIT,
+                PROPOSAL_NONE,
+            ],
+            dtype=torch.int8,
+        ),
+    )
+    debt = _verification_debt_mask(foliage)
+
+    assert torch.equal(
+        debt,
+        torch.tensor([False, True, True, False, True, False]),
+    )
+    fraction = float(debt.float().mean())
+    assert fraction == pytest.approx(0.5)
+    assert _verification_debt_capacity_scale(
+        fraction,
+        soft_fraction=0.05,
+        hard_fraction=0.12,
+        minimum_scale=0.0,
+    ) == pytest.approx(0.0)
 
 
 def test_candidate_interval_descendant_index_rebuilds_after_split():
@@ -7010,12 +8629,651 @@ def test_counterfactual_transparency_routes_only_volume_alpha_gradient():
     assert surface_alpha.grad is None
 
 
+def _canonical_occlusion_fixture(*, surface_in_front: bool = False):
+    target = torch.full((3, 2, 2), 0.2)
+    surface = torch.full((3, 2, 2), 0.8, requires_grad=True)
+    # Intrinsic foliage colour is 0.2 at alpha 0.30 on the renderer's white
+    # background: V_white = .30*.20 + .70*1 = .76.  The hypothetical
+    # volume-front composite is therefore .76 + .70*(.80-1) = .62.
+    # This fixture is physically self-consistent and does not hand-inject a
+    # mixed contribution behind an opaque surface.
+    volume_white = torch.full((3, 2, 2), 0.76, requires_grad=True)
+    alpha = torch.full((1, 2, 2), 0.30, requires_grad=True)
+    surface_alpha = torch.ones(1, 2, 2, requires_grad=True)
+    surface_depth = torch.full(
+        (1, 2, 2), 2.0 if surface_in_front else 4.0,
+        requires_grad=True,
+    )
+    volume_depth = torch.full(
+        (1, 2, 2), 4.0 if surface_in_front else 2.0,
+        requires_grad=True,
+    )
+    task = {
+        "p_canopy": torch.ones(2, 2),
+        "p_canopy_core": torch.ones(2, 2),
+        "p_transient": torch.zeros(2, 2),
+        "p_boundary_uncertain": torch.zeros(2, 2),
+        "w_rgb": torch.ones(2, 2),
+    }
+    return (
+        volume_white,
+        surface,
+        target,
+        alpha,
+        surface_alpha,
+        surface_depth,
+        volume_depth,
+        task,
+    )
+
+
+def test_moge3_depth_query_bounds_are_continuous_and_fail_closed():
+    depth = torch.tensor([[[4.0, 8.0, float("nan")]]])
+    evidence = {
+        "moge3_depth_m": depth,
+        "moge3_valid_mask": torch.tensor([[[1.0, 1.0, 1.0]]]),
+        "moge3_refinement_log_depth_std": torch.tensor(
+            [[[0.01, 0.08, 0.01]]]
+        ),
+        "moge3_refinement_final_delta_log_depth": torch.tensor(
+            [[[0.0, 0.02, 0.0]]]
+        ),
+    }
+    prehit_bounds, hit_bounds, valid, reliability, audit = (
+        _moge3_depth_query_bounds(
+        evidence, global_log_scale_sigma=0.05
+        )
+    )
+
+    assert audit["contract"] == MOGE3_CANOPY_OPTICAL_CONTRACT
+    assert audit["valid_pixels"] == 2
+    assert valid.tolist() == [[True, True, False]]
+    assert torch.isnan(prehit_bounds[:, 0, 2]).all()
+    assert torch.isnan(hit_bounds[:, 0, 2]).all()
+    assert torch.all(prehit_bounds[0, 0, :2] < depth[0, 0, :2])
+    assert torch.allclose(prehit_bounds[1, 0, :2], depth[0, 0, :2])
+    assert torch.all(hit_bounds[0, 0, :2] < depth[0, 0, :2])
+    assert torch.all(hit_bounds[1, 0, :2] > depth[0, 0, :2])
+    assert (hit_bounds[1, 0, 1] - hit_bounds[0, 0, 1]) > (
+        hit_bounds[1, 0, 0] - hit_bounds[0, 0, 0]
+    )
+    assert audit["mean_hit_metric_half_width"] <= 0.400001
+    assert reliability[0, 0] > reliability[0, 1] > 0
+    assert reliability[0, 2].item() == 0.0
+
+
+def test_moge3_global_scale_uncertainty_never_thickens_positive_hit():
+    depth = torch.full((1, 1, 1), 20.0)
+    evidence = {
+        "moge3_depth_m": depth,
+        "moge3_valid_mask": torch.ones_like(depth),
+        "moge3_refinement_log_depth_std": torch.full_like(depth, 0.03),
+        "moge3_refinement_final_delta_log_depth": torch.zeros_like(depth),
+    }
+    low = _moge3_depth_query_bounds(
+        evidence, global_log_scale_sigma=0.0
+    )
+    high = _moge3_depth_query_bounds(
+        evidence, global_log_scale_sigma=0.20
+    )
+    low_prehit, low_hit, _, low_reliability, _ = low
+    high_prehit, high_hit, _, high_reliability, audit = high
+    # More global gauge uncertainty makes only the negative free-space bound
+    # conservative and reduces evidence weight. Positive support stays local.
+    assert high_prehit[0].item() < low_prehit[0].item()
+    assert torch.equal(high_hit, low_hit)
+    assert high_reliability.item() < low_reliability.item()
+    assert audit["mean_hit_metric_half_width"] <= 0.400001
+    assert audit["mean_prehit_metric_offset"] > 1.0
+
+
+def test_moge3_canopy_optical_loss_grows_hit_retires_prehit_and_ignores_invalid():
+    prehit = torch.tensor(
+        [[[0.2, 0.1, 0.8]]], requires_grad=True
+    )
+    hit = torch.tensor(
+        [[[0.1, 0.7, 0.2]]], requires_grad=True
+    )
+    valid = torch.tensor([[True, True, False]])
+    reliability = torch.ones(1, 3)
+    task = {
+        "p_canopy": torch.tensor([[1.0, 1.0, 1.0]]),
+        "p_canopy_core": torch.tensor([[1.0, 1.0, 1.0]]),
+        "p_rigid": torch.zeros(1, 3),
+        "p_distortion_valid": torch.ones(1, 3),
+        "p_transient": torch.zeros(1, 3),
+        "w_rgb": torch.ones(1, 3),
+    }
+    loss, audit = _moge3_canopy_optical_loss(
+        prehit, hit, task, valid, reliability
+    )
+    loss.backward()
+
+    assert audit["contract"] == MOGE3_CANOPY_OPTICAL_CONTRACT
+    assert audit["behind_interval_gradient"] is False
+    # Optimizer descent reduces pre-hit alpha and increases deficient hit
+    # alpha. The second hit remains below the 0.75 core target, so it also
+    # receives a smaller but non-zero growth request.
+    assert prehit.grad[0, 0, 0] > 0
+    assert prehit.grad[0, 0, 1] > 0
+    assert hit.grad[0, 0, 0] < 0
+    assert hit.grad[0, 0, 1] < 0
+    assert prehit.grad[0, 0, 2].item() == 0.0
+    assert hit.grad[0, 0, 2].item() == 0.0
+
+
+def test_moge3_canopy_hit_owner_uses_current_metric_ray_for_persistent_detail():
+    foliage = SimpleNamespace(
+        static_leaf_mask=torch.tensor(
+            [True, True, True, False, True, True]
+        ),
+        dynamic_leaf_mask=torch.zeros(6, dtype=torch.bool),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([2, 1, 1, 2, 1, 2]),
+        verified_sequence_count=torch.ones(6, dtype=torch.int16),
+        proposal_kind=torch.tensor(
+            [
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+                PROPOSAL_SPLIT,
+            ],
+            dtype=torch.int8,
+        ),
+    )
+    exact_camera = torch.tensor([False, True, False, True, True, True])
+
+    owner = _moge3_canopy_hit_owner_mask(foliage, exact_camera)
+
+    # Persistent detail consumes independent current-ray metric evidence even
+    # when that camera was not in its original support table. A measured
+    # single-view row remains exact-camera-only. Envelope/non-detail,
+    # legacy one-camera VERIFIED rows and unresolved proposals fail closed.
+    assert owner.tolist() == [True, True, False, False, False, False]
+
+
+def test_moge3_log_alpha_deficit_does_not_vanish_near_transparency():
+    prehit = torch.zeros((1, 1, 1), requires_grad=True)
+    hit = torch.tensor([[[1.0e-4]]], requires_grad=True)
+    valid = torch.ones((1, 1), dtype=torch.bool)
+    reliability = torch.ones((1, 1))
+    task = {
+        "p_canopy": torch.ones((1, 1)),
+        "p_canopy_core": torch.ones((1, 1)),
+        "p_rigid": torch.zeros((1, 1)),
+        "p_distortion_valid": torch.ones((1, 1)),
+        "p_transient": torch.zeros((1, 1)),
+        "w_rgb": torch.ones((1, 1)),
+    }
+
+    loss, audit = _moge3_canopy_optical_loss(
+        prehit, hit, task, valid, reliability
+    )
+    loss.backward()
+
+    assert audit["hit_loss_semantics"] == (
+        "one_sided_relative_log_alpha_smooth_l1"
+    )
+    assert audit["mean_relative_log_alpha_deficit"] > 8.0
+    # Direct dL/d(alpha) is intentionally inverse-alpha. After the renderer's
+    # sigmoid opacity chain this becomes an order-one growth request instead
+    # of the old O(alpha) request.
+    assert hit.grad.item() < -1_000.0
+
+
+def test_moge3_uncovered_hit_proposal_preserves_exact_ray_interval():
+    class View:
+        focal_x = 1.0
+        focal_y = 1.0
+        cx = 1.0
+        cy = 1.0
+        colmap_id = 17
+        world_view_transform = torch.eye(4)
+        camera_center = torch.zeros(3)
+        original_image = torch.stack(
+            [
+                torch.full((3, 3), 0.2),
+                torch.full((3, 3), 0.4),
+                torch.full((3, 3), 0.6),
+            ]
+        )
+
+    lower = torch.full((3, 3), float("nan"))
+    upper = torch.full((3, 3), float("nan"))
+    lower[1, 1], upper[1, 1] = 1.8, 2.2
+    bounds = torch.stack([lower, upper])
+    valid = torch.zeros((3, 3), dtype=torch.bool)
+    valid[1, 1] = True
+    reliability = torch.zeros((3, 3))
+    reliability[1, 1] = 0.9
+    canopy = torch.zeros((3, 3))
+    canopy[1, 1] = 1.0
+    task = {
+        "p_canopy": canopy,
+        "p_canopy_core": canopy,
+        "p_distortion_valid": torch.ones((3, 3)),
+        "p_transient": torch.zeros((3, 3)),
+        "w_rgb": torch.ones((3, 3)),
+    }
+    proposals, audit = _moge3_uncovered_hit_proposals(
+        View(),
+        bounds,
+        torch.zeros((1, 3, 3)),
+        task,
+        valid,
+        reliability,
+    )
+
+    assert proposals is not None
+    assert audit["selected_proposals"] == 1
+    assert audit["direct_append"] is False
+    assert proposals["camera_id"] == 17
+    assert proposals["centers"][0].tolist() == pytest.approx(
+        [0.0, 0.0, np.sqrt(1.8 * 2.2)]
+    )
+    assert proposals["directions"][0].tolist() == pytest.approx(
+        [0.0, 0.0, 1.0]
+    )
+    assert proposals["hit_start"][0].item() == pytest.approx(1.8)
+    assert proposals["hit_end"][0].item() == pytest.approx(2.2)
+    assert proposals["colors"][0].tolist() == pytest.approx([0.2, 0.4, 0.6])
+
+    no_proposal, no_audit = _moge3_uncovered_hit_proposals(
+        View(),
+        bounds,
+        torch.full((1, 3, 3), 0.8),
+        task,
+        valid,
+        reliability,
+    )
+    assert no_proposal is None
+    assert no_audit["candidate_pixels"] == 0
+
+
+def test_moge3_runtime_waits_for_causal_rigid_depth_scale():
+    class Geometry:
+        moge3_records = {"view": {}}
+
+        def __init__(self):
+            self.scale = None
+
+        def configure_moge3_metric_scale(self, value):
+            self.scale = float(value)
+
+    class Args:
+        moge3_rigid_depth_weight = 0.0
+        moge3_canopy_optical_weight = 0.0
+
+    geometry = Geometry()
+    enabled, sigma = _configure_moge3_runtime(geometry, {}, Args())
+    assert not enabled
+    assert sigma == 0.0
+    assert geometry.scale is None
+
+    active = Args()
+    active.moge3_rigid_depth_weight = 0.04
+    with pytest.raises(RuntimeError, match="rigid-depth-calibrated"):
+        _configure_moge3_runtime(geometry, {}, active)
+
+    payload = {
+        "audit": {
+            "moge3_exact_k_front_hit": {
+                "metric_to_cambridge_scale": 1.37,
+                "global_log_scale_sigma": 0.064,
+            }
+        }
+    }
+    enabled, sigma = _configure_moge3_runtime(geometry, payload, active)
+    assert enabled
+    assert sigma == pytest.approx(0.064)
+    assert geometry.scale == pytest.approx(1.37)
+
+    chart_geometry = Geometry()
+    chart_geometry.moge3_chart_scale_audit = {
+        "metric_to_cambridge_scale": 0.83,
+        "global_log_scale_sigma": 0.05,
+    }
+    enabled, sigma = _configure_moge3_runtime(
+        chart_geometry, {}, active
+    )
+    assert enabled
+    assert sigma == pytest.approx(0.05)
+    assert chart_geometry.scale == pytest.approx(0.83)
+
+    inconsistent = {
+        "audit": {
+            "moge3_exact_k_front_hit": {
+                "metric_to_cambridge_scale": 1.37,
+                "global_log_scale_sigma": 0.064,
+            }
+        }
+    }
+    with pytest.raises(RuntimeError, match="scene-scale authorities disagree"):
+        _configure_moge3_runtime(chart_geometry, inconsistent, active)
+
+
+def test_canonical_occlusion_completion_grows_only_volume_alpha():
+    values = _canonical_occlusion_fixture()
+    loss, audit = _canonical_occlusion_completion_loss(
+        *values, canonical_view=True, surface_leakage_tolerance=0.03
+    )
+    loss.backward()
+
+    volume_white, surface, _, alpha, surface_alpha, surface_depth, volume_depth, _ = (
+        values
+    )
+    assert audit["contract"] == CANONICAL_OCCLUSION_COMPLETION_CONTRACT
+    assert audit["supported_pixels"] == 4
+    assert audit["ordering_conflict_pixels"] == 0
+    assert audit["mean_optical_scale"] == pytest.approx(10.0 / 3.0, rel=1e-3)
+    assert audit["mean_target_alpha"] > audit["mean_current_alpha"]
+    # Uniform per-pixel support means the weighted reduction must equal the
+    # scalar smooth-L1 map rather than being divided by image height.
+    # This catches the former accidental division by image height.
+    current_tau = -np.log1p(-0.30)
+    target_tau = current_tau * (10.0 / 3.0)
+    expected = abs(target_tau - current_tau) - 0.05
+    assert float(loss) == pytest.approx(expected, rel=2e-4)
+    assert audit["loss_normalization"] == (
+        "one_scalar_channel_over_weighted_pixels"
+    )
+    # A negative dL/dalpha asks the optimizer to increase extinction.
+    assert alpha.grad is not None
+    assert float(alpha.grad.sum()) < 0
+    assert volume_white.grad is None
+    assert surface.grad is None
+    assert surface_alpha.grad is None
+    assert surface_depth.grad is None
+    assert volume_depth.grad is None
+
+
+def test_canonical_occlusion_completion_separates_wrong_depth_order():
+    front_values = _canonical_occlusion_fixture(surface_in_front=False)
+    front_loss, front_audit = _canonical_occlusion_completion_loss(
+        *front_values, canonical_view=True, surface_leakage_tolerance=0.03
+    )
+    wrong_values = _canonical_occlusion_fixture(surface_in_front=True)
+    wrong_loss, wrong_audit = _canonical_occlusion_completion_loss(
+        *wrong_values, canonical_view=True, surface_leakage_tolerance=0.03
+    )
+
+    assert wrong_loss < 1.0e-4 * front_loss
+    assert wrong_audit["ordering_conflict_pixels"] == 4
+    assert wrong_audit["supported_pixels"] == 0
+    assert front_audit["supported_pixels"] == 4
+
+
+def test_canonical_completion_has_no_semantic_floor_without_volume_support():
+    values = list(_canonical_occlusion_fixture(surface_in_front=True))
+    # No intrinsic volume contribution means no measured colour direction or
+    # optical owner. Topology/ray birth owns this hole; semantics alone may
+    # not grow an arbitrary Gaussian, especially behind a facade.
+    values[0] = torch.ones_like(values[0], requires_grad=True)
+    values[3] = torch.zeros_like(values[3], requires_grad=True)
+    loss, audit = _canonical_occlusion_completion_loss(
+        *values,
+        canonical_view=True,
+        surface_leakage_tolerance=0.03,
+    )
+    loss.backward()
+
+    volume_white, surface, _, alpha, surface_alpha, surface_depth, volume_depth, _ = (
+        values
+    )
+    assert audit["directional_supported_pixels"] == 0
+    assert audit["visibility_floor_supported_pixels"] == 0
+    assert audit["supported_pixels"] == 0
+    assert audit["ordering_conflict_pixels"] == 0
+    assert audit["mean_visibility_floor_alpha"] == 0.0
+    assert float(loss) == 0.0
+    assert alpha.grad is not None
+    torch.testing.assert_close(alpha.grad, torch.zeros_like(alpha))
+    assert volume_white.grad is None
+    assert surface.grad is None
+    assert surface_alpha.grad is None
+    assert surface_depth.grad is None
+    assert volume_depth.grad is None
+
+
+def test_noncanonical_occlusion_completion_has_no_positive_gradient():
+    values = _canonical_occlusion_fixture()
+    loss, audit = _canonical_occlusion_completion_loss(
+        *values, canonical_view=False
+    )
+    loss.backward()
+
+    alpha = values[3]
+    assert audit["noncanonical_positive_updates_blocked"]
+    assert audit["supported_pixels"] == 0
+    torch.testing.assert_close(alpha.grad, torch.zeros_like(alpha))
+
+
+def test_cuda_rng_restore_ignores_saved_surplus_devices(monkeypatch):
+    restored = []
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_rng_state",
+        lambda state, device: restored.append((state, device)),
+    )
+    states = [
+        torch.tensor([1], dtype=torch.uint8),
+        torch.tensor([2], dtype=torch.uint8),
+    ]
+    audit = _restore_cuda_rng_states(states)
+
+    assert len(restored) == 1
+    assert restored[0][1] == 0
+    torch.testing.assert_close(restored[0][0], states[0])
+    assert audit["saved_device_count"] == 2
+    assert audit["visible_device_count"] == 1
+    assert audit["restored_device_count"] == 1
+
+
+def test_canonical_occlusion_order_moves_only_live_volume_depth_forward():
+    values = _canonical_occlusion_fixture(surface_in_front=True)
+    loss, audit = _canonical_occlusion_order_loss(
+        *values, canonical_view=True, maximum_forward_shift=3.0
+    )
+    loss.backward()
+
+    mixed, surface, _, alpha, surface_alpha, surface_depth, volume_depth, _ = (
+        values
+    )
+    assert audit["contract"] == CANONICAL_OCCLUSION_ORDER_CONTRACT
+    assert audit["supported_pixels"] == 4
+    assert audit["mean_requested_forward_shift"] == pytest.approx(2.03)
+    assert loss > 0
+    # Positive dL/dz makes gradient descent move the foliage toward the
+    # camera. Every alternate way of hiding the conflict remains read-only.
+    assert volume_depth.grad is not None
+    assert float(volume_depth.grad.sum()) > 0
+    assert mixed.grad is None
+    assert surface.grad is None
+    assert alpha.grad is None
+    assert surface_alpha.grad is None
+    assert surface_depth.grad is None
+    assert not audit["surface_retirement_authorized"]
+    assert not audit["opacity_gradient_authorized"]
+
+
+def test_canonical_occlusion_order_is_live_when_front_composite_matches_target():
+    values = list(_canonical_occlusion_fixture(surface_in_front=True))
+    # A local 0.16 m ordering error with an already correct front-composite
+    # colour needs geometry repair, not additional optical depth. The old
+    # requests_growth gate made this exact success case a zero-gradient trap.
+    values[5] = torch.full((1, 2, 2), 2.0, requires_grad=True)
+    values[6] = torch.full((1, 2, 2), 2.13, requires_grad=True)
+    alpha = values[3].detach()
+    values[2] = (
+        values[0].detach()
+        + (1.0 - alpha) * (values[1].detach() - 1.0)
+    )
+    loss, audit = _canonical_occlusion_order_loss(
+        *values,
+        canonical_view=True,
+        maximum_forward_shift=0.25,
+        surface_leakage_tolerance=0.03,
+    )
+    loss.backward()
+
+    assert audit["supported_pixels"] == 4
+    assert audit["mean_optical_scale"] == pytest.approx(1.0, abs=1e-4)
+    assert loss > 0
+    assert values[6].grad is not None
+    assert float(values[6].grad.sum()) > 0
+
+
+def test_canonical_occlusion_order_trust_region_projects_adam_step_and_momentum():
+    class Foliage:
+        def __init__(self):
+            self.xyz = torch.nn.Parameter(
+                torch.tensor([[0.251, 0.0, 0.0], [0.40, 0.0, 0.0]])
+            )
+            self.initialization_center = torch.zeros(2, 3)
+
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = Foliage()
+    optimizer = torch.optim.Adam([foliage.xyz], lr=0.01)
+    optimizer.state[foliage.xyz]["exp_avg"] = torch.tensor(
+        [[-2.0, 3.0, 0.0], [-4.0, 0.0, 0.0]]
+    )
+    owner = torch.tensor([True, False])
+
+    audit = _enforce_canonical_occlusion_order_trust_region(
+        foliage,
+        optimizer,
+        owner,
+        maximum_displacement=0.25,
+    )
+
+    assert audit["projected_rows"] == 1
+    assert audit["outward_momentum_rows_cleared"] == 1
+    assert foliage.xyz[0].norm() <= 0.250002
+    # Only the outward radial Adam component is removed; tangent motion and
+    # non-owner state remain intact.
+    torch.testing.assert_close(
+        optimizer.state[foliage.xyz]["exp_avg"][0],
+        torch.tensor([0.0, 3.0, 0.0]),
+    )
+    torch.testing.assert_close(
+        foliage.xyz[1], torch.tensor([0.40, 0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        optimizer.state[foliage.xyz]["exp_avg"][1],
+        torch.tensor([-4.0, 0.0, 0.0]),
+    )
+
+
+def test_canonical_unknown_protection_accepts_measured_single_view_not_proposals():
+    foliage = SimpleNamespace(
+        dynamic_leaf_mask=torch.zeros(5, dtype=torch.bool),
+        static_leaf_mask=torch.tensor([True, True, True, False, True]),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_UNVERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([1, 1, 1, 1, 0]),
+        proposal_kind=torch.tensor(
+            [
+                PROPOSAL_NONE,
+                PROPOSAL_SPLIT,
+                PROPOSAL_SPLIT,
+                PROPOSAL_NONE,
+                PROPOSAL_NONE,
+            ],
+            dtype=torch.int8,
+        ),
+    )
+
+    protected = _canonical_static_unknown_protection_mask(foliage)
+
+    assert protected.tolist() == [True, False, False, True, False]
+
+
+def test_whole_image_static_authority_requires_resolved_two_camera_evidence():
+    foliage = SimpleNamespace(
+        dynamic_leaf_mask=torch.zeros(4, dtype=torch.bool),
+        static_leaf_mask=torch.tensor([False, False, True, True]),
+        verification_state=torch.full(
+            (4,), VERIFICATION_VERIFIED, dtype=torch.int8
+        ),
+        verified_camera_count=torch.tensor([1, 2, 1, 2]),
+        verified_sequence_count=torch.ones(4, dtype=torch.int16),
+        proposal_kind=torch.tensor(
+            [PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_SPLIT],
+            dtype=torch.int8,
+        ),
+    )
+
+    authority = _persistent_static_evidence_mask(foliage)
+
+    # Neither broad-envelope role nor detail role may turn one camera into a
+    # whole-image completion/order permission. An unresolved split remains
+    # excluded even after its per-row state flips to VERIFIED.
+    assert authority.tolist() == [False, True, False, False]
+
+
+def test_canonical_occlusion_order_rejects_nonlocal_depth_layer():
+    values = _canonical_occlusion_fixture(surface_in_front=True)
+    loss, audit = _canonical_occlusion_order_loss(
+        *values, canonical_view=True, maximum_forward_shift=0.25
+    )
+    loss.backward()
+
+    assert float(loss) == 0.0
+    assert audit["supported_pixels"] == 0
+    assert audit["out_of_trust_region_pixels"] == 4
+    assert audit["mean_rejected_forward_shift"] == pytest.approx(2.03)
+    torch.testing.assert_close(values[6].grad, torch.zeros_like(values[6]))
+
+
+def test_canonical_occlusion_order_is_one_sided_and_noncanonical_zero():
+    correct = _canonical_occlusion_fixture(surface_in_front=False)
+    correct_loss, correct_audit = _canonical_occlusion_order_loss(
+        *correct, canonical_view=True
+    )
+    assert float(correct_loss) == 0.0
+    assert correct_audit["supported_pixels"] == 0
+
+    unknown = _canonical_occlusion_fixture(surface_in_front=True)
+    unknown_loss, unknown_audit = _canonical_occlusion_order_loss(
+        *unknown, canonical_view=False
+    )
+    unknown_loss.backward()
+    assert unknown_audit["noncanonical_geometry_updates_blocked"]
+    torch.testing.assert_close(
+        unknown[6].grad, torch.zeros_like(unknown[6])
+    )
+
+
 def test_static_global_cleanup_routes_only_negative_geometry_optical_signal():
     target = torch.zeros(3, 2, 2)
-    mixed = torch.full((3, 2, 2), 0.8, requires_grad=True)
+    mixed = torch.full((3, 2, 2), 0.9, requires_grad=True)
     surface = torch.zeros(3, 2, 2, requires_grad=True)
-    volume_alpha = torch.full((1, 2, 2), 0.5, requires_grad=True)
-    surface_alpha = torch.ones(1, 2, 2, requires_grad=True)
+    volume_contribution = torch.full(
+        (1, 2, 2), 0.5, requires_grad=True
+    )
     task = {
         "p_rigid": torch.ones(2, 2),
         "p_canopy": torch.zeros(2, 2),
@@ -7030,8 +9288,7 @@ def test_static_global_cleanup_routes_only_negative_geometry_optical_signal():
         mixed,
         surface,
         target,
-        volume_alpha,
-        surface_alpha,
+        volume_contribution,
         task,
         counterfactual_weight=0.5,
     )
@@ -7040,25 +9297,227 @@ def test_static_global_cleanup_routes_only_negative_geometry_optical_signal():
     assert audit["contract"] == STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
     assert audit["rigid_free_supported_pixels"] == 4
     assert audit["gradient_permissions"] == {
-        "verified_exact_static_detail_xyz_scale_rotation": True,
-        "positive_evidence_sequence_static_detail_optical_mass": True,
+        "static_detail_xyz_scale_rotation": False,
+        "persistent_static_detail_global_negative_optical_mass": True,
         "static_detail_sh": False,
         "surface_sky_uncertainty": False,
         "topology_statistics": False,
     }
-    assert volume_alpha.grad is not None
-    assert float(volume_alpha.grad.sum()) > 0
-    assert mixed.grad is None
+    assert volume_contribution.grad is None
+    assert audit["rigid_volume_front_pixels"] == 4
+    assert audit["rigid_behind_or_invalid_pixels_rejected"] == 0
+    assert audit["volume_source"] == (
+        "native_mixed_per_pixel_sorted_contribution_support"
+    )
+    assert audit["optimized_quantity"] == (
+        "signed_live_mixed_rgb_opacity_derivative"
+    )
+    assert audit["harmful_rigid_pixels"] == 4
+    assert mixed.grad is not None
+    assert float(mixed.grad.sum()) > 0
     assert surface.grad is None
-    assert surface_alpha.grad is None
+
+
+def test_static_detail_global_negative_owner_is_camera_independent_and_persistent():
+    foliage = SimpleNamespace(
+        static_leaf_mask=torch.tensor([True, True, True, False]),
+        dynamic_leaf_mask=torch.tensor([False, False, False, False]),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_VERIFIED,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([2, 1, 1, 3]),
+        verified_sequence_count=torch.tensor([1, 1, 1, 1]),
+        proposal_kind=torch.tensor(
+            [PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_NONE],
+            dtype=torch.int8,
+        ),
+    )
+
+    # Only the persistent two-camera detail is a global deployment owner.
+    # No current-camera argument exists, so a non-support canonical camera
+    # cannot accidentally lose its strict negative veto permission.
+    torch.testing.assert_close(
+        _static_detail_global_negative_owner_mask(foliage),
+        torch.tensor([True, False, False, False]),
+    )
+
+
+def test_v107_cleanup_resume_migration_changes_only_negative_authority():
+    fusion = {
+        "contract": "scene canonical",
+        "input_dynamic_rows": 1,
+        "associated_dynamic_rows": 1,
+        "camera_sequence_metadata_source": "fixed",
+        "camera_sequence_metadata_count": 2,
+        "canonical_sequence_policy": "scene",
+        "canonical_mode_voxel_size": 0.1,
+        "maximum_modes_per_group": 4,
+        "minimum_supporting_views": 2,
+        "minimum_supporting_sequences": 1,
+        "voxel_size": 0.1,
+        "output_static_rows": 1,
+    }
+    current_cleanup = {
+        "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
+        "every": 2,
+        "weight": 0.25,
+        "camera_schedule": {
+            "contract": "all canonical",
+            "camera_count": 352,
+            "positive_exact_support_camera_count": 235,
+            "schedule_sha256": "fixed",
+        },
+        "gradient_owners": [
+            "persistent_static_detail_global_negative_optical_mass"
+        ],
+    }
+    saved_cleanup = {
+        **current_cleanup,
+        "contract": STATIC_DETAIL_GLOBAL_CLEANUP_V106_PREDECESSOR_CONTRACT,
+        "camera_schedule": (
+            "dedicated_uniform_scene_canonical_exact_support_epoch"
+        ),
+        "gradient_owners": [
+            "positive_evidence_sequence_static_detail_optical_mass"
+        ],
+    }
+    assert not _resume_training_contract_differences(
+        {
+            "static_detail_global_cleanup": saved_cleanup,
+            "static_fusion": {**fusion, "audit_sum": 1.0},
+            "initialization_manifest_sha256": "init",
+            "foliage_seed_sha256": "seed",
+        },
+        {
+            "static_detail_global_cleanup": current_cleanup,
+            "static_fusion": {**fusion, "audit_sum": 1.0 + 1e-7},
+            "initialization_manifest_sha256": "init",
+            "foliage_seed_sha256": "seed",
+        },
+        allow_v107_global_negative_cleanup_migration=True,
+    )
+
+    changed_weight = {
+        **saved_cleanup,
+        "weight": 0.5,
+    }
+    with pytest.raises(RuntimeError, match="changed more than"):
+        _resume_training_contract_differences(
+            {
+                "static_detail_global_cleanup": changed_weight,
+                "static_fusion": fusion,
+                "initialization_manifest_sha256": "init",
+                "foliage_seed_sha256": "seed",
+            },
+            {
+                "static_detail_global_cleanup": current_cleanup,
+                "static_fusion": fusion,
+                "initialization_manifest_sha256": "init",
+                "foliage_seed_sha256": "seed",
+            },
+            allow_v107_global_negative_cleanup_migration=True,
+        )
+
+
+def test_static_global_cleanup_blocks_beneficial_and_behind_contributions():
+    target = torch.zeros(3, 2, 2)
+    surface = torch.ones(3, 2, 2, requires_grad=True)
+    mixed = torch.zeros(3, 2, 2, requires_grad=True)
+    contribution = torch.full((1, 2, 2), 0.5, requires_grad=True)
+    task = {
+        "p_rigid": torch.ones(2, 2),
+        "p_canopy": torch.zeros(2, 2),
+        "p_canopy_core": torch.zeros(2, 2),
+        "p_sky": torch.zeros(2, 2),
+        "p_transient": torch.zeros(2, 2),
+        "p_boundary_uncertain": torch.zeros(2, 2),
+        "w_rgb": torch.ones(2, 2),
+    }
+    beneficial, beneficial_audit = _static_detail_global_cleanup_loss(
+        mixed,
+        surface,
+        target,
+        contribution,
+        task,
+        counterfactual_weight=1.0,
+    )
+    beneficial.backward()
+    assert float(beneficial) == 0.0
+    assert beneficial_audit["beneficial_or_neutral_rigid_pixels_blocked"] == 4
+    assert contribution.grad is None
+    torch.testing.assert_close(mixed.grad, torch.zeros_like(mixed))
+
+    contribution.grad = None
+    behind = torch.zeros((1, 2, 2), requires_grad=True)
+    harmful_mixed = torch.ones(3, 2, 2, requires_grad=True)
+    behind_loss, behind_audit = _static_detail_global_cleanup_loss(
+        harmful_mixed,
+        torch.zeros_like(surface),
+        target,
+        behind,
+        task,
+        counterfactual_weight=1.0,
+    )
+    behind_loss.backward()
+    assert float(behind_loss) == 0.0
+    assert behind_audit["rigid_behind_or_invalid_pixels_rejected"] == 4
+    assert behind.grad is None
+    torch.testing.assert_close(
+        harmful_mixed.grad, torch.zeros_like(harmful_mixed)
+    )
+
+
+def test_static_cleanup_signed_rgb_derivative_blames_only_harmful_primitive():
+    bad_alpha = torch.tensor(0.20, requires_grad=True)
+    good_alpha = torch.tensor(0.40, requires_grad=True)
+    bad_rgb = torch.tensor([1.0, 0.0, 0.0])
+    good_rgb = torch.tensor([0.0, 1.0, 0.0])
+    background = torch.ones(3)
+    target_rgb = good_rgb
+    mixed_rgb = (
+        bad_alpha * bad_rgb
+        + (1.0 - bad_alpha) * good_alpha * good_rgb
+        + (1.0 - bad_alpha) * (1.0 - good_alpha) * background
+    ).reshape(3, 1, 1)
+    contribution = (
+        bad_alpha + (1.0 - bad_alpha) * good_alpha
+    ).detach().reshape(1, 1, 1)
+    task = {
+        "p_rigid": torch.ones(1, 1),
+        "p_canopy": torch.zeros(1, 1),
+        "p_canopy_core": torch.zeros(1, 1),
+        "p_sky": torch.zeros(1, 1),
+        "p_transient": torch.zeros(1, 1),
+        "p_boundary_uncertain": torch.zeros(1, 1),
+        "w_rgb": torch.ones(1, 1),
+    }
+    loss, audit = _static_detail_global_cleanup_loss(
+        mixed_rgb,
+        target_rgb.reshape(3, 1, 1),
+        target_rgb.reshape(3, 1, 1),
+        contribution,
+        task,
+        counterfactual_weight=1.0,
+    )
+    bad_gradient, good_gradient = torch.autograd.grad(
+        loss, (bad_alpha, good_alpha)
+    )
+    assert audit["rigid_free_supported_pixels"] == 1
+    assert float(bad_gradient) > 0.0
+    assert float(good_gradient) < 0.0
 
 
 def test_persistent_envelope_cleanup_routes_only_global_negative_signal():
     target = torch.zeros(3, 2, 2)
-    mixed = torch.full((3, 2, 2), 0.8, requires_grad=True)
+    volume_white = torch.full((3, 2, 2), 0.9, requires_grad=True)
     surface = torch.zeros(3, 2, 2, requires_grad=True)
     volume_alpha = torch.full((1, 2, 2), 0.5, requires_grad=True)
-    surface_alpha = torch.ones(1, 2, 2, requires_grad=True)
     task = {
         "p_rigid": torch.ones(2, 2),
         "p_canopy": torch.zeros(2, 2),
@@ -7070,11 +9529,10 @@ def test_persistent_envelope_cleanup_routes_only_global_negative_signal():
     }
 
     loss, audit = _persistent_envelope_global_cleanup_loss(
-        mixed,
+        volume_white,
         surface,
         target,
         volume_alpha,
-        surface_alpha,
         task,
         counterfactual_weight=0.5,
     )
@@ -7083,17 +9541,60 @@ def test_persistent_envelope_cleanup_routes_only_global_negative_signal():
     assert audit["contract"] == PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT
     assert audit["rigid_free_supported_pixels"] == 4
     assert audit["gradient_permissions"] == {
-        "persistent_envelope_xyz_scale_rotation": True,
+        "persistent_envelope_xyz_scale_rotation": False,
         "persistent_envelope_optical_mass": True,
         "persistent_envelope_sh": False,
         "surface_sky_uncertainty": False,
         "topology_statistics": False,
     }
-    assert volume_alpha.grad is not None
-    assert float(volume_alpha.grad.sum()) > 0
-    assert mixed.grad is None
+    assert volume_alpha.grad is None
+    assert audit["rigid_volume_front_pixels"] == 4
+    assert audit["rigid_behind_or_invalid_pixels_rejected"] == 0
+    assert volume_white.grad is not None
+    assert float(volume_white.grad.sum()) > 0
     assert surface.grad is None
-    assert surface_alpha.grad is None
+
+
+@pytest.mark.parametrize(
+    "loss_function",
+    (_persistent_envelope_global_cleanup_loss,),
+)
+def test_global_cleanup_strictly_rejects_volume_behind_rigid_surface(loss_function):
+    target = torch.zeros(3, 2, 2)
+    volume_white = torch.full((3, 2, 2), 0.9, requires_grad=True)
+    surface = torch.zeros(3, 2, 2, requires_grad=True)
+    # Native mixed compositing represents a facade-hidden envelope with zero
+    # contribution; no inconsistent aggregate layer depth fixture is needed.
+    volume_alpha = torch.zeros(1, 2, 2, requires_grad=True)
+    task = {
+        "p_rigid": torch.ones(2, 2),
+        "p_canopy": torch.zeros(2, 2),
+        "p_canopy_core": torch.zeros(2, 2),
+        "p_sky": torch.zeros(2, 2),
+        "p_transient": torch.zeros(2, 2),
+        "p_boundary_uncertain": torch.zeros(2, 2),
+        "w_rgb": torch.ones(2, 2),
+    }
+
+    loss, audit = loss_function(
+        volume_white,
+        surface,
+        target,
+        volume_alpha,
+        task,
+        counterfactual_weight=1.0,
+    )
+    loss.backward()
+
+    assert float(loss) == 0.0
+    assert audit["rigid_free_supported_pixels"] == 0
+    assert audit["rigid_volume_front_pixels"] == 0
+    assert audit["rigid_behind_or_invalid_pixels_rejected"] == 4
+    assert volume_alpha.grad is None
+    torch.testing.assert_close(
+        volume_white.grad, torch.zeros_like(volume_white)
+    )
+    assert surface.grad is None
 
 
 def test_static_public_phase_names_never_advertise_dynamic_output():
@@ -7163,13 +9664,38 @@ def test_failed_split_family_rolls_back_without_optical_hole():
     foliage = VolumetricFoliageModel(1, dynamic_rank=0, device="cpu")
     foliage.initialize_from_volume_state(payload)
     parent_mass = foliage.integrated_optical_mass().sum().clone()
+    parent_physical = {
+        name: getattr(foliage, name)[0].detach().clone()
+        for name in (
+            "xyz",
+            "log_scales",
+            "quaternions",
+            "opacity_logits",
+            "features",
+        )
+    }
     split = foliage.split_adaptive(
         torch.tensor([0]), torch.tensor([2]), birth_iteration=100
     )
     assert split["children"] == 2
+    assert len(foliage.split_parent_snapshot_family_id) == 1
+    assert foliage.proposal_parent_support_camera_ids.shape == (1, 4)
+    assert foliage.proposal_parent_position_covariance.shape == (1, 3, 3)
     torch.testing.assert_close(
         foliage.integrated_optical_mass().sum(), parent_mass
     )
+    # A split is an atomic replacement. One verified child cannot authorize
+    # throwing away the optical-mass share of its expired sibling.
+    # Simulate severe optimizer drift: rollback must restore the transaction
+    # snapshot, never merge this separation into one giant Gaussian.
+    with torch.no_grad():
+        foliage.xyz[0] += torch.tensor([4.0, 0.0, 0.0])
+        foliage.xyz[1] -= torch.tensor([4.0, 0.0, 0.0])
+        foliage.log_scales.add_(0.7)
+        foliage.opacity_logits.add_(0.4)
+        foliage.features.add_(0.3)
+    foliage.verification_state[0] = VERIFICATION_VERIFIED
+    foliage.candidate_evidence_primitive_id[0] = -1
 
     remove, representatives, audit = _rollback_failed_split_families(
         SimpleNamespace(
@@ -7179,13 +9705,17 @@ def test_failed_split_family_rolls_back_without_optical_hole():
             canonical_crown_opacity_ceiling=0.20,
         ),
         foliage,
-        torch.ones(len(foliage), dtype=torch.bool),
+        torch.tensor([False, True]),
     )
 
     assert audit["rolled_back_families"] == 1
     assert int(remove.sum()) == 1
     assert len(representatives) == 1
     representative = representatives[0]
+    for name, expected in parent_physical.items():
+        torch.testing.assert_close(
+            getattr(foliage, name)[representative], expected
+        )
     torch.testing.assert_close(
         foliage.integrated_optical_mass()[representative],
         parent_mass,
@@ -7195,6 +9725,27 @@ def test_failed_split_family_rolls_back_without_optical_hole():
     assert foliage.evidence_primitive_id[representative].item() == 17
     assert foliage.parent_lineage_id[representative].item() == -1
     assert foliage.verification_state[representative].item() == VERIFICATION_VERIFIED
+    assert foliage.proposal_kind[representative].item() == PROPOSAL_NONE
+    assert foliage.split_proposal_family_id[representative].item() == -1
+    assert len(foliage.split_parent_snapshot_family_id) == 0
+    assert foliage.support_view_count[representative].item() == 4
+    assert foliage.support_sequence_count[representative].item() == 2
+    torch.testing.assert_close(
+        foliage.support_camera_ids[representative],
+        torch.tensor([11, 12, 13, 14], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        foliage.position_covariance[representative],
+        torch.eye(3) * 0.02,
+    )
+    assert foliage.occupancy_probability[representative].item() == pytest.approx(
+        0.8
+    )
+    torch.testing.assert_close(
+        foliage.initialization_center[representative],
+        torch.tensor([1.0, 2.0, 3.0]),
+    )
+    assert len(torch.unique(foliage.lineage_id)) == len(foliage)
     foliage.replace_and_split_adaptive(
         remove,
         torch.empty(0, dtype=torch.long),
@@ -7207,6 +9758,34 @@ def test_failed_split_family_rolls_back_without_optical_hole():
         rtol=1e-5,
         atol=1e-7,
     )
+
+
+def test_family_rollback_never_groups_ray_births_by_parent_lineage():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor(
+            [[0.0, 0.0, 3.0], [0.1, 0.0, 3.0], [0.2, 0.0, 3.0]]
+        ),
+        "scales": torch.full((3, 3), 0.1),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1),
+        "opacities": torch.full((3, 1), 0.04),
+        "colors": torch.full((3, 3), 0.5),
+    }
+    foliage = VolumetricFoliageModel(0, dynamic_rank=0, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    foliage.parent_lineage_id.fill_(77)
+    foliage.proposal_kind.fill_(PROPOSAL_RAY_BIRTH)
+    foliage.split_proposal_family_id.fill_(-1)
+
+    remove, representatives, audit = _rollback_failed_split_families(
+        SimpleNamespace(maximum_volume_family_rollbacks_per_event=8),
+        foliage,
+        torch.ones(3, dtype=torch.bool),
+    )
+
+    assert not bool(remove.any())
+    assert len(representatives) == 0
+    assert audit["rolled_back_families"] == 0
 
 
 def test_volume_appearance_lr_decays_only_in_topology_free_polish():

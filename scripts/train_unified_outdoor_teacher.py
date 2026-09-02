@@ -7,6 +7,7 @@ import argparse
 import copy
 import gc
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -53,13 +54,22 @@ from outdoor.foliage_view_graph import sequence_id  # noqa: E402
 from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
+    PROPOSAL_NONE,
+    PROPOSAL_RAY_BIRTH,
+    PROPOSAL_SPLIT,
+    VERIFICATION_FACTORIZED_RECEIVER,
+    VERIFICATION_MEASURED_SINGLE,
+    VERIFICATION_REJECTED,
     VERIFICATION_UNVERIFIED,
     VERIFICATION_VERIFIED,
     VolumetricFoliageModel,
     _rotation_matrices_from_quaternions,
     dynamic_visibility_gate,
+    persistent_static_evidence_mask,
+    resolved_static_owner_mask,
     projected_gaussian_cross_section,
     render_hybrid,
+    static_detail_forward_visibility_gate,
 )
 from outdoor.hybrid_teacher_api import (  # noqa: E402
     STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
@@ -68,6 +78,9 @@ from outdoor.hybrid_teacher_api import (  # noqa: E402
     _static_surface_evidence_mixture,
 )
 from outdoor.lazy_scene import LazyScene, rgb_source_contract  # noqa: E402
+from outdoor.moge3_chart_base import (  # noqa: E402
+    MOGE3_CHART_BASE_SOURCES,
+)
 from outdoor.runtime_provenance import collect_runtime_provenance  # noqa: E402
 from outdoor.static_foliage import (  # noqa: E402
     fuse_sequence_evidence_into_static_leaves,
@@ -87,7 +100,56 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule"
+    "cambridge_native_hybrid_teacher_v117_persistent_thin_hit_ownership"
+)
+V107_GLOBAL_NEGATIVE_CLEANUP_PREDECESSOR = {
+    "protocol": (
+        "cambridge_native_hybrid_teacher_v106_exact_support_canonical_coverage"
+    ),
+    "iteration": 18_000,
+    "schedule_horizon": 30_000,
+    "checkpoint_sha256": (
+        "ae7074c7f1e30c48ab1fb04b472d6dc812ebaec6df736b8c12e6ceb6ab830cce"
+    ),
+    "trainer": (
+        "9e34f03cf94fccb0296ec175f41d63121c29678fe3b10f38319bce935a20478b"
+    ),
+    "hybrid_teacher_api": (
+        "324eaccedffdb2d82d47044960614f8bda673ddb8bd621d0b757a52d76fb6069"
+    ),
+}
+V108_EVIDENCE_BOUNDED_COMPLETION_PREDECESSOR = {
+    "protocol": (
+        "cambridge_native_hybrid_teacher_v107_global_canonical_negative_cleanup"
+    ),
+    "iteration": 21_000,
+    "schedule_horizon": 30_000,
+    "checkpoint_sha256": (
+        "e71fd4f8f7e84fa91fd2cc2d03163d303ddfd2e7a52cd32cd235e9d85dbfa500"
+    ),
+    "trainer": (
+        "3e15729b2e8af762e7a9c716cc478b02839bc122224470a172e6ab7efb471c40"
+    ),
+    "hybrid_teacher_api": (
+        "fddf2070395767522903385fe99dcd2b34ce0194b58dd99f9a64305c3b037964"
+    ),
+}
+V100_FRONT_CLIPPED_CLEANUP_PREDECESSOR = {
+    "protocol": "cambridge_native_hybrid_teacher_v99_static_evidence_debt_closed",
+    "iteration": 21_000,
+    "schedule_horizon": 30_000,
+    "checkpoint_sha256": (
+        "18ef5126b48d6b4f988f6ec01434d5f93c216b31b47ccde7fd8b851dd7a42f8f"
+    ),
+    "trainer": (
+        "3084b5bf0900a56667abc9620ede7235b8b7386270ec880145197b73d4f6e5b8"
+    ),
+    "hybrid_teacher_api": (
+        "0fada0adc903156b615eebd4e192b4604d87be8f7ce06696f86568f7faf35964"
+    ),
+}
+DETACHED_SUPERVISOR_CONTRACT_ENVIRONMENT = (
+    "G4SPLAT_DETACHED_SUPERVISOR_CONTRACT"
 )
 STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     "protocol": (
@@ -100,6 +162,62 @@ STATIC_CANONICAL_OWNERSHIP_REPAIR_PREDECESSOR = {
     ),
     "hybrid_teacher_api": (
         "00d177835e9ddbb55f85cc301d3c4cb8a335c58af17c5fbe89212c64e40410ef"
+    ),
+}
+V102_OPTICAL_TRUST_PREDECESSOR = {
+    "protocol": "cambridge_native_hybrid_teacher_v101_snapshot_owned_static_detail",
+    "iteration": 21_000,
+    "schedule_horizon": 30_000,
+    "checkpoint_sha256": (
+        "c80f6bbd32e352fcfb1cef7696664ac7c9f1db81b931d769b1b307f1c37762ab"
+    ),
+    "trainer": (
+        "1c77dc3fc7369b29ff98a912a49a555dfbf74e66bc6fd1d98b20f048f29a8ea0"
+    ),
+    "hybrid_renderer": (
+        "82f5150bba93a633e263116b06e727c4cf281a48a257754c6bf1605ca0c20d11"
+    ),
+    "hybrid_teacher_api": (
+        "227a62e0d6a1782dfe6f7ada89187f939e7f33ec553d23fcd934b31510f79483"
+    ),
+}
+V103_LOCAL_OPTICAL_REDISTRIBUTION_PREDECESSOR = {
+    "protocol": (
+        "cambridge_native_hybrid_teacher_v102_bidirectional_optical_trust"
+    ),
+    "iteration": 24_000,
+    "schedule_horizon": 30_000,
+    "checkpoint_sha256": (
+        "40516bd6db9e6dc701e3a9a89cc253c56a5d86a4588ad804cf578a89d77736b4"
+    ),
+    "trainer": (
+        "886323380fccf74e7ac28be75493bb0d61e4c83bf88828e0b27651958464ea29"
+    ),
+    "hybrid_renderer": (
+        "3c547eca9ea279eae99c75bde5e641c65d6e65b36fd2463401b69343ccf492f2"
+    ),
+    "hybrid_teacher_api": (
+        "7eb467770a24fa69c7eab738f1e829d22d0ce4493126a2182950982fd7f7f3a3"
+    ),
+}
+V105_LATE_OPTICAL_CONVERGENCE_PREDECESSOR = {
+    "protocol": (
+        "cambridge_native_hybrid_teacher_v104_signed_occlusion_responsibility"
+    ),
+    "schedule_horizon": 30_000,
+    "checkpoints": {
+        18_000: (
+            "94c863d07949085045fb171e855967569ec4704080c51d3aee2299e24677841d"
+        ),
+        25_500: (
+            "d3ecfe22c5516a8c8b1c30013b3882df1ee0a660c96dc8b27ed65ea1f58ddba8"
+        ),
+    },
+    "trainer": (
+        "66e8c5f873be7eb39c8c13cd953fccde0e727e96a2ad83517a3a8817044c96ab"
+    ),
+    "hybrid_teacher_api": (
+        "fc3aa1f521b4791c1c1c2abf6f2e9feea0b89885c32f3aadc49353d753e3ac9b"
     ),
 }
 STATIC_DETAIL_ISOLATED_REPAIR_PREDECESSOR = {
@@ -140,11 +258,11 @@ STATIC_DETAIL_ISOLATED_V85_PREDECESSOR_CONTRACT = (
     "persistent_envelope_cannot_occlude_its_training_signal"
 )
 STATIC_DETAIL_ISOLATED_CONTRACT = (
-    "surface_plus_static_detail_counterfactual_routes_rgb_high_frequency_"
-    "and_screen_gradient_only_to_verified_multiview_static_detail_geometry__"
-    "positive_evidence_sequence_geometry_receives_soft_weight__sh_and_"
-    "opacity_are_read_only__intrinsic_sh_colour_is_owned_only_by_the_"
-    "volume_isolated_stream__persistent_envelope_cannot_occlude_geometry"
+    "surface_plus_static_detail_counterfactual_forward_rows_equal_union_of_"
+    "live_geometry_and_optical_owners__oriented_multiscale_rgb_edges_and_"
+    "screen_gradient_route_only_to_persistent_or_exact_measured_detail__sh_"
+    "is_read_only_and_owned_only_by_the_volume_isolated_stream__persistent_"
+    "envelope_and_read_only_detail_cannot_authorize_another_row"
 )
 STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT = (
     "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
@@ -157,12 +275,21 @@ STATIC_VOLUME_ISOLATED_V85_PREDECESSOR_CONTRACT = (
 )
 STATIC_VOLUME_ISOLATED_CONTRACT = (
     "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
-    "support__full_positive_evidence_sequence_sh__verified_positive_"
-    "evidence_sequence_geometry_soft_weight__exact_owner_screen_bandwidth__"
-    "opacity_read_only__alpha_normalized_color_floor005"
+    "support__forward_rows_equal_union_of_live_geometry_sh_and_screen_"
+    "owners__persistent_scene_canonical_sh__persistent_or_exact_measured_"
+    "geometry__exact_owner_screen_bandwidth__opacity_read_only__oriented_"
+    "multiscale_edge_loss__alpha_normalized_color_floor005"
 )
 STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR = 0.005
-STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT = 0.15
+STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT = 0.0
+RENDER_ALPHA_CUTOFF = 1.0e-6
+STATIC_UNKNOWN_PROJECTED_ALPHA = 1.0e-5
+STATIC_SCENE_CANONICAL_RGB_CONTRACT = (
+    "one_scene_sequence_owns_low_frequency_canopy_rgb__detail_positive_"
+    "geometry_sh_and_optical_gradients_are_exact_support_camera_owned__"
+    "all_other_sequences_use_union_of_observed_canopy_and_projected_"
+    "canonical_volume_as_unknown__rigid_rgb_outside_unknown_remains_trainable"
+)
 STATIC_STAGE_RGB_ROLE_PREDECESSOR_CONTRACT = (
     "stage2_envelope_rgb_geometry_mass__stage3_envelope_sh_only__"
     "ray_interval_and_global_counterfactual_retain_envelope_geometry_mass__"
@@ -189,14 +316,14 @@ STATIC_STAGE_RGB_ROLE_V85_PREDECESSOR_CONTRACT = (
     "optical_mass"
 )
 STATIC_STAGE_RGB_ROLE_CONTRACT = (
-    "stage2_envelope_rgb_geometry_mass__stage3_envelope_dc_only_no_positive_"
-    "mass_growth__ray_interval_and_global_counterfactual_retain_envelope_"
-    "geometry_mass__verified_positive_evidence_sequence_static_detail_"
-    "geometry_uses_soft_weight_while_topology_remains_exact_support_owned__"
-    "positive_optical_mass_and_free_space_use_symmetric_real_evidence_"
-    "sequences__same_sequence_static_detail_sh_and_optical_mass_use_"
-    "continuous_weights__verified_multiview_only_high_bandwidth_refinement__"
-    "verified_cross_sequence_consensus_static_detail_ray_optical_mass"
+    "scene_canonical_stage2_envelope_rgb_geometry_mass__stage3_envelope_dc_"
+    "only_no_positive_mass_growth__known_pixel_native_mixed_signed_"
+    "counterfactual_retains_envelope_negative_optical_mass_only__canonical_"
+    "sequence_static_detail_geometry_sh_optical_mass_ray_and_topology_are_"
+    "exact_support_camera_owned__unsupported_canonical_views_retain_only_"
+    "low_frequency_envelope_skeleton_authority__noncanonical_tree_union_is_"
+    "unknown_and_has_no_detail_parameter_or_"
+    "topology_authority"
 )
 STATIC_DETAIL_GLOBAL_CLEANUP_APPEARANCE_PREDECESSOR_CONTRACT = (
     "static_detail_is_unconditionally_visible__all_calibrated_views_route_"
@@ -214,26 +341,66 @@ STATIC_DETAIL_GLOBAL_CLEANUP_V83_PREDECESSOR_CONTRACT = (
     "consensus_routes_positive_ray_geometry_and_optical_mass__cleanup_"
     "never_drives_topology"
 )
+STATIC_DETAIL_GLOBAL_CLEANUP_V102_PREDECESSOR_CONTRACT = (
+    "surface_zero_intrinsic_static_detail_forward_equals_live_negative_"
+    "owners__scene_canonical_known_rigid_pixels_route_cleanup_only_when_"
+    "volume_depth_plus_clearance_is_strictly_in_front_of_surface_depth__"
+    "sky_remains_unoccluded_negative_permission__surface_behind_volume_is_"
+    "fail_closed__geometry_and_optical_mass_only__noncanonical_views_have_"
+    "no_detail_cleanup_authority__cleanup_never_drives_topology"
+)
 STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT = (
-    "static_detail_is_unconditionally_visible__rigid_free_space_and_surface_"
-    "better_counterfactuals_route_only_from_persisted_positive_evidence_"
-    "sequences_to_static_detail_optical_mass__cleanup_geometry_remains_"
-    "verified_exact_support_owned__the_same_evidence_sequences_route_"
-    "positive_rgb_ray_and_direct_prior_optical_mass__exact_support_cameras_"
-    "retain_geometry_and_topology__verified_cross_sequence_consensus_"
-    "remains_a_positive_ray_owner__cleanup_never_drives_topology"
+    "dedicated_uniform_complete_scene_canonical_camera_schedule__native_mixed_"
+    "surface_plus_persistent_static_detail_forward_equals_live_global_negative_"
+    "opacity_owners__positive_growth_remains_exact_support_camera_owned__exact_per_pixel_"
+    "depth_sort_volume_contribution_is_support_only__signed_live_mixed_rgb_"
+    "opacity_derivative_assigns_harm_to_each_primitive__mixed_contribution_"
+    "is_never_reinterpreted_as_intrinsic_optical_depth__beneficial_primitive_"
+    "gradients_are_blocked_not_reversed__opacity_retirement_only_because_rgb_"
+    "harm_has_no_metric_geometry_target__polish_uses_reduced_strict_negative_"
+    "weight__all_scene_canonical_rigid_and_sky_negative_evidence_is_globally_"
+    "authoritative__other_sequence_views_have_no_detail_cleanup_authority__cleanup_"
+    "never_drives_topology"
+)
+STATIC_DETAIL_GLOBAL_CLEANUP_V106_PREDECESSOR_CONTRACT = (
+    "dedicated_scene_canonical_exact_support_camera_schedule__native_mixed_surface_plus_"
+    "static_detail_forward_equals_live_negative_owners__exact_per_pixel_"
+    "depth_sort_volume_contribution_is_support_only__signed_live_mixed_rgb_"
+    "opacity_derivative_assigns_harm_to_each_primitive__mixed_contribution_"
+    "is_never_reinterpreted_as_intrinsic_optical_depth__beneficial_primitive_"
+    "gradients_are_blocked_not_reversed__opacity_retirement_only_because_rgb_"
+    "harm_has_no_metric_geometry_target__polish_uses_reduced_strict_negative_"
+    "weight__other_sequence_views_have_no_detail_cleanup_authority__cleanup_"
+    "never_drives_topology"
 )
 PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT = (
+    "native_mixed_surface_plus_resolved_envelope_forward_equals_live_negative_"
+    "opacity_owners__exact_per_pixel_sorted_volume_contribution_is_support_"
+    "only__signed_live_mixed_rgb_opacity_derivative_assigns_harm_to_each_"
+    "primitive__surface_behind_volume_has_zero_native_contribution__all_"
+    "geometry_appearance_surface_sky_and_topology_read_only__source_separated_"
+    "strict_negative_gradient_survives_canonical_polish_freeze"
+)
+STATIC_DETAIL_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT = (
+    "static_detail_is_unconditionally_visible__scene_canonical_known_"
+    "pixels_route_rigid_free_space_and_surface_better_counterfactuals_to_"
+    "detail_geometry_and_optical_mass__cleanup_geometry_remains_verified_"
+    "exact_support_owned__canonical_cameras_route_positive_rgb_ray_and_"
+    "direct_prior_optical_mass__noncanonical_views_have_no_detail_cleanup_"
+    "authority__cleanup_never_drives_topology"
+)
+PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT = (
     "persistent_envelope_is_unconditionally_visible__all_calibrated_views_"
-    "route_rigid_free_space_and_surface_better_counterfactuals_only_to_"
-    "envelope_geometry_and_optical_mass__canopy_rgb_ray_hits_and_local_"
-    "replacement_remain_separate_positive_owners__cleanup_never_updates_"
-    "envelope_sh_or_drives_topology"
+    "route_known_pixel_rigid_free_space_and_surface_better_"
+    "counterfactuals_only_to_envelope_geometry_and_optical_mass__canopy_"
+    "rgb_ray_hits_and_local_replacement_remain_separate_positive_owners__"
+    "cleanup_never_updates_envelope_sh_or_drives_topology"
 )
 STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT = (
     "uncovered_hit_uses_complete_calibrated_ray_depth_interval__"
     "cross_sequence_segments_vote_in_multiscale_visual_hull_cells__"
-    "minimum_two_cameras_and_two_sequences_remain_mandatory__"
+    "scene_snapshot_requires_two_independent_canonical_cameras__legacy_"
+    "per_tree_mosaic_requires_two_sequences__"
     "newborn_is_low_mass_static_detail_and_free_space_prunable__"
     "continuous_verification_debt_backpressure"
 )
@@ -241,6 +408,86 @@ COUNTERFACTUAL_TRANSPARENCY_CONTRACT = (
     "detached_surface_only_relative_rgb_advantage_requires_independent_"
     "rigid_semantic_permission_and_routes_only_volume_optical_depth__"
     "canopy_semantics_never_authorize_canopy_retirement"
+)
+STATIC_COUNTERFACTUAL_TRANSPARENCY_CONTRACT = (
+    "disabled_for_static_scene__superseded_by_role_isolated_intrinsic_"
+    "volume_alpha_with_strict_front_depth_clipping__mixed_contribution_"
+    "alpha_is_never_interpreted_as_volume_optical_depth"
+)
+ISOLATED_FRONT_CLIPPED_TRANSPARENCY_CONTRACT = (
+    "surface_zero_intrinsic_volume_rgb_and_alpha__detached_hypothetical_"
+    "volume_front_composite__independent_rigid_permission_requires_valid_"
+    "surface_and_volume_depth_and_strict_front_clearance__behind_surface_"
+    "and_invalid_depth_are_zero__only_volume_geometry_and_optical_depth_live"
+)
+CANONICAL_OCCLUSION_DIRECTIONAL_COMPLETION_CONTRACT = (
+    "scene_canonical_surface_leakage_uses_detached_mixed_minus_surface_rgb_"
+    "direction_to_estimate_bounded_missing_optical_depth__only_volume_in_"
+    "front_receives_positive_opacity_gradient__surface_in_front_is_audited_"
+    "as_geometry_order_conflict__surface_sky_rgb_geometry_and_sh_read_only__"
+    "scalar_pixel_loss_is_normalized_over_spatial_support_not_image_height"
+)
+CANONICAL_OCCLUSION_COMPLETION_V107_PREDECESSOR_CONTRACT = (
+    "scene_canonical_surface_zero_resolved_envelope_intrinsic_layer__"
+    "forward_contributors_equal_live_opacity_owners__detached_volume_front_"
+    "rgb_advantage_and_strict_front_depth_request_bounded_optical_growth__"
+    "no_semantic_visibility_floor__unsupported_and_surface_behind_rows_zero__"
+    "surface_sky_geometry_and_all_appearance_read_only__scalar_pixel_loss_"
+    "normalized_over_spatial_support_not_image_height"
+)
+CANONICAL_OCCLUSION_COMPLETION_CONTRACT = (
+    "scene_canonical_surface_zero_single_optical_owner_intrinsic_layer__"
+    "exact_camera_persistent_detail_replaces_its_envelope_group__"
+    "unreplaced_groups_fall_back_to_resolved_envelope__"
+    "forward_contributors_equal_live_opacity_owners__detached_volume_front_"
+    "rgb_advantage_and_strict_front_depth_request_bounded_optical_growth__"
+    "no_semantic_visibility_floor__unsupported_and_surface_behind_rows_zero__"
+    "surface_sky_geometry_and_all_appearance_read_only__scalar_pixel_loss_"
+    "normalized_over_spatial_support_not_image_height"
+)
+MOGE3_CANOPY_OPTICAL_V113_PREDECESSOR_CONTRACT = (
+    "exact_k_metric_depth_query_separates_global_scale_uncertainty_from_local_"
+    "hit_thickness__global_scale_only_weakens_reliability_and_conservatively_"
+    "moves_the_negative_prehit_bound__local_refinement_uncertainty_has_a_"
+    "strict_metric_hit_half_width__native_volume_only_per_pixel_product_"
+    "transmittance__prehit_is_negative_only__hit_growth_is_exact_support_"
+    "camera_owned__coverage_query_is_all_owner_read_only__forward_rows_equal_"
+    "live_opacity_owners_for_each_loss__surface_and_behind_hit_volume_have_"
+    "zero_gradient__missing_hit_mass_emits_thin_exact_ray_intervals_to_two_"
+    "camera_canonical_voxel_consensus__noncanonical_sequences_are_unknown"
+)
+MOGE3_CANOPY_OPTICAL_CONTRACT = (
+    "exact_k_metric_depth_query_separates_global_scale_uncertainty_from_local_"
+    "hit_thickness__global_scale_only_weakens_reliability_and_conservatively_"
+    "moves_the_negative_prehit_bound__local_refinement_uncertainty_has_a_"
+    "strict_metric_hit_half_width__native_volume_only_per_pixel_product_"
+    "transmittance__prehit_is_negative_only__persistent_multiview_detail_"
+    "hit_growth_is_current_metric_ray_owned__measured_single_detail_remains_"
+    "exact_support_camera_owned__relative_log_alpha_deficit_preserves_"
+    "gradient_at_low_transmittance__coverage_query_is_all_owner_read_only__"
+    "forward_rows_equal_"
+    "live_opacity_owners_for_each_loss__surface_and_behind_hit_volume_have_"
+    "zero_gradient__missing_hit_mass_emits_thin_exact_ray_intervals_to_two_"
+    "camera_canonical_voxel_consensus__noncanonical_sequences_are_unknown"
+)
+CANONICAL_OCCLUSION_ACTIVATION_PREDECESSOR_CONTRACT = (
+    "inactive_while_volume_topology_can_mutate__first_active_iteration_is_"
+    "strictly_after_volume_densify_until_iteration__completion_opacity_and_"
+    "depth_order_xyz_share_the_same_fixed_topology_settlement_schedule"
+)
+CANONICAL_OCCLUSION_ACTIVATION_CONTRACT = (
+    "inactive_while_volume_topology_can_grow__first_active_iteration_is_"
+    "strictly_after_volume_densify_until_iteration__dedicated_uniform_"
+    "canonical_snapshot_schedule__stops_at_end_of_ownership_cleanup_before_"
+    "appearance_polish__later_topology_events_are_prune_or_failed_family_"
+    "rollback_only"
+)
+MIXED_VISIBILITY_SORT_CONTRACT = (
+    "joint_native_tile_list__volume_center_depth_stream__surface_exact_"
+    "ray_intersection_depth_topk_batches_have_unbounded_total_capacity__"
+    "sorted_exactly_per_pixel_by_depth_then_primitive_id_in_forward_and_"
+    "backward__batch_capacity_changes_work_only_never_image_semantics__"
+    "no_whole_layer_deployment_override"
 )
 RAY_EPOCH_BOUNDARY_CONTRACT = (
     "short_tail_never_wraps_into_next_camera_epoch"
@@ -252,10 +499,25 @@ VOLUME_TOPOLOGY_SETTLE_CONTRACT = (
     "screen_adaptive_until_configured_end__disabled_during_"
     "canonical_polish_settle"
 )
+VOLUME_OPACITY_SETTLE_V107_PREDECESSOR_CONTRACT = (
+    "static_persistent_detail_uses_immutable_evidence_mass_anchor_and_"
+    "signed_adam_updates__per_row_upper_bound_prevents_mass_monopoly__"
+    "bounded_local_initialization_voxel_groups_are_audit_only__dense_cells_"
+    "are_deterministically_sharded__all_lower_floor_restoration_is_disabled_"
+    "because_negative_evidence_must_survive_post_adam_projection__"
+    "measured_single_detail_consumes_only_exact_camera_negative_cleanup_"
+    "retirement_while_other_nonpersistent_detail_is_frozen__legacy_"
+    "conditioned_mode_may_retain_bounded_retirement_only"
+)
 VOLUME_OPACITY_SETTLE_CONTRACT = (
-    "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
-    "growth_momentum_constrained__temporal_opacity_frozen__geometry_scale_"
-    "rotation_and_sh_continue__retirement_window_then_automatic_freeze"
+    "static_persistent_detail_uses_immutable_evidence_mass_anchor_and_"
+    "signed_adam_updates__per_row_upper_and_lower_source_barriers_bound_"
+    "rgb_calibration_without_post_adam_mass_restoration__stronger_deletion_"
+    "requires_explicit_geometric_rejection__bounded_local_initialization_"
+    "voxel_groups_are_audit_only__dense_cells_are_deterministically_"
+    "sharded__measured_single_detail_consumes_only_exact_camera_negative_"
+    "cleanup_retirement_while_other_nonpersistent_detail_is_frozen__legacy_"
+    "conditioned_mode_may_retain_bounded_retirement_only"
 )
 STATIC_OPTICAL_POLICY_PREDECESSOR_CONTRACT = (
     "single_static_map__envelope_growth_continuously_attenuated_only_by_"
@@ -296,13 +558,21 @@ STATIC_OPTICAL_POLICY_V86_PREDECESSOR_CONTRACT = (
     "integrated_optical_mass"
 )
 STATIC_OPTICAL_POLICY_CONTRACT = (
-    "single_static_map__topology_establishes_optical_existence__late_ray_hit_"
-    "keeps_full_geometry_gradient_but_phase_attenuates_only_positive_opacity_"
-    "growth__static_detail_positive_mass_growth_anneals_during_ownership_"
-    "cleanup__envelope_high_order_sh_frozen_after_detail_activation__"
-    "persistent_handoff_uses_reversible_expected_cross_view_coverage__"
+    "single_static_map__topology_establishes_optical_existence__ray_hit_has_"
+    "one_source_strength_control_and_keeps_full_geometry_gradient__static_"
+    "detail_mass_is_exact_or_persistent_evidence_owned_then_post_topology_"
+    "bidirectional_with_local_immutable_evidence_mass_trust_bounds_and_per_"
+    "row_upper_caps_without_post_adam_lower_mass_restoration__envelope_"
+    "and_nonpersistent_detail_high_order_sh_frozen__persistent_detail_sh_"
+    "has_a_hard_rowwise_trust_region__scene_canonical_bounded_"
+    "occlusion_deficit_is_an_explicit_stage3_envelope_growth_owner__"
+    "persistent_handoff_uses_reversible_expected_cross_view_coverage_until_"
+    "ownership_settlement_then_freezes_during_canonical_polish__"
     "negative_free_space_and_cleanup_remain_trainable__canonical_polish_"
-    "freezes_geometry_covariance_and_mass_together"
+    "freezes_ordinary_stable_envelope_skeleton_geometry_mass_and_topology_"
+    "while_source_separated_strict_negative_envelope_cleanup_remains_live__"
+    "detail_geometry_covariance_and_high_order_sh_freeze__detail_dc_and_"
+    "reduced_signed_strict_negative_alpha_calibration_remain_live"
 )
 VOLUME_OPACITY_SETTLE_PREDECESSOR_CONTRACT = (
     "post_calibrated_optical_mass_freeze_or_retirement_only__base_adam_"
@@ -346,6 +616,12 @@ PERFORMANCE_RESUME_PREDECESSOR = {
 VOLUME_SPLIT_REPAIR_PREDECESSOR = {
     "trainer": "61f826d76bceeedf3868d60096f576127489f03f4ee56628e746e18bd38236c2",
     "hybrid_renderer": "ab3676b2fc968cefb60162f4e1265353a49a1444441be568639b6e42a9f6aab9",
+}
+SPLIT_TRANSACTION_REPAIR_PREDECESSOR = {
+    "protocol": "cambridge_native_hybrid_teacher_v95_atomic_split_intrinsic_occlusion",
+    "iteration": 3000,
+    "trainer": "befa44911687073f005f4d1892fa1fab2b4e9e3e6408724a79a44e6f74738205",
+    "hybrid_renderer": "a008e3dc35b823e9b0b09c00828e7d9940ee8995ca0a663e8d4aab4092c635cf",
 }
 # Exact implementation pair immediately before the tangent-area preserving
 # surface split repair.  The checkpoint schema and optimiser state are
@@ -403,7 +679,11 @@ VOLUME_REALLOCATION_CONTRACT = (
     "role_matched_lineage_safe_retire_then_evidence_adaptive_split"
 )
 VOLUME_TOPOLOGY_MUTATION_CONTRACT = (
-    "single_materialization_retire_and_adaptive_split_then_single_adam_migration"
+    "single_materialization_retire_and_adaptive_split_then_single_adam_"
+    "migration__globally_monotonic_lineage_and_split_transaction_ids__"
+    "rollback_uses_only_one_sparse_exact_physical_metric_and_evidence_parent_"
+    "snapshot_per_atomic_split_family__failed_child_drift_is_discarded__ray_"
+    "birth_and_receiver_ancestry_never_define_transactions"
 )
 DYNAMIC_LIFECYCLE_REPAIR_PREDECESSOR = (
     "persistent_observation_identity_survives_sampling_windows"
@@ -1017,12 +1297,26 @@ def _parse_args():
     parser.add_argument(
         "--static-canonical-sequence-policy",
         choices=("scene", "per_tree"),
-        default="per_tree",
+        default="scene",
         help=(
-            "Static production selects one internally consistent acquisition "
-            "per independent tree instance. This preserves trees absent from "
-            "one global sequence while still emitting one unconditional "
-            "static map. 'scene' is retained as a strict counterfactual."
+            "Static production selects one internally consistent scene-wide "
+            "acquisition for leaf/detail appearance and topology. Other "
+            "sequences may still supervise rigid structure and persistent "
+            "cross-sequence tree geometry, but their changing leaf pixels "
+            "are unknown for canonical RGB. 'per_tree' is retained only as "
+            "an explicit cross-time mosaic ablation."
+        ),
+    )
+    parser.add_argument(
+        "--static-canonical-snapshot-frames",
+        type=int,
+        nargs="+",
+        default=(75, 76, 77),
+        help=(
+            "Frame ids inside the selected scene-canonical sequence that "
+            "anchor the canonical appearance diagnostic. They do not limit "
+            "multi-view training coverage: exact-support cameras throughout "
+            "the selected sequence own their supported detail rows."
         ),
     )
     parser.add_argument(
@@ -1039,26 +1333,21 @@ def _parse_args():
     parser.add_argument(
         "--static-detail-same-sequence-appearance-weight",
         type=float,
-        default=0.35,
+        default=0.0,
         help=(
-            "Continuous SH/RGB permission for calibrated cameras in the "
-            "same acquisition sequence as a static-detail support camera. "
-            "Geometry, opacity, ray ownership and topology remain exact-"
-            "camera/verified-evidence owned. Set to zero for the former "
-            "strict exact-camera appearance ablation."
+            "Legacy soft SH/RGB permission for non-owner cameras in the same "
+            "acquisition sequence. Production scene-canonical training keeps "
+            "this at zero: high-frequency appearance is exact-camera owned."
         ),
     )
     parser.add_argument(
         "--static-detail-same-sequence-optical-weight",
         type=float,
-        default=0.35,
+        default=0.0,
         help=(
-            "Continuous opacity/RGB permission for cameras in a persisted "
-            "positive-evidence sequence of a static-detail primitive. Exact "
-            "support cameras retain weight one; geometry and topology remain "
-            "exact-camera/verified owned. This closes the former asymmetry "
-            "where any camera could delete a leaf but only one seed camera "
-            "could restore its optical coverage."
+            "Legacy soft opacity/RGB permission for non-owner cameras in a "
+            "positive-evidence sequence. Production keeps this at zero and "
+            "uses the complete exact-support camera schedule instead."
         ),
     )
     parser.add_argument(
@@ -1191,12 +1480,21 @@ def _parse_args():
     parser.add_argument("--volume-position-lr", type=float, default=8e-5)
     parser.add_argument("--volume-feature-lr", type=float, default=8e-4)
     parser.add_argument(
+        "--static-detail-high-order-sh-norm-ceiling",
+        type=float,
+        default=4.0,
+        help=(
+            "Hard per-row L2 trust bound for persistent static-detail SH "
+            "coefficients above DC. Non-persistent detail is kept at DC-only."
+        ),
+    )
+    parser.add_argument(
         "--volume-opacity-lr",
         type=float,
         default=None,
         help=(
             "Adam learning rate for volumetric optical depth. It defaults "
-            "to 4e-3 for every profile. Sparse exact-owner updates are "
+            "to 2e-3 for every profile. Sparse exact-owner updates are "
             "handled by the camera schedule; accelerating opacity alone "
             "forms an opaque low-frequency layer before colour and topology "
             "have acquired the corresponding bandwidth."
@@ -1204,14 +1502,51 @@ def _parse_args():
     )
     parser.add_argument(
         "--volume-opacity-settle-policy",
-        choices=("none", "freeze", "retirement_only"),
+        choices=("none", "freeze", "retirement_only", "evidence_trust_region"),
         default=None,
         help=(
             "Policy after the calibrated optical-mass stage. 'freeze' "
-            "holds base and temporal opacity fixed; 'retirement_only' still "
-            "allows base opacity to decrease while preventing further "
-            "optical-mass growth. Geometry, covariance and SH colour remain "
-            "trainable. The handoff profile defaults to retirement_only."
+            "holds base and temporal opacity fixed; 'retirement_only' is the "
+            "legacy one-way policy; 'evidence_trust_region' allows symmetric "
+            "evidence-owned updates with a per-row upper bound and a local "
+            "initialization-voxel coverage bound. Static reconstruction "
+            "defaults to evidence_trust_region."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-optical-trust-lower",
+        type=float,
+        default=0.85,
+        help=(
+            "Minimum local persistent-detail group mass relative to the sum "
+            "of immutable settle anchors in that initialization voxel."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-optical-trust-upper",
+        type=float,
+        default=1.15,
+        help="Maximum persistent-detail optical mass relative to its settle anchor.",
+    )
+    parser.add_argument(
+        "--static-detail-optical-trust-voxel-size",
+        type=float,
+        default=0.10,
+        help=(
+            "World-space size of immutable initialization cells whose total "
+            "persistent-detail optical mass is bounded after settlement. "
+            "Rows may redistribute mass inside a cell; each row retains only "
+            "the upper bound that prevents a new optical monopoly."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-optical-trust-maximum-group-size",
+        type=int,
+        default=32,
+        help=(
+            "Maximum rows in one local optical-mass conservation group. "
+            "Dense initialization cells are deterministically sharded; "
+            "single-row cells receive no artificial lower mass floor."
         ),
     )
     parser.add_argument(
@@ -1303,6 +1638,65 @@ def _parse_args():
     parser.add_argument("--plane-weight", type=float, default=0.10)
     parser.add_argument("--normal-weight", type=float, default=0.04)
     parser.add_argument("--ordinal-weight", type=float, default=0.015)
+    parser.add_argument(
+        "--moge3-rigid-depth-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Auxiliary exact-K metric depth weight in rigid pixels lacking "
+            "a plane/Chart owner. It never supervises canopy geometry."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-rigid-normal-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Auxiliary exact-camera MoGe3 normal weight in rigid pixels "
+            "lacking an existing plane/Chart metric owner. Confidence is "
+            "continuous in refinement stability, direct/depth-normal "
+            "agreement and local depth-boundary sharpness."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-canopy-optical-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the owner-isolated native per-pixel MoGe3 canopy "
+            "pre-hit free-space and hit-interval optical factor. It is "
+            "active only on the selected scene-canonical sequence and "
+            "stops before canonical polish."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-canopy-optical-every",
+        type=int,
+        default=0,
+        help=(
+            "Evaluate the MoGe3 canopy optical factor on canonical RGB "
+            "views at this cadence; zero disables it."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-canopy-prehit-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "Relative negative-only weight for volume optical depth before "
+            "the lower MoGe3 target-depth bound."
+        ),
+    )
+    parser.add_argument(
+        "--moge3-canopy-maximum-birth-proposals",
+        type=int,
+        default=256,
+        help=(
+            "Maximum target-depth canopy-hole intervals contributed by one "
+            "scheduled exact camera. Birth still requires independent "
+            "two-camera voxel consensus."
+        ),
+    )
     parser.add_argument("--track-weight", type=float, default=0.05)
     parser.add_argument(
         "--geometry-gradient-ratio",
@@ -1325,6 +1719,15 @@ def _parse_args():
         ),
     )
     parser.add_argument("--chart-anchor-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--chart-base-source",
+        choices=MOGE3_CHART_BASE_SOURCES,
+        default="matcha",
+        help=(
+            "Immutable Chart inverse-depth base. MoGe3 alternatives are "
+            "source-separated evidence and never overwrite chart_geometry."
+        ),
+    )
     parser.add_argument(
         "--chart-atlas-lr",
         type=float,
@@ -1398,6 +1801,124 @@ def _parse_args():
             "Evaluate the extra conditioned surface-only counterfactual at "
             "this cadence. The canonical pass reuses its existing rigid "
             "render every iteration."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-completion-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "Weight of the scene-canonical one-sided optical-depth repair. "
+            "It increases foliage extinction only when the current mixed-"
+            "minus-surface RGB direction already improves the real target "
+            "and the foliage contribution is in front of the surface."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-start-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Last iteration on which canonical occlusion completion and "
+            "depth-order repair remain inactive. By default this is exactly "
+            "--volume-densify-until-iteration, so optical existence cannot "
+            "compete with changing foliage support."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-maximum-scale",
+        type=float,
+        default=4.0,
+        help=(
+            "Maximum per-update optical-depth multiplier inferred from the "
+            "detached canonical RGB counterfactual. This bounds the target; "
+            "it is not a fixed alpha or a pass/fail threshold."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-surface-leakage-tolerance",
+        type=float,
+        default=0.03,
+        help=(
+            "Allowed mean absolute RGB leakage from the detached structural "
+            "counterfactual on a scene-canonical canopy ray. Above this "
+            "continuous tolerance, image formation derives a minimum volume "
+            "visibility; it is not a binary target-alpha mask."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-advantage-margin",
+        type=float,
+        default=0.005,
+        help=(
+            "Soft RGB-L1 advantage margin for positive foliage occlusion "
+            "responsibility."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-advantage-temperature",
+        type=float,
+        default=0.02,
+        help=(
+            "Temperature of the continuous mixed-versus-surface positive "
+            "responsibility."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-order-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Experimental weight of the scene-canonical depth-order repair "
+            "(disabled by default). It moves only foliage geometry toward "
+            "the camera where the detached RGB counterfactual asks for more "
+            "foliage but the current volume depth is behind a real structural "
+            "contribution. Weight 0.001 was too weak in the 6000-to-7000 "
+            "ablation; a later continuation at 0.1 produced a "
+            "measurable canonical tree improvement. It remains explicit "
+            "because this extra geometry render changes the training method "
+            "and must be evaluated against non-tree structure."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-order-clearance",
+        type=float,
+        default=0.03,
+        help=(
+            "Minimum metric-depth clearance requested between a canonical "
+            "foliage contribution and the structural layer it should occlude."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-order-maximum-forward-shift",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum metric forward displacement that the canonical depth-"
+            "order factor may interpret as a local foliage/surface ordering "
+            "error. Larger separations are rejected instead of clipping and "
+            "moving an unrelated depth layer toward the facade."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-every",
+        type=int,
+        default=4,
+        help=(
+            "Run completion/order on their own deterministic canonical "
+            "snapshot schedule at this cadence. They never depend on the "
+            "1,487-view RGB schedule accidentally selecting a snapshot."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-occlusion-until-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Last iteration allowed to update canonical completion/depth "
+            "order. Static profiles default to the end of ownership_cleanup, "
+            "leaving canonical_polish to appearance and strict negative "
+            "wall-front evidence only."
         ),
     )
     parser.add_argument("--occupancy-weight", type=float, default=0.06)
@@ -1653,11 +2174,10 @@ def _parse_args():
         type=int,
         default=2,
         help=(
-            "For a static reconstruction, route all-camera rigid spill, "
-            "confirmed free-space and surface-better counterfactuals to "
-            "static-detail geometry/scale/rotation/optical mass at this "
-            "cadence. Appearance stays read-only and this pass never feeds "
-            "topology. Set to zero only for the ownership-conflict ablation."
+            "On the dedicated canonical snapshot schedule, minimize only "
+            "native mixed detail contribution that makes a rigid pixel worse "
+            "than the same-camera surface-only counterfactual. Appearance "
+            "stays read-only and this pass never feeds topology."
         ),
     )
     parser.add_argument(
@@ -1665,8 +2185,19 @@ def _parse_args():
         type=float,
         default=0.25,
         help=(
-            "Weight of the all-view static-detail negative-evidence pass. "
+            "Weight of canonical native-mixed harmful-contribution cleanup. "
             "Positive ray hits and RGB remain canonical-support-owned."
+        ),
+    )
+    parser.add_argument(
+        "--static-detail-global-cleanup-polish-scale",
+        type=float,
+        default=0.10,
+        help=(
+            "Multiplier applied to the signed, strict wall-front detail "
+            "cleanup after ownership_cleanup. Ordinary global opacity "
+            "retirement is therefore rapidly annealed during polish without "
+            "disabling a proven facade contradiction."
         ),
     )
     parser.add_argument(
@@ -1675,7 +2206,7 @@ def _parse_args():
         default=1.0,
         help=(
             "Relative weight of surface-better counterfactual evidence "
-            "inside the all-view static-detail cleanup objective. This is "
+            "inside canonical static-detail cleanup. This is "
             "intentionally independent of --counterfactual-transparency-"
             "weight: the latter belongs to the canonical RGB pass and "
             "must not silently attenuate the cleanup pass a second time."
@@ -1686,11 +2217,10 @@ def _parse_args():
         type=int,
         default=2,
         help=(
-            "For a static reconstruction, render the persistent crown "
-            "envelope without leaf detail and route all-camera rigid spill, "
-            "free-space and surface-better counterfactuals only to envelope "
-            "geometry/scale/rotation/optical mass. Appearance stays read-only "
-            "and this pass never feeds topology."
+            "For a static reconstruction, render native mixed surface plus "
+            "persistent envelope without leaf detail. Exact sorted facade-"
+            "front RGB harm routes only to envelope opacity; geometry, "
+            "appearance, surface, sky and topology remain read-only."
         ),
     )
     parser.add_argument(
@@ -1774,11 +2304,21 @@ def _parse_args():
         type=int,
         default=256,
         help=(
-            "Maximum failed, entirely unverified split lineage families "
-            "merged back to one evidence-supported representative per event."
+            "Maximum failed atomic split lineage families merged back to one "
+            "mass-conserving representative per event."
         ),
     )
     parser.add_argument("--ray-posterior-every", type=int, default=4)
+    parser.add_argument(
+        "--static-canonical-ray-every",
+        type=int,
+        default=0,
+        help=(
+            "Optional experimental scene-canonical ray/depth cadence for "
+            "static detail only. Disabled by default: doubling the interval "
+            "factor thinned detail optical mass in the v89 causal run."
+        ),
+    )
     parser.add_argument(
         "--ray-posterior-maximum-rays", type=int, default=512
     )
@@ -1935,6 +2475,79 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--allow-v100-front-clipped-cleanup-resume",
+        action="store_true",
+        help=(
+            "Resume only the content-addressed v99 iteration-21000 "
+            "checkpoint into v100. Only the two future global negative-"
+            "evidence cleanup passes migrate from mixed contribution alpha "
+            "to owner-isolated, strict front-depth-clipped optical cleanup."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v102-optical-trust-resume",
+        action="store_true",
+        help=(
+            "Resume only the content-addressed v101 iteration-21000 best "
+            "checkpoint into v102. The boundary is render-exact; only future "
+            "persistent-detail opacity updates change from one-way retirement "
+            "to a bidirectional evidence-owned mass trust region."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v103-local-optical-redistribution-resume",
+        action="store_true",
+        help=(
+            "Resume only the content-addressed v102 iteration-24000 "
+            "checkpoint into v103. Future detail cleanup moves to the "
+            "dedicated canonical snapshot schedule and native mixed per-"
+            "pixel contribution; the settle lower bound moves from each row "
+            "to a local immutable initialization voxel."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v105-late-optical-convergence-resume",
+        action="store_true",
+        help=(
+            "Deprecated historical v105 migration. v106 changes the set of "
+            "authoritative cameras and must start from a clean canonical "
+            "initialization; this flag is rejected."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v107-global-negative-cleanup-resume",
+        action="store_true",
+        help=(
+            "Resume only the content-addressed v106 iteration-18000 "
+            "checkpoint into v107. Positive detail fitting remains exact-"
+            "support owned; only future persistent-detail negative cleanup "
+            "expands to every camera in the authoritative canonical sequence."
+        ),
+    )
+    parser.add_argument(
+        "--allow-v108-evidence-bounded-completion-resume",
+        action="store_true",
+        help=(
+            "Resume only the content-addressed v107 iteration-21000 "
+            "checkpoint into v108. Persistent detail retirement becomes "
+            "existence-bounded and canonical completion uses exact-camera "
+            "detail in place of its envelope group, with no schedule, "
+            "renderer, CUDA, model or optimizer-state migration."
+        ),
+    )
+    parser.add_argument(
+        "--allow-canonical-occlusion-weight-ablation-resume",
+        action="store_true",
+        help=(
+            "Explicit experiment only: allow the registered canonical-"
+            "occlusion completion and/or order weight to change across a "
+            "resume boundary. Every other field of both loss contracts and "
+            "every other optimization, evidence, schedule, model and CUDA "
+            "contract must remain exact. Requires --resume and --allow-"
+            "trainer-repair-resume."
+        ),
+    )
+    parser.add_argument(
         "--allow-static-detail-isolated-repair-resume",
         action="store_true",
         help=(
@@ -1971,6 +2584,15 @@ def _parse_args():
             "Resume only the exact audited predecessor across the "
             "mass-safe sqrt(2) volumetric split repair. Evidence, schedules, "
             "state schemas, optimizers and CUDA kernels must remain identical."
+        ),
+    )
+    parser.add_argument(
+        "--allow-split-transaction-repair-resume",
+        action="store_true",
+        help=(
+            "Resume only the exact v95 iteration-3000 predecessor across "
+            "the atomic skeleton split-rollback repair. All evidence, "
+            "schedules, optimizers and CUDA kernels must remain identical."
         ),
     )
     parser.add_argument(
@@ -2047,6 +2669,55 @@ def _parse_args():
     parser.add_argument("--resume", type=Path)
     cli_tokens = tuple(sys.argv[1:])
     args = parser.parse_args()
+    if args.allow_v105_late_optical_convergence_resume:
+        parser.error(
+            "v106 exact-support canonical coverage changes supervision "
+            "authority and cannot resume a v104/v105 optimization state; "
+            "start from a clean scene-canonical initialization"
+        )
+    if (
+        args.allow_v107_global_negative_cleanup_resume
+        and args.resume is None
+    ):
+        parser.error(
+            "--allow-v107-global-negative-cleanup-resume requires --resume"
+        )
+    if (
+        args.allow_v108_evidence_bounded_completion_resume
+        and args.resume is None
+    ):
+        parser.error(
+            "--allow-v108-evidence-bounded-completion-resume requires --resume"
+        )
+    if args.allow_v107_global_negative_cleanup_resume and any(
+        (
+            args.allow_trainer_repair_resume,
+            args.allow_v100_front_clipped_cleanup_resume,
+            args.allow_v102_optical_trust_resume,
+            args.allow_v103_local_optical_redistribution_resume,
+            args.allow_v105_late_optical_convergence_resume,
+        )
+    ):
+        parser.error(
+            "--allow-v107-global-negative-cleanup-resume is a narrow "
+            "content-addressed migration and cannot be combined with other "
+            "repair-resume flags"
+        )
+    if args.allow_v108_evidence_bounded_completion_resume and any(
+        (
+            args.allow_trainer_repair_resume,
+            args.allow_v100_front_clipped_cleanup_resume,
+            args.allow_v102_optical_trust_resume,
+            args.allow_v103_local_optical_redistribution_resume,
+            args.allow_v105_late_optical_convergence_resume,
+            args.allow_v107_global_negative_cleanup_resume,
+        )
+    ):
+        parser.error(
+            "--allow-v108-evidence-bounded-completion-resume is a narrow "
+            "content-addressed migration and cannot be combined with other "
+            "repair-resume flags"
+        )
     profile = TRAINING_PROFILES[args.training_profile]
     if args.iterations is None:
         args.iterations = int(profile["iterations"])
@@ -2110,6 +2781,10 @@ def _parse_args():
         parser.error("--static-detail-global-cleanup-every must be >= 0")
     if args.static_detail_global_cleanup_weight < 0:
         parser.error("--static-detail-global-cleanup-weight must be >= 0")
+    if not 0.0 <= args.static_detail_global_cleanup_polish_scale <= 1.0:
+        parser.error(
+            "--static-detail-global-cleanup-polish-scale must lie in [0, 1]"
+        )
     if args.static_detail_global_counterfactual_weight < 0:
         parser.error(
             "--static-detail-global-counterfactual-weight must be >= 0"
@@ -2126,6 +2801,8 @@ def _parse_args():
         parser.error(
             "--persistent-envelope-global-counterfactual-weight must be >= 0"
         )
+    if args.canonical_occlusion_every <= 0:
+        parser.error("--canonical-occlusion-every must be positive")
     if args.static_ray_birth_voxel_size <= 0:
         parser.error("--static-ray-birth-voxel-size must be positive")
     if (
@@ -2166,6 +2843,58 @@ def _parse_args():
     if args.allow_static_detail_isolated_repair_resume and args.resume is None:
         parser.error(
             "--allow-static-detail-isolated-repair-resume requires --resume"
+        )
+    if args.allow_v100_front_clipped_cleanup_resume and args.resume is None:
+        parser.error(
+            "--allow-v100-front-clipped-cleanup-resume requires --resume"
+        )
+    if args.allow_v102_optical_trust_resume and args.resume is None:
+        parser.error("--allow-v102-optical-trust-resume requires --resume")
+    if (
+        args.allow_v103_local_optical_redistribution_resume
+        and args.resume is None
+    ):
+        parser.error(
+            "--allow-v103-local-optical-redistribution-resume requires "
+            "--resume"
+        )
+    if args.allow_v105_late_optical_convergence_resume and args.resume is None:
+        parser.error(
+            "--allow-v105-late-optical-convergence-resume requires --resume"
+        )
+    if args.allow_v105_late_optical_convergence_resume and (
+        args.allow_trainer_repair_resume
+        or args.allow_v102_optical_trust_resume
+        or args.allow_v103_local_optical_redistribution_resume
+        or args.allow_v100_front_clipped_cleanup_resume
+    ):
+        parser.error(
+            "--allow-v105-late-optical-convergence-resume is a narrow "
+            "migration and cannot be combined with another trainer repair"
+        )
+    if (
+        args.allow_v102_optical_trust_resume
+        and args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "--allow-v102-optical-trust-resume is a narrow migration and "
+            "must not be combined with --allow-trainer-repair-resume"
+        )
+    if args.allow_v103_local_optical_redistribution_resume and (
+        args.allow_trainer_repair_resume
+        or args.allow_v102_optical_trust_resume
+    ):
+        parser.error(
+            "--allow-v103-local-optical-redistribution-resume is a narrow "
+            "migration and cannot be combined with another repair flag"
+        )
+    if (
+        args.allow_v100_front_clipped_cleanup_resume
+        and args.allow_trainer_repair_resume
+    ):
+        parser.error(
+            "--allow-v100-front-clipped-cleanup-resume is deliberately "
+            "mutually exclusive with the broad trainer repair flag"
         )
     if (
         args.allow_surface_screen_evidence_repair_resume
@@ -2243,6 +2972,18 @@ def _parse_args():
             "--allow-conditioned-schedule-repair-resume requires both "
             "--resume and --allow-trainer-repair-resume"
         )
+    if args.allow_canonical_occlusion_weight_ablation_resume and (
+        args.resume is None
+        or not (
+            args.allow_trainer_repair_resume
+            or args.allow_v100_front_clipped_cleanup_resume
+        )
+    ):
+        parser.error(
+            "--allow-canonical-occlusion-weight-ablation-resume requires "
+            "--resume and either the generic trainer-repair boundary or "
+            "the exact v100 cleanup boundary"
+        )
     if args.allow_v38_causal_repair_resume and (
         args.resume is None or not args.allow_trainer_repair_resume
     ):
@@ -2271,6 +3012,37 @@ def _parse_args():
     if args.counterfactual_transparency_temperature <= 0:
         parser.error(
             "--counterfactual-transparency-temperature must be positive"
+        )
+    if args.canonical_occlusion_completion_weight < 0:
+        parser.error(
+            "--canonical-occlusion-completion-weight cannot be negative"
+        )
+    if args.canonical_occlusion_maximum_scale <= 1:
+        parser.error(
+            "--canonical-occlusion-maximum-scale must be greater than one"
+        )
+    if args.canonical_occlusion_surface_leakage_tolerance <= 0:
+        parser.error(
+            "--canonical-occlusion-surface-leakage-tolerance must be positive"
+        )
+    if args.canonical_occlusion_advantage_margin < 0:
+        parser.error(
+            "--canonical-occlusion-advantage-margin cannot be negative"
+        )
+    if args.canonical_occlusion_advantage_temperature <= 0:
+        parser.error(
+            "--canonical-occlusion-advantage-temperature must be positive"
+        )
+    if args.canonical_occlusion_order_weight < 0:
+        parser.error("--canonical-occlusion-order-weight cannot be negative")
+    if args.canonical_occlusion_order_clearance < 0:
+        parser.error(
+            "--canonical-occlusion-order-clearance cannot be negative"
+        )
+    if args.canonical_occlusion_order_maximum_forward_shift <= 0:
+        parser.error(
+            "--canonical-occlusion-order-maximum-forward-shift must be "
+            "positive"
         )
     if args.conditioned_counterfactual_every <= 0:
         parser.error("--conditioned-counterfactual-every must be positive")
@@ -2325,6 +3097,10 @@ def _parse_args():
         )
     if args.maximum_volume_scale <= 0:
         parser.error("--maximum-volume-scale must be positive")
+    if args.static_detail_high_order_sh_norm_ceiling <= 0:
+        parser.error(
+            "--static-detail-high-order-sh-norm-ceiling must be positive"
+        )
     if args.maximum_dynamic_volume_scale <= 0:
         parser.error("--maximum-dynamic-volume-scale must be positive")
     if args.maximum_volume_radius_pixels <= 0:
@@ -2362,7 +3138,7 @@ def _parse_args():
     if not 0.0 < args.mature_chart_atlas_lr_scale <= 1.0:
         parser.error("--mature-chart-atlas-lr-scale must lie in (0, 1]")
     if args.volume_opacity_lr is None:
-        args.volume_opacity_lr = 4e-3
+        args.volume_opacity_lr = 2e-3
     if args.volume_opacity_lr <= 0:
         parser.error("--volume-opacity-lr must be positive")
     if args.volume_topology_ramp_iterations is None:
@@ -2399,6 +3175,8 @@ def _parse_args():
         )
     if args.ray_posterior_every <= 0:
         parser.error("--ray-posterior-every must be positive")
+    if args.static_canonical_ray_every < 0:
+        parser.error("--static-canonical-ray-every must be non-negative")
     if args.ray_posterior_maximum_rays <= 0:
         parser.error("--ray-posterior-maximum-rays must be positive")
     if args.ray_posterior_maximum_candidates <= 0:
@@ -2409,6 +3187,20 @@ def _parse_args():
         parser.error("--geometry-gradient-ratio must be non-negative")
     if args.projected_rigid_depth_weight < 0:
         parser.error("--projected-rigid-depth-weight must be non-negative")
+    if args.moge3_rigid_depth_weight < 0:
+        parser.error("--moge3-rigid-depth-weight must be non-negative")
+    if args.moge3_rigid_normal_weight < 0:
+        parser.error("--moge3-rigid-normal-weight must be non-negative")
+    if args.moge3_canopy_optical_weight < 0:
+        parser.error("--moge3-canopy-optical-weight must be non-negative")
+    if args.moge3_canopy_optical_every < 0:
+        parser.error("--moge3-canopy-optical-every must be non-negative")
+    if args.moge3_canopy_prehit_weight < 0:
+        parser.error("--moge3-canopy-prehit-weight must be non-negative")
+    if args.moge3_canopy_maximum_birth_proposals <= 0:
+        parser.error(
+            "--moge3-canopy-maximum-birth-proposals must be positive"
+        )
     if args.image_prefetch_workers < 0:
         parser.error("--image-prefetch-workers must be non-negative")
     if args.image_prefetch_depth < 0:
@@ -2488,21 +3280,87 @@ def _parse_args():
             "--volume-densify-until-iteration must lie in [1, "
             "--phase-schedule-horizon]"
         )
+    if args.canonical_occlusion_start_iteration is None:
+        args.canonical_occlusion_start_iteration = int(
+            args.volume_densify_until_iteration
+        )
+    ownership_cleanup_end = dict(
+        _resolved_phase_schedule(
+            args.training_profile, args.phase_schedule_horizon
+        )
+    ).get("ownership_cleanup", args.phase_schedule_horizon)
+    if args.canonical_occlusion_until_iteration is None:
+        args.canonical_occlusion_until_iteration = int(ownership_cleanup_end)
+    if not (
+        0
+        <= args.canonical_occlusion_start_iteration
+        <= args.phase_schedule_horizon
+    ):
+        parser.error(
+            "--canonical-occlusion-start-iteration must lie in [0, "
+            "--phase-schedule-horizon]"
+        )
+    if not (
+        args.canonical_occlusion_start_iteration
+        <= args.canonical_occlusion_until_iteration
+        <= args.phase_schedule_horizon
+    ):
+        parser.error(
+            "--canonical-occlusion-until-iteration must lie between the "
+            "occlusion start and --phase-schedule-horizon"
+        )
+    if (
+        args.reconstruction_target == "static"
+        and (
+            args.canonical_occlusion_completion_weight > 0
+            or args.canonical_occlusion_order_weight > 0
+        )
+        and args.canonical_occlusion_start_iteration
+        < args.volume_densify_until_iteration
+    ):
+        parser.error(
+            "Static canonical occlusion repair cannot start before volume "
+            "topology is frozen; set --canonical-occlusion-start-iteration "
+            "at or after --volume-densify-until-iteration"
+        )
     if args.volume_opacity_settle_policy is None:
         args.volume_opacity_settle_policy = (
-            "retirement_only"
-            if (
-                args.training_profile == "hybrid_handoff_quality"
-                and args.reconstruction_target
-                == "sequence_conditioned_legacy"
+            "evidence_trust_region"
+            if args.reconstruction_target == "static"
+            else (
+                "retirement_only"
+                if (
+                    args.training_profile == "hybrid_handoff_quality"
+                    and args.reconstruction_target
+                    == "sequence_conditioned_legacy"
+                )
+                else "none"
             )
-            else "none"
+        )
+    if not (
+        0.0 < args.static_detail_optical_trust_lower <= 1.0
+        <= args.static_detail_optical_trust_upper
+    ):
+        parser.error(
+            "static detail optical trust bounds must satisfy "
+            "0 < lower <= 1 <= upper"
+        )
+    if args.static_detail_optical_trust_voxel_size <= 0.0:
+        parser.error(
+            "--static-detail-optical-trust-voxel-size must be positive"
+        )
+    if args.static_detail_optical_trust_maximum_group_size < 2:
+        parser.error(
+            "--static-detail-optical-trust-maximum-group-size must be >= 2"
         )
     if args.volume_opacity_settle_start_iteration is None:
-        if (
+        if args.reconstruction_target == "static":
+            args.volume_opacity_settle_start_iteration = int(
+                args.volume_densify_until_iteration
+            )
+        elif (
             args.training_profile == "hybrid_handoff_quality"
-            and args.reconstruction_target
-            == "sequence_conditioned_legacy"
+            and args.reconstruction_target == "sequence_conditioned_legacy"
         ):
             args.volume_opacity_settle_start_iteration = min(
                 int(args.volume_densify_until_iteration),
@@ -2522,7 +3380,10 @@ def _parse_args():
             "--phase-schedule-horizon]"
         )
     if args.volume_opacity_retirement_until_iteration is None:
-        if args.volume_opacity_settle_policy == "retirement_only":
+        if args.volume_opacity_settle_policy in {
+            "retirement_only",
+            "evidence_trust_region",
+        }:
             args.volume_opacity_retirement_until_iteration = min(
                 int(args.phase_schedule_horizon),
                 int(args.volume_opacity_settle_start_iteration)
@@ -2624,9 +3485,75 @@ def _surface_capture_to_device(capture, device: torch.device):
 
 
 def _save_checkpoint(path: Path, payload: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary)
-    temporary.replace(path)
+    _atomic_torch_save(path, payload, keep_previous=True)
+
+
+def _temporary_artifact_path(path: Path) -> Path:
+    return path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_torch_save(
+    path: Path,
+    payload,
+    *,
+    keep_previous: bool = False,
+) -> None:
+    """Durably replace a torch artifact without exposing a partial ZIP."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_artifact_path(path)
+    previous_temporary = _temporary_artifact_path(
+        path.with_suffix(path.suffix + ".previous")
+    )
+    try:
+        torch.save(payload, temporary)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        if keep_previous and path.is_file():
+            previous = path.with_suffix(path.suffix + ".previous")
+            os.link(path, previous_temporary)
+            os.replace(previous_temporary, previous)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+        previous_temporary.unlink(missing_ok=True)
+
+
+def _restore_cuda_rng_states(saved_states) -> dict[str, int | str]:
+    """Restore logical CUDA RNGs without assuming the same device count.
+
+    Training is single-device, but checkpoints historically serialized every
+    GPU visible to the process. ``torch.cuda.set_rng_state_all`` indexes the
+    current generators with the saved list length and crashes when a restart
+    deliberately exposes only GPU 0. Restore the common logical prefix; the
+    default training generator remains exact and unused surplus states do not
+    affect any tensor or schedule.
+    """
+    states = list(saved_states)
+    visible = int(torch.cuda.device_count())
+    if visible > 0 and not states:
+        raise RuntimeError("Checkpoint contains no CUDA RNG state")
+    restored = min(visible, len(states))
+    for device_index in range(restored):
+        torch.cuda.set_rng_state(states[device_index], device=device_index)
+    return {
+        "contract": "restore_common_logical_cuda_device_prefix",
+        "saved_device_count": len(states),
+        "visible_device_count": visible,
+        "restored_device_count": restored,
+    }
 
 
 def _checkpoint_due(
@@ -2664,12 +3591,45 @@ def _checkpoint_due(
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_artifact_path(path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _durable_unlink(path: Path) -> None:
+    path = Path(path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+def _save_surface_ply_atomic(surface, path: Path) -> None:
+    """Persist the portable final surfel model as one atomic artifact."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_artifact_path(path)
+    try:
+        surface.save_ply(str(temporary))
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @torch.no_grad()
@@ -2891,6 +3851,32 @@ def _volume_topology_active(step: int, args, phase: str) -> bool:
     )
 
 
+def _canonical_occlusion_schedule_active(step: int, args) -> bool:
+    """Activate occlusion repair only after foliage support is immutable.
+
+    Opacity cannot distinguish missing optical mass from missing spatial
+    support while densification is still creating and splitting primitives.
+    The strict boundary also makes the two schedules disjoint: iteration
+    ``N`` may mutate topology and iteration ``N + 1`` may first repair
+    canonical opacity/depth order, never both on the same optimizer step.
+    """
+    iteration = int(step) + 1
+    cadence = int(getattr(args, "canonical_occlusion_every", 1))
+    stop = int(
+        getattr(
+            args,
+            "canonical_occlusion_until_iteration",
+            2**63 - 1,
+        )
+    )
+    return (
+        iteration > int(args.canonical_occlusion_start_iteration)
+        and iteration <= stop
+        and cadence > 0
+        and iteration % cadence == 0
+    )
+
+
 def _volume_topology_ramp_scale(step: int, args) -> float:
     """Return a continuous optical-mass-before-bandwidth schedule.
 
@@ -2946,9 +3932,9 @@ def _static_detail_canonical_ownership_gate(
 ) -> torch.Tensor:
     """Route static-detail learning without changing forward visibility.
 
-    A single static snapshot must remain renderable from every camera, but a
+    A single scene-canonical map remains renderable from every camera, but a
     leaf cluster cannot be optimized toward incompatible leaf positions from
-    later traversals. Its persisted calibrated support cameras own RGB,
+    later traversals. Its persisted calibrated support/witness cameras own RGB,
     positive ray-hit and topology gradients. Globally valid negative
     evidence (confirmed free space, rigid spill and surface-better
     counterfactuals) deliberately bypasses this gate in separate loss paths.
@@ -2961,7 +3947,7 @@ def _static_detail_canonical_ownership_gate(
     detail = foliage.static_leaf_mask
     if not bool(detail.any()):
         return gate
-    if foliage.support_camera_ids.numel() == 0 or camera_id < 0:
+    if camera_id < 0:
         gate[detail] = 0
         return gate
     if camera_sequence_lookup is not None and (
@@ -2972,14 +3958,69 @@ def _static_detail_canonical_ownership_gate(
         return gate
     if int(support_chunk_size) <= 0:
         raise ValueError("support_chunk_size must be positive")
-    support = foliage.support_camera_ids
+    camera_tables = [
+        table
+        for table in (
+            getattr(foliage, "support_camera_ids", None),
+            getattr(foliage, "verified_camera_ids", None),
+        )
+        if torch.is_tensor(table) and table.ndim == 2 and table.numel()
+    ]
+    if not camera_tables:
+        gate[detail] = 0
+        return gate
     owned = torch.zeros(len(foliage), dtype=torch.bool, device=gate.device)
     for start in range(0, len(foliage), int(support_chunk_size)):
         stop = min(start + int(support_chunk_size), len(foliage))
-        support_chunk = support[start:stop]
-        owned[start:stop] = (support_chunk == int(camera_id)).any(dim=1)
+        for table in camera_tables:
+            owned[start:stop] |= (
+                table[start:stop] == int(camera_id)
+            ).any(dim=1)
     gate[detail] = owned[detail].to(gate.dtype)
     return gate
+
+
+def _canonical_occlusion_completion_owner_mask(
+    foliage,
+    camera_id: int,
+    camera_sequence_lookup: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select exactly one positive optical explanation per replacement group.
+
+    A verified detail primitive may receive missing-opacity supervision only
+    in one of its persisted support/witness cameras.  Where such detail is
+    available it replaces the broad envelope for the same replacement group;
+    otherwise the resolved envelope remains the low-frequency fallback.  This
+    prevents an envelope and its detail descendants from both absorbing the
+    same canonical residual while still allowing thin, camera-supported
+    branches to become opaque enough to hide the facade behind them.
+    """
+    persistent = _persistent_static_evidence_mask(foliage)
+    exact = _static_detail_canonical_ownership_gate(
+        foliage,
+        int(camera_id),
+        camera_sequence_lookup,
+    ) > 0
+    detail_owner = foliage.static_leaf_mask & persistent & exact
+    envelope_owner = (
+        foliage.persistent_envelope_mask
+        & _resolved_static_owner_mask(foliage)
+    )
+    detail_groups = foliage.replacement_group[detail_owner]
+    detail_groups = detail_groups[detail_groups >= 0]
+    if len(detail_groups):
+        grouped_envelope = envelope_owner & (foliage.replacement_group >= 0)
+        envelope_owner = envelope_owner & ~(
+            grouped_envelope
+            & torch.isin(
+                foliage.replacement_group,
+                torch.unique(detail_groups),
+            )
+        )
+    owner = detail_owner | envelope_owner
+    if bool((owner & foliage.static_skeleton_mask).any()):
+        raise RuntimeError("Canonical completion selected a skeleton owner")
+    return owner
 
 
 def _static_detail_support_sequence_audit_gate(
@@ -3098,6 +4139,11 @@ def _static_detail_same_sequence_appearance_gate(
     ).reshape(-1)
     if len(exact) != len(foliage):
         raise ValueError("exact ownership gate must align with foliage")
+    blocked_exact = foliage.static_leaf_mask & (
+        (foliage.verification_state == VERIFICATION_FACTORIZED_RECEIVER)
+        | (foliage.verification_state == VERIFICATION_REJECTED)
+    )
+    exact[blocked_exact] = 0
     appearance = exact.clone()
     if weight <= 0.0 or not bool(foliage.static_leaf_mask.any()):
         return appearance
@@ -3119,6 +4165,7 @@ def _static_detail_same_sequence_appearance_gate(
     fallback = (
         same_sequence
         & foliage.static_leaf_mask
+        & _persistent_static_evidence_mask(foliage)
         & (exact <= 0)
     )
     appearance[fallback] = weight
@@ -3152,6 +4199,11 @@ def _static_detail_same_sequence_optical_gate(
     ).reshape(-1)
     if len(exact) != len(foliage):
         raise ValueError("exact ownership gate must align with foliage")
+    blocked_exact = foliage.static_leaf_mask & (
+        (foliage.verification_state == VERIFICATION_FACTORIZED_RECEIVER)
+        | (foliage.verification_state == VERIFICATION_REJECTED)
+    )
+    exact[blocked_exact] = 0
     optical = exact.clone()
     if weight <= 0.0 or not bool(foliage.static_leaf_mask.any()):
         return optical
@@ -3170,7 +4222,12 @@ def _static_detail_same_sequence_optical_gate(
     )
     if len(same_sequence) != len(foliage):
         raise ValueError("positive evidence sequence gate must align with foliage")
-    fallback = same_sequence & foliage.static_leaf_mask & (exact <= 0)
+    fallback = (
+        same_sequence
+        & foliage.static_leaf_mask
+        & _persistent_static_evidence_mask(foliage)
+        & (exact <= 0)
+    )
     optical[fallback] = weight
     return optical
 
@@ -3249,13 +4306,13 @@ def _static_detail_cleanup_gradient_gates(
     geometry_gate: torch.Tensor | None,
     optical_gate: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Route cleanup through the same positive owners as reconstruction.
+    """Route negative cleanup only to evidence-owned optical mass.
 
     The cleanup counterfactual may render all evidence-sequence detail rows,
-    but a same-sequence non-owner camera is only an optical witness.  It must
-    not move geometry at full strength while its positive RGB path cannot do
-    so.  Geometry therefore retains the verified exact-owner gate, opacity
-    uses the continuous optical gate, and SH remains read-only.
+    but RGB harm supplies no metric 3-D target. Moving a primitive sideways
+    or behind a facade can hide the current error while exporting it to
+    another view. Geometry and SH therefore remain read-only; only the
+    continuous, positive-evidence optical owner may retire mass.
     """
 
     zero = torch.zeros_like(foliage.opacities)
@@ -3273,7 +4330,11 @@ def _static_detail_cleanup_gradient_gates(
             raise ValueError("cleanup gradient gate must align with foliage")
         return result * detail.to(result.dtype)
 
-    return _routed(geometry_gate), zero, _routed(optical_gate)
+    # Validate the caller-provided geometry table even though this loss is
+    # deliberately forbidden from consuming it. This keeps shape mistakes
+    # fail-closed without granting an unjustified geometry update.
+    _routed(geometry_gate)
+    return zero.clone(), zero, _routed(optical_gate)
 
 
 def _static_detail_consensus_hit_gate(foliage) -> torch.Tensor:
@@ -3309,6 +4370,170 @@ def _static_detail_consensus_hit_gate(foliage) -> torch.Tensor:
         & (verified_cameras >= 2)
         & (verified_sequences >= 2)
     )
+
+
+def _persistent_static_evidence_mask(foliage) -> torch.Tensor:
+    """Return static rows with durable, real-camera existence evidence.
+
+    High-frequency detail requires at least two cameras in the canonical
+    snapshot; resolved low-frequency envelope/skeleton remains persistent.
+    One-camera detail seeds now have their own measured state, and malformed
+    state fails closed instead of regaining global high-frequency authority.
+    """
+
+    return persistent_static_evidence_mask(foliage)
+
+
+def _moge3_canopy_hit_owner_mask(
+    foliage, exact_camera_mask: torch.Tensor
+) -> torch.Tensor:
+    """Select rows allowed to absorb a current-view metric canopy hit.
+
+    A persistent multiview detail primitive belongs to the scene-canonical
+    map, so a calibrated current-view MoGe hit interval is independent new
+    geometric evidence for that primitive. Requiring the current camera to
+    appear in its original support table made almost all such evidence
+    unusable. One-camera measured detail has no whole-image authority and
+    therefore remains exact-support-camera-only. Envelopes, skeletons and
+    unresolved proposals can never consume this high-frequency factor.
+    """
+
+    exact_camera = torch.as_tensor(
+        exact_camera_mask,
+        device=foliage.static_leaf_mask.device,
+        dtype=torch.bool,
+    ).reshape(-1)
+    if len(exact_camera) != len(foliage.static_leaf_mask):
+        raise ValueError("MoGe3 exact-camera ownership must align with foliage")
+    detail = foliage.static_leaf_mask
+    resolved = foliage.proposal_kind == PROPOSAL_NONE
+    persistent_detail = (
+        detail & resolved & _persistent_static_evidence_mask(foliage)
+    )
+    measured_single_exact = (
+        detail
+        & resolved
+        & (foliage.verification_state == VERIFICATION_MEASURED_SINGLE)
+        & exact_camera
+    )
+    return persistent_detail | measured_single_exact
+
+
+def _resolved_static_owner_mask(foliage) -> torch.Tensor:
+    """Return resolved rows eligible for exact/local lifecycle operations."""
+
+    return resolved_static_owner_mask(foliage)
+
+
+def _static_detail_global_negative_owner_mask(foliage) -> torch.Tensor:
+    """Return globally deployed detail eligible for canonical veto evidence.
+
+    Camera ownership is intentionally absent here. Positive RGB/geometry/
+    opacity updates use exact support cameras, but a persistent detail row is
+    visible in every canonical deployment view and must therefore accept a
+    strict negative opacity derivative from any such view. Nonpersistent or
+    unresolved rows fail closed.
+    """
+
+    return foliage.static_leaf_mask & _persistent_static_evidence_mask(
+        foliage
+    )
+
+
+@torch.no_grad()
+def _static_detail_evidence_tier_audit(foliage) -> dict[str, object]:
+    """Account for every detail row and its optical/high-frequency capacity."""
+
+    detail = foliage.static_leaf_mask
+    persistent = detail & _persistent_static_evidence_mask(foliage)
+    state = foliage.verification_state
+    resolved = foliage.proposal_kind == PROPOSAL_NONE
+    measured = detail & resolved & ~persistent & (
+        (state == VERIFICATION_MEASURED_SINGLE)
+        | (state == VERIFICATION_VERIFIED)
+    )
+    factorized = (
+        detail & resolved & (state == VERIFICATION_FACTORIZED_RECEIVER)
+    )
+    pending = detail & ~persistent & ~measured & ~factorized & (
+        (state == VERIFICATION_UNVERIFIED)
+        | (foliage.proposal_kind != PROPOSAL_NONE)
+    )
+    rejected = detail & (state == VERIFICATION_REJECTED)
+    classified = persistent | measured | factorized | pending | rejected
+    unclassified = detail & ~classified
+    if bool(unclassified.any()):
+        values = sorted(
+            set(int(value) for value in state[unclassified].cpu().tolist())
+        )
+        raise RuntimeError(
+            "Static detail evidence tier is incomplete for "
+            f"{int(unclassified.sum())} rows with states {values}"
+        )
+    optical_mass = foliage.integrated_optical_mass().reshape(-1)
+    if len(optical_mass) != len(foliage):
+        raise RuntimeError("Static detail optical-mass audit is misaligned")
+    high_order_norm = (
+        foliage.features[:, 1:].flatten(1).norm(dim=1)
+        if foliage.features.shape[1] > 1
+        else torch.zeros_like(optical_mass)
+    )
+
+    def tier(mask: torch.Tensor) -> dict[str, int | float]:
+        return {
+            "rows": int(mask.sum()),
+            "integrated_optical_mass": float(optical_mass[mask].sum()),
+            "maximum_high_order_sh_norm": (
+                float(high_order_norm[mask].max()) if bool(mask.any()) else 0.0
+            ),
+        }
+
+    return {
+        "contract": (
+            "all_detail_rows_exactly_one_evidence_tier__global_training_and_"
+            "deployment_authority_requires_persistent_multiview_evidence"
+        ),
+        "detail_rows": int(detail.sum()),
+        "persistent": tier(persistent),
+        "measured_single": tier(measured),
+        "factorized_receiver": tier(factorized),
+        "pending_proposal": tier(pending),
+        "rejected": tier(rejected),
+        "unclassified_rows": 0,
+    }
+
+
+def _canonical_static_unknown_protection_mask(foliage) -> torch.Tensor:
+    """Protect measured canonical occupancy without granting positive updates.
+
+    A single-camera measured detail seed is insufficient evidence for a
+    whole-image completion/order gradient, but it is still part of the chosen
+    canonical snapshot.  A different sequence revealing the facade behind
+    that leaf must therefore remain unknown at its projected footprint.
+    Pending split/ray-birth proposals are excluded until real-camera
+    verification resolves their lifecycle.
+    """
+    required = (
+        "verification_state",
+        "verified_camera_count",
+        "proposal_kind",
+    )
+    missing = [name for name in required if not hasattr(foliage, name)]
+    if missing:
+        raise RuntimeError(
+            "Canonical unknown-protection metadata is missing: "
+            + ", ".join(missing)
+        )
+    resolved_measured_state = (
+        (foliage.verification_state == VERIFICATION_VERIFIED)
+        | (foliage.verification_state == VERIFICATION_MEASURED_SINGLE)
+    )
+    resolved_measured = (
+        ~foliage.dynamic_leaf_mask
+        & resolved_measured_state
+        & (foliage.proposal_kind == PROPOSAL_NONE)
+    )
+    return resolved_measured & (foliage.verified_camera_count >= 1)
 
 
 def _static_detail_refinement_gate(
@@ -4293,10 +5518,7 @@ def _static_detail_evidence_sequence_view_indices(
         raise TypeError("camera_sequence_lookup must be a tensor")
     lookup = camera_sequence_lookup.detach().cpu().reshape(-1)
     verified_detail = (
-        foliage.static_leaf_mask
-        & (foliage.verification_state == VERIFICATION_VERIFIED)
-        & (foliage.verified_camera_count >= 2)
-        & (foliage.verified_sequence_count >= 1)
+        foliage.static_leaf_mask & _persistent_static_evidence_mask(foliage)
     )
     evidence_sequences: set[int] = set()
     if bool(verified_detail.any()):
@@ -4341,16 +5563,12 @@ def _static_replacement_evidence_view_indices(
     """
     groups = foliage.replacement_group.long()
     valid_group = groups >= 0
-    verified_envelope = (
-        foliage.persistent_envelope_mask
-        & (foliage.verification_state == VERIFICATION_VERIFIED)
-        & valid_group
-    )
+    persistent = _persistent_static_evidence_mask(foliage)
+    resolved = _resolved_static_owner_mask(foliage)
+    verified_envelope = foliage.persistent_envelope_mask & resolved & valid_group
     verified_detail = (
         foliage.static_leaf_mask
-        & (foliage.verification_state == VERIFICATION_VERIFIED)
-        & (foliage.verified_camera_count >= 2)
-        & (foliage.verified_sequence_count >= 1)
+        & persistent
         & valid_group
     )
     paired_detail = torch.zeros_like(verified_detail)
@@ -4379,11 +5597,15 @@ def _static_replacement_evidence_view_indices(
                 ).tolist()
                 if int(value) >= 0
             )
-    canopy = set(int(index) for index in canopy_view_indices)
+    # A persisted exact support/witness camera is stronger evidence than the
+    # global image-level canopy-fraction heuristic. The latter can be below
+    # threshold for a small local crown while still being the second camera
+    # that makes a particular handoff measurable.
+    del canopy_view_indices
     indices = sorted(
         int(index)
         for index, view in enumerate(views)
-        if index in canopy and int(view.colmap_id) in camera_ids
+        if int(view.colmap_id) in camera_ids
     )
     return indices, camera_ids, int(paired_detail.sum())
 
@@ -4447,6 +5669,35 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_tree_sha256(root: Path) -> str:
+    """Hash the complete compiled-source contract, not a hand-picked subset."""
+    root = root.resolve()
+    suffixes = {".cu", ".cuh", ".h", ".hpp", ".cpp", ".py"}
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in suffixes
+        and "build" not in path.relative_to(root).parts
+        and "__pycache__" not in path.relative_to(root).parts
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(_file_sha256(path)))
+    return digest.hexdigest()
+
+
+def _loaded_module_binary_sha256(module_name: str) -> str:
+    """Bind resume identity to the binary Python actually imported."""
+    module = importlib.import_module(module_name)
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        raise RuntimeError(f"Loaded module {module_name} has no binary origin")
+    return _file_sha256(Path(origin).resolve())
 
 
 def _immutable_ray_epoch_capacity(value: dict) -> dict:
@@ -4561,6 +5812,7 @@ def _resume_training_contract_differences(
     current: dict,
     *,
     allow_trainer_repair_migration: bool = False,
+    allow_canonical_occlusion_weight_ablation: bool = False,
     allow_conditioned_schedule_repair_migration: bool = False,
     allow_volume_capacity_repair_migration: bool = False,
     allow_volume_topology_settle_migration: bool = False,
@@ -4570,6 +5822,12 @@ def _resume_training_contract_differences(
     allow_static_detail_isolated_repair_migration: bool = False,
     allow_static_canonical_ownership_repair_migration: bool = False,
     allow_surface_screen_evidence_repair_migration: bool = False,
+    allow_v100_front_clipped_cleanup_migration: bool = False,
+    allow_v102_optical_trust_migration: bool = False,
+    allow_v103_local_optical_redistribution_migration: bool = False,
+    allow_v105_late_optical_convergence_migration: bool = False,
+    allow_v107_global_negative_cleanup_migration: bool = False,
+    allow_v108_evidence_bounded_completion_migration: bool = False,
 ) -> set[str]:
     """Compare optimization identity without treating an RGB cache as K.
 
@@ -4589,12 +5847,295 @@ def _resume_training_contract_differences(
     current = dict(current)
     saved.pop("cpu_parallelism", None)
     current.pop("cpu_parallelism", None)
+    if allow_v108_evidence_bounded_completion_migration:
+        saved_completion = saved.get("canonical_occlusion_completion")
+        current_completion = current.get("canonical_occlusion_completion")
+        if not isinstance(saved_completion, dict) or not isinstance(
+            current_completion, dict
+        ):
+            raise RuntimeError(
+                "v108 migration requires both completion contracts"
+            )
+        expected_saved = copy.deepcopy(current_completion)
+        expected_saved["contract"] = (
+            CANONICAL_OCCLUSION_COMPLETION_V107_PREDECESSOR_CONTRACT
+        )
+        if saved_completion != expected_saved:
+            raise RuntimeError(
+                "v108 completion migration changed more than the single-"
+                "owner envelope/detail forward contract"
+            )
+        saved["canonical_occlusion_completion"] = current_completion
+        saved_settle = saved.get("volume_opacity_settle")
+        current_settle = current.get("volume_opacity_settle")
+        if not isinstance(saved_settle, dict) or not isinstance(
+            current_settle, dict
+        ):
+            raise RuntimeError("v108 migration requires both settle contracts")
+        expected_saved_settle = copy.deepcopy(current_settle)
+        expected_saved_settle["contract"] = (
+            VOLUME_OPACITY_SETTLE_V107_PREDECESSOR_CONTRACT
+        )
+        expected_saved_settle["trainable_after_settle"] = (
+            "persistent_static_detail_bidirectional_optical_mass_inside_"
+            "local_voxel_trust_region_with_per_row_upper_only__geometry_"
+            "scale_rotation_sh_and_dynamic_deformation_feature"
+        )
+        if saved_settle != expected_saved_settle:
+            raise RuntimeError(
+                "v108 settle migration changed more than the persistent "
+                "detail lower source barrier"
+            )
+        saved["volume_opacity_settle"] = current_settle
+    if allow_v107_global_negative_cleanup_migration:
+        saved_cleanup = saved.get("static_detail_global_cleanup")
+        current_cleanup = current.get("static_detail_global_cleanup")
+        if not isinstance(saved_cleanup, dict) or not isinstance(
+            current_cleanup, dict
+        ):
+            raise RuntimeError(
+                "v107 cleanup migration requires both cleanup contracts"
+            )
+        expected_saved = copy.deepcopy(current_cleanup)
+        expected_saved["contract"] = (
+            STATIC_DETAIL_GLOBAL_CLEANUP_V106_PREDECESSOR_CONTRACT
+        )
+        expected_saved["camera_schedule"] = (
+            "dedicated_uniform_scene_canonical_exact_support_epoch"
+        )
+        expected_saved["gradient_owners"] = [
+            "positive_evidence_sequence_static_detail_optical_mass"
+        ]
+        if saved_cleanup != expected_saved:
+            raise RuntimeError(
+                "v107 cleanup migration changed more than canonical negative "
+                "camera/owner authority"
+            )
+        saved["static_detail_global_cleanup"] = current_cleanup
+        # The fused initialization is audit-only on resume; exact foliage and
+        # optimizer tensors come from the content-addressed checkpoint.
+        # Parallel CPU reductions can perturb only aggregate floating-point
+        # diagnostics, so compare the immutable fusion identity and retain
+        # the predecessor audit exactly as the broad historical guard does.
+        saved_fusion = saved.get("static_fusion")
+        current_fusion = current.get("static_fusion")
+        fusion_identity_fields = (
+            "contract",
+            "input_dynamic_rows",
+            "associated_dynamic_rows",
+            "camera_sequence_metadata_source",
+            "camera_sequence_metadata_count",
+            "canonical_sequence_policy",
+            "canonical_mode_voxel_size",
+            "maximum_modes_per_group",
+            "minimum_supporting_views",
+            "minimum_supporting_sequences",
+            "voxel_size",
+            "output_static_rows",
+        )
+        if not (
+            isinstance(saved_fusion, dict)
+            and isinstance(current_fusion, dict)
+            and saved.get("initialization_manifest_sha256")
+            == current.get("initialization_manifest_sha256")
+            and saved.get("foliage_seed_sha256")
+            == current.get("foliage_seed_sha256")
+            and all(
+                saved_fusion.get(key) == current_fusion.get(key)
+                for key in fusion_identity_fields
+            )
+        ):
+            raise RuntimeError(
+                "v107 cleanup migration static-fusion identity mismatch"
+            )
+        current["static_fusion"] = saved_fusion
+    if allow_v105_late_optical_convergence_migration:
+        saved_order = dict(saved.get("canonical_occlusion_order", {}))
+        current_order = dict(current.get("canonical_occlusion_order", {}))
+        expected_saved_order = dict(current_order)
+        expected_saved_order["contract"] = (
+            CANONICAL_OCCLUSION_ORDER_V104_PREDECESSOR_CONTRACT
+        )
+        if saved_order != expected_saved_order:
+            raise RuntimeError(
+                "v105 order migration changed more than primitive "
+                "responsibility semantics"
+            )
+        saved_settle = dict(saved.get("volume_opacity_settle", {}))
+        current_settle = dict(current.get("volume_opacity_settle", {}))
+        expected_saved_settle = dict(current_settle)
+        expected_saved_settle["contract"] = (
+            "static_persistent_detail_uses_immutable_evidence_mass_anchor_"
+            "and_symmetric_bidirectional_adam_updates__per_row_upper_bound_"
+            "prevents_mass_monopoly_while_bounded_local_initialization_voxel_"
+            "groups_preserve_shared_coverage__dense_cells_are_"
+            "deterministically_sharded_and_singleton_cells_have_no_"
+            "artificial_lower_floor__harmful_rows_may_retire_below_their_"
+            "own_anchor__post_adam_waterfill_projection_preserves_surviving_"
+            "relative_responsibility__measured_single_detail_consumes_only_"
+            "exact_camera_negative_cleanup_retirement_while_other_"
+            "nonpersistent_detail_is_frozen__legacy_conditioned_mode_may_"
+            "retain_bounded_retirement_only"
+        )
+        if saved_settle != expected_saved_settle:
+            raise RuntimeError(
+                "v105 settle migration changed more than lower restoration"
+            )
+        expected_saved_policy = (
+            "single_static_map__topology_establishes_optical_existence__ray_"
+            "hit_has_one_source_strength_control_and_keeps_full_geometry_"
+            "gradient__static_detail_mass_is_exact_or_persistent_evidence_"
+            "owned_then_post_topology_bidirectional_with_local_immutable_"
+            "evidence_mass_trust_bounds_and_per_row_upper_caps__envelope_and_"
+            "nonpersistent_detail_high_order_sh_frozen__persistent_detail_sh_"
+            "has_a_hard_rowwise_trust_region__scene_canonical_bounded_"
+            "occlusion_deficit_is_an_explicit_stage3_envelope_growth_owner__"
+            "persistent_handoff_uses_reversible_expected_cross_view_coverage_"
+            "_negative_free_space_and_cleanup_remain_trainable__canonical_"
+            "polish_freezes_ordinary_stable_envelope_skeleton_geometry_mass_"
+            "and_topology_while_source_separated_strict_negative_envelope_"
+            "cleanup_remains_live__detail_geometry_and_covariance_freeze__"
+            "detail_dc_high_order_appearance_and_reduced_signed_strict_"
+            "negative_alpha_calibration_remain_live"
+        )
+        if saved.get("static_optical_policy_contract") != expected_saved_policy:
+            raise RuntimeError("v105 static optical policy predecessor mismatch")
+        saved["canonical_occlusion_order"] = current_order
+        saved["volume_opacity_settle"] = current_settle
+        saved["static_optical_policy_contract"] = current.get(
+            "static_optical_policy_contract"
+        )
+    if allow_v100_front_clipped_cleanup_migration:
+        saved_detail = saved.get("static_detail_global_cleanup")
+        current_detail = current.get("static_detail_global_cleanup")
+        saved_envelope = saved.get("persistent_envelope_global_cleanup")
+        current_envelope = current.get("persistent_envelope_global_cleanup")
+        if not all(
+            isinstance(value, dict)
+            for value in (
+                saved_detail,
+                current_detail,
+                saved_envelope,
+                current_envelope,
+            )
+        ):
+            raise RuntimeError(
+                "v100 cleanup migration requires both cleanup contracts"
+            )
+        expected_saved_detail = dict(current_detail)
+        expected_saved_detail["contract"] = (
+            STATIC_DETAIL_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT
+        )
+        expected_saved_detail["forward_roles"] = [
+            "surface",
+            "static_detail",
+        ]
+        expected_saved_detail.pop("rigid_depth_permission", None)
+        expected_saved_detail.pop("behind_surface_policy", None)
+        expected_saved_envelope = dict(current_envelope)
+        expected_saved_envelope["contract"] = (
+            PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_V99_PREDECESSOR_CONTRACT
+        )
+        expected_saved_envelope["forward_roles"] = [
+            "surface",
+            "persistent_envelope",
+        ]
+        expected_saved_envelope.pop("rigid_depth_permission", None)
+        expected_saved_envelope.pop("behind_surface_policy", None)
+        if saved_detail != expected_saved_detail:
+            raise RuntimeError(
+                "v100 static-detail cleanup predecessor contract mismatch"
+            )
+        if saved_envelope != expected_saved_envelope:
+            raise RuntimeError(
+                "v100 envelope cleanup predecessor contract mismatch"
+            )
+        # Copy only the two explicitly repaired future-loss declarations.
+        # Every other top-level contract key remains subject to exact compare.
+        saved["static_detail_global_cleanup"] = current_detail
+        saved["persistent_envelope_global_cleanup"] = current_envelope
+    if allow_canonical_occlusion_weight_ablation:
+        for field in (
+            "canonical_occlusion_completion",
+            "canonical_occlusion_order",
+        ):
+            saved_loss = saved.get(field)
+            current_loss = current.get(field)
+            if not isinstance(saved_loss, dict) or not isinstance(
+                current_loss, dict
+            ):
+                raise RuntimeError(
+                    "Canonical occlusion weight ablation requires both loss "
+                    "contracts on both sides of the resume boundary"
+                )
+            saved_without_weight = dict(saved_loss)
+            current_without_weight = dict(current_loss)
+            saved_weight = saved_without_weight.pop("weight", None)
+            current_weight = current_without_weight.pop("weight", None)
+            if (
+                saved_weight is None
+                or current_weight is None
+                or not np.isfinite(float(saved_weight))
+                or not np.isfinite(float(current_weight))
+                or float(saved_weight) < 0.0
+                or float(current_weight) < 0.0
+                or saved_without_weight != current_without_weight
+            ):
+                raise RuntimeError(
+                    "Canonical occlusion weight ablation may change only "
+                    "finite non-negative completion/order weights"
+                )
+            # This is an explicit future-trajectory ablation, not an exact
+            # resume. Copy only the requested scalar into the saved comparison
+            # contract; all remaining top-level fields are compared below.
+            saved[field] = current_loss
     # Older checkpoints accidentally omitted three volume-topology controls
     # from the immutable optimization contract.  An explicit trainer-repair
     # resume may migrate those missing fields once; the next checkpoint
     # persists them and all later resumes compare them normally.
     if allow_trainer_repair_migration:
         saved = dict(saved)
+        saved_moge = saved.get("moge3_canopy_optical")
+        current_moge = current.get("moge3_canopy_optical")
+        if isinstance(saved_moge, dict) and isinstance(current_moge, dict):
+            expected_saved_moge = dict(current_moge)
+            expected_saved_moge["contract"] = (
+                MOGE3_CANOPY_OPTICAL_V113_PREDECESSOR_CONTRACT
+            )
+            expected_saved_moge["positive_owner"] = (
+                "exact_camera_resolved_measured_static_detail"
+            )
+            expected_saved_moge.pop("hit_loss", None)
+            if saved_moge == expected_saved_moge:
+                # Model, renderer, schedules and optimizer tensors are
+                # unchanged. Only future current-view thin-hit ownership and
+                # its low-alpha loss parameterization migrate.
+                saved["moge3_canopy_optical"] = current_moge
+        saved_cleanup = saved.get("static_detail_global_cleanup")
+        current_cleanup = current.get("static_detail_global_cleanup")
+        if isinstance(saved_cleanup, dict) and isinstance(current_cleanup, dict):
+            normalized_saved_cleanup = copy.deepcopy(saved_cleanup)
+            normalized_current_cleanup = copy.deepcopy(current_cleanup)
+            saved_camera_audit = normalized_saved_cleanup.get(
+                "camera_schedule", {}
+            )
+            current_camera_audit = normalized_current_cleanup.get(
+                "camera_schedule", {}
+            )
+            if isinstance(saved_camera_audit, dict) and isinstance(
+                current_camera_audit, dict
+            ):
+                saved_camera_audit.pop(
+                    "positive_exact_support_camera_count", None
+                )
+                current_camera_audit.pop(
+                    "positive_exact_support_camera_count", None
+                )
+            if normalized_saved_cleanup == normalized_current_cleanup:
+                # This count is computed from the freshly fused seed before
+                # resume restoration. It is audit-only; the actual foliage
+                # support tables and camera schedule are restored/hashed.
+                saved["static_detail_global_cleanup"] = current_cleanup
         for key in (
             "maximum_volume_scale",
             "maximum_dynamic_volume_scale",
@@ -4602,6 +6143,105 @@ def _resume_training_contract_differences(
         ):
             if key not in saved and key in current:
                 saved[key] = current[key]
+        for field in (
+            "canonical_occlusion_completion",
+            "canonical_occlusion_order",
+        ):
+            saved_loss = saved.get(field)
+            current_loss = current.get(field)
+            if not isinstance(saved_loss, dict) or not isinstance(
+                current_loss, dict
+            ):
+                continue
+            if saved_loss.get("contract") != current_loss.get("contract"):
+                continue
+            current_without_activation = dict(current_loss)
+            activation = current_without_activation.pop(
+                "activation_contract", None
+            )
+            start_iteration = current_without_activation.pop(
+                "start_iteration", None
+            )
+            start_is_integer = (
+                start_iteration is not None
+                and np.isfinite(float(start_iteration))
+                and float(start_iteration) >= 0.0
+                and float(start_iteration).is_integer()
+            )
+            if (
+                "activation_contract" not in saved_loss
+                and "start_iteration" not in saved_loss
+                and activation
+                == CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+                and start_is_integer
+                and saved_loss == current_without_activation
+            ):
+                # v91/v92 checkpoints already have exactly the same tensors,
+                # renderer and per-loss method.  The v93 repair only prevents
+                # those losses from running before their configured future
+                # fixed-topology boundary.
+                saved[field] = current_loss
+        saved_completion = saved.get("canonical_occlusion_completion")
+        current_completion = current.get("canonical_occlusion_completion")
+        if (
+            isinstance(saved_completion, dict)
+            and isinstance(current_completion, dict)
+            and saved_completion.get("contract")
+            == CANONICAL_OCCLUSION_COMPLETION_CONTRACT
+            and current_completion.get("contract")
+            == CANONICAL_OCCLUSION_COMPLETION_CONTRACT
+        ):
+            saved_common = dict(saved_completion)
+            current_common = dict(current_completion)
+            saved_common.pop("unverified_positive_authority", None)
+            current_common.pop("unverified_positive_authority", None)
+            saved_common["activation_contract"] = (
+                CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+                if saved_common.get("activation_contract")
+                == CANONICAL_OCCLUSION_ACTIVATION_PREDECESSOR_CONTRACT
+                else saved_common.get("activation_contract")
+            )
+            if saved_common == current_common:
+                saved["canonical_occlusion_completion"] = current_completion
+        if (
+            "post_growth_verification_maintenance" not in saved
+            and isinstance(
+                current.get("post_growth_verification_maintenance"), dict
+            )
+        ):
+            saved["post_growth_verification_maintenance"] = current[
+                "post_growth_verification_maintenance"
+            ]
+        saved_lifecycle = saved.get("child_verification_lifecycle")
+        current_lifecycle = current.get("child_verification_lifecycle")
+        if isinstance(saved_lifecycle, dict) and isinstance(
+            current_lifecycle, dict
+        ):
+            saved_common = dict(saved_lifecycle)
+            current_common = dict(current_lifecycle)
+            saved_permissions = saved_common.pop(
+                "unverified_permissions", None
+            )
+            current_permissions = current_common.pop(
+                "unverified_permissions", None
+            )
+            if (
+                saved_common == current_common
+                and isinstance(saved_permissions, dict)
+                and saved_permissions.get("dc_and_mass_growth") is True
+                and isinstance(current_permissions, dict)
+                and current_permissions.get("positive_mass_growth")
+                == "exact_owner_ray_factor_only"
+                and current_permissions.get(
+                    "whole_image_rgb_and_completion_mass_growth"
+                )
+                is False
+            ):
+                saved["child_verification_lifecycle"] = current_lifecycle
+        # v95 changes occlusion evidence from mixed contribution statistics
+        # to isolated intrinsic owner-only passes and removes the semantic
+        # visibility floor.  Those are method changes, not metadata repair;
+        # the broad historical trainer-repair flag must never migrate them.
         current_receiver_materialization = current.get(
             "static_detail_receiver_materialization"
         )
@@ -5746,6 +7386,162 @@ def _resume_training_contract_differences(
             SURFACE_SCREEN_TOPOLOGY_CONTRACT
         )
 
+    if allow_v102_optical_trust_migration:
+        saved = dict(saved)
+        saved_settle = dict(saved.get("volume_opacity_settle", {}))
+        current_settle = dict(current.get("volume_opacity_settle", {}))
+        if (
+            saved_settle.get("policy") != "retirement_only"
+            or saved_settle.get("start_iteration") != 18_000
+            or saved_settle.get("retirement_until_iteration") != 25_500
+            or current_settle.get("policy") != "evidence_trust_region"
+            or current_settle.get("start_iteration") != 18_000
+            or current_settle.get("retirement_until_iteration") != 25_500
+            or current_settle.get("static_detail_optical_trust_lower") != 0.85
+            or current_settle.get("static_detail_optical_trust_upper") != 1.15
+        ):
+            raise RuntimeError(
+                "v102 optical-trust migration requires the exact 18k settle, "
+                "25.5k legacy window and 0.85/1.15 target trust bounds"
+            )
+        migrated_settle = dict(saved_settle)
+        migrated_settle.update(
+            {
+                "contract": current_settle["contract"],
+                "policy": current_settle["policy"],
+                "static_detail_optical_trust_lower": 0.85,
+                "static_detail_optical_trust_upper": 1.15,
+                "trainable_after_settle": current_settle[
+                    "trainable_after_settle"
+                ],
+            }
+        )
+        if migrated_settle != current_settle:
+            raise RuntimeError(
+                "v102 optical-trust migration changed an unrelated settle field"
+            )
+        migrated_permissions = copy.deepcopy(
+            saved.get("parameter_loss_permission_matrix", {})
+        )
+        old_permission = "post_topology_retirement_only_then_frozen"
+        new_permission = (
+            "post_topology_bidirectional_evidence_mass_trust_region"
+        )
+        leaf_permissions = migrated_permissions.get(
+            "static_leaf_optical_mass", []
+        )
+        if old_permission not in leaf_permissions:
+            raise RuntimeError("v101 optical permission predecessor mismatch")
+        migrated_permissions["static_leaf_optical_mass"] = [
+            new_permission if value == old_permission else value
+            for value in leaf_permissions
+        ]
+        if migrated_permissions != current.get(
+            "parameter_loss_permission_matrix"
+        ):
+            raise RuntimeError(
+                "v102 optical-trust migration changed unrelated permissions"
+            )
+        migrated_stages = dict(saved.get("static_training_stages", {}))
+        migrated_stages["joint_polish"] = current.get(
+            "static_training_stages", {}
+        ).get("joint_polish")
+        if migrated_stages != current.get("static_training_stages"):
+            raise RuntimeError(
+                "v102 optical-trust migration changed unrelated stage fields"
+            )
+        saved["volume_opacity_settle"] = current_settle
+        saved["parameter_loss_permission_matrix"] = migrated_permissions
+        saved["static_training_stages"] = migrated_stages
+        saved["static_optical_policy_contract"] = current.get(
+            "static_optical_policy_contract"
+        )
+
+    if allow_v103_local_optical_redistribution_migration:
+        saved = dict(saved)
+        saved_settle = dict(saved.get("volume_opacity_settle", {}))
+        current_settle = dict(current.get("volume_opacity_settle", {}))
+        if (
+            saved_settle.get("contract")
+            != (
+                "static_persistent_detail_uses_immutable_evidence_mass_"
+                "anchor_and_symmetric_bidirectional_adam_updates_inside_a_"
+                "per_row_trust_region__outward_gradient_and_momentum_are_"
+                "closed_and_post_adam_mass_is_hard_projected__nonpersistent_"
+                "detail_is_frozen__legacy_conditioned_mode_may_retain_"
+                "bounded_retirement_only"
+            )
+            or saved_settle.get("policy") != "evidence_trust_region"
+            or saved_settle.get("static_detail_optical_trust_lower") != 0.85
+            or saved_settle.get("static_detail_optical_trust_upper") != 1.15
+            or "static_detail_optical_trust_voxel_size" in saved_settle
+            or current_settle.get("contract")
+            != VOLUME_OPACITY_SETTLE_CONTRACT
+            or current_settle.get("policy") != "evidence_trust_region"
+            or current_settle.get("static_detail_optical_trust_lower")
+            != 0.85
+            or current_settle.get("static_detail_optical_trust_upper")
+            != 1.15
+            or current_settle.get("static_detail_optical_trust_voxel_size")
+            != 0.10
+        ):
+            raise RuntimeError(
+                "v103 redistribution requires the exact v102 per-row "
+                "optical trust contract and audited target bounds"
+            )
+        saved_cleanup = dict(saved.get("static_detail_global_cleanup", {}))
+        current_cleanup = dict(
+            current.get("static_detail_global_cleanup", {})
+        )
+        if (
+            saved_cleanup.get("contract")
+            != STATIC_DETAIL_GLOBAL_CLEANUP_V102_PREDECESSOR_CONTRACT
+            or current_cleanup.get("contract")
+            != STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT
+            or saved_cleanup.get("every") != current_cleanup.get("every")
+            or saved_cleanup.get("weight") != current_cleanup.get("weight")
+            or saved_cleanup.get("counterfactual_weight")
+            != current_cleanup.get("counterfactual_weight")
+        ):
+            raise RuntimeError(
+                "v103 cleanup migration is not the exact v102 schedule and "
+                "weight predecessor"
+            )
+        if (
+            "static_detail_evidence_tiers" in saved
+            or "static_detail_evidence_tiers" in current
+        ):
+            current_tiers = copy.deepcopy(
+                current.get("static_detail_evidence_tiers")
+            )
+            expected_saved_tiers = copy.deepcopy(current_tiers)
+            if not isinstance(expected_saved_tiers, dict):
+                raise RuntimeError(
+                    "v103 detail-tier migration requires an explicit tier "
+                    "contract"
+                )
+            expected_saved_tiers["measured_single"] = (
+                "real_one_camera_seed__exact_camera_training_and_"
+                "deployment_visibility_only__no_soft_sequence_sh_or_"
+                "opacity_authority"
+            )
+            if saved.get("static_detail_evidence_tiers") != (
+                expected_saved_tiers
+            ):
+                raise RuntimeError(
+                    "v103 measured-single cleanup requires the exact v102 "
+                    "evidence-tier predecessor"
+                )
+        for key in (
+            "volume_opacity_settle",
+            "static_detail_global_cleanup",
+            "static_detail_evidence_tiers",
+            "static_training_stages",
+            "parameter_loss_permission_matrix",
+            "static_optical_policy_contract",
+        ):
+            saved[key] = copy.deepcopy(current.get(key))
+
     differences = {
         key
         for key in set(saved) | set(current)
@@ -5775,6 +7571,55 @@ def _gradient_norm(parameter: torch.Tensor) -> float:
     if gradient is None:
         return 0.0
     return float(torch.nan_to_num(gradient).norm().detach())
+
+
+@torch.no_grad()
+def _assert_finite_foliage_optimization_state(
+    foliage,
+    volume_optimizer,
+    *,
+    iteration: int,
+    stage: str,
+    check_gradients: bool,
+) -> None:
+    """Fail before a finite scalar loss can silently corrupt persistent state.
+
+    Several raster/image losses have perfectly finite forward values at
+    nondifferentiable pixels.  A non-finite backward contribution must stop
+    before Adam writes it into every parameter and both moments of the owner
+    row.  Checking after all source/role policies also proves the tensors the
+    optimizer will actually consume, rather than an earlier diagnostic copy.
+    """
+
+    failures: list[str] = []
+    named = dict(foliage.named_parameters())
+    for name, parameter in named.items():
+        finite_parameter = torch.isfinite(parameter)
+        if not bool(finite_parameter.all()):
+            failures.append(
+                f"parameter:{name}={int((~finite_parameter).sum())}"
+            )
+        if check_gradients and parameter.grad is not None:
+            finite_gradient = torch.isfinite(parameter.grad)
+            if not bool(finite_gradient.all()):
+                failures.append(
+                    f"gradient:{name}={int((~finite_gradient).sum())}"
+                )
+        state = volume_optimizer.state.get(parameter, {})
+        for state_name, value in state.items():
+            if not torch.is_tensor(value) or not value.dtype.is_floating_point:
+                continue
+            finite_state = torch.isfinite(value)
+            if not bool(finite_state.all()):
+                failures.append(
+                    f"optimizer:{name}.{state_name}="
+                    f"{int((~finite_state).sum())}"
+                )
+    if failures:
+        raise RuntimeError(
+            "Non-finite foliage optimization state at iteration "
+            f"{int(iteration)} ({stage}): " + ", ".join(failures)
+        )
 
 
 def _adaptive_geometry_scale(
@@ -5856,6 +7701,8 @@ def _teacher_gradient_audit(
 def _parameter_loss_gradient_audit(
     foliage,
     losses: dict[str, torch.Tensor],
+    *,
+    maximum_rows: int = 250_000,
 ) -> dict[str, object]:
     """Audit loss ownership by static role without changing optimization.
 
@@ -5865,6 +7712,27 @@ def _parameter_loss_gradient_audit(
     steps and deliberately reports conflicts instead of imposing a brittle
     pass/fail gate.
     """
+    row_count = int(len(foliage.xyz))
+    if row_count > int(maximum_rows):
+        # This is a diagnostic, not an optimization objective. Materializing
+        # one dense gradient for every (loss, parameter) pair at 900k rows
+        # repeatedly allocated hundreds of MiB for SH alone, fragmented the
+        # CUDA cache, and made the following real backward OOM at v99/19.6k.
+        # Production ownership is already enforced by source-separated
+        # backward inputs and audited after policy/Adam; never let this
+        # optional decomposition consume unbounded training memory.
+        return {
+            "contract": (
+                "sampled_loss_by_static_role_parameter_signed_gradient__"
+                "bounded_diagnostic_never_controls_optimization"
+            ),
+            "losses": {},
+            "warnings": [],
+            "skipped": True,
+            "reason": "foliage_row_count_exceeds_bounded_audit_budget",
+            "foliage_rows": row_count,
+            "maximum_rows": int(maximum_rows),
+        }
     parameters = {
         "xyz": foliage.xyz,
         "scale": foliage.log_scales,
@@ -6184,6 +8052,95 @@ def _high_frequency_loss(
         + (vertical * vertical_weight).sum()
         / vertical_weight.sum().clamp_min(1)
     )
+
+
+def _oriented_multiscale_high_frequency_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Match foliage edge direction and energy at two image scales.
+
+    First-difference RGB L1 can be reduced by a duplicated blur or an
+    unrelated colour impulse.  Foliage quality instead depends on where an
+    oriented opacity/geometry edge lies.  A detached GT-edge confidence gates
+    Sobel direction and magnitude losses, matching the evaluation quantities
+    without turning flat semantic canopy interiors into arbitrary texture.
+    """
+
+    if prediction.shape != target.shape or prediction.ndim != 3:
+        raise ValueError("oriented high-frequency inputs must be [3,H,W]")
+    if weight.shape != prediction.shape[1:]:
+        raise ValueError("oriented high-frequency weight must be [H,W]")
+    luminance = prediction.new_tensor([0.299, 0.587, 0.114]).reshape(1, 3, 1, 1)
+    sobel_x = prediction.new_tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+    ).reshape(1, 1, 3, 3) / 8.0
+    sobel_y = sobel_x.transpose(2, 3)
+    total = prediction.new_zeros(())
+    used = 0
+    for scale in (1, 2):
+        pred = prediction[None]
+        truth = target.detach()[None]
+        support = weight[None, None].clamp(0.0, 1.0)
+        if scale > 1:
+            pred = F.avg_pool2d(pred, scale, stride=scale)
+            truth = F.avg_pool2d(truth, scale, stride=scale)
+            support = F.avg_pool2d(support, scale, stride=scale)
+        pred_luma = (pred * luminance).sum(dim=1, keepdim=True)
+        truth_luma = (truth * luminance).sum(dim=1, keepdim=True)
+        pred_grad = torch.cat(
+            [
+                F.conv2d(pred_luma, sobel_x, padding=1),
+                F.conv2d(pred_luma, sobel_y, padding=1),
+            ],
+            dim=1,
+        )
+        truth_grad = torch.cat(
+            [
+                F.conv2d(truth_luma, sobel_x, padding=1),
+                F.conv2d(truth_luma, sobel_y, padding=1),
+            ],
+            dim=1,
+        )
+        # ``sqrt(gx**2 + gy**2)`` has a finite forward value but an undefined
+        # derivative at a perfectly flat pixel.  In practice the first
+        # volume-only refinement pass sent 0 * inf = NaN back to every
+        # parameter of a small set of persistent detail rows while the scalar
+        # loss itself still looked healthy.  Subtracting the smoothing radius
+        # keeps an exactly-zero magnitude at zero gradient and gives the norm
+        # a finite zero derivative there.
+        magnitude_epsilon = 1.0e-6
+        pred_magnitude = (
+            pred_grad.square().sum(dim=1) + magnitude_epsilon**2
+        ).sqrt() - magnitude_epsilon
+        truth_magnitude = (
+            truth_grad.square().sum(dim=1) + magnitude_epsilon**2
+        ).sqrt() - magnitude_epsilon
+        edge_confidence = (
+            truth_magnitude / (truth_magnitude + 0.02)
+        ).detach()
+        pixel_weight = support[:, 0] * edge_confidence
+        if not bool((pixel_weight > 1.0e-6).any()):
+            continue
+        dot = (pred_grad * truth_grad).sum(dim=1)
+        denominator = pred_magnitude * truth_magnitude
+        cosine = torch.where(
+            denominator > 1.0e-8,
+            (dot / denominator.clamp_min(1.0e-8)).clamp(-1.0, 1.0),
+            torch.zeros_like(dot),
+        )
+        direction = 1.0 - cosine
+        magnitude = (
+            (pred_magnitude - truth_magnitude).abs()
+            / (truth_magnitude + 0.02)
+        ).clamp(max=4.0)
+        total = total + _weighted_mean(
+            0.60 * direction + 0.40 * magnitude,
+            pixel_weight,
+        )
+        used += 1
+    return total / max(used, 1)
 
 
 def _rigid_residual_patch_loss(
@@ -6508,71 +8465,1222 @@ def _counterfactual_volume_transparency_loss(
     }
 
 
-def _static_detail_global_cleanup_loss(
-    mixed_prediction: torch.Tensor,
+def _strict_volume_front_mask(
+    volume_alpha: torch.Tensor,
+    surface_alpha: torch.Tensor,
+    surface_depth: torch.Tensor,
+    volume_depth: torch.Tensor,
+    *,
+    clearance: float = 0.03,
+) -> torch.Tensor:
+    """Return detached pixels where intrinsic volume is proven surface-front.
+
+    The mask deliberately fails closed.  A semantic rigid label without a
+    valid rendered surface hit is not metric evidence that foliage should be
+    deleted, and a volume behind that hit is a legitimate occluded layer.
+    """
+    if float(clearance) < 0.0:
+        raise ValueError("front-clipped cleanup clearance cannot be negative")
+    alpha = volume_alpha.reshape_as(surface_alpha)
+    surface_z = surface_depth.reshape_as(alpha).detach()
+    volume_z = volume_depth.reshape_as(alpha).detach()
+    surface_support = surface_alpha.reshape_as(alpha).detach()
+    valid = (
+        torch.isfinite(surface_z)
+        & torch.isfinite(volume_z)
+        & (surface_z > 0.0)
+        & (volume_z > 0.0)
+        & (surface_support > 0.05)
+        & (alpha.detach() > 1.0e-6)
+    )
+    return (valid & (volume_z + float(clearance) < surface_z)).detach()
+
+
+def _moge3_depth_query_bounds(
+    evidence: dict[str, torch.Tensor],
+    *,
+    global_log_scale_sigma: float,
+    model_log_depth_floor: float = 0.025,
+    interval_sigma: float = 2.0,
+    maximum_log_half_width: float = 0.30,
+    maximum_hit_log_half_width: float = 0.08,
+    maximum_hit_metric_half_width: float = 0.40,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, object],
+]:
+    """Build separate conservative-prehit and thin-hit depth intervals.
+
+    MoGe supplies camera-z depth after exact-K reprojection.  The single
+    scene-wide scale uncertainty is epistemic: it reduces reliability and
+    moves the negative free-space bound towards the camera, but must not turn
+    one visible leaf hit into metres of positive volume.  The positive hit
+    and birth interval uses only local refinement uncertainty and has both a
+    relative and an absolute metric cap. Invalid evidence is encoded as NaN.
+    """
+    required = (
+        "moge3_depth_m",
+        "moge3_valid_mask",
+        "moge3_refinement_log_depth_std",
+        "moge3_refinement_final_delta_log_depth",
+    )
+    missing = [name for name in required if name not in evidence]
+    if missing:
+        raise KeyError("MoGe3 depth query fields are missing: " + ", ".join(missing))
+    if float(global_log_scale_sigma) < 0.0:
+        raise ValueError("MoGe3 global log-scale sigma cannot be negative")
+    if float(model_log_depth_floor) <= 0.0:
+        raise ValueError("MoGe3 model log-depth floor must be positive")
+    if float(interval_sigma) <= 0.0:
+        raise ValueError("MoGe3 interval sigma must be positive")
+    if float(maximum_log_half_width) <= 0.0:
+        raise ValueError("MoGe3 maximum log half-width must be positive")
+    if float(maximum_hit_log_half_width) <= 0.0:
+        raise ValueError("MoGe3 maximum hit log half-width must be positive")
+    if float(maximum_hit_metric_half_width) <= 0.0:
+        raise ValueError("MoGe3 maximum hit metric half-width must be positive")
+
+    depth = evidence["moge3_depth_m"][0].detach()
+    refinement_std = evidence[
+        "moge3_refinement_log_depth_std"
+    ][0].detach()
+    refinement_delta = evidence[
+        "moge3_refinement_final_delta_log_depth"
+    ][0].detach()
+    valid = (
+        (evidence["moge3_valid_mask"][0].detach() > 0.5)
+        & torch.isfinite(depth)
+        & (depth > 0.0)
+        & torch.isfinite(refinement_std)
+        & torch.isfinite(refinement_delta)
+        & (refinement_std >= 0.0)
+    )
+    safe_std = torch.where(valid, refinement_std.clamp_min(0.0), torch.zeros_like(depth))
+    safe_delta = torch.where(valid, refinement_delta.abs(), torch.zeros_like(depth))
+    local_sigma_log = torch.sqrt(
+        safe_std.square()
+        + safe_delta.square()
+        + float(model_log_depth_floor) ** 2
+    )
+    total_sigma_log = torch.sqrt(
+        local_sigma_log.square() + float(global_log_scale_sigma) ** 2
+    )
+    prehit_half_width = (float(interval_sigma) * total_sigma_log).clamp(
+        min=float(model_log_depth_floor),
+        max=float(maximum_log_half_width),
+    )
+    hit_log_half_width = (float(interval_sigma) * local_sigma_log).clamp(
+        min=float(model_log_depth_floor),
+        max=float(maximum_hit_log_half_width),
+    )
+    safe_depth = torch.where(valid, depth, torch.ones_like(depth))
+    prehit_lower = safe_depth * torch.exp(-prehit_half_width)
+    # Convert the log-symmetric local interval to camera-z thickness, then
+    # enforce the absolute cap.  A distant facade/tree pixel therefore
+    # cannot authorize a multi-metre positive foliage segment.
+    hit_metric_half_width = (
+        safe_depth * torch.sinh(hit_log_half_width)
+    ).clamp(max=float(maximum_hit_metric_half_width))
+    hit_lower = (safe_depth - hit_metric_half_width).clamp_min(1.0e-4)
+    hit_upper = safe_depth + hit_metric_half_width
+    nan = torch.full_like(depth, float("nan"))
+    prehit_bounds = torch.stack(
+        [
+            torch.where(valid, prehit_lower, nan),
+            torch.where(valid, safe_depth, nan),
+        ]
+    ).detach()
+    hit_bounds = torch.stack(
+        [
+            torch.where(valid, hit_lower, nan),
+            torch.where(valid, hit_upper, nan),
+        ]
+    ).detach()
+    reliability = (
+        1.0 / (1.0 + (total_sigma_log / 0.12).square())
+    ) * valid.to(depth.dtype)
+    return prehit_bounds, hit_bounds, valid.detach(), reliability.detach(), {
+        "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+        "valid_pixels": int(valid.sum()),
+        "global_log_scale_sigma": float(global_log_scale_sigma),
+        "model_log_depth_floor": float(model_log_depth_floor),
+        "interval_sigma": float(interval_sigma),
+        "maximum_log_half_width": float(maximum_log_half_width),
+        "maximum_hit_log_half_width": float(maximum_hit_log_half_width),
+        "maximum_hit_metric_half_width": float(
+            maximum_hit_metric_half_width
+        ),
+        "mean_prehit_log_half_width": (
+            float(prehit_half_width[valid].mean())
+            if bool(valid.any())
+            else 0.0
+        ),
+        "mean_prehit_metric_offset": (
+            float((safe_depth - prehit_lower)[valid].mean())
+            if bool(valid.any())
+            else 0.0
+        ),
+        "mean_hit_log_half_width": (
+            float(hit_log_half_width[valid].mean())
+            if bool(valid.any())
+            else 0.0
+        ),
+        "mean_hit_metric_half_width": (
+            float(hit_metric_half_width[valid].mean())
+            if bool(valid.any())
+            else 0.0
+        ),
+        "mean_reliability": (
+            float(reliability[valid].mean()) if bool(valid.any()) else 0.0
+        ),
+    }
+
+
+def _moge3_canopy_optical_loss(
+    prehit_alpha: torch.Tensor,
+    hit_interval_alpha: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    reliability: torch.Tensor,
+    *,
+    prehit_weight: float = 0.25,
+    minimum_hit_alpha: float = 0.35,
+    core_hit_alpha: float = 0.75,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Apply metric pre-hit free space and bounded canopy-hit coverage.
+
+    The two alpha tensors must come from separate owner-isolated renders in
+    the caller.  This function intentionally has no RGB or surface input:
+    MoGe's first visible target depth says which volume interval may own the
+    ray, while semantics says whether that interval is expected to contain
+    canopy.  Volume behind the upper bound is absent from both derivatives.
+    """
+    if float(prehit_weight) < 0.0:
+        raise ValueError("MoGe3 prehit weight cannot be negative")
+    if not 0.0 < float(minimum_hit_alpha) < 1.0:
+        raise ValueError("MoGe3 minimum hit alpha must lie in (0,1)")
+    if not float(minimum_hit_alpha) <= float(core_hit_alpha) < 1.0:
+        raise ValueError("MoGe3 core hit alpha must be in [minimum,1)")
+    prehit = prehit_alpha.reshape_as(valid).clamp(0.0, 1.0 - 1.0e-5)
+    hit = hit_interval_alpha.reshape_as(valid).clamp(0.0, 1.0 - 1.0e-5)
+    if prehit.shape != valid.shape or reliability.shape != valid.shape:
+        raise ValueError("MoGe3 optical query tensors must share one HxW shape")
+    distortion_valid = task.get(
+        "p_distortion_valid", torch.ones_like(reliability)
+    ).clamp(0.0, 1.0)
+    transient_free = 1.0 - task.get(
+        "p_transient", torch.zeros_like(reliability)
+    ).clamp(0.0, 1.0)
+    rgb_weight = task.get("w_rgb", torch.ones_like(reliability)).clamp_min(0.0)
+    common = (
+        valid.to(reliability.dtype)
+        * reliability
+        * distortion_valid
+        * transient_free
+        * rgb_weight
+    ).detach()
+    canopy = task["p_canopy"].clamp(0.0, 1.0)
+    canopy_core = task["p_canopy_core"].clamp(0.0, 1.0)
+    rigid_or_canopy = (task["p_rigid"] + canopy).clamp(0.0, 1.0)
+    prehit_permission = (common * rigid_or_canopy).detach()
+    hit_permission = (common * canopy).detach()
+    target_hit = (
+        float(minimum_hit_alpha)
+        + (float(core_hit_alpha) - float(minimum_hit_alpha)) * canopy_core
+    ).detach()
+    prehit_optical_depth = -torch.log1p(-prehit)
+    # Work in optical/log-alpha space. The old squared alpha deficit had a
+    # vanishing opacity-logit derivative when an under-covered ray started
+    # near transparent, precisely where reconstruction needs the strongest
+    # request. A one-sided relative log deficit keeps an O(1) logit gradient
+    # while still stopping completely once the bounded target is reached.
+    safe_hit = hit.clamp_min(1.0e-6)
+    hit_log_deficit = (
+        torch.log(target_hit.clamp_min(1.0e-6)) - torch.log(safe_hit)
+    ).clamp_min(0.0)
+    prehit_loss = _weighted_mean(prehit_optical_depth, prehit_permission)
+    hit_loss = _weighted_mean(
+        torch.nn.functional.smooth_l1_loss(
+            hit_log_deficit,
+            torch.zeros_like(hit_log_deficit),
+            reduction="none",
+            beta=0.25,
+        ),
+        hit_permission,
+    )
+    total = hit_loss + float(prehit_weight) * prehit_loss
+    prehit_supported = prehit_permission > 1.0e-4
+    hit_supported = hit_permission > 1.0e-4
+    return total, {
+        "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+        "prehit": float(prehit_loss.detach()),
+        "hit": float(hit_loss.detach()),
+        "prehit_weight": float(prehit_weight),
+        "prehit_supported_pixels": int(prehit_supported.sum()),
+        "hit_supported_pixels": int(hit_supported.sum()),
+        "mean_prehit_alpha": (
+            float(prehit.detach()[prehit_supported].mean())
+            if bool(prehit_supported.any())
+            else 0.0
+        ),
+        "mean_hit_alpha": (
+            float(hit.detach()[hit_supported].mean())
+            if bool(hit_supported.any())
+            else 0.0
+        ),
+        "mean_target_hit_alpha": (
+            float(target_hit[hit_supported].mean())
+            if bool(hit_supported.any())
+            else 0.0
+        ),
+        "mean_relative_log_alpha_deficit": (
+            float(hit_log_deficit.detach()[hit_supported].mean())
+            if bool(hit_supported.any())
+            else 0.0
+        ),
+        "hit_loss_semantics": "one_sided_relative_log_alpha_smooth_l1",
+        "gradient_owner": "volume_opacity_only_in_owner_isolated_passes",
+        "behind_interval_gradient": False,
+    }
+
+
+@torch.no_grad()
+def _moge3_uncovered_hit_proposals(
+    view,
+    query_bounds: torch.Tensor,
+    coverage_hit_alpha: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    reliability: torch.Tensor,
+    *,
+    maximum_proposals: int = 256,
+    minimum_alpha_deficit: float = 0.20,
+    minimum_canopy_probability: float = 0.50,
+    minimum_support: float = 0.10,
+    minimum_hit_alpha: float = 0.35,
+    core_hit_alpha: float = 0.75,
+) -> tuple[dict[str, torch.Tensor | int] | None, dict[str, object]]:
+    """Convert uncovered MoGe hit pixels into bounded world-ray intervals.
+
+    This is topology evidence, not a direct Gaussian append.  The caller adds
+    the intervals to :class:`StaticRayBirthAccumulator`, which requires two
+    independent exact cameras in the selected canonical sequence before a
+    low-mass measured proposal can be born.  Existing persistent/detail mass
+    is measured by an all-owner read-only query so one primitive can never
+    authorize another primitive's opacity gradient.
+    """
+    if int(maximum_proposals) <= 0:
+        raise ValueError("MoGe3 maximum birth proposals must be positive")
+    if float(minimum_alpha_deficit) <= 0.0:
+        raise ValueError("MoGe3 minimum alpha deficit must be positive")
+    if not 0.0 <= float(minimum_canopy_probability) <= 1.0:
+        raise ValueError("MoGe3 minimum canopy probability is invalid")
+    if float(minimum_support) < 0.0:
+        raise ValueError("MoGe3 minimum proposal support cannot be negative")
+    if query_bounds.ndim != 3 or query_bounds.shape[0] != 2:
+        raise ValueError("MoGe3 query bounds must have shape [2,H,W]")
+    hit = coverage_hit_alpha.reshape_as(valid).detach().clamp(0.0, 1.0)
+    if query_bounds.shape[1:] != valid.shape or reliability.shape != valid.shape:
+        raise ValueError("MoGe3 proposal rasters must share one HxW shape")
+
+    canopy = task["p_canopy"].detach().clamp(0.0, 1.0)
+    canopy_core = task["p_canopy_core"].detach().clamp(0.0, 1.0)
+    distortion_valid = task.get(
+        "p_distortion_valid", torch.ones_like(canopy)
+    ).detach().clamp(0.0, 1.0)
+    transient_free = 1.0 - task.get(
+        "p_transient", torch.zeros_like(canopy)
+    ).detach().clamp(0.0, 1.0)
+    rgb_weight = task.get(
+        "w_rgb", torch.ones_like(canopy)
+    ).detach().clamp_min(0.0)
+    support = (
+        valid.to(canopy.dtype)
+        * reliability.detach().clamp(0.0, 1.0)
+        * distortion_valid
+        * transient_free
+        * rgb_weight
+        * canopy
+    )
+    target = (
+        float(minimum_hit_alpha)
+        + (float(core_hit_alpha) - float(minimum_hit_alpha)) * canopy_core
+    )
+    deficit = (target - hit).clamp_min(0.0)
+    lower, upper = query_bounds.detach()
+    candidates = (
+        valid
+        & torch.isfinite(lower)
+        & torch.isfinite(upper)
+        & (lower > 0.0)
+        & (upper >= lower)
+        & (canopy >= float(minimum_canopy_probability))
+        & (support >= float(minimum_support))
+        & (deficit >= float(minimum_alpha_deficit))
+    )
+    rows, columns = torch.nonzero(candidates, as_tuple=True)
+    audit: dict[str, object] = {
+        "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+        "candidate_pixels": int(len(rows)),
+        "selected_proposals": 0,
+        "maximum_proposals": int(maximum_proposals),
+        "minimum_alpha_deficit": float(minimum_alpha_deficit),
+        "requires_independent_cameras": 2,
+        "requires_canonical_sequences": 1,
+        "direct_append": False,
+    }
+    if not len(rows):
+        return None, audit
+
+    score = support[rows, columns] * (
+        deficit[rows, columns] / target[rows, columns].clamp_min(1.0e-4)
+    )
+    if len(rows) > int(maximum_proposals):
+        selected = torch.topk(
+            score,
+            k=int(maximum_proposals),
+            largest=True,
+            sorted=True,
+        ).indices
+        rows, columns, score = rows[selected], columns[selected], score[selected]
+
+    dtype, device = lower.dtype, lower.device
+    target_depth = torch.sqrt(
+        lower[rows, columns] * upper[rows, columns]
+    )
+    x_over_z = (
+        columns.to(dtype) - float(view.cx)
+    ) / max(float(view.focal_x), 1.0e-8)
+    y_over_z = (
+        rows.to(dtype) - float(view.cy)
+    ) / max(float(view.focal_y), 1.0e-8)
+    camera_points = torch.stack(
+        [x_over_z * target_depth, y_over_z * target_depth, target_depth],
+        dim=1,
+    )
+    homogeneous = torch.cat(
+        [camera_points, torch.ones_like(camera_points[:, :1])], dim=1
+    )
+    camera_to_world = torch.linalg.inv(
+        view.world_view_transform.to(device=device, dtype=dtype)
+    )
+    world_homogeneous = homogeneous @ camera_to_world
+    centers = world_homogeneous[:, :3] / world_homogeneous[
+        :, 3:4
+    ].clamp_min(1.0e-8)
+    origin = view.camera_center.to(device=device, dtype=dtype).reshape(1, 3)
+    ray = centers - origin
+    ray_distance = ray.norm(dim=1).clamp_min(1.0e-8)
+    directions = ray / ray_distance[:, None]
+    distance_per_camera_z = (
+        camera_points.norm(dim=1) / target_depth.clamp_min(1.0e-8)
+    )
+    hit_start = lower[rows, columns] * distance_per_camera_z
+    hit_end = upper[rows, columns] * distance_per_camera_z
+
+    proposals: dict[str, torch.Tensor | int] = {
+        "centers": centers.detach().cpu(),
+        "confidence": score.clamp(0.05, 1.0).detach().cpu(),
+        "camera_id": int(view.colmap_id),
+        "origins": origin.expand(len(rows), -1).detach().cpu(),
+        "directions": directions.detach().cpu(),
+        "hit_start": hit_start.detach().cpu(),
+        "hit_end": hit_end.detach().cpu(),
+    }
+    image = getattr(view, "original_image", None)
+    if image is not None:
+        image = image.to(device=device, dtype=dtype)
+        proposals["colors"] = image[:, rows, columns].T.detach().cpu()
+    audit.update(
+        {
+            "selected_proposals": int(len(rows)),
+            "mean_selected_alpha_deficit": float(
+                deficit[rows, columns].mean()
+            ),
+            "mean_selected_reliability": float(
+                reliability[rows, columns].mean()
+            ),
+            "mean_hit_interval_length": float((hit_end - hit_start).mean()),
+            "depth_coordinate": "camera_z_converted_to_unit_ray_distance",
+        }
+    )
+    return proposals, audit
+
+
+def _configure_moge3_runtime(
+    geometry,
+    seed_payload: dict,
+    args,
+) -> tuple[bool, float]:
+    """Enable MoGe fields only after a causal scene-scale calibration.
+
+    The staged runner first trains a rigid-only scaffold from a placeholder
+    foliage initialization.  That prefix deliberately has no trained-rigid
+    depth and therefore cannot contain the MoGe-to-Cambridge scale.  It is
+    valid only while every MoGe objective is disabled.  The later calibrated
+    initialization must persist one positive scale before any field is read.
+    """
+    if not geometry.moge3_records:
+        return False, 0.0
+    initialization = seed_payload.get("audit", {}).get(
+        "moge3_exact_k_front_hit", {}
+    )
+    scale = initialization.get("metric_to_cambridge_scale")
+    chart_scale_audit = dict(
+        getattr(geometry, "moge3_chart_scale_audit", {})
+    )
+    if not chart_scale_audit:
+        # Backward-compatible in-memory fixtures and old pre-v112 evidence.
+        geometry_chart = getattr(geometry, "chart", None)
+        chart_scale_audit = (
+            geometry_chart.get("moge3_base_metadata", {}).get(
+                "scale_calibration", {}
+            )
+            if geometry_chart is not None
+            else {}
+        )
+    chart_scale = chart_scale_audit.get("metric_to_cambridge_scale")
+    active = (
+        float(args.moge3_rigid_depth_weight) > 0.0
+        or float(getattr(args, "moge3_rigid_normal_weight", 0.0)) > 0.0
+        or float(args.moge3_canopy_optical_weight) > 0.0
+    )
+    if scale is None:
+        if chart_scale is not None:
+            scale = float(chart_scale)
+            initialization = chart_scale_audit
+        elif active:
+            raise RuntimeError(
+                "An active MoGe3 objective requires the clean, rigid-depth-"
+                "calibrated initialization or source-separated Chart base "
+                "with a persisted one scene-wide metric-to-Cambridge scale"
+            )
+        else:
+            return False, 0.0
+    if chart_scale is not None and abs(
+        math.log(float(scale) / float(chart_scale))
+    ) > 0.18:
+        raise RuntimeError(
+            "MoGe3 foliage and Chart scene-scale authorities disagree: "
+            f"foliage={float(scale):.6f}, chart={float(chart_scale):.6f}"
+        )
+    geometry.configure_moge3_metric_scale(float(scale))
+    global_log_sigma = float(
+        initialization.get("global_log_scale_sigma", 0.0)
+    )
+    if not math.isfinite(global_log_sigma) or global_log_sigma < 0.0:
+        raise RuntimeError(
+            "MoGe3 initialization has an invalid global log-scale sigma"
+        )
+    return True, global_log_sigma
+
+
+def _isolated_front_clipped_transparency_loss(
+    volume_white_prediction: torch.Tensor,
     surface_prediction: torch.Tensor,
     target: torch.Tensor,
     volume_alpha: torch.Tensor,
     surface_alpha: torch.Tensor,
+    surface_depth: torch.Tensor,
+    volume_depth: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    *,
+    margin: float = 0.02,
+    temperature: float = 0.015,
+    clearance: float = 0.03,
+) -> tuple[torch.Tensor, dict[str, float | int | str]]:
+    """Retire only isolated intrinsic foliage proven in front of rigid RGB."""
+    if volume_white_prediction.shape != surface_prediction.shape:
+        raise ValueError("Volume and surface counterfactual RGB shapes differ")
+    if volume_white_prediction.shape != target.shape:
+        raise ValueError("Front-clipped counterfactual target RGB differs")
+    if volume_white_prediction.ndim != 3 or volume_white_prediction.shape[0] != 3:
+        raise ValueError("Front-clipped counterfactual RGB must be [3,H,W]")
+    alpha = volume_alpha.reshape_as(task["p_rigid"]).clamp(
+        0.0, 1.0 - 1.0e-5
+    )
+    front = _strict_volume_front_mask(
+        alpha,
+        surface_alpha.reshape_as(alpha),
+        surface_depth,
+        volume_depth,
+        clearance=clearance,
+    )
+    volume_white = volume_white_prediction.detach()
+    surface = surface_prediction.detach()
+    observed = target.detach()
+    hypothetical_front = volume_white + (1.0 - alpha.detach())[None] * (
+        surface - 1.0
+    )
+    front_error = (hypothetical_front - observed).abs().mean(0)
+    surface_error = (surface - observed).abs().mean(0)
+    relative_advantage = front_error - surface_error
+    responsibility = torch.sigmoid(
+        (relative_advantage - float(margin)) / float(temperature)
+    )
+    rigid_permission = task["p_rigid"].clamp(0.0, 1.0)
+    base_weight = (
+        responsibility
+        * surface_alpha.detach().reshape_as(alpha).clamp(0.0, 1.0)
+        * task.get("w_rgb", torch.ones_like(rigid_permission))
+        * (1.0 - task.get("p_transient", torch.zeros_like(rigid_permission)))
+        * _boundary_evidence_weight(task)
+    )
+    evidence_weight = (
+        base_weight * rigid_permission * front.to(base_weight.dtype)
+    ).detach()
+    optical_depth = -torch.log1p(-alpha)
+    loss = _weighted_mean(optical_depth, evidence_weight)
+    supported = evidence_weight > 1.0e-4
+    rigid_candidate = rigid_permission > 1.0e-4
+    behind_or_invalid = rigid_candidate & ~front
+    return loss, {
+        "contract": ISOLATED_FRONT_CLIPPED_TRANSPARENCY_CONTRACT,
+        "supported_pixels": int(supported.sum()),
+        "front_pixels": int((rigid_candidate & front).sum()),
+        "behind_or_invalid_pixels_rejected": int(behind_or_invalid.sum()),
+        "mean_responsibility": (
+            float(responsibility[supported].mean())
+            if bool(supported.any())
+            else 0.0
+        ),
+        "mean_relative_rgb_advantage": (
+            float(relative_advantage[supported].mean())
+            if bool(supported.any())
+            else 0.0
+        ),
+        "mean_volume_alpha_on_support": (
+            float(alpha.detach()[supported].mean())
+            if bool(supported.any())
+            else 0.0
+        ),
+        "clearance": float(clearance),
+        "gradient_owner": "intrinsic_volume_geometry_and_optical_depth_only",
+    }
+
+
+def _canonical_occlusion_completion_loss(
+    volume_white_prediction: torch.Tensor,
+    surface_prediction: torch.Tensor,
+    target: torch.Tensor,
+    volume_alpha: torch.Tensor,
+    surface_alpha: torch.Tensor,
+    surface_depth: torch.Tensor,
+    volume_depth: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    *,
+    canonical_view: bool,
+    maximum_optical_scale: float = 4.0,
+    surface_leakage_tolerance: float = 0.03,
+    advantage_margin: float = 0.005,
+    advantage_temperature: float = 0.02,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Increase intrinsic foliage extinction only in the correct depth layer.
+
+    ``volume_white_prediction`` and ``volume_alpha/depth`` come from a
+    surface-zero render of durable static foliage.  They are intrinsic layer
+    quantities, unlike the mixed-kernel role maps ``sum(T_before * alpha)``.
+    With white renderer background, the detached hypothetical image for the
+    volume in front of the calibrated surface is
+
+        C_front = V_white + (1 - A_v) * (S - 1).
+
+    Projecting ``G-S`` onto ``C_front-S`` gives a bounded multiplicative
+    optical-depth request.  There is deliberately no semantic visibility
+    floor: an exactly unsupported ray is topology/ray-birth responsibility,
+    and foliage currently behind the surface receives no opacity gradient.
+    """
+    if volume_white_prediction.shape != surface_prediction.shape:
+        raise ValueError("Volume and surface counterfactual RGB shapes differ")
+    if volume_white_prediction.shape != target.shape:
+        raise ValueError("Canonical occlusion target RGB shape differs")
+    if (
+        volume_white_prediction.ndim != 3
+        or volume_white_prediction.shape[0] != 3
+    ):
+        raise ValueError("Canonical occlusion RGB tensors must be [3,H,W]")
+    if float(maximum_optical_scale) <= 1.0:
+        raise ValueError("maximum_optical_scale must be greater than one")
+    if float(surface_leakage_tolerance) <= 0.0:
+        raise ValueError("surface_leakage_tolerance must be positive")
+    if float(advantage_margin) < 0.0:
+        raise ValueError("advantage_margin cannot be negative")
+    if float(advantage_temperature) <= 0.0:
+        raise ValueError("advantage_temperature must be positive")
+
+    alpha = volume_alpha.reshape_as(task["p_canopy_core"]).clamp(
+        0.0, 1.0 - 1.0e-5
+    )
+    zero = alpha.sum() * 0.0
+    audit: dict[str, object] = {
+        "contract": CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+        "canonical_view": bool(canonical_view),
+        "supported_pixels": 0,
+        "directional_supported_pixels": 0,
+        "visibility_floor_supported_pixels": 0,
+        "ordering_conflict_pixels": 0,
+        "mean_responsibility": 0.0,
+        "mean_optical_scale": 1.0,
+        "mean_current_alpha": 0.0,
+        "mean_target_alpha": 0.0,
+        "mean_volume_front_probability": 0.0,
+        "maximum_optical_scale": float(maximum_optical_scale),
+        "surface_leakage_tolerance": float(surface_leakage_tolerance),
+        "mean_visibility_floor_alpha": 0.0,
+        "gradient_owner": "volume_opacity_only",
+        "volume_source": "surface_zero_intrinsic_layer",
+        "geometry_order_conflict_gradient": False,
+        "noncanonical_positive_updates_blocked": not bool(canonical_view),
+    }
+    if not canonical_view:
+        return zero, audit
+
+    volume_white = volume_white_prediction.detach()
+    surface = surface_prediction.detach()
+    observed = target.detach()
+    detached_alpha = alpha.detach()
+    volume_front = volume_white + (1.0 - detached_alpha)[None] * (
+        surface - 1.0
+    )
+    foliage_effect = volume_front - surface
+    effect_energy = foliage_effect.square().sum(0)
+    requested_projection = (
+        (observed - surface) * foliage_effect
+    ).sum(0) / (effect_energy + 1.0e-6)
+    optical_scale = requested_projection.clamp(
+        1.0, float(maximum_optical_scale)
+    )
+
+    mixed_error = (volume_front - observed).abs().mean(0)
+    surface_error = (surface - observed).abs().mean(0)
+    positive_advantage = surface_error - mixed_error
+    responsibility = torch.sigmoid(
+        (positive_advantage - float(advantage_margin))
+        / float(advantage_temperature)
+    )
+    # Fade continuously when the hypothetical front composite and S are
+    # indistinguishable.  Such a ray has
+    # no RGB evidence for the direction of an opacity correction and remains
+    # the responsibility of calibrated hit/ray-birth factors.
+    effect_support = effect_energy / (effect_energy + 0.03**2)
+    volume_support = (detached_alpha / 0.005).clamp(0.0, 1.0)
+
+    surface_z = surface_depth.reshape_as(alpha).detach()
+    volume_z = volume_depth.reshape_as(alpha).detach()
+    surface_contribution = surface_alpha.reshape_as(alpha).detach().clamp(0, 1)
+    both_valid = (
+        (surface_z > 0)
+        & torch.isfinite(surface_z)
+        & (volume_z > 0)
+        & torch.isfinite(volume_z)
+    )
+    depth_softness = (0.04 + 0.015 * volume_z.clamp_min(0)).clamp(0.04, 0.25)
+    front_order = both_valid & (volume_z <= surface_z - 0.03)
+    volume_in_front = torch.where(
+        front_order,
+        torch.sigmoid(
+            (surface_z - volume_z - 0.03) / depth_softness
+        ),
+        torch.zeros_like(alpha),
+    )
+    surface_support = (surface_contribution / 0.05).clamp(0.0, 1.0)
+    canopy = task.get("p_canopy", task["p_canopy_core"]).clamp(0.0, 1.0)
+    common_weight = (
+        canopy
+        * task.get("w_rgb", torch.ones_like(canopy))
+        * (1.0 - task.get("p_transient", torch.zeros_like(canopy)))
+        * _boundary_evidence_weight(task)
+        * surface_support
+    ).detach()
+    surface_residual = (surface - observed).abs().mean(0)
+    leakage_excess = (
+        surface_residual - float(surface_leakage_tolerance)
+    ).clamp_min(0.0)
+    leakage_support = leakage_excess / (
+        leakage_excess + float(surface_leakage_tolerance)
+    ).clamp_min(1.0e-8)
+    directional_weight = (
+        common_weight
+        * effect_support
+        * responsibility
+        * volume_support
+        * leakage_support
+        * volume_in_front
+    ).detach()
+    evidence_weight = directional_weight
+
+    optical_depth = -torch.log1p(-alpha)
+    directional_target_optical_depth = (
+        optical_depth.detach() * optical_scale.detach()
+    )
+    target_optical_depth = directional_target_optical_depth
+    loss_map = F.smooth_l1_loss(
+        optical_depth,
+        target_optical_depth,
+        reduction="none",
+        beta=0.10,
+    )
+    # ``loss_map`` is scalar per pixel. _weighted_mean interprets a leading
+    # dimension as channels, so keep that scalar channel explicit. Passing
+    # [H,W] here made the old call divide by ``H`` (360 in production),
+    # reducing this corrective gradient by exactly one image height while
+    # the support/target audits still looked correct.
+    loss = _weighted_mean(loss_map[None], evidence_weight)
+
+    requests_directional_growth = optical_scale > 1.001
+    requests_growth = target_optical_depth > optical_depth.detach() + 1.0e-4
+    supported = (evidence_weight > 1.0e-4) & requests_growth
+    # The same positive RGB evidence is useful for diagnosis when its current
+    # volume is behind the structural layer, but it must not create opacity.
+    ordering_weight = (
+        common_weight
+        * effect_support
+        * responsibility
+        * volume_support
+        * leakage_support
+        * requests_directional_growth
+        * (1.0 - volume_in_front)
+        * requests_growth
+    ).detach()
+    ordering_conflict = ordering_weight > 1.0e-4
+    target_alpha = -torch.expm1(-target_optical_depth)
+    if bool(supported.any()):
+        audit.update(
+            {
+                "supported_pixels": int(supported.sum()),
+                "directional_supported_pixels": int(
+                    (
+                        (directional_weight > 1.0e-4)
+                        & requests_directional_growth
+                    ).sum()
+                ),
+                "visibility_floor_supported_pixels": 0,
+                "mean_responsibility": float(
+                    responsibility[supported].mean()
+                ),
+                "mean_optical_scale": float(
+                    optical_scale[supported].mean()
+                ),
+                "mean_current_alpha": float(alpha.detach()[supported].mean()),
+                "mean_target_alpha": float(target_alpha[supported].mean()),
+                "mean_volume_front_probability": float(
+                    volume_in_front[supported].mean()
+                ),
+                "mean_visibility_floor_alpha": 0.0,
+            }
+        )
+    audit["ordering_conflict_pixels"] = int(ordering_conflict.sum())
+    audit["ordering_conflict_weight"] = float(ordering_weight.sum())
+    audit["loss_normalization"] = (
+        "one_scalar_channel_over_weighted_pixels"
+    )
+    return loss, audit
+
+
+CANONICAL_OCCLUSION_ORDER_PREDECESSOR_CONTRACT = (
+    "scene_canonical_detached_rgb_counterfactual_routes_only_wrong_depth_"
+    "order_to_volume_xyz__surface_geometry_opacity_rgb_sh_and_volume_"
+    "opacity_rgb_sh_read_only__noncanonical_tree_pixels_unknown"
+)
+CANONICAL_OCCLUSION_ORDER_V104_PREDECESSOR_CONTRACT = (
+    "scene_canonical_surface_zero_resolved_multiview_local_owner_layer__"
+    "forward_contributors_equal_live_xyz_owners__detached_volume_front_rgb_"
+    "advantage_routes_wrong_depth_order_only_along_camera_ray__opacity_growth_"
+    "is_not_a_permission__initialization_ball_and_adam_momentum_hard_bound__"
+    "surface_and_all_appearance_opacity_read_only__noncanonical_tree_pixels_"
+    "unknown"
+)
+CANONICAL_OCCLUSION_ORDER_CONTRACT = (
+    "scene_canonical_surface_zero_resolved_multiview_local_owner_layer__"
+    "forward_contributors_equal_live_xyz_owners__detached_volume_front_rgb_"
+    "advantage_routes_wrong_depth_order_only_along_camera_ray__opacity_growth_"
+    "is_not_a_permission__initialization_ball_and_adam_momentum_hard_bound__"
+    "surface_and_all_appearance_opacity_read_only__primitive_gradient_rows_"
+    "bounded_per_supported_pixel__noncanonical_tree_pixels_unknown"
+)
+CANONICAL_OCCLUSION_ORDER_MAXIMUM_ROWS_PER_PIXEL = 8
+
+
+def _cap_canonical_occlusion_order_gradient_responsibility(
+    order_gradient: torch.Tensor,
+    *,
+    supported_pixels: int,
+    maximum_rows_per_pixel: int = (
+        CANONICAL_OCCLUSION_ORDER_MAXIMUM_ROWS_PER_PIXEL
+    ),
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Bound aggregate-depth ambiguity to a finite primitive budget.
+
+    The isolated raster pass produces a correct pixel loss, but its normalized
+    depth is an aggregate and may give a tiny gradient to every overlapping
+    primitive.  Until the CUDA API exposes exact per-pixel primitive IDs,
+    retain the strongest ray-aligned responsibilities with a conservative
+    finite layer budget.  This cannot create a gradient or change direction.
+    """
+    if order_gradient.ndim != 2 or order_gradient.shape[1] != 3:
+        raise ValueError("Canonical order gradient must have shape [N,3]")
+    if int(supported_pixels) < 0 or int(maximum_rows_per_pixel) <= 0:
+        raise ValueError("Canonical order responsibility bounds are invalid")
+    gradient_norm = order_gradient.norm(dim=1)
+    before = int((gradient_norm > 0).sum())
+    maximum_rows = int(supported_pixels) * int(maximum_rows_per_pixel)
+    if before <= maximum_rows:
+        return order_gradient, {
+            "gradient_rows_before_responsibility_cap": before,
+            "maximum_gradient_rows": maximum_rows,
+            "responsibility_cap_rows_blocked": 0,
+        }
+    nonzero_rows = torch.nonzero(
+        gradient_norm > 0, as_tuple=False
+    ).reshape(-1)
+    keep = torch.topk(
+        gradient_norm[nonzero_rows],
+        k=maximum_rows,
+        largest=True,
+        sorted=False,
+    ).indices
+    keep_mask = torch.zeros_like(gradient_norm, dtype=torch.bool)
+    keep_mask[nonzero_rows[keep]] = True
+    capped = order_gradient.clone()
+    capped[~keep_mask] = 0
+    return capped, {
+        "gradient_rows_before_responsibility_cap": before,
+        "maximum_gradient_rows": maximum_rows,
+        "responsibility_cap_rows_blocked": before - maximum_rows,
+    }
+
+
+def _canonical_occlusion_order_loss(
+    volume_white_prediction: torch.Tensor,
+    surface_prediction: torch.Tensor,
+    target: torch.Tensor,
+    volume_alpha: torch.Tensor,
+    surface_alpha: torch.Tensor,
+    surface_depth: torch.Tensor,
+    volume_depth: torch.Tensor,
+    task: dict[str, torch.Tensor],
+    *,
+    canonical_view: bool,
+    clearance: float = 0.03,
+    maximum_forward_shift: float = 0.25,
+    maximum_optical_scale: float = 4.0,
+    surface_leakage_tolerance: float = 0.03,
+    advantage_margin: float = 0.005,
+    advantage_temperature: float = 0.02,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Repair only the depth order of canonical foliage occlusion evidence.
+
+    This is the geometry counterpart of
+    :func:`_canonical_occlusion_completion_loss`.  The detached RGB
+    counterfactual uses a surface-zero intrinsic volume layer to establish
+    how that foliage would affect the real target if placed in front.  This
+    evidence remains available when the authoritative mixed compositor has
+    hidden the volume behind an opaque facade.  Where the structural layer
+    sorts in front, live volume depth is pulled to
+    ``surface_depth-clearance``.
+
+    The caller supplies this depth from a geometry-only render and backprops
+    exclusively to ``foliage.xyz``.  Deleting the facade, painting either
+    branch, or increasing opacity cannot reduce this loss.
+    """
+    if volume_white_prediction.shape != surface_prediction.shape:
+        raise ValueError("Volume and surface counterfactual RGB shapes differ")
+    if volume_white_prediction.shape != target.shape:
+        raise ValueError("Canonical occlusion target RGB shape differs")
+    if (
+        volume_white_prediction.ndim != 3
+        or volume_white_prediction.shape[0] != 3
+    ):
+        raise ValueError("Canonical occlusion RGB tensors must be [3,H,W]")
+    if float(clearance) < 0.0:
+        raise ValueError("Canonical occlusion order clearance cannot be negative")
+    if float(maximum_forward_shift) <= 0.0:
+        raise ValueError(
+            "Canonical occlusion maximum forward shift must be positive"
+        )
+    if float(maximum_optical_scale) <= 1.0:
+        raise ValueError("maximum_optical_scale must be greater than one")
+    if float(surface_leakage_tolerance) <= 0.0:
+        raise ValueError("surface_leakage_tolerance must be positive")
+    if float(advantage_margin) < 0.0:
+        raise ValueError("advantage_margin cannot be negative")
+    if float(advantage_temperature) <= 0.0:
+        raise ValueError("advantage_temperature must be positive")
+
+    live_volume_z = volume_depth.reshape_as(task["p_canopy_core"])
+    zero = live_volume_z.sum() * 0.0
+    audit: dict[str, object] = {
+        "contract": CANONICAL_OCCLUSION_ORDER_CONTRACT,
+        "canonical_view": bool(canonical_view),
+        "supported_pixels": 0,
+        "mean_depth_violation": 0.0,
+        "mean_requested_forward_shift": 0.0,
+        "out_of_trust_region_pixels": 0,
+        "mean_rejected_forward_shift": 0.0,
+        "mean_optical_scale": 1.0,
+        "clearance": float(clearance),
+        "maximum_forward_shift": float(maximum_forward_shift),
+        "surface_leakage_tolerance": float(surface_leakage_tolerance),
+        "gradient_owner": "volume_xyz_only",
+        "volume_source": "surface_zero_intrinsic_layer",
+        "surface_retirement_authorized": False,
+        "opacity_gradient_authorized": False,
+        "noncanonical_geometry_updates_blocked": not bool(canonical_view),
+    }
+    if not canonical_view:
+        return zero, audit
+
+    volume_white = volume_white_prediction.detach()
+    surface = surface_prediction.detach()
+    observed = target.detach()
+    detached_alpha = volume_alpha.reshape_as(live_volume_z).detach().clamp(
+        0.0, 1.0 - 1.0e-5
+    )
+    volume_front = volume_white + (1.0 - detached_alpha)[None] * (
+        surface - 1.0
+    )
+    foliage_effect = volume_front - surface
+    effect_energy = foliage_effect.square().sum(0)
+    requested_projection = (
+        (observed - surface) * foliage_effect
+    ).sum(0) / (effect_energy + 1.0e-6)
+    optical_scale = requested_projection.clamp(
+        1.0, float(maximum_optical_scale)
+    )
+
+    mixed_error = (volume_front - observed).abs().mean(0)
+    surface_error = (surface - observed).abs().mean(0)
+    responsibility = torch.sigmoid(
+        (surface_error - mixed_error - float(advantage_margin))
+        / float(advantage_temperature)
+    )
+    effect_support = effect_energy / (effect_energy + 0.03**2)
+    surface_contribution = surface_alpha.reshape_as(live_volume_z).detach().clamp(0, 1)
+    volume_contribution = detached_alpha
+    surface_z = surface_depth.reshape_as(live_volume_z).detach()
+    detached_volume_z = live_volume_z.detach()
+    both_valid = (
+        (surface_z > float(clearance))
+        & torch.isfinite(surface_z)
+        & (detached_volume_z > 0)
+        & torch.isfinite(detached_volume_z)
+    )
+    target_volume_z = (surface_z - float(clearance)).clamp_min(1.0e-4)
+    requested_forward_shift = (
+        detached_volume_z - target_volume_z
+    ).clamp_min(0.0)
+    wrong_order = both_valid & (requested_forward_shift > 0.0)
+    local_order = wrong_order & (
+        requested_forward_shift <= float(maximum_forward_shift)
+    )
+    depth_softness = (
+        0.04 + 0.015 * detached_volume_z.clamp_min(0)
+    ).clamp(0.04, 0.25)
+    normalized_violation = (
+        live_volume_z - target_volume_z
+    ) / depth_softness
+    detached_violation = normalized_violation.detach()
+    surface_in_front = torch.where(
+        wrong_order,
+        torch.sigmoid(detached_violation),
+        torch.zeros_like(detached_violation),
+    )
+
+    canopy = task.get("p_canopy", task["p_canopy_core"]).clamp(0.0, 1.0)
+    surface_residual = (surface - observed).abs().mean(0)
+    leakage_excess = (
+        surface_residual - float(surface_leakage_tolerance)
+    ).clamp_min(0.0)
+    leakage_support = leakage_excess / (
+        leakage_excess + float(surface_leakage_tolerance)
+    ).clamp_min(1.0e-8)
+    evidence_weight = (
+        canopy
+        * task.get("w_rgb", torch.ones_like(canopy))
+        * (1.0 - task.get("p_transient", torch.zeros_like(canopy)))
+        * _boundary_evidence_weight(task)
+        * (surface_contribution / 0.05).clamp(0.0, 1.0)
+        * (volume_contribution / 0.01).clamp(0.0, 1.0)
+        * effect_support
+        * responsibility
+        * leakage_support
+        * surface_in_front
+        * local_order
+    ).detach()
+    # A one-sided Huber hinge has zero incentive to move already-correct
+    # foliage farther forward.  Keep the scalar channel explicit so spatial
+    # normalization cannot accidentally divide by image height.
+    violation = normalized_violation.clamp_min(0.0)
+    loss_map = F.smooth_l1_loss(
+        violation, torch.zeros_like(violation), reduction="none", beta=1.0
+    )
+    loss = _weighted_mean(loss_map[None], evidence_weight)
+    supported = evidence_weight > 1.0e-4
+    otherwise_supported = (
+        canopy
+        * task.get("w_rgb", torch.ones_like(canopy))
+        * (1.0 - task.get("p_transient", torch.zeros_like(canopy)))
+        * _boundary_evidence_weight(task)
+        * (surface_contribution / 0.05).clamp(0.0, 1.0)
+        * (volume_contribution / 0.01).clamp(0.0, 1.0)
+        * effect_support
+        * responsibility
+        * leakage_support
+        * surface_in_front
+    ).detach() > 1.0e-4
+    rejected = otherwise_supported & ~local_order
+    audit["out_of_trust_region_pixels"] = int(rejected.sum())
+    if bool(rejected.any()):
+        audit["mean_rejected_forward_shift"] = float(
+            requested_forward_shift[rejected].mean()
+        )
+    if bool(supported.any()):
+        audit.update(
+            {
+                "supported_pixels": int(supported.sum()),
+                "mean_depth_violation": float(
+                    requested_forward_shift[supported].mean()
+                ),
+                "mean_requested_forward_shift": float(
+                    requested_forward_shift[supported].mean()
+                ),
+                "mean_optical_scale": float(
+                    optical_scale[supported].mean()
+                ),
+                "mean_responsibility": float(
+                    responsibility[supported].mean()
+                ),
+                "loss_normalization": (
+                    "one_scalar_channel_over_weighted_pixels"
+                ),
+            }
+        )
+    return loss, audit
+
+
+def _static_detail_global_cleanup_loss(
+    mixed_prediction: torch.Tensor,
+    surface_prediction: torch.Tensor,
+    target: torch.Tensor,
+    volume_contribution_alpha: torch.Tensor,
     task: dict[str, torch.Tensor],
     *,
     counterfactual_weight: float,
     margin: float = 0.02,
     temperature: float = 0.015,
 ) -> tuple[torch.Tensor, dict[str, object]]:
-    """Apply only negative, globally valid evidence to static leaf detail.
+    """Retire only harmful, actually front-contributing static detail.
 
-    Static detail is visible in every deployment camera.  Its RGB and
-    positive hit evidence must remain owned by the internally consistent
-    canonical support set, but a primitive that occludes a rigid surface or
-    occupies calibrated free space in *any* camera is globally invalid.  The
-    former shared ownership gate blocked those contradictions together with
-    appearance, leaving cross-sequence tree splats painted over buildings.
-
-    This objective depends on the detail-only rendered alpha.  RGB values are
-    detached inside the counterfactual and are used only to decide whether
-    the immutable surface is the better explanation.  Consequently it can
-    update projected geometry and optical mass, never SH, surface, sky,
-    uncertainty or topology.
+    The native mixed kernel has already sorted every surface ray intersection
+    and volume event for each pixel. ``volume_contribution_alpha`` is its
+    ``sum(T_before * alpha)`` attribution for the owner-isolated detail rows.
+    It is intentionally *not* converted to optical depth. A volume behind an
+    opaque surface contributes zero, while a front-running footprint remains
+    live. Detached mixed-vs-surface RGB decides whether that contribution is
+    harmful. The contribution is support, not the optimized scalar: the live
+    mixed RGB derivative assigns a signed opacity effect to every primitive.
+    A correct leaf behind a wrong leaf therefore receives a beneficial
+    (growth-direction) derivative that the negative-only caller blocks,
+    instead of inheriting the wrong leaf's retirement request.
     """
     if float(counterfactual_weight) < 0:
         raise ValueError("counterfactual_weight cannot be negative")
-    counterfactual, counterfactual_audit = (
-        _counterfactual_volume_transparency_loss(
-            mixed_prediction,
-            surface_prediction,
-            target,
-            volume_alpha,
-            surface_alpha,
-            task,
-            margin=margin,
-            temperature=temperature,
-        )
+    if mixed_prediction.shape != surface_prediction.shape:
+        raise ValueError("Mixed and surface cleanup RGB shapes differ")
+    if mixed_prediction.shape != target.shape:
+        raise ValueError("Static detail cleanup target RGB shape differs")
+    if mixed_prediction.ndim != 3 or mixed_prediction.shape[0] != 3:
+        raise ValueError("Static detail cleanup RGB tensors must be [3,H,W]")
+    if float(margin) < 0 or float(temperature) <= 0:
+        raise ValueError("Cleanup margin/temperature are invalid")
+    contribution = volume_contribution_alpha.reshape_as(
+        task["p_rigid"]
+    ).clamp(0.0, 1.0)
+    live_mixed_error = (
+        mixed_prediction - target.detach()
+    ).abs().mean(0)
+    mixed_error = live_mixed_error.detach()
+    surface_error = (
+        surface_prediction.detach() - target.detach()
+    ).abs().mean(0)
+    harmful_excess = (
+        mixed_error - surface_error - float(margin)
+    ).clamp_min(0.0)
+    harmful_responsibility = harmful_excess / (
+        harmful_excess + float(temperature)
     )
-    alpha = volume_alpha.reshape_as(task["p_rigid"]).clamp(
-        0.0, 1.0 - 1e-5
-    )
-    rigid_free_weight = (
-        (task["p_rigid"] + 0.35 * task["p_sky"]).clamp(0.0, 1.0)
+    rigid_weight = (
+        task["p_rigid"].clamp(0.0, 1.0)
+        * harmful_responsibility
         * task.get("w_rgb", torch.ones_like(task["p_rigid"]))
         * (1.0 - task.get("p_transient", torch.zeros_like(task["p_rigid"])))
         * _boundary_evidence_weight(task)
     ).detach()
-    rigid_free = _weighted_mean(
-        -torch.log1p(-alpha), rigid_free_weight
+    sky_weight = (
+        0.35
+        * task["p_sky"].clamp(0.0, 1.0)
+        * task.get("w_rgb", torch.ones_like(task["p_rigid"]))
+        * (1.0 - task.get("p_transient", torch.zeros_like(task["p_rigid"])))
+    ).detach()
+    evidence_weight = (
+        float(counterfactual_weight) * rigid_weight + sky_weight
     )
-    objective = rigid_free + float(counterfactual_weight) * counterfactual
+    evidence_weight = (
+        evidence_weight
+        * (contribution.detach() > 1.0e-6).to(evidence_weight.dtype)
+    ).detach()
+    objective = _weighted_mean(live_mixed_error[None], evidence_weight)
+    supported = (evidence_weight > 1.0e-4) & (
+        contribution.detach() > 1.0e-6
+    )
+    rigid_candidates = task["p_rigid"] > 1.0e-4
     return objective, {
         "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
-        "rigid_free": float(rigid_free.detach()),
-        "rigid_free_supported_pixels": int(
-            (rigid_free_weight > 1e-4).sum()
+        "rigid_free": float(objective.detach()),
+        "rigid_free_supported_pixels": int(supported.sum()),
+        "rigid_volume_front_pixels": int(
+            (rigid_candidates & (contribution.detach() > 1.0e-6)).sum()
         ),
+        "rigid_behind_or_invalid_pixels_rejected": int(
+            (rigid_candidates & (contribution.detach() <= 1.0e-6)).sum()
+        ),
+        "harmful_rigid_pixels": int(
+            (rigid_candidates & (harmful_excess > 0)).sum()
+        ),
+        "beneficial_or_neutral_rigid_pixels_blocked": int(
+            (rigid_candidates & (harmful_excess <= 0)).sum()
+        ),
+        "mean_harmful_excess": (
+            float(harmful_excess[supported].mean())
+            if bool(supported.any())
+            else 0.0
+        ),
+        "mean_native_volume_contribution": (
+            float(contribution.detach()[supported].mean())
+            if bool(supported.any())
+            else 0.0
+        ),
+        "volume_source": "native_mixed_per_pixel_sorted_contribution_support",
+        "optimized_quantity": "signed_live_mixed_rgb_opacity_derivative",
         "counterfactual_weight": float(counterfactual_weight),
-        "counterfactual": counterfactual_audit,
+        "counterfactual": {
+            "contract": (
+                "detached_mixed_minus_surface_rgb_harm_exact_zero_when_"
+                "beneficial_or_neutral"
+            ),
+            "supported_pixels": int(supported.sum()),
+            "mean_responsibility": (
+                float(harmful_responsibility[supported].mean())
+                if bool(supported.any())
+                else 0.0
+            ),
+        },
         "gradient_permissions": {
-            "verified_exact_static_detail_xyz_scale_rotation": True,
-            "positive_evidence_sequence_static_detail_optical_mass": True,
+            "static_detail_xyz_scale_rotation": False,
+            "persistent_static_detail_global_negative_optical_mass": True,
             "static_detail_sh": False,
             "surface_sky_uncertainty": False,
             "topology_statistics": False,
@@ -6584,69 +9692,46 @@ def _persistent_envelope_global_cleanup_loss(
     mixed_prediction: torch.Tensor,
     surface_prediction: torch.Tensor,
     target: torch.Tensor,
-    volume_alpha: torch.Tensor,
-    surface_alpha: torch.Tensor,
+    volume_contribution_alpha: torch.Tensor,
     task: dict[str, torch.Tensor],
     *,
     counterfactual_weight: float,
     margin: float = 0.02,
     temperature: float = 0.015,
 ) -> tuple[torch.Tensor, dict[str, object]]:
-    """Route globally valid contradictions to the persistent envelope only.
+    """Route exact native wall-front contradictions to envelope opacity.
 
-    The envelope is a deployable, unconditional low-frequency volume.  A
-    canonical tree mask is therefore insufficient authority to keep it in
-    front of a rigid surface that explains the same calibrated ray better.
-    Rendering this role in isolation also prevents leaf/detail alpha from
-    hiding the envelope's own counterfactual responsibility.
-
-    As with static-detail cleanup, RGB and the immutable surface participate
-    only as detached evidence.  This path can shrink, move or reduce envelope
-    optical mass, but cannot recolour it or request topology capacity.
+    The envelope is a deployable, unconditional low-frequency volume. A
+    rigid surface can contradict it only on caller-declared known pixels;
+    noncanonical observed/projected tree unions are unknown.
+    The native mixed renderer sorts surface intersections and envelope events
+    per pixel. Its ``sum(T_before * alpha)`` attribution is zero for an
+    envelope behind an opaque facade and positive only for actual visible
+    contribution. It is support only; signed live mixed-RGB derivatives own
+    per-primitive opacity retirement. No aggregate layer depth is used.
     """
-    if float(counterfactual_weight) < 0:
-        raise ValueError("counterfactual_weight cannot be negative")
-    counterfactual, counterfactual_audit = (
-        _counterfactual_volume_transparency_loss(
-            mixed_prediction,
-            surface_prediction,
-            target,
-            volume_alpha,
-            surface_alpha,
-            task,
-            margin=margin,
-            temperature=temperature,
-        )
+    objective, audit = _static_detail_global_cleanup_loss(
+        mixed_prediction,
+        surface_prediction,
+        target,
+        volume_contribution_alpha,
+        task,
+        counterfactual_weight=counterfactual_weight,
+        margin=margin,
+        temperature=temperature,
     )
-    alpha = volume_alpha.reshape_as(task["p_rigid"]).clamp(
-        0.0, 1.0 - 1e-5
+    audit["contract"] = PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT
+    audit["volume_source"] = (
+        "native_mixed_per_pixel_sorted_envelope_contribution_support"
     )
-    rigid_free_weight = (
-        (task["p_rigid"] + 0.35 * task["p_sky"]).clamp(0.0, 1.0)
-        * task.get("w_rgb", torch.ones_like(task["p_rigid"]))
-        * (1.0 - task.get("p_transient", torch.zeros_like(task["p_rigid"])))
-        * _boundary_evidence_weight(task)
-    ).detach()
-    rigid_free = _weighted_mean(
-        -torch.log1p(-alpha), rigid_free_weight
-    )
-    objective = rigid_free + float(counterfactual_weight) * counterfactual
-    return objective, {
-        "contract": PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
-        "rigid_free": float(rigid_free.detach()),
-        "rigid_free_supported_pixels": int(
-            (rigid_free_weight > 1e-4).sum()
-        ),
-        "counterfactual_weight": float(counterfactual_weight),
-        "counterfactual": counterfactual_audit,
-        "gradient_permissions": {
-            "persistent_envelope_xyz_scale_rotation": True,
-            "persistent_envelope_optical_mass": True,
-            "persistent_envelope_sh": False,
-            "surface_sky_uncertainty": False,
-            "topology_statistics": False,
-        },
+    audit["gradient_permissions"] = {
+        "persistent_envelope_xyz_scale_rotation": False,
+        "persistent_envelope_optical_mass": True,
+        "persistent_envelope_sh": False,
+        "surface_sky_uncertainty": False,
+        "topology_statistics": False,
     }
+    return objective, audit
 
 
 def _initialize_surface(
@@ -7232,9 +10317,7 @@ def _write_rigid_stage_surface_handoff(
             }
         )
     destination = output / "rigid_surface_handoff.json"
-    destination.write_text(
-        json.dumps(handoff, indent=2) + "\n", encoding="utf-8"
-    )
+    _write_json_atomic(destination, handoff)
     return destination
 
 
@@ -8004,6 +11087,8 @@ def _backward_conditioned_foliage(
     loss: torch.Tensor,
     foliage,
     volume_means2d: torch.Tensor | None,
+    *,
+    retain_graph: bool = True,
 ) -> None:
     """Backpropagate leaf ownership and preserve its topology signal.
 
@@ -8018,7 +11103,53 @@ def _backward_conditioned_foliage(
     inputs = tuple(foliage.parameters())
     if volume_means2d is not None and volume_means2d.requires_grad:
         inputs = (*inputs, volume_means2d)
-    torch.autograd.backward(loss, inputs=inputs, retain_graph=True)
+    torch.autograd.backward(
+        loss, inputs=inputs, retain_graph=bool(retain_graph)
+    )
+
+
+def _backward_canonical_with_foliage_supplement(
+    canonical_loss: torch.Tensor,
+    foliage_supplement: torch.Tensor,
+    foliage,
+    *,
+    foliage_active: bool,
+) -> torch.Tensor | None:
+    """Backpropagate a shared render graph with bounded lifetime.
+
+    Canonical RGB updates all normal owners, while the additional canopy
+    objective updates foliage only. The historical order ran the full
+    canonical backward with ``retain_graph=True`` and kept its largest mixed
+    render graph alive for a second traversal. At outdoor scale that made the
+    real backward compete with a retained graph for the last few hundred MiB.
+
+    Traverse the narrower foliage-only supplement first, retain once, then
+    run the full canonical backward without retention so saved rasterizer
+    tensors are released as soon as their last consumer executes. Return the
+    canonical-only opacity component expected by the downstream policy audit;
+    the accumulated live gradients remain exactly canonical + supplement.
+    """
+    supplement_opacity_gradient = None
+    if foliage_active:
+        torch.autograd.backward(
+            foliage_supplement,
+            inputs=tuple(foliage.parameters()),
+            retain_graph=True,
+        )
+        supplement_opacity_gradient = (
+            foliage.opacity_logits.grad.detach().clone()
+            if foliage.opacity_logits.grad is not None
+            else torch.zeros_like(foliage.opacity_logits)
+        )
+    canonical_loss.backward()
+    if not foliage_active:
+        return None
+    total_opacity_gradient = (
+        foliage.opacity_logits.grad.detach().clone()
+        if foliage.opacity_logits.grad is not None
+        else torch.zeros_like(foliage.opacity_logits)
+    )
+    return total_opacity_gradient - supplement_opacity_gradient
 
 
 def _confirmed_contradiction_fraction(
@@ -8633,6 +11764,7 @@ def _refresh_split_child_owner_colors(
     child_start: int,
     owner_camera_ids: torch.Tensor,
     view_by_camera_id: dict[int, object],
+    canonical_rgb_sequence: str | None = None,
     support_fallback_enabled: bool = True,
     geometry_evidence=None,
     foliage_ray_evidence: FoliageRayEvidence | None = None,
@@ -8640,12 +11772,13 @@ def _refresh_split_child_owner_colors(
     """Re-anchor optical children to full-resolution immutable RGB evidence.
 
     Copying a broad parent's optimized DC colour into every child preserves
-    the very low-pass appearance that subdivision is meant to remove.  For
-    exact-owner leaf rows, project each new child into its calibrated source
-    camera.  For a canonical child, robustly pool the calibrated observations
-    whose measured depth is consistent with the child's current projection.
-    Both paths sample the immutable native target with pixel-centre bilinear
-    coordinates; no camera-plane appearance grid participates.
+    the very low-pass appearance that subdivision is meant to remove. For an
+    exact-owner leaf row, project each new child into its calibrated source
+    camera. For a canonical child, robustly pool depth-consistent calibrated
+    observations from the selected scene snapshot only. Cross-sequence
+    support remains geometry evidence but never becomes subdivision RGB
+    authority. Both paths sample the immutable native target with pixel-centre
+    bilinear coordinates; no camera-plane appearance grid participates.
     """
     owner_camera_ids = torch.as_tensor(
         owner_camera_ids,
@@ -8681,6 +11814,9 @@ def _refresh_split_child_owner_colors(
             "ray_source_pixel_distance_maximum": 0.0,
             "ray_depth_confidence_mean": 0.0,
             "owner_camera_count": 0,
+            "canonical_rgb_sequence": canonical_rgb_sequence,
+            "noncanonical_rgb_camera_count_blocked": 0,
+            "noncanonical_rgb_children_blocked": 0,
             "skipped_without_scene_lookup": 0,
         }
     child_indices = torch.arange(
@@ -8698,6 +11834,8 @@ def _refresh_split_child_owner_colors(
         len(child_indices), dtype=torch.bool, device=foliage.xyz.device
     )
     refreshed_cameras: set[int] = set()
+    noncanonical_rgb_cameras_blocked: set[int] = set()
+    noncanonical_rgb_children_blocked = 0
     missing_scene_camera_children = 0
     dynamic_depth_candidate = torch.zeros_like(dynamic_child)
     metric_depth_candidate = torch.zeros_like(dynamic_child)
@@ -8758,9 +11896,11 @@ def _refresh_split_child_owner_colors(
         *,
         measured_depth: torch.Tensor | None = None,
         measured_uv: torch.Tensor | None = None,
+        require_canonical_sequence: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return valid local rows and their exact-raster RGB samples."""
         nonlocal missing_scene_camera_children
+        nonlocal noncanonical_rgb_children_blocked
         view = view_by_camera_id.get(camera_id)
         if view is None:
             if not view_by_camera_id:
@@ -8772,6 +11912,16 @@ def _refresh_split_child_owner_colors(
                 f"Split child evidence camera {camera_id} is absent from "
                 "scene"
             )
+        if (
+            require_canonical_sequence
+            and canonical_rgb_sequence is not None
+            and sequence_id(view.image_name) != canonical_rgb_sequence
+        ):
+            noncanonical_rgb_cameras_blocked.add(camera_id)
+            noncanonical_rgb_children_blocked += int(
+                len(local_child_indices)
+            )
+            return local_child_indices[:0], foliage.xyz.new_empty((0, 3))
         indices = child_indices[local_child_indices]
         xyz = foliage.xyz.detach()[indices]
         homogeneous = torch.cat(
@@ -9063,6 +12213,7 @@ def _refresh_split_child_owner_colors(
                     selected_local,
                     measured_depth=selected_depth,
                     measured_uv=selected_uv,
+                    require_canonical_sequence=True,
                 )
                 if not len(valid_local):
                     continue
@@ -9115,7 +12266,9 @@ def _refresh_split_child_owner_colors(
                         slot_camera == camera_id
                     ]
                     valid_local, colors = sample_projected_rgb(
-                        camera_id, selected_local
+                        camera_id,
+                        selected_local,
+                        require_canonical_sequence=True,
                     )
                     if not len(valid_local):
                         continue
@@ -9285,8 +12438,23 @@ def _refresh_split_child_owner_colors(
             else 0.0
         ),
         "owner_camera_count": len(refreshed_cameras),
+        "canonical_rgb_sequence": canonical_rgb_sequence,
+        "noncanonical_rgb_camera_count_blocked": len(
+            noncanonical_rgb_cameras_blocked
+        ),
+        "noncanonical_rgb_children_blocked": int(
+            noncanonical_rgb_children_blocked
+        ),
         "skipped_without_scene_lookup": missing_scene_camera_children,
     }
+
+
+@torch.no_grad()
+def _clear_split_parent_snapshot(
+    foliage, family_ids: torch.Tensor
+) -> None:
+    """Release compact transaction state after atomic resolution."""
+    foliage.remove_split_parent_snapshots(family_ids)
 
 
 @torch.no_grad()
@@ -9294,14 +12462,16 @@ def _rollback_failed_split_families(
     args,
     foliage,
     failed_candidate: torch.Tensor,
+    *,
+    force_family_candidate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
     """Merge wholly failed child families back to one physical hypothesis.
 
-    A split is a local proposal, not irreversible truth.  When every extant
-    child of one parent has exhausted its real-camera verification window and
-    remains optically/visually unused, deleting all children creates a hole.
-    Restore one representative carrying the parent's candidate evidence and
-    merge the family moments in world space.  This is deliberately local and
+    A split is one atomic local proposal, not irreversible truth. When every
+    unresolved child of a parent has exhausted its independent-camera window,
+    accepting only the verified subset would discard the optical mass assigned
+    to failed siblings. Restore one representative for the entire family and
+    merge its moments in world space. This is deliberately conservative and
     never consults a whole-image metric gate.
     """
     count = len(foliage)
@@ -9313,164 +12483,298 @@ def _rollback_failed_split_families(
     )
     base_audit: dict[str, object] = {
         "contract": (
-            "all_extant_siblings_unverified_expired_zero_owner_witness_"
-            "without_free_space_contradiction__local_lineage_merge_preserves_"
-            "integrated_optical_mass"
+            "explicit_atomic_split_family_only__all_verified_resolves__any_"
+            "strong_contradiction_or_all_resolved_with_failure_rolls_back__"
+            "one_sparse_exact_parent_snapshot_restores_physical_metric_and_"
+            "evidence_state__failed_child_drift_is_discarded__lineage_identity_"
+            "remains_globally_unique"
         ),
         "eligible_families": 0,
+        "resolved_verified_families": 0,
         "rolled_back_families": 0,
         "removed_children": 0,
         "representatives": 0,
         "integrated_mass_before": 0.0,
         "integrated_mass_after": 0.0,
     }
-    if not count or limit <= 0:
+    if not count:
         return remove, empty, base_audit
-    parent = foliage.parent_lineage_id.to(torch.int64)
-    family_rows = parent >= 0
+    proposal_kind = getattr(foliage, "proposal_kind", None)
+    family = getattr(foliage, "split_proposal_family_id", None)
+    if proposal_kind is None or family is None:
+        # Legacy ancestry is provably ambiguous: ray births and exact
+        # receiver factorisations wrote the same parent field as splits.
+        # Never infer a rollback transaction from that history.
+        base_audit["legacy_family_inference_blocked"] = True
+        return remove, empty, base_audit
+    proposal_kind = proposal_kind.to(torch.int8)
+    family = family.to(torch.int64)
+    malformed = ((proposal_kind == PROPOSAL_SPLIT) != (family >= 0))
+    if bool(malformed.any()):
+        raise RuntimeError(
+            "Split proposal kind/family metadata is inconsistent"
+        )
+    if len(torch.unique(foliage.lineage_id)) != count:
+        raise RuntimeError("Foliage lineage ids are not globally unique")
+    family_rows = proposal_kind == PROPOSAL_SPLIT
     if not bool(family_rows.any()):
         return remove, empty, base_audit
     rows = torch.nonzero(family_rows, as_tuple=False).flatten()
-    parents, inverse, family_counts = torch.unique(
-        parent[rows], sorted=True, return_inverse=True, return_counts=True
+    families, inverse, family_counts = torch.unique(
+        family[rows], sorted=True, return_inverse=True, return_counts=True
     )
-    candidate_counts = torch.zeros_like(family_counts)
-    candidate_counts.scatter_add_(
-        0, inverse, failed_candidate[rows].to(candidate_counts.dtype)
+    # Every live transaction must have exactly one immutable parent record.
+    # Resolve the complete set before changing any family so corruption cannot
+    # partially commit successful families and fail only on a later rollback.
+    foliage.split_parent_snapshot_indices(families)
+    if bool(((family_counts != 2) & (family_counts != 4)).any()):
+        bad = families[(family_counts != 2) & (family_counts != 4)]
+        raise RuntimeError(
+            "Split proposal family cardinality is not 2 or 4: "
+            f"{bad[:8].tolist()}"
+        )
+    for name in (
+        "birth_iteration",
+        "tree_instance_id",
+        "layer_role",
+        "split_generation",
+        "parent_lineage_id",
+    ):
+        values = getattr(foliage, name)[rows].to(torch.int64)
+        minimum = torch.full(
+            (len(families),),
+            torch.iinfo(torch.int64).max,
+            dtype=torch.int64,
+            device=device,
+        )
+        maximum = torch.full(
+            (len(families),),
+            torch.iinfo(torch.int64).min,
+            dtype=torch.int64,
+            device=device,
+        )
+        minimum.scatter_reduce_(
+            0, inverse, values, reduce="amin", include_self=True
+        )
+        maximum.scatter_reduce_(
+            0, inverse, values, reduce="amax", include_self=True
+        )
+        if bool((minimum != maximum).any()):
+            raise RuntimeError(
+                f"Split proposal family disagrees on {name}"
+            )
+    failed_counts = torch.zeros_like(family_counts)
+    failed_counts.scatter_add_(
+        0, inverse, failed_candidate[rows].to(failed_counts.dtype)
     )
-    eligible = (family_counts >= 2) & (candidate_counts == family_counts)
+    verification = getattr(
+        foliage,
+        "verification_state",
+        torch.full_like(foliage.layer_role, VERIFICATION_VERIFIED),
+    )
+    verified_counts = torch.zeros_like(family_counts)
+    verified_counts.scatter_add_(
+        0,
+        inverse,
+        (verification[rows] == VERIFICATION_VERIFIED).to(
+            verified_counts.dtype
+        ),
+    )
+    # A successful split resolves atomically as well.  Clearing the family
+    # only after every sibling has a real witness prevents one verified child
+    # from recursively splitting while another is still pending.
+    fully_verified = verified_counts == family_counts
+    for family_id in families[fully_verified]:
+        siblings = torch.nonzero(
+            family == family_id, as_tuple=False
+        ).flatten()
+        _clear_split_parent_snapshot(foliage, family_id[None])
+        foliage.proposal_kind[siblings] = PROPOSAL_NONE
+        foliage.split_proposal_family_id[siblings] = -1
+    base_audit["resolved_verified_families"] = int(fully_verified.sum())
+    if bool(fully_verified.all()):
+        return remove, empty, base_audit
+    if limit <= 0:
+        return remove, empty, base_audit
+
+    force = (
+        torch.zeros(count, dtype=torch.bool, device=device)
+        if force_family_candidate is None
+        else torch.as_tensor(
+            force_family_candidate, device=device, dtype=torch.bool
+        ).reshape(count)
+    )
+    forced_counts = torch.zeros_like(family_counts)
+    forced_counts.scatter_add_(
+        0, inverse, force[rows].to(forced_counts.dtype)
+    )
+    eligible = (
+        ~fully_verified
+        & (
+            (forced_counts > 0)
+            | (
+                (failed_counts > 0)
+                & (failed_counts + verified_counts == family_counts)
+            )
+        )
+    )
     eligible_offsets = torch.nonzero(eligible, as_tuple=False).flatten()
     base_audit["eligible_families"] = int(len(eligible_offsets))
     if not len(eligible_offsets):
         return remove, empty, base_audit
-    chosen_offsets = eligible_offsets[:limit]
-    chosen_parents = parents[chosen_offsets]
+    eligible_birth = torch.full(
+        (len(families),),
+        torch.iinfo(torch.int32).max,
+        dtype=torch.int32,
+        device=device,
+    )
+    eligible_birth.scatter_reduce_(
+        0,
+        inverse,
+        foliage.birth_iteration[rows],
+        reduce="amin",
+        include_self=True,
+    )
+    chosen_offsets = eligible_offsets[
+        torch.argsort(eligible_birth[eligible_offsets], stable=True)
+    ][:limit]
+    chosen_families = families[chosen_offsets]
     representatives: list[torch.Tensor] = []
     before_mass = 0.0
     after_mass = 0.0
     integrated_mass = foliage.integrated_optical_mass().detach()
-    for parent_id in chosen_parents:
+    for family_id in chosen_families:
         siblings = torch.nonzero(
-            parent == parent_id, as_tuple=False
+            family == family_id, as_tuple=False
         ).flatten()
+        snapshot_row = foliage.split_parent_snapshot_indices(
+            family_id[None]
+        )[0]
         sibling_mass = integrated_mass[siblings].clamp_min(1.0e-12)
         total_mass = sibling_mass.sum()
-        weights = sibling_mass / total_mass
-        representative = siblings[torch.argmax(sibling_mass)]
-        center = (weights[:, None] * foliage.xyz[siblings]).sum(dim=0)
-        rotations = _rotation_matrices_from_quaternions(
-            foliage.normalized_quaternions[siblings]
-        )
-        scales = foliage.scales[siblings]
-        covariance = torch.bmm(
-            rotations * scales.square()[:, None, :],
-            rotations.transpose(1, 2),
-        )
-        offset = foliage.xyz[siblings] - center
-        second_moment = (
-            weights[:, None, None]
-            * (covariance + offset[:, :, None] * offset[:, None, :])
-        ).sum(dim=0)
-        representative_rotation = _rotation_matrices_from_quaternions(
-            foliage.normalized_quaternions[representative][None]
-        )[0]
-        local_covariance = (
-            representative_rotation.transpose(0, 1)
-            @ second_moment
-            @ representative_rotation
-        )
-        merged_scales = torch.diagonal(local_covariance).clamp_min(
-            1.0e-10
-        ).sqrt()
-        if bool(foliage.static_skeleton_mask[representative]):
-            alpha_ceiling = float(args.skeleton_opacity_ceiling)
-        elif bool(foliage.dynamic_leaf_mask[representative]):
-            alpha_ceiling = float(args.dynamic_leaf_opacity_ceiling)
-        else:
-            alpha_ceiling = float(args.canonical_crown_opacity_ceiling)
-        maximum_tau = -np.log1p(-alpha_ceiling)
-        merged_area = projected_gaussian_cross_section(
-            merged_scales[None]
-        )[0].clamp_min(1.0e-12)
-        required_area = total_mass / max(maximum_tau, 1.0e-8)
-        if bool(merged_area < required_area):
-            merged_scales *= torch.sqrt(required_area / merged_area)
-            merged_area = projected_gaussian_cross_section(
-                merged_scales[None]
-            )[0].clamp_min(1.0e-12)
-        merged_alpha = -torch.expm1(-total_mass / merged_area)
-        merged_alpha = merged_alpha.clamp(1.0e-6, alpha_ceiling)
-        foliage.xyz[representative] = center
-        foliage.log_scales[representative] = merged_scales.log()
-        foliage.opacity_logits[representative, 0] = torch.logit(
-            merged_alpha
-        )
+        representative = siblings[0]
+        def exact_parent_snapshot(name: str) -> torch.Tensor:
+            return getattr(foliage, name)[snapshot_row]
+
+        # A failed transaction restores the exact parent hypothesis.  Merging
+        # optimized child moments here used to turn metre-scale child drift
+        # into one huge Gaussian, directly recreating facade penetration.
+        # Child observations remain diagnostic; they are not authority to
+        # mutate the fallback state of a split that failed atomically.
         for name in (
+            "xyz",
+            "log_scales",
+            "quaternions",
+            "opacity_logits",
             "features",
             "deformation_basis",
             "dynamic_feature_basis",
             "dynamic_opacity_basis",
         ):
-            value = getattr(foliage, name)
-            reshape = (len(weights),) + (1,) * (value.ndim - 1)
-            value[representative] = (
-                weights.reshape(reshape) * value[siblings]
-            ).sum(dim=0)
-        foliage.initialization_center[representative] = center
-        foliage.position_covariance[representative] = second_moment
-        foliage.scale_ceiling[representative] = torch.maximum(
-            foliage.scale_ceiling[siblings].amax(dim=0), merged_scales
+            getattr(foliage, name)[representative] = exact_parent_snapshot(
+                f"proposal_parent_{name}"
+            )
+
+        # Metric posterior and evidence state are observations, not fields
+        # that may be averaged or summed across duplicated children.
+        foliage.initialization_center[representative] = exact_parent_snapshot(
+            "proposal_parent_initialization_center"
         )
-        foliage.occupancy_probability[representative] = (
-            weights * foliage.occupancy_probability[siblings]
-        ).sum()
-        for name in (
-            "support_view_count",
-            "support_sequence_count",
-            "free_space_violation_count",
-            "unknown_view_count",
-        ):
-            value = getattr(foliage, name)
-            maximum = torch.iinfo(value.dtype).max
-            value[representative] = value[siblings].to(torch.int64).sum().clamp(
-                max=maximum
-            ).to(value.dtype)
-        support_ids = torch.unique(
-            foliage.support_camera_ids[siblings].reshape(-1)
+        foliage.position_covariance[representative] = exact_parent_snapshot(
+            "proposal_parent_position_covariance"
         )
-        support_ids = support_ids[support_ids >= 0]
-        foliage.support_camera_ids[representative].fill_(-1)
-        retained_ids = support_ids[
-            : foliage.support_camera_ids.shape[1]
-        ]
-        foliage.support_camera_ids[
-            representative, : len(retained_ids)
-        ] = retained_ids
+        foliage.scale_ceiling[representative] = exact_parent_snapshot(
+            "proposal_parent_scale_ceiling"
+        )
+        foliage.occupancy_probability[representative] = exact_parent_snapshot(
+            "proposal_parent_occupancy_probability"
+        )
+        foliage.support_camera_ids[representative] = exact_parent_snapshot(
+            "proposal_parent_support_camera_ids"
+        )
+        foliage.support_view_count[representative] = exact_parent_snapshot(
+            "proposal_parent_support_view_count"
+        )
+        foliage.support_sequence_count[representative] = exact_parent_snapshot(
+            "proposal_parent_support_sequence_count"
+        )
+        foliage.free_space_violation_count[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_free_space_violation_count"
+            )
+        )
+        foliage.unknown_view_count[representative] = exact_parent_snapshot(
+            "proposal_parent_unknown_view_count"
+        )
         generation = int(foliage.split_generation[siblings].min())
         foliage.split_generation[representative] = max(generation - 1, 0)
-        foliage.lineage_id[representative] = int(parent_id)
-        foliage.parent_lineage_id[representative] = -1
-        foliage.birth_iteration[representative] = -1
-        foliage.verification_state[representative] = VERIFICATION_VERIFIED
-        candidate_evidence = foliage.candidate_evidence_primitive_id[siblings]
-        candidate_evidence = candidate_evidence[candidate_evidence >= 0]
-        if len(candidate_evidence):
-            foliage.evidence_primitive_id[representative] = candidate_evidence[0]
-        foliage.candidate_evidence_primitive_id[representative] = -1
-        foliage.verified_camera_ids[representative].fill_(-1)
-        verified_ids = retained_ids[: foliage.verified_camera_ids.shape[1]]
-        foliage.verified_camera_ids[
-            representative, : len(verified_ids)
-        ] = verified_ids
-        foliage.verified_camera_count[representative] = len(verified_ids)
-        foliage.verified_sequence_count[representative] = max(
-            min(int(foliage.support_sequence_count[representative]), 2), 1
+        # Keep the representative's globally unique lineage id, but restore
+        # the replaced parent's ancestry edge. Reusing the replaced parent's
+        # own id would collide with non-replacing descendants such as births.
+        parent_ids = torch.unique(foliage.parent_lineage_id[siblings])
+        if len(parent_ids) != 1:
+            raise RuntimeError(
+                "Split proposal siblings do not share one parent lineage"
+            )
+        foliage.parent_lineage_id[representative] = exact_parent_snapshot(
+            "proposal_parent_parent_lineage_id"
         )
-        foliage.replacement_overlap_ema[representative] = 0
-        foliage.replacement_observation_count[representative] = 0
-        foliage.replacement_camera_signature[representative] = 0
-        foliage.handoff_retired_fraction[representative] = 0
-        foliage.handoff_reference_mass[representative] = total_mass
+        foliage.birth_iteration[representative] = exact_parent_snapshot(
+            "proposal_parent_birth_iteration"
+        )
+        parent_state = exact_parent_snapshot(
+            "proposal_parent_verification_state"
+        )
+        if int(parent_state) < 0:
+            raise RuntimeError(
+                "Split proposal lacks an exact parent verification snapshot"
+            )
+        foliage.verification_state[representative] = parent_state
+        foliage.verified_camera_ids[representative] = exact_parent_snapshot(
+            "proposal_parent_verified_camera_ids"
+        )
+        foliage.verified_camera_count[representative] = exact_parent_snapshot(
+            "proposal_parent_verified_camera_count"
+        )
+        foliage.verified_sequence_count[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_verified_sequence_count"
+            )
+        )
+        foliage.evidence_primitive_id[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_evidence_primitive_id"
+            )
+        )
+        foliage.candidate_evidence_primitive_id[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_candidate_evidence_primitive_id"
+            )
+        )
+        foliage.replacement_overlap_ema[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_replacement_overlap_ema"
+            )
+        )
+        foliage.replacement_observation_count[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_replacement_observation_count"
+            )
+        )
+        foliage.replacement_camera_signature[representative] = (
+            exact_parent_snapshot(
+                "proposal_parent_replacement_camera_signature"
+            )
+        )
+        foliage.handoff_reference_mass[representative] = exact_parent_snapshot(
+            "proposal_parent_handoff_reference_mass"
+        )
+        foliage.handoff_retired_fraction[representative] = exact_parent_snapshot(
+            "proposal_parent_handoff_retired_fraction"
+        )
+        _clear_split_parent_snapshot(foliage, family_id[None])
+        foliage.proposal_kind[representative] = PROPOSAL_NONE
+        foliage.split_proposal_family_id[representative] = -1
         remove[siblings] = True
         remove[representative] = False
         representatives.append(representative)
@@ -9523,11 +12827,137 @@ def _verification_debt_capacity_scale(
     return minimum_scale + (1.0 - minimum_scale) * smooth
 
 
+def _verification_debt_mask(foliage) -> torch.Tensor:
+    """Return every row whose lifecycle still consumes verification capacity.
+
+    Verification debt is not synonymous with the legacy UNVERIFIED enum.
+    A factorized receiver waits for the same real-camera witnesses, and a
+    partially verified split child remains transaction-local until all of its
+    siblings resolve.  Omitting either population let receiver creation run at
+    its full fixed quota while ordinary splits were already almost stopped.
+    """
+
+    state = getattr(foliage, "verification_state", None)
+    proposal = getattr(foliage, "proposal_kind", None)
+    if state is None or proposal is None:
+        raise RuntimeError(
+            "Verification-debt accounting requires state and proposal kind"
+        )
+    state = torch.as_tensor(state, device=foliage.xyz.device).reshape(-1)
+    proposal = torch.as_tensor(
+        proposal, device=foliage.xyz.device
+    ).reshape(-1)
+    if len(state) != len(foliage) or len(proposal) != len(foliage):
+        raise RuntimeError(
+            "Verification-debt metadata no longer aligns with foliage"
+        )
+    return (
+        (state == VERIFICATION_UNVERIFIED)
+        | (state == VERIFICATION_FACTORIZED_RECEIVER)
+        | (proposal != PROPOSAL_NONE)
+    )
+
+
+@torch.no_grad()
+def _restore_expired_factorized_receiver_mass(
+    foliage,
+    expired_receivers: torch.Tensor,
+    remove: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, int | float | str]]:
+    """Return an unverified receiver's local mass before terminal removal.
+
+    Receiver materialization partitions an envelope's optical depth.  If the
+    new detail row never obtains two real-camera witnesses, deleting only the
+    child opens a 5% hole.  Restore its current integrated mass to the live,
+    resolved parent before the fused topology mutation.  Orphaned children
+    remain removable but cannot manufacture a new owner.
+    """
+
+    expired = torch.as_tensor(
+        expired_receivers, device=foliage.xyz.device, dtype=torch.bool
+    ).reshape(-1)
+    remove = torch.as_tensor(
+        remove, device=foliage.xyz.device, dtype=torch.bool
+    ).reshape(-1)
+    if expired.shape != (len(foliage),) or remove.shape != (len(foliage),):
+        raise ValueError("Factorized receiver terminal masks are misaligned")
+    empty = torch.empty(0, dtype=torch.long, device=foliage.xyz.device)
+    child_rows = torch.nonzero(expired, as_tuple=False).flatten()
+    audit: dict[str, int | float | str] = {
+        "contract": (
+            "expired_unverified_factorized_receiver_restores_integrated_"
+            "mass_to_live_resolved_parent_then_terminally_removes"
+        ),
+        "expired_rows": int(len(child_rows)),
+        "restored_parent_rows": 0,
+        "orphaned_rows": 0,
+        "restored_integrated_optical_mass": 0.0,
+        "orphaned_integrated_optical_mass": 0.0,
+    }
+    if not len(child_rows):
+        return empty, audit
+    if not bool(
+        (
+            foliage.verification_state[child_rows]
+            == VERIFICATION_FACTORIZED_RECEIVER
+        ).all()
+    ):
+        raise RuntimeError("Receiver terminal mask contains another state")
+
+    lineage = foliage.lineage_id.to(torch.int64)
+    sorted_lineage, order = torch.sort(lineage)
+    requested_parent = foliage.parent_lineage_id[child_rows].to(torch.int64)
+    position = torch.searchsorted(sorted_lineage, requested_parent)
+    in_range = position < len(sorted_lineage)
+    safe_position = position.clamp_max(max(len(sorted_lineage) - 1, 0))
+    matched = in_range & (
+        sorted_lineage[safe_position] == requested_parent
+    )
+    parent_rows = order[safe_position]
+    valid = (
+        matched
+        & ~remove[parent_rows]
+        & foliage.persistent_envelope_mask[parent_rows]
+        & _resolved_static_owner_mask(foliage)[parent_rows]
+        & (
+            foliage.replacement_group[parent_rows]
+            == foliage.replacement_group[child_rows]
+        )
+    )
+    mass = foliage.integrated_optical_mass().detach()
+    audit["orphaned_rows"] = int((~valid).sum())
+    audit["orphaned_integrated_optical_mass"] = float(
+        mass[child_rows[~valid]].sum()
+    )
+    if not bool(valid.any()):
+        return empty, audit
+    valid_children = child_rows[valid]
+    valid_parents = parent_rows[valid]
+    restored_by_row = torch.zeros_like(mass)
+    restored_by_row.index_add_(0, valid_parents, mass[valid_children])
+    unique_parents = torch.unique(valid_parents)
+    target_parent_mass = mass[unique_parents] + restored_by_row[unique_parents]
+    parent_area = projected_gaussian_cross_section(
+        foliage.scales[unique_parents]
+    ).clamp_min(1.0e-12)
+    parent_tau = target_parent_mass / parent_area
+    parent_alpha = (-torch.expm1(-parent_tau)).clamp(
+        1.0e-12, 1.0 - 1.0e-6
+    )
+    foliage.opacity_logits[unique_parents, 0] = torch.logit(parent_alpha)
+    audit["restored_parent_rows"] = int(len(unique_parents))
+    audit["restored_integrated_optical_mass"] = float(
+        mass[valid_children].sum()
+    )
+    return unique_parents, audit
+
+
 @torch.no_grad()
 def _select_missing_static_detail_receiver_parents(
     foliage,
     stats: dict[str, torch.Tensor],
     maximum_receivers: int,
+    eligible_camera_ids: torch.Tensor | list[int] | None = None,
 ) -> tuple[torch.Tensor, dict[str, int | float | str]]:
     """Select one visible envelope row per spatial group lacking detail.
 
@@ -9587,25 +13017,56 @@ def _select_missing_static_detail_receiver_parents(
     missing_detail = envelope
     if len(detail_groups):
         missing_detail &= ~torch.isin(groups, detail_groups)
-    verification = getattr(
-        foliage,
-        "verification_state",
-        torch.full_like(foliage.layer_role, VERIFICATION_VERIFIED),
-    )
     contribution = stats["contribution"].float().clamp_min(0.0)
-    visible_supported = (
+    base_candidate = (
         missing_detail
-        & (verification == VERIFICATION_VERIFIED)
+        & _resolved_static_owner_mask(foliage)
         & (foliage.support_view_count > 0)
-        & (foliage.support_camera_ids >= 0).any(dim=1)
         & (contribution > 0)
     )
-    rows = torch.nonzero(visible_supported, as_tuple=False).flatten()
+    base_rows = torch.nonzero(base_candidate, as_tuple=False).flatten()
+    support_camera = foliage.support_camera_ids[base_rows]
+    eligible_support = support_camera >= 0
+    if eligible_camera_ids is not None:
+        eligible_ids = torch.as_tensor(
+            eligible_camera_ids,
+            device=support_camera.device,
+            dtype=support_camera.dtype,
+        ).reshape(-1)
+        if not len(eligible_ids):
+            eligible_support.zero_()
+        else:
+            maximum_id = int(eligible_ids.max())
+            lookup = torch.zeros(
+                maximum_id + 1,
+                dtype=torch.bool,
+                device=support_camera.device,
+            )
+            lookup[eligible_ids.long()] = True
+            in_range = eligible_support & (support_camera <= maximum_id)
+            eligible_support = in_range & lookup[
+                support_camera.clamp(0, maximum_id).long()
+            ]
+    eligible_values = torch.where(
+        eligible_support,
+        support_camera,
+        torch.full_like(support_camera, -1),
+    ).sort(dim=1).values
+    distinct_support = eligible_values >= 0
+    if eligible_values.shape[1] > 1:
+        distinct_support[:, 1:] &= (
+            eligible_values[:, 1:] != eligible_values[:, :-1]
+        )
+    promotable_support = distinct_support.sum(dim=1) >= 2
+    rows = base_rows[promotable_support]
     base_audit.update(
         {
             "groups_with_any_static_detail": int(len(detail_groups)),
             "missing_detail_envelope_rows": int(missing_detail.sum()),
             "visible_evidence_supported_candidates": int(len(rows)),
+            "unpromotable_support_rows_excluded": int(
+                len(base_rows) - len(rows)
+            ),
         }
     )
     if not len(rows):
@@ -9655,6 +13116,91 @@ def _select_missing_static_detail_receiver_parents(
     return selected, base_audit
 
 
+def _has_two_distinct_supported_camera_ids(
+    camera_ids: torch.Tensor,
+    supported_camera_lookup: torch.Tensor,
+) -> torch.Tensor:
+    """Return rows containing two distinct IDs selected by ``lookup``.
+
+    The persisted Cambridge support table is intentionally wide (105 slots).
+    Sorting an ``N x 105`` int64 copy merely to answer this boolean question
+    used more than 1.2 GiB of transient CUDA storage at 804k rows and caused
+    the v99 16.2k topology event to OOM. Scan columns while retaining only
+    the first accepted ID per row. Peak temporary storage is O(N), the table
+    dtype is preserved, and duplicate slots still cannot impersonate two
+    independent camera witnesses.
+    """
+    return _has_two_distinct_camera_ids_across_tables(
+        (camera_ids,), supported_camera_lookup
+    )
+
+
+def _has_two_distinct_camera_ids_across_tables(
+    camera_id_tables: tuple[torch.Tensor, ...],
+    supported_camera_lookup: torch.Tensor,
+) -> torch.Tensor:
+    """Scan persisted support and witness tables as one evidence set.
+
+    ``support_camera_ids`` and ``verified_camera_ids`` are both real-camera
+    evidence. A camera duplicated within or across the tables is still one
+    witness; two different selected IDs are required. The streaming scan
+    retains the O(N) memory bound of the single-table helper.
+    """
+    if not camera_id_tables:
+        raise ValueError("at least one camera ID table is required")
+    for camera_ids in camera_id_tables:
+        if camera_ids.ndim != 2:
+            raise ValueError("camera_ids must have shape [N, K]")
+    if supported_camera_lookup.ndim != 1:
+        raise ValueError("supported_camera_lookup must have shape [C]")
+    if supported_camera_lookup.dtype != torch.bool:
+        raise ValueError("supported_camera_lookup must be boolean")
+    row_count = int(camera_id_tables[0].shape[0])
+    camera_dtype = camera_id_tables[0].dtype
+    for camera_ids in camera_id_tables:
+        if camera_ids.device != supported_camera_lookup.device:
+            raise ValueError("camera IDs and lookup must share one device")
+        if int(camera_ids.shape[0]) != row_count:
+            raise ValueError("camera ID tables must have the same row count")
+        if camera_ids.dtype != camera_dtype:
+            raise ValueError("camera ID tables must have the same dtype")
+    result = torch.zeros(
+        row_count, dtype=torch.bool, device=supported_camera_lookup.device
+    )
+    if (
+        all(int(camera_ids.shape[1]) == 0 for camera_ids in camera_id_tables)
+        or len(supported_camera_lookup) == 0
+    ):
+        return result
+    first_supported_id = torch.full(
+        (row_count,),
+        -1,
+        dtype=camera_dtype,
+        device=supported_camera_lookup.device,
+    )
+    maximum_lookup_index = len(supported_camera_lookup) - 1
+    for camera_ids in camera_id_tables:
+        for slot_index in range(int(camera_ids.shape[1])):
+            current_id = camera_ids[:, slot_index]
+            in_bounds = (current_id >= 0) & (
+                current_id <= maximum_lookup_index
+            )
+            safe_id = current_id.clamp(0, maximum_lookup_index)
+            current_supported = in_bounds & supported_camera_lookup[safe_id]
+            has_first = first_supported_id >= 0
+            result |= (
+                current_supported
+                & has_first
+                & (current_id != first_supported_id)
+            )
+            first_supported_id = torch.where(
+                current_supported & ~has_first,
+                current_id,
+                first_supported_id,
+            )
+    return result
+
+
 def _adapt_volume(
     args,
     foliage,
@@ -9665,9 +13211,11 @@ def _adapt_volume(
     split_capacity_scale: float = 1.0,
     camera_forward_lookup: torch.Tensor | None = None,
     view_by_camera_id: dict[int, object] | None = None,
+    canonical_rgb_sequence: str | None = None,
     geometry_evidence=None,
     foliage_ray_evidence: FoliageRayEvidence | None = None,
-    current_iteration: int = -1,
+    current_iteration: int = 0,
+    prune_only_maintenance: bool = False,
 ):
     """Prune contradictions first, then split residuals in one mutation.
 
@@ -9677,11 +13225,12 @@ def _adapt_volume(
     split_capacity_scale = float(
         np.clip(split_capacity_scale, 0.0, 1.0)
     )
-    effective_split_limit = int(
+    unbackpressured_split_limit = int(
         np.floor(
             int(args.maximum_volume_splits) * split_capacity_scale
         )
     )
+    effective_split_limit = unbackpressured_split_limit
     static_detail_exclusive_topology = (
         _static_detail_exclusive_topology_active(args, phase)
     )
@@ -9718,10 +13267,23 @@ def _adapt_volume(
     # sampled in the current topology window.  The former absolute
     # ``observed once => never prune`` rule accumulated exactly the persistent
     # low-opacity fog that the posterior was supposed to retire.
-    independently_verified_positive = (
+    cross_sequence_positive = (
         (foliage.support_view_count >= 2)
         & (foliage.support_sequence_count >= 2)
-        & (contradiction_ratio < 0.50)
+    )
+    scene_snapshot_positive = (
+        getattr(args, "reconstruction_target", None) == "static"
+        and getattr(args, "static_canonical_sequence_policy", None)
+        == "scene"
+    )
+    if scene_snapshot_positive:
+        cross_sequence_positive = cross_sequence_positive | (
+            foliage.static_leaf_mask
+            & (foliage.support_view_count >= 2)
+            & (foliage.support_sequence_count >= 1)
+        )
+    independently_verified_positive = (
+        cross_sequence_positive & (contradiction_ratio < 0.50)
     )
     weak_free_remove = (
         (contradiction_ratio >= 0.30)
@@ -9736,44 +13298,47 @@ def _adapt_volume(
         & ~independently_verified_positive
     )
     weak_remove = weak_free_remove | weak_occupancy_remove
-    remove = strong_contradiction | weak_remove
+    remove = (
+        strong_contradiction.clone()
+        if prune_only_maintenance
+        else strong_contradiction | weak_remove
+    )
     verification_state = getattr(
         foliage,
         "verification_state",
         torch.full_like(foliage.layer_role, VERIFICATION_VERIFIED),
     )
-    unverified_before = verification_state == VERIFICATION_UNVERIFIED
-    verification_debt_fraction = (
-        float(unverified_before.float().mean()) if old_count else 0.0
+    proposal_kind = getattr(
+        foliage,
+        "proposal_kind",
+        torch.full_like(foliage.layer_role, PROPOSAL_NONE),
     )
-    debt_soft = float(
-        getattr(args, "volume_verification_debt_soft_fraction", 0.05)
-    )
-    debt_hard = float(
-        getattr(args, "volume_verification_debt_hard_fraction", 0.12)
-    )
-    verification_capacity_scale = _verification_debt_capacity_scale(
-        verification_debt_fraction,
-        soft_fraction=debt_soft,
-        hard_fraction=debt_hard,
-        minimum_scale=float(
-            getattr(
-                args,
-                "volume_verification_debt_minimum_split_scale",
-                0.0,
-            )
-        ),
-    )
-    effective_split_limit = int(
-        np.floor(
-            effective_split_limit * verification_capacity_scale + 1.0e-6
+    unresolved_split = proposal_kind == PROPOSAL_SPLIT
+    lifecycle_row = proposal_kind != PROPOSAL_NONE
+    if bool(
+        (
+            lifecycle_row
+            & (verification_state == VERIFICATION_UNVERIFIED)
+            & (foliage.birth_iteration < 0)
+        ).any()
+    ):
+        raise RuntimeError(
+            "An unresolved topology proposal has no lifecycle birth iteration"
         )
-    )
     birth_iteration = getattr(
         foliage,
         "birth_iteration",
         torch.full_like(foliage.layer_role, -1, dtype=torch.int32),
     )
+    if bool(
+        (
+            (verification_state == VERIFICATION_FACTORIZED_RECEIVER)
+            & (birth_iteration < 0)
+        ).any()
+    ):
+        raise RuntimeError(
+            "A factorized receiver has no lifecycle birth iteration"
+        )
     verification_grace = (
         (verification_state == VERIFICATION_UNVERIFIED)
         & (birth_iteration >= 0)
@@ -9801,6 +13366,20 @@ def _adapt_volume(
             )
         )
     )
+    factorized_receiver_expired = (
+        (verification_state == VERIFICATION_FACTORIZED_RECEIVER)
+        & (birth_iteration >= 0)
+        & (
+            verification_age
+            >= int(
+                getattr(
+                    args,
+                    "child_verification_timeout_iterations",
+                    3000,
+                )
+            )
+        )
+    )
     verified_camera_count = getattr(
         foliage,
         "verified_camera_count",
@@ -9812,6 +13391,9 @@ def _adapt_volume(
         & low_contribution
         & low_opacity
     )
+    expired_ray_birth = verification_expired & (
+        proposal_kind == PROPOSAL_RAY_BIRTH
+    )
     # During the grace interval positive hit/RGB evidence may grow a child,
     # while ordinary opacity/utility cleanup cannot erase it before its
     # candidate owner cameras are revisited.
@@ -9821,27 +13403,80 @@ def _adapt_volume(
     # the opacity bottom decile has accumulated negative verification
     # evidence. Retire only that conjunction; age alone is never a prune
     # permission and partially verified/high-utility rows remain available.
-    remove |= expired_unobserved_low_utility
+    # A ray birth is a bounded existence proposal. If its exact candidate
+    # cameras cannot supply the required two real witnesses before timeout,
+    # it reaches a terminal rejection regardless of how conveniently it
+    # paints the current image. Otherwise one high-residual/one-witness row
+    # can remain unverified forever and permanently consume debt/capacity.
+    remove |= (
+        expired_unobserved_low_utility
+        | expired_ray_birth
+        | factorized_receiver_expired
+    )
     # Family rollback is a proposal-state transition, not an ordinary prune.
     # Generic render contribution can be high precisely because a wrong
-    # child paints an image edge; it is not an independent real-camera owner
-    # witness.  If every sibling timed out without such a witness, merge the
-    # whole family back to one mass-conserving hypothesis.  Individual rows
-    # outside a complete failed family retain the stricter low-utility prune.
-    failed_family_candidate = (
-        verification_expired
-        & (verified_camera_count <= 0)
-        & ~strong_contradiction
-        & ~weak_contradiction
-        & ~foliage.static_skeleton_mask
-        & (foliage.candidate_evidence_primitive_id >= 0)
-    )
+    # child paints an image edge; it is not sufficient independent-camera
+    # proof. A split is atomic: once every unresolved sibling has timed out,
+    # roll the whole family back even if another sibling verified. Otherwise
+    # deleting only failed siblings silently discards their partition of the
+    # parent's optical mass. A single candidate-camera witness remains useful
+    # colour/depth evidence but does not make a displaced split persistent.
+    # Individual rows outside a resolvable family retain the stricter
+    # low-utility prune.
+    failed_family_candidate = verification_expired
+    # Split replacement is an atomic transaction.  Generic per-row pruning
+    # must never leave a partial family; strong contradiction forces an
+    # immediate whole-family rollback and ordinary timeout waits until all
+    # remaining siblings are either verified or expired.
+    remove &= ~unresolved_split
     (
         rollback_remove,
         rollback_representatives,
         rollback_audit,
     ) = _rollback_failed_split_families(
-        args, foliage, failed_family_candidate
+        args,
+        foliage,
+        failed_family_candidate,
+        force_family_candidate=strong_contradiction,
+    )
+    # Successful families are resolved inside the atomic lifecycle helper,
+    # and failed families leave one resolved representative.  Do not retain
+    # the pre-transition proposal mask for this same topology event.
+    verification_state = foliage.verification_state
+    proposal_kind = foliage.proposal_kind
+    unresolved_split = proposal_kind == PROPOSAL_SPLIT
+    # Verification throughput constrains only transactions which remain open
+    # after this event's terminal transitions.  Counting an all-verified
+    # family before clearing it creates a one-event capacity deadlock and
+    # delays otherwise eligible descendants for no physical reason.
+    unverified_before = _verification_debt_mask(foliage)
+    verification_debt_fraction = (
+        float(unverified_before.float().mean()) if old_count else 0.0
+    )
+    debt_soft = float(
+        getattr(args, "volume_verification_debt_soft_fraction", 0.05)
+    )
+    debt_hard = float(
+        getattr(args, "volume_verification_debt_hard_fraction", 0.12)
+    )
+    verification_capacity_scale = _verification_debt_capacity_scale(
+        verification_debt_fraction,
+        soft_fraction=debt_soft,
+        hard_fraction=debt_hard,
+        minimum_scale=float(
+            getattr(
+                args,
+                "volume_verification_debt_minimum_split_scale",
+                0.0,
+            )
+        ),
+    )
+    effective_split_limit = int(
+        np.floor(
+            unbackpressured_split_limit
+            * verification_capacity_scale
+            + 1.0e-6
+        )
     )
     if len(rollback_representatives):
         remove |= rollback_remove
@@ -9894,13 +13529,26 @@ def _adapt_volume(
     # free-space posterior.  Apply that contract before recording the actual
     # contradiction-prune mask so the audit cannot claim a protected trunk was
     # removed.
-    remove &= ~foliage.static_skeleton_mask
+    # Generic canopy contradiction cannot delete the independent skeleton,
+    # but an atomic failed-split rollback must remove every non-representative
+    # sibling, including skeleton-role siblings.  Keep that transaction mask
+    # separate from ordinary pruning all the way into the fused mutation.
+    remove = (
+        (remove & ~foliage.static_skeleton_mask)
+        | rollback_remove
+    )
+    if len(rollback_representatives):
+        remove[rollback_representatives] = False
     observed_unverified_prunable = (
         observed_identity
         & remove
         & ~independently_verified_positive
     )
-    contradiction_remove = remove & ~expired_unobserved_low_utility
+    contradiction_remove = remove & ~(
+        expired_unobserved_low_utility
+        | expired_ray_birth
+        | factorized_receiver_expired
+    )
     effective_budget = (
         args.maximum_volume_gaussians
         if volume_budget is None
@@ -10003,12 +13651,49 @@ def _adapt_volume(
     pre_skeleton_eligible = (
         pre_evidence_eligible
         & foliage.static_skeleton_mask
+        & ~unresolved_split
         & (
             stats["radius"]
             >= float(args.volume_split_radius)
         )
         & (foliage.support_sequence_count >= 2)
     )
+    canonical_split_support = torch.ones(
+        old_count, dtype=torch.bool, device=foliage.xyz.device
+    )
+    scene_canonical_split = bool(
+        getattr(args, "reconstruction_target", None) == "static"
+        and getattr(args, "static_canonical_sequence_policy", None) == "scene"
+        and canonical_rgb_sequence is not None
+    )
+    if scene_canonical_split:
+        if not view_by_camera_id:
+            raise RuntimeError(
+                "Scene-canonical split verification requires camera metadata"
+            )
+        maximum_camera_id = max(int(value) for value in view_by_camera_id)
+        canonical_camera_lookup = torch.zeros(
+            maximum_camera_id + 1,
+            dtype=torch.bool,
+            device=foliage.xyz.device,
+        )
+        for camera_id, candidate_view in view_by_camera_id.items():
+            if sequence_id(candidate_view.image_name) == canonical_rgb_sequence:
+                canonical_camera_lookup[int(camera_id)] = True
+        # Camera tables are expected to be unique, but lifecycle permission
+        # must not silently turn two duplicate slots into two independent
+        # witnesses. Prove the existence of two distinct calibrated cameras
+        # without materializing/sorting an int64 copy of the wide table.
+        canonical_split_support = _has_two_distinct_supported_camera_ids(
+            foliage.support_camera_ids,
+            canonical_camera_lookup,
+        )
+        # Every proposal created by a scene-canonical reconstruction is
+        # revisited only by cameras from that canonical sequence.  Apply the
+        # reachability condition to every physical role before allocation;
+        # checking only canonical-crown rows allowed an unsupported skeleton
+        # split to mutate the model and fail after the fact.
+        pre_skeleton_eligible &= canonical_split_support
     pre_canonical_eligible = (
         pre_evidence_eligible
         & foliage.canonical_crown_mask
@@ -10017,7 +13702,9 @@ def _adapt_volume(
             >= float(args.volume_split_radius)
         )
         & pre_canonical_lineage_supported
+        & canonical_split_support
         & (verification_state == VERIFICATION_VERIFIED)
+        & ~unresolved_split
         & ~rollback_representative_mask
     )
     if static_detail_exclusive_topology:
@@ -10025,6 +13712,7 @@ def _adapt_volume(
     if has_exact_conditioned_stats:
         pre_dynamic_eligible = (
             foliage.dynamic_leaf_mask
+            & ~unresolved_split
             & (
                 conditioned_radius
                 >= float(args.volume_split_radius)
@@ -10037,6 +13725,7 @@ def _adapt_volume(
     else:
         pre_dynamic_eligible = (
             foliage.dynamic_leaf_mask
+            & ~unresolved_split
             & (
                 topology_radius_before
                 >= float(args.volume_split_radius)
@@ -10054,6 +13743,8 @@ def _adapt_volume(
             observed_before_prune
             | (stats["contribution"] > 0)
         )
+    if scene_canonical_split:
+        pre_dynamic_eligible &= canonical_split_support
     pre_eligible_counts = {
         "static_skeleton": int(pre_skeleton_eligible.sum()),
         "canonical_crown": int(pre_canonical_eligible.sum()),
@@ -10112,11 +13803,19 @@ def _adapt_volume(
             foliage,
             stats,
             retirement_requested,
-            excluded=remove,
+            excluded=remove | unresolved_split,
             requested_by_role=retirement_quota_by_role,
         )
     )
     remove |= reallocation_remove
+    (
+        factorized_restored_parent_rows,
+        factorized_receiver_terminal_audit,
+    ) = _restore_expired_factorized_receiver_mass(
+        foliage,
+        factorized_receiver_expired,
+        remove,
+    )
     # Keep selection in the original index space.  The old implementation
     # materialized a complete pruned model here and a second complete model in
     # ``split_adaptive`` below while Adam still owned the original tensors.
@@ -10246,6 +13945,7 @@ def _adapt_volume(
     skeleton_eligible = (
         evidence_eligible
         & foliage.static_skeleton_mask
+        & ~unresolved_split
         & (working_stats["radius"] >= args.volume_split_radius)
         & (foliage.support_sequence_count >= 2)
     )
@@ -10268,7 +13968,9 @@ def _adapt_volume(
         & foliage.canonical_crown_mask
         & (working_stats["radius"] >= args.volume_split_radius)
         & canonical_lineage_supported
+        & canonical_split_support
         & (verification_state == VERIFICATION_VERIFIED)
+        & ~unresolved_split
         & ~rollback_representative_mask
     )
     if static_detail_exclusive_topology:
@@ -10286,6 +13988,7 @@ def _adapt_volume(
     if has_exact_conditioned_stats:
         dynamic_eligible = (
             foliage.dynamic_leaf_mask
+            & ~unresolved_split
             & screen_bandwidth_deficit
             & persistent_observation
             & conditioned_evidence
@@ -10294,6 +13997,7 @@ def _adapt_volume(
     else:
         dynamic_eligible = (
             foliage.dynamic_leaf_mask
+            & ~unresolved_split
             & screen_bandwidth_deficit
             & (
                 (observation_evidence & (observation_gradient > 0))
@@ -10310,6 +14014,9 @@ def _adapt_volume(
                 )
             )
         )
+    if scene_canonical_split:
+        skeleton_eligible &= canonical_split_support
+        dynamic_eligible &= canonical_split_support
     split_score = torch.where(
         foliage.dynamic_leaf_mask, dynamic_split_score, split_score
     )
@@ -10472,10 +14179,12 @@ def _adapt_volume(
                     if name == "dynamic_leaf"
                     else static_lineage_family
                 )
-                # A four-child mutation costs three net rows and halves
-                # projected scale in one step.  Reserve it for parents at
-                # least twice the target radius; smaller deficits retain the
-                # ordinary two-child, one-row-growth split.
+                # A four-child mutation costs three net rows and refines both
+                # dominant projected axes in one step. Reserve it for parents
+                # at least twice the target radius; smaller deficits retain
+                # the ordinary two-child, one-row-growth split. The mutation
+                # itself is deliberately render-preserving rather than a hard
+                # one-event radius clamp.
                 quaternary_candidates = indices[
                     topology_radius[indices]
                     >= 2.0 * float(args.volume_split_radius)
@@ -10710,8 +14419,48 @@ def _adapt_volume(
             allow_static_skeleton=True,
             split_plane_normals=split_plane_normals,
             birth_iteration=int(current_iteration),
+            transaction_remove=rollback_remove,
         )
         split_child_start = int(split_event.pop("_child_start"))
+        if scene_canonical_split and split_child_start < len(foliage):
+            child_rows = torch.arange(
+                split_child_start,
+                len(foliage),
+                device=foliage.xyz.device,
+            )
+            child_support = foliage.support_camera_ids[child_rows]
+            valid_child_support = (child_support >= 0) & (
+                child_support < len(canonical_camera_lookup)
+            )
+            safe_child_support = child_support.long().clamp(
+                0, len(canonical_camera_lookup) - 1
+            )
+            keep_child_support = (
+                valid_child_support
+                & canonical_camera_lookup[safe_child_support]
+            )
+            child_support[~keep_child_support] = -1
+            child_support_ids = torch.where(
+                keep_child_support,
+                child_support.long(),
+                torch.full_like(child_support.long(), -1),
+            ).sort(dim=1).values
+            child_support_unique = child_support_ids >= 0
+            if child_support_ids.shape[1] > 1:
+                child_support_unique[:, 1:] &= (
+                    child_support_ids[:, 1:]
+                    != child_support_ids[:, :-1]
+                )
+            child_support_count = child_support_unique.sum(dim=1)
+            if bool((child_support_count < 2).any()):
+                raise RuntimeError(
+                    "Scene-canonical split emitted a child without two "
+                    "reachable canonical verification cameras"
+                )
+            foliage.support_view_count[child_rows] = child_support_count.to(
+                foliage.support_view_count.dtype
+            )
+            foliage.support_sequence_count[child_rows] = 1
         split_child_owner_camera_ids = conditioned_context_id[
             selected
         ].repeat_interleave(selected_child_counts)
@@ -10776,6 +14525,7 @@ def _adapt_volume(
             ),
             allow_static_skeleton=True,
             birth_iteration=int(current_iteration),
+            transaction_remove=rollback_remove,
         )
         split_child_start = int(prune_event.pop("_child_start"))
         split_child_owner_camera_ids = torch.empty(
@@ -10787,6 +14537,7 @@ def _adapt_volume(
         child_start=split_child_start,
         owner_camera_ids=split_child_owner_camera_ids,
         view_by_camera_id=(view_by_camera_id or {}),
+        canonical_rgb_sequence=canonical_rgb_sequence,
         support_fallback_enabled=bool(
             getattr(args, "canonical_child_support_color_refresh", True)
         ),
@@ -10839,12 +14590,27 @@ def _adapt_volume(
         "configured_split_limit": int(args.maximum_volume_splits),
         "effective_split_limit": effective_split_limit,
         "topology_ramp_scale": split_capacity_scale,
+        "prune_only_maintenance": bool(prune_only_maintenance),
         "verification_debt": {
             "contract": (
-                "continuous_unverified_population_backpressure_with_nonzero_"
-                "ordinary_split_floor__failed_families_rollback_after_timeout"
+                "all_unresolved_state_and_transaction_rows_share_continuous_"
+                "backpressure__ordinary_split_keeps_a_small_floor__failed_"
+                "families_rollback_after_timeout"
             ),
             "unverified_rows": int(unverified_before.sum()),
+            "unresolved_rows": int(unverified_before.sum()),
+            "state_unverified_rows": int(
+                (verification_state == VERIFICATION_UNVERIFIED).sum()
+            ),
+            "factorized_receiver_rows": int(
+                (
+                    verification_state
+                    == VERIFICATION_FACTORIZED_RECEIVER
+                ).sum()
+            ),
+            "unresolved_proposal_rows": int(
+                (proposal_kind != PROPOSAL_NONE).sum()
+            ),
             "fraction": verification_debt_fraction,
             "soft_fraction": debt_soft,
             "hard_fraction": debt_hard,
@@ -10928,18 +14694,43 @@ def _adapt_volume(
             "expired_zero_witness_low_utility_pruned": int(
                 expired_unobserved_low_utility.sum()
             ),
+            "expired_ray_birth_terminally_rejected": int(
+                expired_ray_birth.sum()
+            ),
+            "factorized_receiver_terminal": (
+                factorized_receiver_terminal_audit
+            ),
             "unverified_before_mutation": int(
                 (verification_state == VERIFICATION_UNVERIFIED).sum()
             ),
+            "unresolved_before_mutation": int(unverified_before.sum()),
             "unverified_after_mutation": int(
                 (
-                    foliage.verification_state
-                    == VERIFICATION_UNVERIFIED
+                    (foliage.verification_state == VERIFICATION_UNVERIFIED)
+                    | (
+                        foliage.verification_state
+                        == VERIFICATION_FACTORIZED_RECEIVER
+                    )
                 ).sum()
+            ),
+            "unresolved_after_mutation": int(
+                _verification_debt_mask(foliage).sum()
             ),
             "new_children_are_unverified": True,
             "unverified_split_eligible": 0,
             "failed_family_rollback": rollback_audit,
+            "unresolved_split_snapshot_families": int(
+                len(foliage.split_parent_snapshot_family_id)
+            ),
+            "sparse_split_snapshot_bytes": int(
+                foliage.split_parent_snapshot_family_id.numel()
+                * foliage.split_parent_snapshot_family_id.element_size()
+                + sum(
+                    getattr(foliage, name).numel()
+                    * getattr(foliage, name).element_size()
+                    for name in foliage.split_parent_snapshot_names
+                )
+            ),
         },
         "selection_contract": (
             "continuous_screen_demand_then_lineage_safe_replace_retire_then_"
@@ -10950,7 +14741,11 @@ def _adapt_volume(
             "split_with_exact_ray_camera_plane_refinement"
         ),
         "phase": phase,
-        "_rollback_old_rows": rollback_representatives,
+        "_rollback_old_rows": torch.unique(
+            torch.cat(
+                [rollback_representatives, factorized_restored_parent_rows]
+            )
+        ),
         "_new_to_old": final_to_old if mutated else None,
     }
 
@@ -11096,6 +14891,447 @@ def _apply_volume_opacity_settle_policy(
     return audit
 
 
+def _apply_static_detail_opacity_settle_policy(
+    foliage,
+    volume_optimizer,
+    step: int,
+    args,
+    *,
+    exact_measured_cleanup_gradient: torch.Tensor | None = None,
+    exact_measured_optical_gradient: torch.Tensor | None = None,
+) -> dict[str, object]:
+    """Route late static-detail opacity through a calibrated trust region.
+
+    ``retirement_only`` is retained solely for legacy reproductions.  It is
+    not a valid static-map default: deleting every negative residual while
+    discarding every positive residual is a one-way estimator and v101 lost
+    more than half of its persistent leaf mass after 21k.  The evidence trust
+    region keeps both directions live.  Persistent multiview verification is
+    evidence that a row exists, so ordinary RGB cleanup may calibrate but not
+    erase more than the configured fraction of its immutable optical mass.
+    Rows requiring stronger retirement must first enter an explicit geometric
+    contradiction/rejection lifecycle; a single projected RGB residual is not
+    sufficient evidence of non-existence.
+    """
+
+    policy = str(args.volume_opacity_settle_policy)
+    iteration = int(step) + 1
+    start = int(args.volume_opacity_settle_start_iteration)
+    retirement_end = int(args.volume_opacity_retirement_until_iteration)
+    effective = (
+        "freeze"
+        if policy == "retirement_only" and iteration > retirement_end
+        else policy
+    )
+    detail = foliage.static_leaf_mask
+    audit: dict[str, object] = {
+        "contract": (
+            "post_topology_persistent_detail_evidence_bounded_calibration__"
+            "per_row_growth_and_retirement_closed_at_immutable_bounds__"
+            "stronger_deletion_requires_explicit_geometric_rejection"
+        ),
+        "policy": policy,
+        "effective_policy": effective,
+        "start_iteration": start,
+        "retirement_until_iteration": retirement_end,
+        "active": bool(policy != "none" and iteration > start),
+        "detail_rows": int(detail.sum()),
+        "growth_rows_suppressed": 0,
+        "growth_gradient_suppressed": 0.0,
+        "growth_momentum_entries_suppressed": 0,
+        "frozen_rows": 0,
+        "measured_single_cleanup_retirement_rows": 0,
+        "measured_single_exact_optical_rows": 0,
+        "measured_single_exact_optical_growth_rows": 0,
+        "measured_single_exact_optical_retirement_rows": 0,
+        "persistent_rows": 0,
+        "reference_rows_initialized": 0,
+        "outward_retirement_rows_suppressed": 0,
+        "outward_growth_rows_suppressed": 0,
+        "trust_lower": float(
+            getattr(args, "static_detail_optical_trust_lower", 0.85)
+        ),
+        "trust_upper": float(
+            getattr(args, "static_detail_optical_trust_upper", 1.15)
+        ),
+        "trust_voxel_size": float(
+            getattr(args, "static_detail_optical_trust_voxel_size", 0.10)
+        ),
+    }
+    if not audit["active"] or not bool(detail.any()):
+        return audit
+    gradient = foliage.opacity_logits.grad
+    state = volume_optimizer.state.get(foliage.opacity_logits, {})
+    first_moment = state.get("exp_avg")
+    if effective == "evidence_trust_region":
+        persistent = (
+            detail
+            & _persistent_static_evidence_mask(foliage)
+            & (foliage.proposal_kind == PROPOSAL_NONE)
+        )
+        audit["persistent_rows"] = int(persistent.sum())
+        current_mass = foliage.integrated_optical_mass().detach()
+        reference = foliage.opacity_settle_reference_mass
+        initialize = persistent & (
+            ~torch.isfinite(reference) | (reference <= 0)
+        )
+        with torch.no_grad():
+            reference[initialize] = current_mass[initialize]
+        audit["reference_rows_initialized"] = int(initialize.sum())
+        upper_mass = reference * float(
+            args.static_detail_optical_trust_upper
+        )
+        lower_mass = reference * float(
+            args.static_detail_optical_trust_lower
+        )
+        at_upper = persistent & (current_mass >= upper_mass * (1.0 - 1e-6))
+        at_lower = persistent & (current_mass <= lower_mass * (1.0 + 1e-6))
+        nonpersistent = detail & ~persistent
+        measured_single = (
+            detail
+            & (foliage.verification_state == VERIFICATION_MEASURED_SINGLE)
+            & (foliage.proposal_kind == PROPOSAL_NONE)
+        )
+        measured_cleanup_rows = torch.zeros_like(detail)
+        if gradient is not None:
+            # Adam subtracts the gradient: positive means retirement and
+            # negative means growth.  Clamp the *source direction* at the
+            # immutable bounds rather than restoring opacity after Adam.  The
+            # old post-step water-fill recreated contradicted splats; this
+            # pre-step barrier never increases a parameter and therefore
+            # cannot undo valid negative evidence already consumed.
+            outward_growth = at_upper[:, None] & (gradient < 0)
+            outward_retirement = at_lower[:, None] & (gradient > 0)
+            audit["outward_growth_rows_suppressed"] = int(
+                outward_growth.flatten(1).any(dim=1).sum()
+            )
+            audit["outward_retirement_rows_suppressed"] = int(
+                outward_retirement.flatten(1).any(dim=1).sum()
+            )
+            gradient[outward_growth] = 0
+            gradient[outward_retirement] = 0
+            # A measured-single or unresolved proposal has no global optical
+            # authority after settlement. Exact-owner training may establish
+            # it before this stage; it cannot drift in the global polish.
+            gradient[nonpersistent] = 0
+            if exact_measured_cleanup_gradient is not None:
+                cleanup_gradient = torch.as_tensor(
+                    exact_measured_cleanup_gradient,
+                    device=gradient.device,
+                    dtype=gradient.dtype,
+                )
+                if cleanup_gradient.shape != gradient.shape:
+                    raise ValueError(
+                        "Exact measured cleanup gradient must align with "
+                        "static detail opacity"
+                    )
+                measured_cleanup_rows = (
+                    measured_single
+                    & (cleanup_gradient > 0).flatten(1).any(dim=1)
+                )
+                gradient[measured_cleanup_rows] = cleanup_gradient[
+                    measured_cleanup_rows
+                ]
+            measured_exact_rows = torch.zeros_like(detail)
+            if exact_measured_optical_gradient is not None:
+                exact_gradient = torch.as_tensor(
+                    exact_measured_optical_gradient,
+                    device=gradient.device,
+                    dtype=gradient.dtype,
+                )
+                if exact_gradient.shape != gradient.shape:
+                    raise ValueError(
+                        "Exact measured optical gradient must align with "
+                        "static detail opacity"
+                    )
+                measured_exact_rows = measured_single & (
+                    exact_gradient.abs().flatten(1).any(dim=1)
+                )
+                gradient[measured_exact_rows] = exact_gradient[
+                    measured_exact_rows
+                ]
+            audit["measured_single_cleanup_retirement_rows"] = int(
+                measured_cleanup_rows.sum()
+            )
+            audit["measured_single_exact_optical_rows"] = int(
+                measured_exact_rows.sum()
+            )
+            audit["measured_single_exact_optical_growth_rows"] = int(
+                (
+                    measured_exact_rows[:, None]
+                    & (exact_gradient < 0)
+                ).flatten(1).any(dim=1).sum()
+            ) if exact_measured_optical_gradient is not None else 0
+            audit["measured_single_exact_optical_retirement_rows"] = int(
+                (
+                    measured_exact_rows[:, None]
+                    & (exact_gradient > 0)
+                ).flatten(1).any(dim=1).sum()
+            ) if exact_measured_optical_gradient is not None else 0
+            audit["frozen_rows"] = int(
+                (
+                    nonpersistent
+                    & ~measured_cleanup_rows
+                    & ~measured_exact_rows
+                ).sum()
+            )
+        if torch.is_tensor(first_moment):
+            first_moment[
+                at_upper[:, None] & (first_moment < 0)
+            ] = 0
+            first_moment[
+                at_lower[:, None] & (first_moment > 0)
+            ] = 0
+            first_moment[nonpersistent] = 0
+    elif effective == "retirement_only":
+        if gradient is not None:
+            increasing = detail[:, None] & (gradient < 0)
+            audit["growth_rows_suppressed"] = int(
+                increasing.flatten(1).any(dim=1).sum()
+            )
+            audit["growth_gradient_suppressed"] = float(
+                (-gradient[increasing]).sum()
+            )
+            gradient[increasing] = 0
+        if torch.is_tensor(first_moment):
+            increasing_momentum = detail[:, None] & (first_moment < 0)
+            audit["growth_momentum_entries_suppressed"] = int(
+                increasing_momentum.sum()
+            )
+            first_moment[increasing_momentum] = 0
+    elif effective == "freeze":
+        if gradient is not None:
+            audit["frozen_rows"] = int(
+                (gradient[detail].abs().flatten(1).sum(dim=1) > 0).sum()
+            )
+            gradient[detail] = 0
+        if torch.is_tensor(first_moment):
+            first_moment[detail] = 0
+    elif effective != "none":
+        raise ValueError(f"Unknown static detail settle policy {effective!r}")
+    return audit
+
+
+def _static_detail_optical_trust_groups(
+    foliage,
+    owned: torch.Tensor,
+    voxel_size: float,
+    maximum_group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return bounded local groups in immutable initialization coordinates.
+
+    A raw 10 cm cell can contain thousands of descendants sharing one seed
+    centre. Treating that population as one optical owner lets unrelated
+    leaves exchange mass. Dense cells are therefore sharded by immutable
+    lineage order. Conversely, a singleton has no neighbouring coverage to
+    conserve and receives no lower mass floor in the projection below.
+    """
+
+    if float(voxel_size) <= 0.0:
+        raise ValueError("static detail optical trust voxel must be positive")
+    maximum_group_size = int(maximum_group_size)
+    if maximum_group_size < 2:
+        raise ValueError("static detail optical trust group cap must be >= 2")
+    rows = torch.nonzero(owned, as_tuple=False).reshape(-1)
+    cached = getattr(foliage, "_opacity_settle_group_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 5
+        and float(cached[0]) == float(voxel_size)
+        and int(cached[1]) == maximum_group_size
+        and torch.equal(cached[2], rows)
+    ):
+        return rows, cached[3], int(cached[4])
+    if not len(rows):
+        return rows, rows.clone(), 0
+    centers = foliage.initialization_center[rows].detach()
+    if centers.shape != (len(rows), 3) or not bool(
+        torch.isfinite(centers).all()
+    ):
+        raise RuntimeError(
+            "Persistent detail optical groups require finite immutable centers"
+        )
+    tree = foliage.tree_instance_id[rows].to(dtype=torch.int64)
+    voxel = torch.floor(centers / float(voxel_size)).to(dtype=torch.int64)
+    keys = torch.cat([tree[:, None], voxel], dim=1)
+    _, base_groups = torch.unique(
+        keys, dim=0, sorted=True, return_inverse=True
+    )
+    lineage = foliage.lineage_id[rows].to(dtype=torch.int64)
+    lineage_order = torch.argsort(lineage, stable=True)
+    order = lineage_order[
+        torch.argsort(base_groups[lineage_order], stable=True)
+    ]
+    ordered_groups = base_groups[order]
+    _, base_counts = torch.unique_consecutive(
+        ordered_groups, return_counts=True
+    )
+    offsets = torch.cumsum(base_counts, dim=0) - base_counts
+    ranks = torch.arange(
+        len(rows), device=rows.device, dtype=torch.int64
+    ) - torch.repeat_interleave(offsets, base_counts)
+    shard_counts = torch.div(
+        base_counts + maximum_group_size - 1,
+        maximum_group_size,
+        rounding_mode="floor",
+    )
+    shard_offsets = torch.cumsum(shard_counts, dim=0) - shard_counts
+    ordered_shards = (
+        torch.repeat_interleave(shard_offsets, base_counts)
+        + torch.div(
+            ranks * torch.repeat_interleave(shard_counts, base_counts),
+            torch.repeat_interleave(base_counts, base_counts),
+            rounding_mode="floor",
+        )
+    )
+    inverse = torch.empty_like(base_groups)
+    inverse[order] = ordered_shards
+    group_count = int(shard_counts.sum())
+    foliage._opacity_settle_group_cache = (
+        float(voxel_size),
+        maximum_group_size,
+        rows.detach().clone(),
+        inverse.detach(),
+        group_count,
+    )
+    return rows, inverse, group_count
+
+
+@torch.no_grad()
+def _enforce_static_detail_optical_mass_trust_region(
+    foliage,
+    volume_optimizer,
+    args,
+) -> dict[str, float | int | str]:
+    """Apply an upper safety cap without inventing missing optical mass.
+
+    The immutable initialization mass is a capacity prior, not evidence that
+    opacity must continue to exist.  A lower projection after Adam reverses
+    signed wall/free-space evidence and was measurably adding mass during
+    final polish.  Coverage is therefore learned by positive image evidence;
+    this projector is deliberately incapable of increasing any row.
+    """
+
+    persistent = (
+        foliage.static_leaf_mask
+        & _persistent_static_evidence_mask(foliage)
+        & (foliage.proposal_kind == PROPOSAL_NONE)
+    )
+    reference = foliage.opacity_settle_reference_mass
+    owned = persistent & torch.isfinite(reference) & (reference > 0)
+    audit: dict[str, float | int | str] = {
+        "contract": (
+            "bounded_immutable_initialization_voxel_evidence_mass_anchor__"
+            "dense_cells_sharded_by_lineage__singleton_lower_floor_disabled__"
+            "all_lower_floor_restoration_disabled__harmful_rows_may_retire_"
+            "below_row_and_group_anchor__per_row_upper_cap_only__post_adam_"
+            "projection_can_never_increase_optical_mass"
+        ),
+        "owner_rows": int(owned.sum()),
+        "projected_rows": 0,
+        "projected_up_rows": 0,
+        "projected_down_rows": 0,
+        "mass_before": 0.0,
+        "mass_after": 0.0,
+        "group_count": 0,
+        "groups_below_lower_before": 0,
+        "groups_above_upper_before": 0,
+        "rows_below_individual_lower_after": 0,
+        "singleton_groups_without_lower_floor": 0,
+        "maximum_group_rows": 0,
+        "voxel_size": float(
+            getattr(args, "static_detail_optical_trust_voxel_size", 0.10)
+        ),
+    }
+    if not bool(owned.any()):
+        return audit
+    current = foliage.integrated_optical_mass().detach()
+    rows, groups, group_count = _static_detail_optical_trust_groups(
+        foliage,
+        owned,
+        float(getattr(args, "static_detail_optical_trust_voxel_size", 0.10)),
+        int(
+            getattr(
+                args,
+                "static_detail_optical_trust_maximum_group_size",
+                32,
+            )
+        ),
+    )
+    audit["group_count"] = int(group_count)
+    reference_rows = reference[rows]
+    current_rows = current[rows]
+    row_upper = reference_rows * float(args.static_detail_optical_trust_upper)
+    row_lower = reference_rows * float(args.static_detail_optical_trust_lower)
+    target_rows = torch.minimum(current_rows, row_upper)
+    group_reference = reference_rows.new_zeros(group_count).scatter_add_(
+        0, groups, reference_rows
+    )
+    group_rows = torch.zeros(
+        group_count,
+        device=groups.device,
+        dtype=torch.int64,
+    ).scatter_add_(0, groups, torch.ones_like(groups))
+    audit["singleton_groups_without_lower_floor"] = int(
+        (group_rows == 1).sum()
+    )
+    audit["maximum_group_rows"] = int(group_rows.max())
+    group_lower = group_reference * float(
+        args.static_detail_optical_trust_lower
+    )
+    group_lower = torch.where(
+        group_rows >= 2, group_lower, torch.zeros_like(group_lower)
+    )
+    group_upper = group_reference * float(
+        args.static_detail_optical_trust_upper
+    )
+    group_current_before = current_rows.new_zeros(group_count).scatter_add_(
+        0, groups, current_rows
+    )
+    audit["groups_below_lower_before"] = int(
+        (group_current_before < group_lower * (1.0 - 1.0e-6)).sum()
+    )
+    audit["groups_above_upper_before"] = int(
+        (group_current_before > group_upper * (1.0 + 1.0e-6)).sum()
+    )
+
+    # Do not add a water-fill lower projection here.  In v104 this block ran
+    # after signed cleanup and restored roughly 95k rows in a single late
+    # step.  That made a correct negative gradient disappear before the next
+    # render and was the direct cause of the 25.5k -> 30k canopy regression.
+    target = current.clone()
+    target[rows] = target_rows
+    projected = owned & ~torch.isclose(
+        target, current, rtol=1.0e-6, atol=1.0e-12
+    )
+    audit["projected_rows"] = int(projected.sum())
+    audit["projected_up_rows"] = int((projected & (target > current)).sum())
+    audit["projected_down_rows"] = int((projected & (target < current)).sum())
+    audit["mass_before"] = float(current[owned].sum())
+    audit["rows_below_individual_lower_after"] = int(
+        (target_rows < row_lower * (1.0 - 1.0e-6)).sum()
+    )
+    if audit["projected_up_rows"] != 0:
+        raise RuntimeError(
+            "Static-detail optical trust projection increased opacity"
+        )
+    if bool(projected.any()):
+        area = projected_gaussian_cross_section(
+            foliage.scales.detach()[projected]
+        ).clamp_min(1.0e-12)
+        tau = target[projected] / area
+        alpha = (-torch.expm1(-tau)).clamp(1.0e-6, 1.0 - 1.0e-6)
+        foliage.opacity_logits[projected] = torch.logit(alpha)[:, None]
+        state = volume_optimizer.state.get(foliage.opacity_logits, {})
+        first_moment = state.get("exp_avg")
+        if torch.is_tensor(first_moment):
+            first_moment[projected] = 0
+    audit["mass_after"] = float(
+        foliage.integrated_optical_mass().detach()[owned].sum()
+    )
+    return audit
+
+
 @torch.no_grad()
 def _measure_static_ray_local_replacement(
     view,
@@ -11123,13 +15359,13 @@ def _measure_static_ray_local_replacement(
     renderer; a primitive-centre proxy is neither necessary nor allowed to
     veto those pixels.
     """
-    envelope_mask = foliage.persistent_envelope_mask
-    detail_mask = foliage.static_leaf_mask & (
-        foliage.verification_state == VERIFICATION_VERIFIED
-    ) & (foliage.verified_camera_count >= 2)
-    verified_envelope_mask = envelope_mask & (
-        foliage.verification_state == VERIFICATION_VERIFIED
+    persistent = _persistent_static_evidence_mask(foliage)
+    envelope_mask = (
+        foliage.persistent_envelope_mask
+        & _resolved_static_owner_mask(foliage)
     )
+    detail_mask = foliage.static_leaf_mask & persistent
+    verified_envelope_mask = envelope_mask
     empty = foliage.xyz.new_zeros(len(foliage))
     if not bool(envelope_mask.any()) or not bool(detail_mask.any()):
         return empty, envelope_mask & False, envelope_mask & False, {
@@ -11307,7 +15543,7 @@ def _accumulate_static_replacement_evidence(
     visible = torch.as_tensor(
         visible, device=foliage.xyz.device, dtype=torch.bool
     ).reshape(-1) & foliage.persistent_envelope_mask & (
-        foliage.verification_state == VERIFICATION_VERIFIED
+        _resolved_static_owner_mask(foliage)
     )
     if candidate_visible is None:
         candidate = visible
@@ -11348,7 +15584,7 @@ def _accumulate_static_replacement_evidence(
     ).clamp(0.0, 1.0)
     authority = foliage.replacement_overlap_ema * readiness
     envelope = foliage.persistent_envelope_mask & (
-        foliage.verification_state == VERIFICATION_VERIFIED
+        _resolved_static_owner_mask(foliage)
     )
     return {
         "contract": (
@@ -11426,11 +15662,19 @@ def _apply_static_ray_local_mass_handoff(
     what prevents both duplicate fog and one-way transparent holes.
     """
     all_envelope = foliage.persistent_envelope_mask
-    envelope = all_envelope & (
-        foliage.verification_state == VERIFICATION_VERIFIED
-    )
+    envelope = all_envelope & _resolved_static_owner_mask(foliage)
     previous = foliage.handoff_retired_fraction.clamp(0.0, 0.95)
-    illegally_retired = all_envelope & ~envelope & (previous > 0)
+    # An unresolved split is an atomic transaction.  Its children inherit
+    # the parent's realized retirement state and must keep it unchanged until
+    # the whole family verifies or rolls back.  Treating those rows as a
+    # legacy "illegal retirement" restored hidden mass mid-transaction and
+    # made a successful split permanently denser than its parent.
+    terminal_ineligible = (
+        all_envelope
+        & (foliage.proposal_kind == PROPOSAL_NONE)
+        & ~_resolved_static_owner_mask(foliage)
+    )
+    illegally_retired = terminal_ineligible & (previous > 0)
     if (
         not bool(envelope.any())
         and not bool(illegally_retired.any())
@@ -11499,6 +15743,7 @@ def _finalize_static_ray_local_mass_handoff(
     *,
     scheduled: bool,
     maximum_fraction_per_event: float,
+    allow_mass_transfer: bool = True,
 ) -> dict[str, float | int | str | bool]:
     """Fold the optimizer update into reference mass, then transfer mass.
 
@@ -11515,7 +15760,7 @@ def _finalize_static_ray_local_mass_handoff(
         realized_before / retained_before
     )
     audit: dict[str, float | int | str | bool]
-    if scheduled:
+    if scheduled and allow_mass_transfer:
         audit = _apply_static_ray_local_mass_handoff(
             foliage,
             volume_optimizer,
@@ -11528,6 +15773,7 @@ def _finalize_static_ray_local_mass_handoff(
             "removed_mass": 0.0,
             "restored_mass": 0.0,
             "scheduled_after_optimizer_step": False,
+            "mass_transfer_frozen": bool(scheduled and not allow_mass_transfer),
         }
     realized_after = foliage.integrated_optical_mass()
     retained_after = (1.0 - foliage.handoff_retired_fraction).clamp_min(
@@ -11536,7 +15782,12 @@ def _finalize_static_ray_local_mass_handoff(
     foliage.handoff_reference_mass.copy_(
         realized_after / retained_after
     )
-    audit["scheduled_after_optimizer_step"] = bool(scheduled)
+    audit["scheduled_after_optimizer_step"] = bool(
+        scheduled and allow_mass_transfer
+    )
+    audit["mass_transfer_frozen"] = bool(
+        scheduled and not allow_mass_transfer
+    )
     return audit
 
 
@@ -11618,10 +15869,7 @@ def _initialize_static_ray_birth_mass_handoff(
     valid_owner = (
         (owner_rows >= 0)
         & foliage.persistent_envelope_mask[safe_owner_rows]
-        & (
-            foliage.verification_state[safe_owner_rows]
-            == VERIFICATION_VERIFIED
-        )
+        & _resolved_static_owner_mask(foliage)[safe_owner_rows]
         & (foliage.replacement_group[birth_rows] >= 0)
         & (
             foliage.replacement_group[birth_rows]
@@ -11892,6 +16140,7 @@ def _update_static_child_verification_from_render(
     camera_id: int,
     camera_sequence_lookup: torch.Tensor | None,
     volume_optimizer=None,
+    required_sequence_count: int | None = None,
 ) -> dict[str, int | str]:
     """Re-verify topology children from native real-ray contribution.
 
@@ -11901,13 +16150,24 @@ def _update_static_child_verification_from_render(
     then requires two cameras and every independent sequence available to the
     parent (up to two); no repeated visit can manufacture multiview support.
     """
-    unverified = (
+    proposal_unverified = (
         foliage.verification_state == VERIFICATION_UNVERIFIED
     ) & ~foliage.dynamic_leaf_mask
-    if not bool(unverified.any()) or package.responsibility is None:
+    verification_candidate = (
+        proposal_unverified
+        | (foliage.verification_state == VERIFICATION_FACTORIZED_RECEIVER)
+        | (foliage.verification_state == VERIFICATION_MEASURED_SINGLE)
+    ) & ~foliage.dynamic_leaf_mask
+    if bool(proposal_unverified.any()) and bool(
+        (foliage.birth_iteration[proposal_unverified] < 0).any()
+    ):
+        raise RuntimeError(
+            "An unverified static proposal has no lifecycle birth iteration"
+        )
+    if not bool(verification_candidate.any()) or package.responsibility is None:
         return {
             "contract": "real_ray_child_reverification",
-            "candidate_rows": int(unverified.sum()),
+            "candidate_rows": int(verification_candidate.sum()),
             "new_camera_witnesses": 0,
             "new_color_witnesses": 0,
             "newly_verified": 0,
@@ -11920,9 +16180,11 @@ def _update_static_child_verification_from_render(
     rigid_fraction = volume[:, 2] / total
     candidate_camera = (foliage.support_camera_ids == int(camera_id)).any(
         dim=1
-    ) if foliage.support_camera_ids.shape[1] else torch.zeros_like(unverified)
+    ) if foliage.support_camera_ids.shape[1] else torch.zeros_like(
+        verification_candidate
+    )
     witnessed = (
-        unverified
+        verification_candidate
         & candidate_camera
         & (volume[:, 0] > 1.0e-5)
         & (canopy_fraction > rigid_fraction)
@@ -12023,16 +16285,28 @@ def _update_static_child_verification_from_render(
                 )
             sequence_count += first.to(torch.int16)
         foliage.verified_sequence_count.copy_(sequence_count)
-    required_sequences = torch.minimum(
-        foliage.support_sequence_count.clamp_min(1),
-        torch.full_like(foliage.support_sequence_count, 2),
-    )
+    if required_sequence_count is None:
+        required_sequences = torch.minimum(
+            foliage.support_sequence_count.clamp_min(1),
+            torch.full_like(foliage.support_sequence_count, 2),
+        )
+    else:
+        required = int(required_sequence_count)
+        if required <= 0:
+            raise ValueError("required_sequence_count must be positive")
+        required_sequences = torch.full_like(
+            foliage.support_sequence_count, required
+        )
     verified = (
-        unverified
+        verification_candidate
         & (foliage.verified_camera_count >= 2)
         & (foliage.verified_sequence_count >= required_sequences)
     )
     foliage.verification_state[verified] = VERIFICATION_VERIFIED
+    resolved_ray_birth = verified & (
+        foliage.proposal_kind == PROPOSAL_RAY_BIRTH
+    )
+    foliage.proposal_kind[resolved_ray_birth] = PROPOSAL_NONE
     # The parent evidence row was only a candidate after displacement.  Once
     # two real owner cameras (and the required independent sequences) have
     # witnessed the child at its new position, promote that candidate into
@@ -12044,13 +16318,20 @@ def _update_static_child_verification_from_render(
     foliage.candidate_evidence_primitive_id[promotable] = -1
     return {
         "contract": "real_ray_child_reverification",
-        "candidate_rows": int(unverified.sum()),
+        "candidate_rows": int(verification_candidate.sum()),
         "real_contributing_candidates": int(witnessed.sum()),
         "new_camera_witnesses": int(added),
         "new_color_witnesses": int(color_witnesses),
         "newly_verified": int(verified.sum()),
+        "resolved_ray_births": int(resolved_ray_birth.sum()),
         "remaining_unverified": int(
-            (foliage.verification_state == VERIFICATION_UNVERIFIED).sum()
+            (
+                (foliage.verification_state == VERIFICATION_UNVERIFIED)
+                | (
+                    foliage.verification_state
+                    == VERIFICATION_FACTORIZED_RECEIVER
+                )
+            ).sum()
         ),
     }
 
@@ -12066,7 +16347,6 @@ def _static_detail_stage_trainable(phase: str) -> bool:
     return str(phase) not in {
         "canonical_bootstrap",
         "topology",
-        "canonical_polish",
     }
 
 
@@ -12076,18 +16356,98 @@ def _static_spatial_uncertainty_active(
     foliage_active: bool,
     static_detail_active: bool,
 ) -> bool:
-    """Enable robust spatial routing without enabling a temporal model.
+    """Never let a learned residual decide static supervision authority.
 
-    The final representation remains one canonical static map.  This module
-    estimates only where cross-traversal RGB is unreliable after the detail
-    branch exists; it owns no geometry, opacity, RGB residual or deployment
-    parameter.
+    In a static scene-snapshot target, cross-sequence leaf disagreement is a
+    missing-target problem, not heteroscedastic noise.  A learned sigma that
+    is trained from the same RGB residual it later downweights forms a
+    circular escape route: the hardest crown pixels lose supervision exactly
+    when they need it.  Static authority is instead fixed by
+    :func:`_static_scene_rgb_ownership`; uncertainty remains available only
+    to the legacy sequence-conditioned reconstruction.
     """
 
-    return bool(
-        reconstruction_target == "static"
-        and foliage_active
-        and static_detail_active
+    del reconstruction_target, foliage_active, static_detail_active
+    return False
+
+
+def _static_scene_rgb_ownership(
+    background_weight: torch.Tensor,
+    canopy_weight: torch.Tensor,
+    observed_canopy_probability: torch.Tensor,
+    canonical_volume_alpha: torch.Tensor,
+    *,
+    reconstruction_target: str,
+    canonical_sequence_policy: str,
+    canonical_sequence: str | None,
+    view_sequence: str,
+    view_is_canonical_snapshot: bool | None = None,
+    dilation_pixels: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Apply the scene-snapshot known/unknown contract to RGB weights.
+
+    Only the selected acquisition is a target for leaf colour, porosity and
+    high-frequency placement.  In every other traversal the union of the
+    observed tree silhouette and the *detached* projected canonical volume is
+    unknown: observed foliage must not create a second seasonal snapshot, and
+    a revealed facade must not erase canonical leaves.  Rigid/sky pixels
+    outside that union remain useful supervision.
+
+    The projected term reaches full unknown authority above a small but
+    physically rendered alpha, while weaker tails fade continuously.  A
+    small dilation covers raster/semantic edge mismatch without turning the
+    whole image into an ignored region.
+    """
+
+    if background_weight.shape != canopy_weight.shape:
+        raise ValueError("Static RGB weight maps must have identical shapes")
+    if observed_canopy_probability.shape != background_weight.shape:
+        raise ValueError("Observed canopy probability must align with RGB")
+    alpha = canonical_volume_alpha
+    if alpha.ndim == 3 and alpha.shape[0] == 1:
+        alpha = alpha[0]
+    if alpha.shape != background_weight.shape:
+        raise ValueError("Canonical volume alpha must align with RGB")
+    unknown = torch.zeros_like(background_weight)
+    active = (
+        str(reconstruction_target) == "static"
+        and str(canonical_sequence_policy) == "scene"
+    )
+    if not active:
+        return background_weight, canopy_weight, unknown, True
+    if canonical_sequence is None:
+        raise RuntimeError(
+            "Scene-canonical static RGB requires a selected sequence"
+        )
+    is_canonical = str(view_sequence) == str(canonical_sequence)
+    # A snapshot frame list anchors diagnostics; it must not collapse camera
+    # coverage inside the selected canonical acquisition.  Retain the keyword
+    # for checkpoint/test-call compatibility, but sequence membership is the
+    # sole pixel-level authority boundary.
+    del view_is_canonical_snapshot
+    if is_canonical:
+        return background_weight, canopy_weight, unknown, True
+    observed = observed_canopy_probability.detach().clamp(0.0, 1.0)
+    projected = (
+        alpha.detach().clamp_min(0.0) / STATIC_UNKNOWN_PROJECTED_ALPHA
+    ).clamp(0.0, 1.0)
+    unknown = 1.0 - (1.0 - observed) * (1.0 - projected)
+    radius = max(int(dilation_pixels), 0)
+    if radius:
+        kernel = 2 * radius + 1
+        unknown = F.max_pool2d(
+            unknown[None, None],
+            kernel_size=kernel,
+            stride=1,
+            padding=radius,
+        )[0, 0]
+    unknown = unknown.clamp(0.0, 1.0)
+    known = 1.0 - unknown
+    return (
+        background_weight * known,
+        torch.zeros_like(canopy_weight),
+        unknown,
+        False,
     )
 
 
@@ -12099,11 +16459,12 @@ def _static_detail_ray_trainable(phase: str) -> bool:
     Its calibrated exact-owner ray/depth posterior is nevertheless valid
     before RGB activation.  Deferring this factor consumed the first and, in
     a short causal prefix, only evidence visit of low-id cameras while the
-    intended detail owner was frozen.  Keep the final polish freeze, but let
-    real hit/free/depth evidence establish geometry and optical existence
-    from the first scheduled ray epoch.
+    intended detail owner was frozen.  Final polish freezes topology, not
+    evidence-backed leaf calibration, so real hit/free/depth evidence remains
+    trainable through the last update.
     """
-    return str(phase) != "canonical_polish"
+    del phase
+    return True
 
 
 def _static_ray_hit_opacity_gradient_scale(
@@ -12128,50 +16489,72 @@ def _static_ray_hit_opacity_gradient_scale(
         "static_foliage": 0.75,
         "dynamic_appearance": 0.35,
         "ownership_cleanup": 0.10,
-        "canonical_polish": 0.0,
+        "canonical_polish": 0.10,
     }.get(str(phase), 1.0)
 
 
 def _static_detail_positive_opacity_growth_scale(phase: str) -> float:
-    """Keep detail optical calibration continuous without late thickening."""
-    return {
-        "canonical_bootstrap": 1.0,
-        "topology": 1.0,
-        "static_foliage": 1.0,
-        "dynamic_appearance": 0.60,
-        "ownership_cleanup": 0.25,
-        "canonical_polish": 0.0,
-    }.get(str(phase), 1.0)
+    """Do not attenuate the same positive ray evidence a second time.
+
+    Hit-opacity creation is already bounded once at its source by
+    :func:`_static_ray_hit_opacity_gradient_scale` and balanced by free-space
+    and complexity terms.  Scaling the accumulated detail gradient again
+    reduced late recovery to 2.5% and also shrank Adam's retained recovery
+    moment.  One physical signal must have one strength control.
+    """
+    del phase
+    return 1.0
 
 
 def _static_detail_isolated_gradient_gates(
     geometry_gate: torch.Tensor | None,
     appearance_gate: torch.Tensor | None = None,
+    opacity_gate: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Route the detail counterfactual to geometry, never SH or opacity.
+    """Route canonical detail residuals to geometry and optical coverage.
 
     This stream removes the envelope so a real screen residual can align
-    verified detail.  Intrinsic colour has a separate alpha-normalized owner;
-    allowing this low-alpha composite to update SH creates black speckles when
-    ray evidence later raises optical mass.
+    verified detail and decide whether its robust intrinsic colour should
+    occlude the structural surface behind it.  Intrinsic colour has a separate
+    alpha-normalized owner; allowing this low-alpha composite to update SH
+    creates black speckles when optical mass later rises.
+
+    Opacity is deliberately explicit instead of copied from the geometry
+    permission.  Geometry and optical existence have different evidence
+    owners: only a verified positive-sequence optical gate may close the
+    former self-lock where detail could not gain enough alpha to trigger the
+    envelope-to-detail mass hand-off.
     """
     if geometry_gate is None:
         raise ValueError(
             "static detail isolated supervision requires an explicit owner gate"
         )
-    opacity_gate = torch.zeros_like(geometry_gate)
+    if opacity_gate is None:
+        raise ValueError(
+            "static detail isolated supervision requires an explicit "
+            "optical gate"
+        )
+    opacity = torch.as_tensor(
+        opacity_gate,
+        device=geometry_gate.device,
+        dtype=geometry_gate.dtype,
+    ).reshape(-1)
+    if len(opacity) != len(geometry_gate):
+        raise ValueError(
+            "static detail isolated optical gate must align with geometry"
+        )
     # This counterfactual is intentionally geometry-only.  With fixed low
     # alpha, fitting its white-background composite can reduce the loss by
     # driving intrinsic SH toward black.  When later ray evidence raises
     # opacity, those stale black colours become high-contrast speckles.  The
     # volume-only alpha-normalized stream below is the unique intrinsic-colour
-    # owner; keep both SH and opacity read-only here.
+    # owner.  This branch owns only the real occlusion residual for opacity.
     appearance_read_only = torch.zeros_like(geometry_gate)
-    return geometry_gate, appearance_read_only, opacity_gate
+    return geometry_gate, appearance_read_only, opacity
 
 
 def _static_volume_isolated_gradient_gates(
@@ -12299,6 +16682,8 @@ def _static_ray_candidate_masks(
     phase: str,
     camera_id: int,
     camera_sequence_lookup: torch.Tensor | None,
+    canonical_sequence_index: int | None = None,
+    canonical_snapshot_camera_ids: set[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return independent free-space and positive-hit permissions.
 
@@ -12319,22 +16704,22 @@ def _static_ray_candidate_masks(
     else:
         hit_mask = hit_mask & ~detail
     if getattr(args, "static_detail_canonical_ownership", True):
-        evidence_sequence_owned = (
-            _static_detail_positive_evidence_sequence_gate(
+        # Do not apply the detail-only ownership mask to envelope/skeleton
+        # rows. For detail, only an exact persisted support/witness camera is
+        # an owner. A sequence label or a global verification count is not a
+        # visibility table.
+        exact_camera_owned = (
+            _static_detail_canonical_ownership_gate(
                 foliage,
                 int(camera_id),
                 camera_sequence_lookup,
             )
             > 0
         )
-        # Do not apply the detail-only ownership mask to envelope/skeleton
-        # rows. For detail, exact support is sufficient immediately; verified
-        # two-sequence consensus is additionally a global positive-hit owner
-        # of the single static map. This closes the former loop
-        # ``permission miss -> uncovered hit -> 2048 more low-mass births``.
-        detail_permission = evidence_sequence_owned | (
-            _static_detail_consensus_hit_gate(foliage)
-        )
+        # Positive and negative detail-ray evidence is camera-local.  A
+        # sequence label alone is not a visibility table and previously let
+        # one frame alter every persistent leaf in the traversal.
+        detail_permission = exact_camera_owned
         # The same positive-evidence sequences own both hit and free-space
         # evidence.  The former all-camera free mask let an unrelated season
         # delete a leaf that only its seed camera was allowed to restore.
@@ -12344,6 +16729,30 @@ def _static_ray_candidate_masks(
         )
     else:
         free_mask = free_mask | detail
+    if canonical_sequence_index is not None:
+        current_sequence = -1
+        if (
+            camera_sequence_lookup is not None
+            and 0 <= int(camera_id) < len(camera_sequence_lookup)
+        ):
+            current_sequence = int(
+                camera_sequence_lookup[int(camera_id)].item()
+            )
+        if current_sequence != int(canonical_sequence_index):
+            # Cross-sequence rays still calibrate the persistent envelope and
+            # skeleton. A seasonal absence is neither free-space evidence
+            # against canonical leaf detail nor authority to create it.
+            free_mask = free_mask & ~detail
+            hit_mask = hit_mask & ~detail
+        elif (
+            canonical_snapshot_camera_ids is not None
+            and int(camera_id) not in canonical_snapshot_camera_ids
+        ):
+            # The caller supplies the exact canonical camera set. Cameras
+            # outside it may still calibrate persistent envelope/skeleton,
+            # but they may neither delete nor create canonical detail.
+            free_mask = free_mask & ~detail
+            hit_mask = hit_mask & ~detail
     return free_mask, hit_mask
 
 
@@ -12471,6 +16880,11 @@ def _apply_static_optical_policy(
     phase: str,
     *,
     canonical_evidence_opacity_gradient: torch.Tensor | None = None,
+    canonical_occlusion_opacity_gradient: torch.Tensor | None = None,
+    canonical_occlusion_xyz_gradient: torch.Tensor | None = None,
+    exact_owner_ray_opacity_gradient: torch.Tensor | None = None,
+    moge3_canopy_optical_opacity_gradient: torch.Tensor | None = None,
+    persistent_envelope_cleanup_opacity_gradient: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Enforce the static parameter/loss ownership matrix continuously.
 
@@ -12481,19 +16895,28 @@ def _apply_static_optical_policy(
     are removed while every negative/free-space component is retained.
     Static detail and skeleton mass never inherit the envelope-retirement
     rule.
-    During final polish, geometry, covariance and mass freeze together so
-    appearance cannot create holes by moving a fixed-alpha Gaussian.
+    During final polish, topology and the stable envelope/skeleton scaffold
+    freeze together. Evidence-backed detail geometry and mass remain
+    trainable so a real coverage hole is not made permanent by the phase
+    boundary.
     """
     audit: dict[str, object] = {
         "contract": STATIC_OPTICAL_POLICY_CONTRACT,
         "phase": phase,
-        "joint_polish_freeze": phase == "canonical_polish",
+        "joint_polish_freeze": False,
+        "polish_freeze_scope": (
+            "stable_envelope_skeleton_geometry_covariance_mass"
+            if phase == "canonical_polish"
+            else "not_active"
+        ),
         "envelope_growth_rows_attenuated": 0,
         "envelope_positive_growth_attenuation": (
-            "stage3_canonical_geometry_ray_only__ray_hit_opacity_is_phase_"
-            "annealed_at_source__stage2_actual_local_handoff_retired_fraction"
+            "stage3_canonical_geometry_ray_plus_bounded_occlusion_deficit__"
+            "ray_hit_opacity_is_phase_annealed_at_source__stage2_actual_"
+            "local_handoff_retired_fraction"
         ),
         "envelope_high_order_sh_rows_frozen": 0,
+        "persistent_detail_high_order_sh_rows_frozen": 0,
         "mean_envelope_replacement_authority": 0.0,
         "static_detail_mass_trainable": _static_detail_stage_trainable(phase),
         "static_detail_ray_trainable": _static_detail_ray_trainable(phase),
@@ -12504,19 +16927,201 @@ def _apply_static_optical_policy(
         "skeleton_mass_trainable": phase != "canonical_polish",
         "opacity_growth_before_policy": {},
         "opacity_growth_removed_by_policy": {},
+        "canonical_occlusion_growth": {},
+        "canonical_occlusion_polish_exception": False,
+        "persistent_envelope_cleanup_polish_exception": False,
+        "unverified_positive_authority": "exact_owner_ray_factor_only",
+        "unverified_growth_rows_blocked": 0,
+        "unverified_growth_magnitude_blocked": 0.0,
+        "unverified_growth_momentum_rows_cleared": 0,
     }
+    verification_state = getattr(foliage, "verification_state", None)
+    unverified = (
+        verification_state == VERIFICATION_UNVERIFIED
+        if verification_state is not None
+        else torch.zeros_like(foliage.persistent_envelope_mask)
+    )
+    detail = foliage.static_leaf_mask
+    nonpersistent_detail = detail & ~_persistent_static_evidence_mask(foliage)
+    restricted_optical_growth = unverified | nonpersistent_detail
+    exact_owner_gradient = torch.zeros_like(foliage.opacity_logits)
+    if exact_owner_ray_opacity_gradient is not None:
+        exact_owner_gradient = torch.as_tensor(
+            exact_owner_ray_opacity_gradient,
+            device=foliage.opacity_logits.device,
+            dtype=foliage.opacity_logits.dtype,
+        )
+        if exact_owner_gradient.shape != foliage.opacity_logits.shape:
+            raise ValueError(
+                "exact owner ray opacity gradient must align with foliage "
+                "opacity"
+            )
+    if moge3_canopy_optical_opacity_gradient is not None:
+        moge3_owner_gradient = torch.as_tensor(
+            moge3_canopy_optical_opacity_gradient,
+            device=foliage.opacity_logits.device,
+            dtype=foliage.opacity_logits.dtype,
+        )
+        if moge3_owner_gradient.shape != foliage.opacity_logits.shape:
+            raise ValueError(
+                "MoGe3 canopy optical gradient must align with foliage opacity"
+            )
+        exact_owner_gradient = exact_owner_gradient + moge3_owner_gradient
+
+    def route_unverified_opacity_growth(
+        eligible: torch.Tensor | None = None,
+    ) -> None:
+        gradient = foliage.opacity_logits.grad
+        routed_rows = (
+            restricted_optical_growth
+            if eligible is None
+            else restricted_optical_growth & eligible
+        )
+        if gradient is None or not bool(routed_rows.any()):
+            return
+        before = gradient.detach().clone()
+        non_owner = before - exact_owner_gradient
+        routed = exact_owner_gradient + non_owner.clamp_min(0.0)
+        gradient[routed_rows] = routed[routed_rows]
+        blocked = (
+            (-before).clamp_min(0.0)
+            - (-routed).clamp_min(0.0)
+        ).clamp_min(0.0)[routed_rows]
+        audit["unverified_growth_rows_blocked"] = int(
+            blocked.flatten(1).any(dim=1).sum()
+        )
+        audit["unverified_growth_magnitude_blocked"] = float(
+            blocked.sum()
+        )
+
+    def clear_unverified_growth_momentum() -> None:
+        state = volume_optimizer.state.get(foliage.opacity_logits, {})
+        first_moment = state.get("exp_avg")
+        if not torch.is_tensor(first_moment) or not bool(
+            restricted_optical_growth.any()
+        ):
+            return
+        contaminated = restricted_optical_growth[:, None] & (first_moment < 0)
+        audit["unverified_growth_momentum_rows_cleared"] = int(
+            contaminated.flatten(1).any(dim=1).sum()
+        )
+        first_moment[contaminated] = 0
+
     if phase == "canonical_polish":
+        envelope = foliage.persistent_envelope_mask
+        skeleton = getattr(
+            foliage,
+            "static_skeleton_mask",
+            torch.zeros_like(envelope),
+        )
+        dynamic = getattr(
+            foliage,
+            "dynamic_leaf_mask",
+            torch.zeros_like(envelope),
+        )
+        stable_scaffold = envelope | skeleton | dynamic
+        # Final polish is an appearance stage.  Freeze every static geometry
+        # chart after topology/verification has settled; otherwise SH and xyz
+        # can continue trading a colour edge for a moving speckle.  Detail
+        # opacity is handled separately by the explicit settle policy below.
+        geometry_scaffold = stable_scaffold | detail
         for parameter in (
             foliage.xyz,
             foliage.log_scales,
             foliage.quaternions,
-            foliage.opacity_logits,
+        ):
+            if parameter.grad is not None:
+                parameter.grad[geometry_scaffold] = 0
+            state = volume_optimizer.state.get(parameter, {})
+            first_moment = state.get("exp_avg")
+            if torch.is_tensor(first_moment):
+                first_moment[geometry_scaffold] = 0
+        if foliage.opacity_logits.grad is not None:
+            foliage.opacity_logits.grad[stable_scaffold] = 0
+        opacity_state = volume_optimizer.state.get(
+            foliage.opacity_logits, {}
+        )
+        opacity_moment = opacity_state.get("exp_avg")
+        if torch.is_tensor(opacity_moment):
+            opacity_moment[stable_scaffold] = 0
+        if canonical_occlusion_xyz_gradient is not None:
+            order_gradient = torch.as_tensor(
+                canonical_occlusion_xyz_gradient,
+                device=foliage.xyz.device,
+                dtype=foliage.xyz.dtype,
+            )
+            if order_gradient.shape != foliage.xyz.shape:
+                raise ValueError(
+                    "canonical occlusion xyz gradient must align with foliage"
+                )
+            if foliage.xyz.grad is None:
+                foliage.xyz.grad = torch.zeros_like(foliage.xyz)
+            foliage.xyz.grad[envelope] = order_gradient[envelope]
+            audit["canonical_occlusion_polish_exception"] = bool(
+                order_gradient[envelope].abs().any()
+            )
+        if canonical_occlusion_opacity_gradient is not None:
+            occlusion_gradient = torch.as_tensor(
+                canonical_occlusion_opacity_gradient,
+                device=foliage.opacity_logits.device,
+                dtype=foliage.opacity_logits.dtype,
+            )
+            if occlusion_gradient.shape != foliage.opacity_logits.shape:
+                raise ValueError(
+                    "canonical occlusion opacity gradient must align with foliage"
+                )
+            if foliage.opacity_logits.grad is None:
+                foliage.opacity_logits.grad = torch.zeros_like(
+                    foliage.opacity_logits
+                )
+            # Completion is a positive-existence factor by construction.
+            # Keep only that source-separated growth direction on the frozen
+            # envelope; all ordinary polish opacity paths remain frozen.
+            foliage.opacity_logits.grad[envelope] = occlusion_gradient[
+                envelope
+            ].clamp(max=0.0)
+            audit["canonical_occlusion_polish_exception"] = bool(
+                audit["canonical_occlusion_polish_exception"]
+                or occlusion_gradient[envelope].abs().any()
+            )
+        if persistent_envelope_cleanup_opacity_gradient is not None:
+            cleanup_gradient = torch.as_tensor(
+                persistent_envelope_cleanup_opacity_gradient,
+                device=foliage.opacity_logits.device,
+                dtype=foliage.opacity_logits.dtype,
+            )
+            if cleanup_gradient.shape != foliage.opacity_logits.shape:
+                raise ValueError(
+                    "persistent envelope cleanup gradient must align with "
+                    "foliage opacity"
+                )
+            if foliage.opacity_logits.grad is None:
+                foliage.opacity_logits.grad = torch.zeros_like(
+                    foliage.opacity_logits
+                )
+            # Adam subtracts the gradient. Only the positive, retirement
+            # direction of the native wall-front RGB derivative survives the
+            # polish freeze. This is separate from completion's negative
+            # existence gradient and cannot create opacity.
+            foliage.opacity_logits.grad[envelope] += cleanup_gradient[
+                envelope
+            ].clamp_min(0.0)
+            audit["persistent_envelope_cleanup_polish_exception"] = bool(
+                cleanup_gradient[envelope].clamp_min(0.0).any()
+            )
+        for parameter in (
             foliage.deformation_basis,
             foliage.dynamic_feature_basis,
             foliage.dynamic_opacity_basis,
         ):
             parameter.grad = None
-        envelope = foliage.persistent_envelope_mask
+        verification_state = getattr(foliage, "verification_state", None)
+        # Final polish is convergence, not another bandwidth-growth stage.
+        # Freeze all high-order detail SH here; DC remains trainable for
+        # photometric calibration.  This arrests the monotonic norm-ceiling
+        # pile-up observed from 25.5k to 30k without freezing leaf colour.
+        persistent_detail = detail & _persistent_static_evidence_mask(foliage)
+        high_order_read_only = envelope | nonpersistent_detail | persistent_detail
         if foliage.features.shape[1] > 1:
             if foliage.features.grad is not None:
                 nonzero = (
@@ -12526,17 +17131,27 @@ def _apply_static_optical_policy(
                 audit["envelope_high_order_sh_rows_frozen"] = int(
                     (nonzero > 0).sum()
                 )
-                foliage.features.grad[envelope, 1:] = 0
+                persistent_nonzero = (
+                    foliage.features.grad[persistent_detail, 1:]
+                    .abs().flatten(1).sum(1)
+                )
+                audit["persistent_detail_high_order_sh_rows_frozen"] = int(
+                    (persistent_nonzero > 0).sum()
+                )
+                foliage.features.grad[high_order_read_only, 1:] = 0
             feature_state = volume_optimizer.state.get(
                 foliage.features, {}
             )
-            feature_moment = feature_state.get("exp_avg")
-            if (
-                torch.is_tensor(feature_moment)
-                and feature_moment.ndim == 3
-                and feature_moment.shape[1] > 1
-            ):
-                feature_moment[envelope, 1:] = 0
+            for moment_name in ("exp_avg", "exp_avg_sq"):
+                feature_moment = feature_state.get(moment_name)
+                if (
+                    torch.is_tensor(feature_moment)
+                    and feature_moment.ndim == 3
+                    and feature_moment.shape[1] > 1
+                ):
+                    feature_moment[high_order_read_only, 1:] = 0
+        route_unverified_opacity_growth(~stable_scaffold)
+        clear_unverified_growth_momentum()
         return audit
 
     if not _static_detail_ray_trainable(phase):
@@ -12555,13 +17170,12 @@ def _apply_static_optical_policy(
             if torch.is_tensor(first_moment):
                 first_moment[detail] = 0
 
-    verification_state = getattr(foliage, "verification_state", None)
     if verification_state is not None:
-        unverified = verification_state == VERIFICATION_UNVERIFIED
-        # DC and optical mass are allowed to settle on true owner rays, but a
-        # child cannot invent view-dependent colour before multiview proof.
+        # DC may settle on a true owner ray, but neither a proposal nor a
+        # measured/factorized one-view detail row may invent view-dependent
+        # colour before multiview proof.
         if foliage.features.grad is not None and foliage.features.shape[1] > 1:
-            foliage.features.grad[unverified, 1:] = 0
+            foliage.features.grad[nonpersistent_detail | unverified, 1:] = 0
         feature_state = volume_optimizer.state.get(foliage.features, {})
         feature_moment = feature_state.get("exp_avg")
         if (
@@ -12569,7 +17183,7 @@ def _apply_static_optical_policy(
             and feature_moment.ndim == 3
             and feature_moment.shape[1] > 1
         ):
-            feature_moment[unverified, 1:] = 0
+            feature_moment[nonpersistent_detail | unverified, 1:] = 0
 
     envelope = foliage.persistent_envelope_mask
     detail_visible = _static_detail_stage_visible(phase)
@@ -12635,12 +17249,39 @@ def _apply_static_optical_policy(
                 "magnitude": float(growth_values.sum()),
             }
         gradient_before = gradient.detach().clone()
+        allowed_positive_gradient = canonical_evidence_opacity_gradient
+        if canonical_occlusion_opacity_gradient is not None:
+            occlusion_gradient = torch.as_tensor(
+                canonical_occlusion_opacity_gradient,
+                device=gradient.device,
+                dtype=gradient.dtype,
+            )
+            if occlusion_gradient.shape != gradient.shape:
+                raise ValueError(
+                    "canonical occlusion opacity gradient must align with "
+                    "foliage opacity"
+                )
+            for name, mask in role_masks.items():
+                growth_values = (-occlusion_gradient[mask]).clamp_min(0.0)
+                audit["canonical_occlusion_growth"][name] = {
+                    "rows": int(
+                        growth_values.flatten(1).any(dim=1).sum()
+                    )
+                    if len(growth_values)
+                    else 0,
+                    "magnitude": float(growth_values.sum()),
+                }
+            allowed_positive_gradient = (
+                occlusion_gradient
+                if allowed_positive_gradient is None
+                else allowed_positive_gradient + occlusion_gradient
+            )
         # Newborn children must be able to establish optical existence before
         # they can participate in envelope retirement. Once detail is visible
-        # the broad envelope may grow only from the canonical geometry/ray
-        # objective. Stage-3 RGB already has a zero envelope-opacity gate;
-        # keeping this source separately prevents any auxiliary loss from
-        # recreating the old global low-pass opacity shortcut.
+        # the broad envelope may grow only from canonical geometry/rays and
+        # the separately measured bounded occlusion deficit. Ordinary canopy
+        # RGB remains excluded, preventing auxiliary losses from recreating
+        # the old unrestricted low-pass opacity shortcut.
         growth_owner = envelope if detail_visible else retirement_envelope
         growth = growth_owner[:, None] & (gradient < 0)
         attenuated_growth = (
@@ -12652,13 +17293,13 @@ def _apply_static_optical_policy(
             attenuated_growth.flatten(1).any(dim=1).sum()
         )
         if detail_visible:
-            if canonical_evidence_opacity_gradient is None:
+            if allowed_positive_gradient is None:
                 # Backward-compatible conservative fallback for callers that
                 # do not expose source-separated gradients.
                 gradient[growth] = 0
             else:
                 evidence = torch.as_tensor(
-                    canonical_evidence_opacity_gradient,
+                    allowed_positive_gradient,
                     device=gradient.device,
                     dtype=gradient.dtype,
                 )
@@ -12686,6 +17327,12 @@ def _apply_static_optical_policy(
         )
         if detail_growth_scale < 1.0:
             gradient[detail_growth] *= detail_growth_scale
+        # A topology child is only a proposal. Whole-image RGB, semantic
+        # completion and regularizers may remove its opacity, but only its
+        # calibrated candidate ray factor may establish optical existence.
+        # Source separation here prevents a visually convenient wrong child
+        # from becoming self-validating before two real cameras verify it.
+        route_unverified_opacity_growth()
         removed = (gradient - gradient_before).clamp_min(0.0)
         for name, mask in role_masks.items():
             audit["opacity_growth_removed_by_policy"][name] = float(
@@ -12701,11 +17348,11 @@ def _apply_static_optical_policy(
             first_moment < 0
         )
         if detail_visible:
-            if canonical_evidence_opacity_gradient is None:
+            if allowed_positive_gradient is None:
                 first_moment[growth_momentum] = 0
             else:
                 evidence_growth = (
-                    canonical_evidence_opacity_gradient.to(
+                    allowed_positive_gradient.to(
                         device=first_moment.device,
                         dtype=first_moment.dtype,
                     )
@@ -12725,6 +17372,7 @@ def _apply_static_optical_policy(
         )
         if detail_growth_scale < 1.0:
             first_moment[detail_growth_momentum] *= detail_growth_scale
+    clear_unverified_growth_momentum()
     for parameter in (
         foliage.deformation_basis,
         foliage.dynamic_feature_basis,
@@ -12840,6 +17488,143 @@ def _apply_mature_surface_gradient_policy(
     }
 
 
+@torch.no_grad()
+def _enforce_canonical_occlusion_order_trust_region(
+    foliage,
+    volume_optimizer,
+    owner_rows: torch.Tensor,
+    *,
+    maximum_displacement: float,
+) -> dict[str, object]:
+    """Project order owners into a hard initialization-centred trust ball.
+
+    The loss-side gate alone is insufficient: a row at 0.249 m can cross a
+    0.25 m boundary in one Adam step and retained first-moment state can keep
+    moving it afterwards.  Projection makes the bound invariant, while
+    removing only outward radial momentum preserves tangential/return motion.
+    """
+    limit = float(maximum_displacement)
+    if limit <= 0.0:
+        raise ValueError("canonical occlusion trust radius must be positive")
+    owner = torch.as_tensor(
+        owner_rows, device=foliage.xyz.device, dtype=torch.bool
+    ).reshape(-1)
+    if owner.shape != (len(foliage),):
+        raise ValueError("canonical occlusion trust owner mask is misaligned")
+    delta = foliage.xyz - foliage.initialization_center
+    distance = delta.norm(dim=1)
+    exceeded = owner & (distance > limit)
+    maximum_before = float(distance[owner].max()) if bool(owner.any()) else 0.0
+    cleared_rows = 0
+    if bool(exceeded.any()):
+        direction = delta[exceeded] / distance[exceeded, None].clamp_min(1e-8)
+        foliage.xyz[exceeded] = (
+            foliage.initialization_center[exceeded] + limit * direction
+        )
+        state = volume_optimizer.state.get(foliage.xyz, {})
+        first_moment = state.get("exp_avg")
+        if torch.is_tensor(first_moment):
+            radial_moment = (first_moment[exceeded] * direction).sum(
+                dim=1, keepdim=True
+            )
+            outward_update = radial_moment < 0.0
+            if bool(outward_update.any()):
+                rows = torch.nonzero(exceeded, as_tuple=False).flatten()
+                outward_rows = rows[outward_update[:, 0]]
+                outward_direction = direction[outward_update[:, 0]]
+                outward_radial = radial_moment[outward_update[:, 0]]
+                first_moment[outward_rows] -= (
+                    outward_radial * outward_direction
+                )
+                cleared_rows = int(len(outward_rows))
+    after = (foliage.xyz - foliage.initialization_center).norm(dim=1)
+    tolerance = 2.0e-6
+    if bool((owner & (after > limit + tolerance)).any()):
+        raise RuntimeError("canonical occlusion xyz trust projection failed")
+    return {
+        "contract": "hard_initialization_ball_and_outward_adam_moment_clear",
+        "owner_rows": int(owner.sum()),
+        "projected_rows": int(exceeded.sum()),
+        "outward_momentum_rows_cleared": cleared_rows,
+        "maximum_displacement_before_projection": maximum_before,
+        "maximum_displacement_after_projection": (
+            float(after[owner].max()) if bool(owner.any()) else 0.0
+        ),
+        "maximum_displacement": limit,
+    }
+
+
+@torch.no_grad()
+def _enforce_static_detail_sh_trust_region(
+    foliage,
+    volume_optimizer,
+    *,
+    maximum_high_order_norm: float,
+) -> dict[str, int | float | str]:
+    """Keep foliage appearance identifiable from optical existence.
+
+    Premultiplied RGB constrains roughly ``alpha * colour``.  At low alpha an
+    unconstrained SH vector can therefore grow without changing the current
+    image and later appear as a black/bright speckle when opacity changes.
+    Non-persistent detail is DC-only; persistent detail receives a hard rowwise
+    high-order trust bound.  Adam state is cleared on projected rows so the
+    next step cannot immediately leave the feasible set again.
+    """
+
+    limit = float(maximum_high_order_norm)
+    if limit <= 0:
+        raise ValueError("Static-detail SH norm ceiling must be positive")
+    if foliage.features.shape[1] <= 1 or not bool(
+        foliage.static_leaf_mask.any()
+    ):
+        return {
+            "contract": "persistent_detail_bounded_sh__nonpersistent_dc_only",
+            "persistent_rows": 0,
+            "nonpersistent_rows_zeroed": 0,
+            "projected_rows": 0,
+            "maximum_norm_before": 0.0,
+            "maximum_norm_after": 0.0,
+            "maximum_high_order_norm": limit,
+        }
+    detail = foliage.static_leaf_mask
+    persistent = detail & _persistent_static_evidence_mask(foliage)
+    nonpersistent = detail & ~persistent
+    high_order = foliage.features[:, 1:]
+    nonpersistent_nonzero = (
+        high_order[nonpersistent].abs().flatten(1).sum(dim=1) > 0
+    ) if bool(nonpersistent.any()) else torch.zeros(
+        0, dtype=torch.bool, device=high_order.device
+    )
+    high_order[nonpersistent] = 0
+    norm = high_order.flatten(1).norm(dim=1)
+    exceeded = persistent & (norm > limit)
+    maximum_before = float(norm[persistent].max()) if bool(persistent.any()) else 0.0
+    if bool(exceeded.any()):
+        high_order[exceeded] *= (
+            limit / norm[exceeded].clamp_min(1.0e-8)
+        )[:, None, None]
+    feature_state = volume_optimizer.state.get(foliage.features, {})
+    first_moment = feature_state.get("exp_avg")
+    second_moment = feature_state.get("exp_avg_sq")
+    reset = nonpersistent | exceeded
+    if torch.is_tensor(first_moment) and first_moment.shape == foliage.features.shape:
+        first_moment[reset, 1:] = 0
+    if torch.is_tensor(second_moment) and second_moment.shape == foliage.features.shape:
+        second_moment[reset, 1:] = 0
+    norm_after = high_order.flatten(1).norm(dim=1)
+    return {
+        "contract": "persistent_detail_bounded_sh__nonpersistent_dc_only",
+        "persistent_rows": int(persistent.sum()),
+        "nonpersistent_rows_zeroed": int(nonpersistent_nonzero.sum()),
+        "projected_rows": int(exceeded.sum()),
+        "maximum_norm_before": maximum_before,
+        "maximum_norm_after": (
+            float(norm_after[persistent].max()) if bool(persistent.any()) else 0.0
+        ),
+        "maximum_high_order_norm": limit,
+    }
+
+
 def _apply_surface_spatial_confidence_gradients(surface) -> dict[str, float]:
     """Use per-primitive geometry uncertainty on geometric parameters.
 
@@ -12899,6 +17684,7 @@ def _geometry_losses(
     geometry_weight: torch.Tensor | None = None,
     plane_task_weight: torch.Tensor | None = None,
     native_chart_factor_active: bool = False,
+    world_from_camera_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     zero = package.depth.new_zeros(())
     losses = {
@@ -12907,6 +17693,8 @@ def _geometry_losses(
         "normal": zero,
         "inverse": zero,
         "ordinal": zero,
+        "moge3_rigid_depth": zero,
+        "moge3_rigid_normal": zero,
     }
     predicted_depth = package.depth[0]
     valid_prediction_mask = (
@@ -13121,12 +17909,177 @@ def _geometry_losses(
             if bool(valid.any())
             else zero
         )
+    moge3_pixels = 0
+    moge3_normal_pixels = 0
+    moge3_normal_mean_precision = 0.0
+    if "moge3_depth_m" in evidence:
+        raw_target = evidence["moge3_depth_m"][0]
+        valid_target = (
+            evidence["moge3_valid_mask"][0] > 0.5
+        ) & torch.isfinite(raw_target) & (raw_target > 0.0)
+        refinement_sigma = (
+            evidence["moge3_refinement_log_depth_std"][0].clamp_min(0.0)
+            + evidence[
+                "moge3_refinement_final_delta_log_depth"
+            ][0].clamp_min(0.0)
+        )
+        refinement_precision = 1.0 / (
+            1.0 + (refinement_sigma / 0.12).square()
+        )
+        existing_metric_owner = plane_owner | chart_owner | inverse_valid
+        weight = (
+            geometry_weight
+            * valid_prediction
+            * valid_target.to(geometry_weight.dtype)
+            * refinement_precision
+            * (~existing_metric_owner).to(geometry_weight.dtype)
+        )
+        safe_target = torch.where(
+            valid_target, raw_target, torch.ones_like(raw_target)
+        )
+        relative = (
+            safe_predicted_depth - safe_target
+        ).abs() / safe_target.clamp_min(0.1)
+        losses["moge3_rigid_depth"] = (
+            torch.log1p(relative) * weight
+        ).sum() / weight.sum().clamp_min(1.0)
+        moge3_pixels = int((weight > 0).sum())
+        normal_keys = {
+            "moge3_normal_direct_camera",
+            "moge3_normal_depth_exact_k_camera",
+            "moge3_depth_normal_valid_mask",
+        }
+        if normal_keys <= set(evidence):
+            if world_from_camera_rotation is None:
+                raise RuntimeError(
+                    "MoGe3 normal evidence requires the exact camera-to-world "
+                    "rotation used by the renderer"
+                )
+            world_from_camera = torch.as_tensor(
+                world_from_camera_rotation,
+                device=predicted_depth.device,
+                dtype=predicted_depth.dtype,
+            )
+            if world_from_camera.shape != (3, 3) or not bool(
+                torch.isfinite(world_from_camera).all()
+            ):
+                raise ValueError(
+                    "world_from_camera_rotation must be a finite 3x3 matrix"
+                )
+            direct_camera = evidence[
+                "moge3_normal_direct_camera"
+            ].to(predicted_depth.dtype)
+            depth_camera = evidence[
+                "moge3_normal_depth_exact_k_camera"
+            ].to(predicted_depth.dtype)
+            if direct_camera.shape != package.normal_world.shape or (
+                depth_camera.shape != package.normal_world.shape
+            ):
+                raise ValueError(
+                    "MoGe3 normal rasters must match the rendered normal map"
+                )
+            direct_valid = (
+                torch.isfinite(direct_camera).all(0)
+                & (direct_camera.norm(dim=0) > 1.0e-5)
+            )
+            depth_normal_valid = (
+                evidence["moge3_depth_normal_valid_mask"][0] > 0.5
+            ) & torch.isfinite(depth_camera).all(0) & (
+                depth_camera.norm(dim=0) > 1.0e-5
+            )
+            normal_valid = valid_target & direct_valid & depth_normal_valid
+            safe_direct = torch.where(
+                normal_valid[None],
+                direct_camera,
+                torch.zeros_like(direct_camera),
+            )
+            safe_depth_normal = torch.where(
+                normal_valid[None],
+                depth_camera,
+                torch.zeros_like(depth_camera),
+            )
+            direct_unit = F.normalize(safe_direct, dim=0, eps=1.0e-6)
+            depth_unit = F.normalize(
+                safe_depth_normal, dim=0, eps=1.0e-6
+            )
+            normal_agreement = (
+                (direct_unit * depth_unit).sum(0).clamp(0.0, 1.0).square()
+            )
+            # A normal exactly on a large first-hit discontinuity is not a
+            # single-surface measurement. Keep its influence continuous,
+            # instead of introducing another binary edge threshold.
+            safe_log_depth = safe_target.clamp_min(1.0e-6).log()
+            edge_x = torch.zeros_like(safe_log_depth)
+            edge_y = torch.zeros_like(safe_log_depth)
+            if safe_log_depth.shape[1] > 1:
+                delta_x = (
+                    safe_log_depth[:, 1:] - safe_log_depth[:, :-1]
+                ).abs()
+                edge_x[:, 1:] = torch.maximum(edge_x[:, 1:], delta_x)
+                edge_x[:, :-1] = torch.maximum(edge_x[:, :-1], delta_x)
+            if safe_log_depth.shape[0] > 1:
+                delta_y = (
+                    safe_log_depth[1:, :] - safe_log_depth[:-1, :]
+                ).abs()
+                edge_y[1:, :] = torch.maximum(edge_y[1:, :], delta_y)
+                edge_y[:-1, :] = torch.maximum(edge_y[:-1, :], delta_y)
+            boundary_delta = torch.maximum(edge_x, edge_y)
+            boundary_precision = 1.0 / (
+                1.0 + (boundary_delta / 0.08).square()
+            )
+            normal_precision = (
+                refinement_precision
+                * normal_agreement
+                * boundary_precision
+            )
+            raw_predicted_normal = package.normal_world
+            predicted_normal_valid = (
+                torch.isfinite(raw_predicted_normal).all(0)
+                & (raw_predicted_normal.norm(dim=0) > 1.0e-5)
+            )
+            safe_predicted_normal = torch.where(
+                predicted_normal_valid[None],
+                raw_predicted_normal,
+                torch.zeros_like(raw_predicted_normal),
+            )
+            predicted_normal = F.normalize(
+                safe_predicted_normal, dim=0, eps=1.0e-6
+            )
+            target_normal_world = (
+                direct_unit.permute(1, 2, 0) @ world_from_camera
+            ).permute(2, 0, 1)
+            target_normal_world = F.normalize(
+                target_normal_world, dim=0, eps=1.0e-6
+            )
+            normal_cosine = (
+                predicted_normal * target_normal_world
+            ).sum(0).abs().clamp(0.0, 1.0)
+            normal_weight = (
+                geometry_weight
+                * normal_valid.to(geometry_weight.dtype)
+                * predicted_normal_valid.to(geometry_weight.dtype)
+                * normal_precision
+                * (~existing_metric_owner).to(geometry_weight.dtype)
+            )
+            losses["moge3_rigid_normal"] = (
+                (1.0 - normal_cosine) * normal_weight
+            ).sum() / normal_weight.sum().clamp_min(1.0)
+            normal_supported = normal_weight > 0
+            moge3_normal_pixels = int(normal_supported.sum())
+            if bool(normal_supported.any()):
+                moge3_normal_mean_precision = float(
+                    normal_precision.detach()[normal_supported].mean()
+                )
     total = (
         args.geometry_weight
         * (losses["chart"] + losses["inverse"])
         + args.plane_weight * losses["plane"]
         + args.normal_weight * losses["normal"]
         + args.ordinal_weight * losses["ordinal"]
+        + float(getattr(args, "moge3_rigid_depth_weight", 0.0))
+        * losses["moge3_rigid_depth"]
+        + float(getattr(args, "moge3_rigid_normal_weight", 0.0))
+        * losses["moge3_rigid_normal"]
     )
     values = {
         name: float(value.detach()) for name, value in losses.items()
@@ -13136,6 +18089,11 @@ def _geometry_losses(
             "plane_pixels": int(plane_owner.sum()),
             "chart_pixels": int(chart_owner.sum()),
             "inverse_pixels": int((chart_owner & inverse_valid).sum()),
+            "moge3_rigid_depth_pixels": moge3_pixels,
+            "moge3_rigid_normal_pixels": moge3_normal_pixels,
+            "moge3_rigid_normal_mean_precision": (
+                moge3_normal_mean_precision
+            ),
             "raw_chart_fallback_pixels": int(
                 chart_owner.sum() if not fused_available else 0
             ),
@@ -13744,6 +18702,10 @@ def _evaluate(
     *,
     canonical_canopy_enabled: bool,
     conditioned_enabled: bool,
+    reconstruction_target: str,
+    canonical_sequence_policy: str,
+    canonical_sequence: str | None,
+    canonical_snapshot_frames: set[int] | None = None,
     training_optical_replacement_policy: str = "disabled",
     deployment_optical_replacement_policy: str = "disabled",
     deployment_optical_responsibility_prior: float = 0.0,
@@ -13751,11 +18713,57 @@ def _evaluate(
     from PIL import Image as PILImage
 
     output.mkdir(parents=True, exist_ok=True)
+    requested_indices = [
+        int(index) for index in indices if 0 <= int(index) < len(views)
+    ]
+    evaluation_indices = list(dict.fromkeys(requested_indices))
+    if canonical_canopy_enabled and canonical_sequence is not None:
+        canonical_indices = [
+            index
+            for index, candidate in enumerate(views)
+            if sequence_id(candidate.image_name) == canonical_sequence
+        ]
+        if not canonical_indices:
+            raise RuntimeError(
+                "Targeted evaluation has no view from the authoritative "
+                f"scene-canonical sequence {canonical_sequence!r}"
+            )
+        # Preserve the requested rigid diagnostics, but pair every requested
+        # noncanonical frame with the nearest authoritative canonical frame.
+        # This prevents a convenient seq1 index list from silently becoming a
+        # tree-quality report for a scene whose canonical tree target is seq2.
+        for requested_index in requested_indices:
+            if sequence_id(views[requested_index].image_name) == canonical_sequence:
+                continue
+            requested_frame = int(
+                camera_frame_lookup[int(views[requested_index].colmap_id)]
+            )
+            matched = min(
+                canonical_indices,
+                key=lambda candidate_index: (
+                    abs(
+                        int(
+                            camera_frame_lookup[
+                                int(views[candidate_index].colmap_id)
+                            ]
+                        )
+                        - requested_frame
+                    ),
+                    candidate_index,
+                ),
+            )
+            if matched not in evaluation_indices:
+                evaluation_indices.append(matched)
+
     rows = []
-    for index in indices:
-        if index < 0 or index >= len(views):
-            continue
+    for index in evaluation_indices:
         view = views[index]
+        view_sequence = sequence_id(view.image_name)
+        view_frame = int(camera_frame_lookup[int(view.colmap_id)])
+        tree_rgb_authoritative = bool(
+            canonical_sequence is None
+            or view_sequence == canonical_sequence
+        )
         task = fields.fields(
             view.image_name,
             (view.image_height, view.image_width),
@@ -13777,6 +18785,22 @@ def _evaluate(
         canonical = composite_white_background(
             package.render, package.alpha, sky(view)
         ).clamp(0, 1)
+        intrinsic_volume_alpha = torch.zeros_like(task["p_canopy"])
+        if canonical_canopy_enabled:
+            volume_only = render_hybrid(
+                view,
+                surface,
+                foliage,
+                background=background,
+                include_dynamic=False,
+                surface_gate=torch.zeros_like(
+                    surface.get_opacity.reshape(-1)
+                ),
+                optical_replacement_policy="disabled",
+            )
+            intrinsic_volume_alpha = volume_only.volume_alpha.detach()
+            if intrinsic_volume_alpha.ndim == 3:
+                intrinsic_volume_alpha = intrinsic_volume_alpha[0]
         conditioned = None
         if conditioned_enabled:
             conditioned_package = render_hybrid(
@@ -13806,17 +18830,85 @@ def _evaluate(
                 task,
             ).clamp(0, 1)
         target = view.original_image.cuda()
-        def metrics(value):
-            mse = (value - target).square().mean().clamp_min(1e-12)
+        def metrics(value, weight=None):
+            if weight is None:
+                mse = (value - target).square().mean().clamp_min(1e-12)
+                mae = (value - target).abs().mean()
+                pixels = int(value.shape[-2] * value.shape[-1])
+            else:
+                weight = weight.detach().clamp(0.0, 1.0)
+                denominator = weight.sum() * value.shape[0]
+                if float(denominator) <= 0.0:
+                    return None
+                mse = (
+                    (value - target).square() * weight[None]
+                ).sum() / denominator
+                mae = (
+                    (value - target).abs() * weight[None]
+                ).sum() / denominator
+                pixels = int((weight > 0.5).sum())
             return {
                 "psnr": float(-10 * torch.log10(mse)),
-                "ssim": float(ssim(value, target)),
-                "mae": float((value - target).abs().mean()),
+                "mae": float(mae),
+                "pixels": pixels,
+                **(
+                    {"ssim": float(ssim(value, target))}
+                    if weight is None
+                    else {}
+                ),
             }
+        known_rigid, _, unknown, ownership_is_canonical = (
+            _static_scene_rgb_ownership(
+                task["p_rigid"].clamp(0.0, 1.0),
+                task["p_canopy"].clamp(0.0, 1.0),
+                task["p_canopy"].clamp(0.0, 1.0),
+                intrinsic_volume_alpha,
+                reconstruction_target=reconstruction_target,
+                canonical_sequence_policy=canonical_sequence_policy,
+                canonical_sequence=canonical_sequence,
+                view_sequence=view_sequence,
+            view_is_canonical_snapshot=None,
+            )
+        )
+        if ownership_is_canonical != tree_rgb_authoritative:
+            raise RuntimeError(
+                "Targeted evaluation tree authority disagrees with the "
+                "scene-canonical RGB ownership contract"
+            )
+        canopy = task["p_canopy"].clamp(0.0, 1.0)
+        canopy_neighbourhood = F.max_pool2d(
+            canopy[None, None], kernel_size=9, stride=1, padding=4
+        )[0, 0]
+        rigid_tree_interface = (
+            task["p_rigid"].clamp(0.0, 1.0)
+            * canopy_neighbourhood
+            * (1.0 - canopy)
+        )
         row = {
             "index": index,
             "image_name": str(view.image_name),
+            "sequence_id": view_sequence,
+            "requested": index in requested_indices,
+            "tree_rgb_authority": (
+                "authoritative_scene_canonical"
+                if tree_rgb_authoritative
+                else "unknown_cross_sequence"
+            ),
+            "unknown_fraction": float(unknown.mean()),
             "canonical": metrics(canonical),
+            "canonical_regions": {
+                "known_rigid": metrics(canonical, known_rigid),
+                "canopy": (
+                    metrics(canonical, canopy)
+                    if tree_rgb_authoritative
+                    else None
+                ),
+                "rigid_tree_interface_hard": (
+                    metrics(canonical, rigid_tree_interface)
+                    if tree_rgb_authoritative
+                    else None
+                ),
+            },
         }
         if conditioned is not None:
             row["conditioned"] = metrics(conditioned)
@@ -13851,6 +18943,178 @@ def _evaluate(
     return rows
 
 
+def _read_supervisor_json(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Supervisor artifact is not a regular file: {path}")
+    if path.stat().st_size > 1024 * 1024:
+        raise RuntimeError(f"Supervisor artifact is unexpectedly large: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Supervisor artifact is not a JSON object: {path}")
+    return payload
+
+
+def _active_detached_supervisor_control_files(
+    output: Path,
+    *,
+    current_command: tuple[str, ...] | None = None,
+    process_id: int | None = None,
+    parent_process_id: int | None = None,
+) -> set[Path] | None:
+    """Validate the exact control files allowed in a clean output directory.
+
+    A detached supervisor necessarily creates its lock and liveness records
+    before spawning the trainer.  Treating those files as old model output
+    makes clean supervised training impossible.  This is deliberately not a
+    general non-empty-directory bypass: the contract must name this output,
+    its frozen command must be the command now executing, the heartbeat must
+    identify this PID, and the direct parent must be the recorded supervisor.
+    """
+
+    raw_contract = os.environ.get(DETACHED_SUPERVISOR_CONTRACT_ENVIRONMENT)
+    if not raw_contract:
+        return None
+    output = output.resolve()
+    raw_contract_path = Path(raw_contract).expanduser()
+    if raw_contract_path.is_symlink():
+        raise RuntimeError("Detached supervisor contract may not be a symlink")
+    contract_path = raw_contract_path.resolve()
+    if contract_path.parent != output:
+        raise RuntimeError(
+            "Detached supervisor contract is outside the training output"
+        )
+    contract = _read_supervisor_json(contract_path)
+    if contract.get("schema_version") != 1:
+        raise RuntimeError("Detached supervisor contract schema is unsupported")
+    if Path(str(contract.get("run_dir", ""))).resolve() != output:
+        raise RuntimeError("Detached supervisor contract names another run")
+
+    command = tuple(
+        current_command
+        if current_command is not None
+        else (sys.executable, *sys.argv)
+    )
+    saved_command = contract.get("base_command")
+    if not isinstance(saved_command, list) or tuple(saved_command) != command:
+        raise RuntimeError(
+            "Detached supervisor command does not match this trainer process"
+        )
+    command_sha256 = hashlib.sha256(
+        json.dumps(
+            list(command),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if contract.get("command_sha256") != command_sha256:
+        raise RuntimeError("Detached supervisor command hash is inconsistent")
+
+    control_keys = (
+        "lock_file",
+        "heartbeat_file",
+        "contract_file",
+        "supervisor_log",
+        "training_log",
+    )
+    control_files: set[Path] = set()
+    for key in control_keys:
+        value = contract.get(key)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"Detached supervisor contract lacks {key}")
+        raw_path = Path(value).expanduser()
+        if raw_path.is_symlink():
+            raise RuntimeError(
+                f"Detached supervisor control file {key} is a symlink"
+            )
+        path = raw_path.resolve()
+        if path.parent != output:
+            raise RuntimeError(
+                f"Detached supervisor control file {key} leaves the output"
+            )
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(
+                f"Detached supervisor control file is not regular: {path}"
+            )
+        control_files.add(path)
+    if len(control_files) != len(control_keys) or contract_path not in control_files:
+        raise RuntimeError("Detached supervisor control paths overlap")
+
+    lock = _read_supervisor_json(Path(str(contract["lock_file"])).resolve())
+    current_pid = os.getpid() if process_id is None else int(process_id)
+    parent_pid = (
+        os.getppid()
+        if parent_process_id is None
+        else int(parent_process_id)
+    )
+    # Popen makes the child runnable immediately before the parent replaces
+    # its pre-launch ``starting`` heartbeat with the PID-bound ``running``
+    # record.  Wait only for that narrowly defined handshake; never wait for
+    # an unrelated or stale process identity.
+    heartbeat_path = Path(str(contract["heartbeat_file"])).resolve()
+    heartbeat = None
+    deadline = time.monotonic() + 2.0
+    while True:
+        candidate = _read_supervisor_json(heartbeat_path)
+        supervisor_pid = candidate.get("supervisor_pid")
+        identity_matches = bool(
+            candidate.get("state") == "running"
+            and candidate.get("training_pid") == current_pid
+            and candidate.get("command_sha256") == command_sha256
+            and type(supervisor_pid) is int
+            and supervisor_pid == parent_pid
+            and lock.get("supervisor_pid") == supervisor_pid
+            and lock.get("command_sha256") == command_sha256
+        )
+        if identity_matches:
+            heartbeat = candidate
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    if heartbeat is None:
+        raise RuntimeError(
+            "Detached supervisor liveness identity does not match this process"
+        )
+    return control_files
+
+
+def _assert_clean_training_output(
+    output: Path,
+    *,
+    resume_requested: bool,
+    current_command: tuple[str, ...] | None = None,
+    process_id: int | None = None,
+    parent_process_id: int | None = None,
+) -> None:
+    if resume_requested or not output.exists():
+        return
+    entries = {path.resolve() for path in output.iterdir()}
+    if not entries:
+        return
+    allowed = _active_detached_supervisor_control_files(
+        output,
+        current_command=current_command,
+        process_id=process_id,
+        parent_process_id=parent_process_id,
+    )
+    if allowed is not None and entries != allowed:
+        heartbeat_names = {
+            path.name for path in allowed if "heartbeat" in path.name
+        }
+        transient_prefixes = tuple(
+            f".{name}.tmp-" for name in heartbeat_names
+        )
+        unexpected = entries - allowed
+        if transient_prefixes and unexpected and all(
+            path.name.startswith(transient_prefixes) for path in unexpected
+        ):
+            time.sleep(0.05)
+            entries = {path.resolve() for path in output.iterdir()}
+    if allowed is None or entries != allowed:
+        raise FileExistsError(f"Refusing non-empty output: {output}")
+
+
 def main():
     args, dataset, opt, _pipe = _parse_args()
     cpu_parallelism_audit = _configure_cpu_parallelism(args)
@@ -13858,6 +19122,10 @@ def main():
         args.retain_checkpoint_iterations
     )
     output = Path(dataset.model_path).resolve()
+    _assert_clean_training_output(
+        output,
+        resume_requested=args.resume is not None,
+    )
     evidence_store = load_evidence_store(args.evidence_store)
     if not mast3r_is_geometry_authority(evidence_store):
         raise RuntimeError(
@@ -13956,7 +19224,7 @@ def main():
         str(row["sequence_id"])
         for row in foliage_initialization_audit.get("selected_views", [])
     }
-    if mast3r_is_geometry_authority(evidence_store):
+    if mast3r_is_geometry_authority(evidence_store) and not rigid_placeholder:
         gate_failures = []
         if not foliage_initialization_audit.get(
             "cross_sequence_visual_hull", False
@@ -13989,6 +19257,146 @@ def main():
                 + "; ".join(gate_failures)
             )
     resume = _load(args.resume.resolve()) if args.resume else None
+    v107_global_negative_cleanup_resume = False
+    if args.allow_v107_global_negative_cleanup_resume:
+        predecessor = V107_GLOBAL_NEGATIVE_CLEANUP_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        v107_global_negative_cleanup_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("iteration", -1))
+            == predecessor["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and _file_sha256(args.resume.resolve())
+            == predecessor["checkpoint_sha256"]
+            and resume_hashes.get("trainer") == predecessor["trainer"]
+            and resume_hashes.get("hybrid_teacher_api")
+            == predecessor["hybrid_teacher_api"]
+        )
+        if not v107_global_negative_cleanup_resume:
+            raise RuntimeError(
+                "v107 global-negative cleanup requires the exact content-"
+                "addressed v106 iteration-18000 predecessor"
+            )
+    v108_evidence_bounded_completion_resume = False
+    if args.allow_v108_evidence_bounded_completion_resume:
+        predecessor = V108_EVIDENCE_BOUNDED_COMPLETION_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        v108_evidence_bounded_completion_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("iteration", -1)) == predecessor["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and _file_sha256(args.resume.resolve())
+            == predecessor["checkpoint_sha256"]
+            and resume_hashes.get("trainer") == predecessor["trainer"]
+            and resume_hashes.get("hybrid_teacher_api")
+            == predecessor["hybrid_teacher_api"]
+        )
+        if not v108_evidence_bounded_completion_resume:
+            raise RuntimeError(
+                "v108 evidence-bounded completion requires the exact "
+                "content-addressed v107 iteration-21000 predecessor"
+            )
+    v103_local_optical_redistribution_resume = False
+    if args.allow_v103_local_optical_redistribution_resume:
+        predecessor = V103_LOCAL_OPTICAL_REDISTRIBUTION_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        resume_sha256 = _file_sha256(args.resume.resolve())
+        v103_local_optical_redistribution_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("iteration", -1)) == predecessor["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and resume_sha256 == predecessor["checkpoint_sha256"]
+            and all(
+                resume_hashes.get(name) == predecessor[name]
+                for name in (
+                    "trainer",
+                    "hybrid_renderer",
+                    "hybrid_teacher_api",
+                )
+            )
+            and float(args.static_detail_optical_trust_lower) == 0.85
+            and float(args.static_detail_optical_trust_upper) == 1.15
+            and float(args.static_detail_optical_trust_voxel_size) == 0.10
+        )
+        if not v103_local_optical_redistribution_resume:
+            raise RuntimeError(
+                "v103 local optical redistribution requires the exact "
+                "content-addressed v102 iteration-24000 predecessor and "
+                "the audited 0.85/1.15, 0.10m trust configuration"
+            )
+    v105_late_optical_convergence_resume = False
+    if args.allow_v105_late_optical_convergence_resume:
+        predecessor = V105_LATE_OPTICAL_CONVERGENCE_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        resume_iteration = int((resume or {}).get("iteration", -1))
+        expected_checkpoint = predecessor["checkpoints"].get(resume_iteration)
+        v105_late_optical_convergence_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and expected_checkpoint is not None
+            and _file_sha256(args.resume.resolve()) == expected_checkpoint
+            and resume_hashes.get("trainer") == predecessor["trainer"]
+            and resume_hashes.get("hybrid_teacher_api")
+            == predecessor["hybrid_teacher_api"]
+        )
+        if not v105_late_optical_convergence_resume:
+            raise RuntimeError(
+                "v105 convergence repair requires an exact content-addressed "
+                "v104 18k or 25.5k checkpoint"
+            )
+    v102_optical_trust_resume = False
+    if args.allow_v102_optical_trust_resume:
+        predecessor = V102_OPTICAL_TRUST_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        resume_sha256 = _file_sha256(args.resume.resolve())
+        v102_optical_trust_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("iteration", -1)) == predecessor["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and resume_sha256 == predecessor["checkpoint_sha256"]
+            and all(
+                resume_hashes.get(name) == predecessor[name]
+                for name in ("trainer", "hybrid_renderer", "hybrid_teacher_api")
+            )
+        )
+        if not v102_optical_trust_resume:
+            raise RuntimeError(
+                "v102 optical-trust repair requires the exact content-"
+                "addressed v101 iteration-21000 predecessor"
+            )
+    v100_front_clipped_cleanup_resume = False
+    if args.allow_v100_front_clipped_cleanup_resume:
+        predecessor = V100_FRONT_CLIPPED_CLEANUP_PREDECESSOR
+        resume_hashes = (resume or {}).get("implementation_hashes", {})
+        resume_sha256 = _file_sha256(args.resume.resolve())
+        v100_front_clipped_cleanup_resume = bool(
+            resume is not None
+            and resume.get("protocol") == predecessor["protocol"]
+            and int(resume.get("iteration", -1))
+            == predecessor["iteration"]
+            and int(resume.get("schedule_horizon", -1))
+            == predecessor["schedule_horizon"]
+            and resume_sha256 == predecessor["checkpoint_sha256"]
+            and all(
+                resume_hashes.get(name) == predecessor[name]
+                for name in ("trainer", "hybrid_teacher_api")
+            )
+        )
+        if not v100_front_clipped_cleanup_resume:
+            raise RuntimeError(
+                "v100 cleanup repair requires the exact content-addressed "
+                "v99 iteration-21000 predecessor"
+            )
     v38_causal_repair_resume = False
     if args.allow_v38_causal_repair_resume:
         resume_hashes = (resume or {}).get("implementation_hashes", {})
@@ -14020,8 +19428,6 @@ def main():
                 "9k checkpoint, implementation hashes, 12k schedule horizon "
                 "and 10k->12k volume-topology extension"
             )
-    if output.exists() and any(output.iterdir()) and resume is None:
-        raise FileExistsError(f"Refusing non-empty output: {output}")
     output.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -14135,6 +19541,12 @@ def main():
             and not args.allow_static_detail_isolated_repair_resume
             and not args.allow_static_canonical_ownership_repair_resume
             and not args.allow_surface_screen_evidence_repair_resume
+            and not v100_front_clipped_cleanup_resume
+            and not v102_optical_trust_resume
+            and not v103_local_optical_redistribution_resume
+            and not v105_late_optical_convergence_resume
+            and not v107_global_negative_cleanup_resume
+            and not v108_evidence_bounded_completion_resume
         ):
             raise RuntimeError("Unified teacher resume protocol mismatch")
         if resume["evidence_hash"] != evidence_store["evidence_hash"]:
@@ -14212,6 +19624,73 @@ def main():
                 fixed_camera_sequences=fixed_camera_sequences,
             )
         )
+    static_canonical_sequence = None
+    static_canonical_sequence_index = None
+    if (
+        args.reconstruction_target == "static"
+        and args.static_canonical_sequence_policy == "scene"
+    ):
+        static_canonical_sequence = (
+            None
+            if static_fusion_audit is None
+            else static_fusion_audit.get("canonical_scene_sequence")
+        )
+        # The rigid pretrain intentionally carries one optically inert
+        # foliage row so the hybrid renderer keeps a stable tensor contract.
+        # That placeholder contains no leaf observations and therefore
+        # cannot (and must not) elect a foliage canonical sequence.  Rigid
+        # optimization is independent of this choice; the constraint is
+        # reinstated when the trained surface is used to build the real
+        # foliage initialization for mixed training.
+        if (
+            static_canonical_sequence not in sequence_index
+            and not rigid_placeholder
+        ):
+            raise RuntimeError(
+                "Scene-canonical static fusion did not select a valid fixed "
+                f"camera sequence: {static_canonical_sequence!r}"
+            )
+        if static_canonical_sequence in sequence_index:
+            static_canonical_sequence = str(static_canonical_sequence)
+            static_canonical_sequence_index = int(
+                sequence_index[static_canonical_sequence]
+            )
+    canonical_snapshot_frame_ids = {
+        int(frame) for frame in args.static_canonical_snapshot_frames
+    }
+    if any(frame < 0 for frame in canonical_snapshot_frame_ids):
+        raise ValueError("Static canonical snapshot frames must be non-negative")
+    canonical_snapshot_view_indices = {
+        int(index)
+        for index, candidate_view in enumerate(views)
+        if static_canonical_sequence is not None
+        and sequence_id(candidate_view.image_name) == static_canonical_sequence
+        and int(Path(str(candidate_view.image_name)).stem.rsplit("frame", 1)[-1])
+        in canonical_snapshot_frame_ids
+    }
+    if static_canonical_sequence is not None and len(
+        canonical_snapshot_view_indices
+    ) < 2:
+        raise RuntimeError(
+            "Scene-canonical foliage supervision requires at least two "
+            "calibrated cameras in the configured snapshot; found "
+            f"{len(canonical_snapshot_view_indices)} for frames "
+            f"{sorted(canonical_snapshot_frame_ids)}"
+        )
+    canonical_snapshot_camera_ids = {
+        int(views[index].colmap_id)
+        for index in canonical_snapshot_view_indices
+    }
+    canonical_sequence_view_indices = {
+        int(index)
+        for index, candidate_view in enumerate(views)
+        if static_canonical_sequence is not None
+        and sequence_id(candidate_view.image_name) == static_canonical_sequence
+    }
+    canonical_sequence_camera_ids = {
+        int(views[index].colmap_id)
+        for index in canonical_sequence_view_indices
+    }
     if resume is None:
         foliage.initialize_from_volume_state(seed_payload)
         # Dynamic leaves already come from real sequence-local pointmaps.
@@ -14269,7 +19748,14 @@ def main():
         ),
         max_cached_views=0,
     )
-    geometry = OutdoorGeometryEvidence(args.evidence_store)
+    geometry = OutdoorGeometryEvidence(
+        args.evidence_store,
+        chart_base_source=args.chart_base_source,
+    )
+    (
+        moge3_runtime_enabled,
+        moge3_global_log_scale_sigma,
+    ) = _configure_moge3_runtime(geometry, seed_payload, args)
     pointmap_posterior_preflight = _assert_pointmap_posterior_contract(
         geometry,
         allow_missing=bool(
@@ -14316,6 +19802,32 @@ def main():
             "camera_epoch_audits"
         ].values()
     )
+    ray_camera_id_set = {
+        int(value) for value in foliage_rays.camera_id_values.tolist()
+    }
+    static_canonical_ray_view_indices = (
+        [
+            int(index)
+            for index, candidate_view in enumerate(views)
+            if int(candidate_view.colmap_id) in ray_camera_id_set
+            and int(index) in canonical_sequence_view_indices
+        ]
+        if static_canonical_sequence is not None
+        and args.static_canonical_ray_every > 0
+        else []
+    )
+    primary_ray_factor_calls = (
+        int(args.phase_schedule_horizon) // int(args.ray_posterior_every)
+    )
+    static_canonical_ray_factor_calls = (
+        int(args.phase_schedule_horizon)
+        // int(args.static_canonical_ray_every)
+        if static_canonical_ray_view_indices
+        else 0
+    )
+    total_scheduled_ray_factor_calls = (
+        primary_ray_factor_calls + static_canonical_ray_factor_calls
+    )
     # The per-camera epoch scheduler cannot finish one evidence pass when the
     # configured batch capacity is smaller than the immutable free/hit table.
     # Derive a deterministic lower bound from the final schedule horizon, not
@@ -14331,6 +19843,7 @@ def main():
         args.phase_schedule_horizon,
         args.ray_posterior_every,
         per_camera_rows=per_camera_ray_rows,
+        available_factor_calls=total_scheduled_ray_factor_calls,
     )
     prior_ray_factor_calls = int(
         foliage_ray_evidence_audit["interval_factor_calls"]
@@ -14410,6 +19923,7 @@ def main():
     chart_surface = ChartSurfaceModel(
         Path(initialization["surface_seed"]),
         evidence_store=args.evidence_store,
+        chart_base_source=args.chart_base_source,
         seed=args.seed + 19,
         maximum_tangent_scale=args.maximum_surface_scale,
     ).cuda()
@@ -14487,6 +20001,29 @@ def main():
                 "Migrated the v4 appearance Adam group by appending the "
                 "state-free stripe-free spatial uncertainty decoder; all "
                 "existing foliage/appearance/sky moments were preserved."
+            )
+        if v102_optical_trust_resume:
+            persistent_detail = (
+                foliage.static_leaf_mask
+                & _persistent_static_evidence_mask(foliage)
+                & (foliage.proposal_kind == PROPOSAL_NONE)
+            )
+            with torch.no_grad():
+                realized_mass = foliage.integrated_optical_mass().detach()
+                foliage.opacity_settle_reference_mass[persistent_detail] = (
+                    realized_mass[persistent_detail]
+                )
+            repaired_rows = torch.nonzero(
+                foliage.static_leaf_mask, as_tuple=False
+            ).reshape(-1)
+            _zero_volume_opacity_optimizer_rows(
+                volume_optimizer, repaired_rows
+            )
+            print(
+                "Migrated the exact v101 21k state into v102: anchored "
+                f"{int(persistent_detail.sum())} persistent detail rows at "
+                "their render-identical optical mass and cleared only stale "
+                "detail-opacity Adam moments from the one-way policy."
             )
         if (
             args.allow_trainer_repair_resume
@@ -14620,26 +20157,30 @@ def main():
         > static_detail_canopy_fraction_minimum
     ]
     verified_static_detail = (
-        foliage.static_leaf_mask
-        & (foliage.verification_state == VERIFICATION_VERIFIED)
-        & (foliage.verified_camera_count >= 2)
-        & (foliage.verified_sequence_count >= 1)
+        foliage.static_leaf_mask & _persistent_static_evidence_mask(foliage)
     )
-    detail_support_camera_ids = {
-        int(camera_id)
-        for camera_id in foliage.support_camera_ids[
-            verified_static_detail
-        ].detach().cpu().numpy().reshape(-1)
-        if int(camera_id) >= 0
-    }
+    detail_support_camera_ids = set()
+    for camera_table in (
+        foliage.support_camera_ids,
+        foliage.verified_camera_ids,
+    ):
+        detail_support_camera_ids.update(
+            int(camera_id)
+            for camera_id in camera_table[
+                verified_static_detail
+            ].detach().cpu().numpy().reshape(-1)
+            if int(camera_id) >= 0
+        )
     canopy_view_index_set = set(all_canopy_view_indices)
     exact_detail_view_indices = sorted(
         {
             view_index_by_camera_id[camera_id]
             for camera_id in detail_support_camera_ids
             if camera_id in view_index_by_camera_id
-            and view_index_by_camera_id[camera_id] in canopy_view_index_set
         }
+    )
+    exact_detail_canopy_view_indices = sorted(
+        set(exact_detail_view_indices) & canopy_view_index_set
     )
     (
         static_color_evidence_view_indices,
@@ -14657,30 +20198,165 @@ def main():
         static_detail_view_indices = all_canopy_view_indices or list(
             range(len(views))
         )
+    if static_canonical_sequence is not None:
+        static_detail_view_indices = sorted(
+            set(exact_detail_view_indices) & canonical_sequence_view_indices
+        )
+        if not static_detail_view_indices:
+            raise RuntimeError(
+                "Selected static canonical sequence has no exact-support "
+                "static-detail training cameras"
+            )
+        static_color_evidence_sequences = {
+            int(static_canonical_sequence_index)
+        }
+    static_detail_verification_camera_ids = [
+        int(views[index].colmap_id)
+        for index in static_detail_view_indices
+    ]
+    exact_schedule_camera_lookup = torch.zeros(
+        len(camera_sequence_lookup),
+        dtype=torch.bool,
+        device=foliage.xyz.device,
+    )
+    if static_detail_verification_camera_ids:
+        exact_schedule_camera_lookup[
+            torch.as_tensor(
+                static_detail_verification_camera_ids,
+                dtype=torch.long,
+                device=foliage.xyz.device,
+            )
+        ] = True
+    persistent_detail_with_two_schedule_cameras = (
+        _has_two_distinct_camera_ids_across_tables(
+            (
+                foliage.support_camera_ids,
+                foliage.verified_camera_ids,
+            ),
+            exact_schedule_camera_lookup,
+        )
+    )
+    persistent_detail_without_canonical_pair = (
+        verified_static_detail & ~persistent_detail_with_two_schedule_cameras
+    )
+    if bool(persistent_detail_without_canonical_pair.any()):
+        raise RuntimeError(
+            "Persistent scene-canonical detail lacks two distinct exact "
+            "support cameras in the selected canonical sequence for "
+            f"{int(persistent_detail_without_canonical_pair.sum())} rows"
+        )
     static_detail_schedule = _cycle_schedule(
         static_detail_view_indices,
         args.phase_schedule_horizon,
         args.seed + 5,
     )
+    # Positive detail fitting remains exact-support-camera owned.  Negative
+    # rigid/sky evidence has different semantics: a persistent primitive is
+    # deployed in every view, so every camera in the authoritative canonical
+    # sequence must be able to retire its *actual front contribution*.  Keep
+    # this deterministic fixed-camera schedule independent of the
+    # model-derived exact-support schedule so a support-camera table cannot
+    # suppress contradictions seen elsewhere in the canonical scene.
+    static_detail_cleanup_view_indices = (
+        sorted(canonical_sequence_view_indices)
+        if static_canonical_sequence is not None
+        else list(static_detail_view_indices)
+    )
+    if static_canonical_sequence is not None and not (
+        static_detail_cleanup_view_indices
+    ):
+        raise RuntimeError(
+            "Scene-canonical detail cleanup has no authoritative cameras"
+        )
+    static_detail_cleanup_schedule = _cycle_schedule(
+        static_detail_cleanup_view_indices,
+        args.phase_schedule_horizon,
+        args.seed + 10,
+    )
+    static_detail_cleanup_schedule_audit = {
+        "contract": (
+            "uniform_complete_epochs_over_all_scene_canonical_cameras__"
+            "strict_negative_rigid_and_sky_evidence_only__positive_detail_"
+            "growth_remains_exact_support_camera_owned"
+        ),
+        "canonical_sequence": static_canonical_sequence,
+        "camera_count": int(len(static_detail_cleanup_view_indices)),
+        "positive_exact_support_camera_count": int(
+            len(static_detail_view_indices)
+        ),
+        "schedule_sha256": _schedule_digest(
+            static_detail_cleanup_schedule
+        ),
+    }
     static_detail_schedule_audit = {
         "contract": (
+            "uniform_complete_epochs_over_scene_canonical_exact_support_cameras__"
+            "verified_geometry_exact_camera_weight1__screen_topology_exact_"
+            "camera_owned__nonowner_detail_geometry_sh_opacity_and_topology_"
+            "read_only"
+            if static_canonical_sequence is not None
+            else
             "uniform_complete_epochs_over_all_canopy_cameras_in_verified_"
             "positive_evidence_sequences__verified_geometry_exact_camera_"
             "weight1_plus_positive_sequence_weight015__screen_topology_"
             "exact_camera_owned__sh_and_opacity_read_only"
         ),
+        "canonical_sequence": static_canonical_sequence,
+        "canonical_snapshot_frames": sorted(canonical_snapshot_frame_ids),
         "exact_support_camera_count": int(len(detail_support_camera_ids)),
         "exact_support_canopy_camera_count": int(
-            len(exact_detail_view_indices)
+            len(exact_detail_canopy_view_indices)
         ),
         "positive_evidence_sequence_count": int(
             len(static_color_evidence_sequences)
         ),
         "camera_count": int(len(static_detail_view_indices)),
+        "snapshot_anchor_camera_count": int(
+            len(canonical_snapshot_view_indices)
+        ),
+        "coverage_expansion_camera_count": int(
+            len(static_detail_view_indices)
+            - len(canonical_snapshot_view_indices)
+        ),
+        "persistent_detail_rows_with_two_exact_schedule_cameras": int(
+            (verified_static_detail & persistent_detail_with_two_schedule_cameras).sum()
+        ),
+        "persistent_detail_rows_without_canonical_pair": int(
+            persistent_detail_without_canonical_pair.sum()
+        ),
         "canopy_fraction_minimum": (
             static_detail_canopy_fraction_minimum
         ),
+        "exact_support_overrides_global_canopy_fraction_filter": True,
         "schedule_sha256": _schedule_digest(static_detail_schedule),
+    }
+    static_canonical_ray_schedule = (
+        _cycle_schedule(
+            static_canonical_ray_view_indices,
+            args.phase_schedule_horizon,
+            args.seed + 9,
+        )
+        if static_canonical_ray_view_indices
+        else np.full(args.phase_schedule_horizon, -1, dtype=np.int64)
+    )
+    static_canonical_ray_schedule_audit = {
+        "contract": (
+            "independent_complete_epochs_over_scene_canonical_exact_support_"
+            "cameras_with_"
+            "calibrated_ray_rows__static_detail_hit_free_depth_only__all_"
+            "camera_envelope_skeleton_schedule_remains_unchanged"
+        ),
+        "enabled": bool(static_canonical_ray_view_indices),
+        "canonical_sequence": static_canonical_sequence,
+        "canonical_snapshot_frames": sorted(canonical_snapshot_frame_ids),
+        "camera_count": int(len(static_canonical_ray_view_indices)),
+        "every": int(args.static_canonical_ray_every),
+        "scheduled_factor_calls": int(
+            static_canonical_ray_factor_calls
+        ),
+        "schedule_sha256": _schedule_digest(
+            static_canonical_ray_schedule
+        ),
     }
     (
         static_replacement_view_indices,
@@ -14691,6 +20367,17 @@ def main():
         foliage,
         all_canopy_view_indices,
     )
+    if static_canonical_sequence is not None:
+        static_replacement_view_indices = [
+            int(index)
+            for index in static_replacement_view_indices
+            if int(index) in canonical_sequence_view_indices
+            and int(views[index].colmap_id) in detail_support_camera_ids
+        ]
+        static_replacement_camera_ids = {
+            int(views[index].colmap_id)
+            for index in static_replacement_view_indices
+        }
     static_replacement_schedule = (
         _cycle_schedule(
             static_replacement_view_indices,
@@ -14702,10 +20389,13 @@ def main():
     )
     static_replacement_schedule_audit = {
         "contract": (
-            "uniform_complete_epochs_over_real_support_or_verified_"
+            "uniform_complete_epochs_over_canonical_sequence_real_support_"
+            "or_verified_"
             "cameras_for_verified_detail_with_live_verified_envelope_group"
         ),
         "camera_count": int(len(static_replacement_view_indices)),
+        "canonical_sequence": static_canonical_sequence,
+        "canonical_snapshot_frames": sorted(canonical_snapshot_frame_ids),
         "positive_evidence_camera_count": int(
             len(static_replacement_camera_ids)
         ),
@@ -14783,10 +20473,9 @@ def main():
         ],
     }
     # The volume-isolated stream owns only verified detail colour/bandwidth.
-    # It uses the same positive-evidence-sequence view set as detail-isolated
-    # RGB so non-seed neighbouring cameras can actually teach SH. Per-row
-    # gates below give verified geometry a small positive-sequence correction,
-    # keep screen topology exact, and leave opacity read-only.
+    # It uses the same complete exact-support camera set as detail-isolated
+    # RGB. Per-row gates keep geometry, SH and screen topology camera-owned,
+    # and leave opacity read-only.
     static_volume_view_indices = list(static_detail_view_indices)
     static_volume_schedule = (
         _cycle_schedule(
@@ -14799,9 +20488,15 @@ def main():
     )
     static_volume_schedule_audit = {
         "contract": (
+            "uniform_complete_epochs_over_scene_canonical_exact_support_"
+            "cameras__detail_only_intrinsic_rgb__nonowner_detail_read_only"
+            if static_canonical_sequence is not None
+            else
             "uniform_complete_epochs_over_all_canopy_cameras_in_verified_"
             "positive_evidence_sequences__detail_only_intrinsic_rgb"
         ),
+        "canonical_sequence": static_canonical_sequence,
+        "canonical_snapshot_frames": sorted(canonical_snapshot_frame_ids),
         "camera_count": int(len(static_volume_view_indices)),
         "verified_detail_support_camera_count": int(
             len(detail_support_camera_ids)
@@ -14992,6 +20687,7 @@ def main():
                 "static_replacement": static_replacement_schedule,
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
+                "static_canonical_ray": static_canonical_ray_schedule,
             },
             resume,
             horizon=args.phase_schedule_horizon,
@@ -15012,6 +20708,9 @@ def main():
     static_replacement_schedule = camera_schedules["static_replacement"]
     static_skeleton_schedule = camera_schedules["static_skeleton"]
     static_volume_schedule = camera_schedules["static_volume"]
+    static_canonical_ray_schedule = camera_schedules[
+        "static_canonical_ray"
+    ]
     if resume is not None:
         saved_contract = resume.get("training_contract", {})
         if "conditioned" in restored_schedule_names:
@@ -15038,6 +20737,23 @@ def main():
                     static_skeleton_schedule_audit = copy.deepcopy(saved_audit)
                 else:
                     static_volume_schedule_audit = copy.deepcopy(saved_audit)
+        if "static_replacement" in restored_schedule_names:
+            saved_replacement_audit = saved_contract.get(
+                "static_ray_local_mass_handoff", {}
+            ).get("audit_camera_schedule")
+            if not isinstance(saved_replacement_audit, dict):
+                raise RuntimeError(
+                    "Resume checkpoint restored the static replacement "
+                    "camera schedule but is missing its persisted audit"
+                )
+            # The replacement support is model-derived.  Topology changes
+            # that support during training, so recomputing this audit from
+            # the resumed model describes a different population than the
+            # immutable schedule restored above.  Keep schedule and audit as
+            # one checkpoint-owned object at an exact prefix boundary.
+            static_replacement_schedule_audit = copy.deepcopy(
+                saved_replacement_audit
+            )
     schedule_hash = _schedule_digest(
         rgb_schedule,
         conditioned_schedule,
@@ -15047,6 +20763,7 @@ def main():
         static_replacement_schedule,
         static_skeleton_schedule,
         static_volume_schedule,
+        static_canonical_ray_schedule,
     )
     deployment_optical_replacement_policy = (
         "disabled"
@@ -15077,6 +20794,30 @@ def main():
         ),
         "task_field_ownership": fields.audit(),
         "static_fusion": static_fusion_audit,
+        "static_scene_canonical_rgb": (
+            {
+                "contract": STATIC_SCENE_CANONICAL_RGB_CONTRACT,
+                "canonical_sequence": static_canonical_sequence,
+                "noncanonical_tree_pixels": (
+                    "unknown_union_observed_canopy_projected_volume"
+                ),
+                "noncanonical_rigid_rgb_outside_unknown": True,
+                "learned_uncertainty_controls_rgb_weight": False,
+            }
+            if args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+            else None
+        ),
+        "renderer_alpha_liveness": {
+            "forward_backward_cutoff": float(RENDER_ALPHA_CUTOFF),
+            "volume_minimum_peak_opacity": float(
+                1.0 / (1.0 + math.exp(10.0))
+            ),
+            "surface_minimum_peak_opacity": float(
+                1.0 / (1.0 + math.exp(12.0))
+            ),
+            "every_clamped_live_primitive_has_center_recovery_path": True,
+        },
         "static_replacement_group_association": (
             static_replacement_group_association
         ),
@@ -15085,6 +20826,35 @@ def main():
         ),
         "static_optical_policy_contract": (
             STATIC_OPTICAL_POLICY_CONTRACT
+            if args.reconstruction_target == "static"
+            else None
+        ),
+        "static_detail_evidence_tiers": (
+            {
+                "persistent": (
+                    "resolved_verified_camera_count_gte2_sequence_count_"
+                    "gte1__global_training_and_deployment_authority"
+                ),
+                "measured_single": (
+                    "real_one_camera_seed__exact_camera_training_and_"
+                    "deployment_visibility_only__no_soft_sequence_sh_or_"
+                    "positive_opacity_authority__exact_camera_negative_"
+                    "cleanup_retirement_allowed"
+                ),
+                "factorized_receiver": (
+                    "exact_candidate_camera_training_visibility_read_only_"
+                    "until_two_real_camera_render_witnesses__excluded_from_"
+                    "deployment"
+                ),
+                "pending_proposal": (
+                    "exact_candidate_camera_training_visibility_only__"
+                    "excluded_from_deployment"
+                ),
+                "missing_metadata": "fail_closed",
+                "high_order_sh_norm_ceiling": float(
+                    args.static_detail_high_order_sh_norm_ceiling
+                ),
+            }
             if args.reconstruction_target == "static"
             else None
         ),
@@ -15148,6 +20918,11 @@ def main():
             if args.reconstruction_target == "static"
             else None
         ),
+        "static_canonical_detail_ray_schedule": (
+            static_canonical_ray_schedule_audit
+            if args.reconstruction_target == "static"
+            else None
+        ),
         "child_verification_lifecycle": {
             "grace_iterations": int(
                 args.child_verification_grace_iterations
@@ -15167,6 +20942,10 @@ def main():
             "minimum_strict_ray_birth_capacity_scale": float(
                 args.volume_verification_debt_minimum_birth_scale
             ),
+            "debt_population": (
+                "unverified_state_plus_factorized_receiver_plus_any_"
+                "unresolved_proposal_transaction"
+            ),
             "new_child_state": "unverified",
             "parent_observations": "candidates_not_proof",
             "verification": (
@@ -15174,7 +20953,9 @@ def main():
                 "multiview_sequence"
             ),
             "unverified_permissions": {
-                "dc_and_mass_growth": True,
+                "dc_color_from_real_witness": True,
+                "positive_mass_growth": "exact_owner_ray_factor_only",
+                "whole_image_rgb_and_completion_mass_growth": False,
                 "higher_order_sh": False,
                 "split": False,
                 "ordinary_prune_during_grace": False,
@@ -15191,36 +20972,42 @@ def main():
                     )
                 ).get("topology"),
                 "detail_activation": (
-                    "static_foliage_phase__no_sequence_visibility_gate"
+                    "static_foliage_phase__evidence_tier_visibility_gate"
                 ),
                 "envelope_training_signals": [
                     "all_view_ray_free_space",
                     "cross_sequence_hit_geometry",
-                    "stage2_canonical_low_frequency_rgb_geometry_mass",
-                    "stage3_all_view_dc_only_no_positive_mass_growth",
-                    "persistent_view_depth_local_replacement",
-                    "envelope_only_all_view_rigid_free_counterfactual_cleanup",
+                    "scene_canonical_low_frequency_rgb_geometry_mass",
+                    "stage3_scene_canonical_dc_only_no_positive_mass_growth",
+                    "canonical_view_depth_local_replacement",
+                    "known_pixel_rigid_free_counterfactual_cleanup",
                 ],
                 "detail_training_signals": [
-                    "positive_evidence_sequence_ray_free_space_full_strength",
-                    "positive_evidence_sequence_or_verified_consensus_ray_hit_"
+                    "canonical_sequence_ray_free_space_full_strength",
+                    "canonical_sequence_ray_hit_"
                     "interval_full_geometry_phase_annealed_opacity",
-                    "exact_support_plus_soft_positive_evidence_sequence_"
+                    "exact_support_plus_soft_canonical_sequence_"
                     "verified_canonical_rgb_geometry",
-                    "exact_support_plus_soft_same_sequence_canonical_sh_appearance",
-                    "full_positive_evidence_sequence_isolated_sh_appearance",
-                    "exact_support_plus_soft_positive_evidence_sequence_optical_mass",
-                    "exact_support_plus_soft_positive_evidence_sequence_"
+                    "exact_support_plus_soft_canonical_sequence_sh_appearance",
+                    "canonical_sequence_isolated_sh_appearance",
+                    "exact_support_plus_soft_canonical_sequence_optical_mass",
+                    "exact_support_plus_soft_canonical_sequence_"
                     "verified_surface_plus_detail_geometry",
+                    "persistent_or_exact_measured_oriented_multiscale_"
+                    "edge_alignment",
                     "surface_plus_detail_isolated_screen_gradient",
-                    "positive_evidence_sequence_rigid_free_counterfactual_cleanup",
-                    "positive_evidence_sequence_direct_opacity_priors",
+                    "dedicated_canonical_snapshot_native_mixed_harmful_"
+                    "contribution_cleanup",
+                    "canonical_sequence_direct_opacity_priors",
                     "robust_multiview_color",
                     "ray_local_optical_depth_conserving_replacement",
                 ],
                 "joint_polish": (
-                    "freeze_xyz_scale_rotation_mass_topology_together__"
-                    "train_sh_sky_only"
+                    "freeze_topology_and_all_detail_geometry_covariance__"
+                    "bidirectional_evidence_owned_detail_opacity_inside_"
+                    "local_voxel_mass_trust_region_with_per_row_upper_only__"
+                    "continue_bounded_"
+                    "persistent_detail_appearance_calibration"
                 ),
             }
             if args.reconstruction_target == "static"
@@ -15235,13 +21022,19 @@ def main():
             "gradient_owners": [
                 "verified_exact_plus_soft_positive_evidence_sequence_"
                 "static_detail_xyz_scale_rotation",
+                "verified_exact_plus_soft_scene_canonical_sequence_"
+                "static_detail_occlusion_optical_mass",
                 "verified_consensus_static_detail_ray_optical_mass",
                 "verified_exact_support_static_detail_means2d_topology",
             ],
+            "forward_rows_equal_gradient_owner_union": True,
+            "high_frequency_objective": (
+                "detached_gt_edge_gated_two_scale_sobel_direction_and_"
+                "relative_magnitude"
+            ),
             "excluded_owners": [
                 "persistent_envelope",
                 "skeleton",
-                "static_detail_optical_mass",
                 "static_detail_sh",
                 "surface",
                 "sky",
@@ -15262,6 +21055,11 @@ def main():
                 "static_skeleton_optical_mass_sh",
                 "static_skeleton_means2d_topology",
             ],
+            "forward_rows_equal_gradient_owner_union": True,
+            "high_frequency_objective": (
+                "detached_gt_edge_gated_two_scale_sobel_direction_and_"
+                "relative_magnitude"
+            ),
             "excluded_owners": [
                 "persistent_envelope",
                 "static_detail",
@@ -15279,10 +21077,11 @@ def main():
             ),
             "view_schedule": static_volume_schedule_audit,
             "gradient_owners": [
-                "verified_exact_plus_soft_positive_evidence_sequence_"
-                "static_detail_xyz_scale_rotation",
-                "verified_full_positive_evidence_sequence_static_detail_sh",
-                "verified_exact_support_static_detail_means2d_topology",
+                "verified_exact_support_or_witness_static_detail_"
+                "xyz_scale_rotation",
+                "verified_exact_support_or_witness_static_detail_sh",
+                "verified_exact_support_or_witness_static_detail_"
+                "means2d_topology",
             ],
             "excluded_owners": [
                 "static_volume_opacity",
@@ -15297,20 +21096,31 @@ def main():
             "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
             "every": int(args.static_detail_global_cleanup_every),
             "weight": float(args.static_detail_global_cleanup_weight),
+            "canonical_polish_weight_scale": float(
+                args.static_detail_global_cleanup_polish_scale
+            ),
             "counterfactual_weight": float(
                 args.static_detail_global_counterfactual_weight
             ),
             "counterfactual_weight_is_independent": True,
-            "camera_schedule": (
-                "uniform_authoritative_rgb_epoch_with_per_primitive_"
-                "positive_evidence_sequence_permission"
+            "camera_schedule": static_detail_cleanup_schedule_audit,
+            "forward_roles": [
+                "native_mixed_surface_plus_live_static_detail_owners"
+            ],
+            "optimized_quantity": (
+                "signed_live_mixed_rgb_opacity_derivative"
             ),
-            "forward_roles": ["surface", "static_detail"],
+            "rigid_depth_permission": (
+                "exact_native_per_pixel_depth_sorted_volume_contribution"
+            ),
+            "behind_surface_policy": (
+                "zero_or_surface_attenuated_native_volume_contribution"
+            ),
             "gradient_owners": [
-                "verified_exact_support_static_detail_xyz_scale_rotation",
-                "positive_evidence_sequence_static_detail_optical_mass",
+                "persistent_static_detail_global_negative_optical_mass",
             ],
             "excluded_owners": [
+                "static_detail_xyz_scale_rotation",
                 "static_detail_sh",
                 "persistent_envelope",
                 "skeleton",
@@ -15331,9 +21141,19 @@ def main():
             ),
             "counterfactual_weight_is_independent": True,
             "camera_schedule": "uniform_authoritative_rgb_epoch",
-            "forward_roles": ["surface", "persistent_envelope"],
+            "forward_roles": [
+                "native_mixed_surface_plus_resolved_persistent_envelope"
+            ],
+            "rigid_depth_permission": (
+                "exact_native_per_pixel_sorted_envelope_contribution"
+            ),
+            "behind_surface_policy": (
+                "zero_or_surface_attenuated_native_volume_contribution"
+            ),
+            "optimized_quantity": (
+                "signed_live_mixed_rgb_opacity_derivative"
+            ),
             "gradient_owners": [
-                "persistent_envelope_xyz_scale_rotation",
                 "persistent_envelope_optical_mass",
             ],
             "excluded_owners": [
@@ -15358,7 +21178,9 @@ def main():
                 args.static_ray_birth_maximum_segment_samples
             ),
             "minimum_cameras": 2,
-            "minimum_sequences": 2,
+            "minimum_sequences": (
+                1 if static_canonical_sequence is not None else 2
+            ),
             "maximum_births_per_topology_event": int(
                 args.maximum_static_ray_births_per_event
             ),
@@ -15420,6 +21242,14 @@ def main():
             "birth_forward_contract": (
                 "co_located_same_covariance_same_color_tau_partition"
             ),
+            "verification_state": (
+                "factorized_receiver_exact_candidate_visible_read_only_"
+                "until_two_real_camera_render_witnesses"
+            ),
+            "parent_eligibility": (
+                "resolved_envelope_with_at_least_two_selected_canonical_"
+                "candidate_cameras"
+            ),
             "integrated_optical_mass_conserved": True,
             "existing_detail_group_repeat_forbidden": True,
             "selection": (
@@ -15430,48 +21260,51 @@ def main():
                 "missing_group_receiver_before_strict_ray_birth_and_"
                 "ordinary_detail_split"
             ),
+            "verification_debt_backpressure": (
+                "soft_to_hard_continuous_scale_with_zero_hard_floor__"
+                "receiver_creation_pauses_until_real_witnesses_catch_up"
+            ),
         },
         "static_detail_canonical_ownership": {
             "enabled": bool(args.static_detail_canonical_ownership),
-            "forward_visibility": "unconditional_static",
+            "forward_visibility": (
+                "persistent_global__measured_exact_camera__factorized_"
+                "and_pending_exact_training_only__rejected_"
+                "hidden"
+            ),
             "geometry_topology_owner": (
-                "verified_exact_support_plus_positive_evidence_sequence_"
-                "soft_geometry__topology_exact_support_only"
+                "verified_exact_persisted_support_or_witness_camera_only"
             ),
             "same_sequence_geometry_weight": float(
                 STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT
             ),
             "appearance_owner": (
-                "exact_support_camera_weight1_plus_same_acquisition_"
-                "sequence_soft_weight"
+                "exact_persisted_support_or_witness_camera_weight1_only"
             ),
             "same_sequence_appearance_weight": float(
                 args.static_detail_same_sequence_appearance_weight
             ),
             "optical_mass_owner": (
-                "exact_support_camera_weight1_plus_positive_evidence_"
-                "sequence_soft_weight"
+                "exact_persisted_support_or_witness_camera_weight1_only"
             ),
             "same_sequence_optical_weight": float(
                 args.static_detail_same_sequence_optical_weight
             ),
             "positive_ray_owner": (
-                "persisted_positive_evidence_sequences_or_verified_two_"
-                "sequence_consensus"
+                "exact_persisted_support_or_witness_camera"
             ),
             "owned_signals": [
                 "canonical_rgb",
                 "canonical_high_frequency",
                 "detail_isolated_rgb_high_frequency",
-                "positive_evidence_sequence_or_verified_consensus_positive_"
-                "ray_hit_interval",
+                "exact_support_or_witness_camera_positive_ray_hit_interval",
                 "screen_gradient_topology",
             ],
             "noncanonical_views": (
-                "render_unconditionally__positive_and_negative_optical_"
-                "evidence_are_symmetric_within_persisted_evidence_"
-                "sequences__same_sequence_soft_appearance_mass_and_verified_"
-                "geometry__no_positive_topology"
+                "render_persistent_detail_only__observed_canopy_union_"
+                "projected_"
+                "canonical_volume_is_unknown__no_leaf_rgb_geometry_opacity_"
+                "topology_verification_or_ray_birth_updates"
             ),
         },
         "parameter_loss_permission_matrix": {
@@ -15495,35 +21328,38 @@ def main():
                 "all_view_rigid_free_counterfactual_cleanup",
             ],
             "envelope_sh": [
-                "stage2_all_view_canopy_rgb_all_coefficients",
-                "stage3_all_view_canopy_rgb_dc_only",
+                "stage2_scene_canonical_canopy_rgb_all_coefficients",
+                "stage3_scene_canonical_canopy_rgb_dc_only",
             ],
             "static_leaf_xyz_scale": [
-                "positive_evidence_sequence_ray_free_space",
-                "positive_evidence_sequence_or_verified_consensus_ray_hit",
-                "verified_exact_plus_soft_positive_evidence_sequence_"
+                "scene_canonical_sequence_ray_free_space",
+                "scene_canonical_sequence_ray_hit",
+                "verified_exact_plus_soft_scene_canonical_sequence_"
                 "canonical_rgb",
-                "verified_exact_plus_soft_positive_evidence_sequence_"
+                "verified_exact_plus_soft_scene_canonical_sequence_"
                 "detail_isolated_rgb_high_frequency",
-                "verified_exact_plus_soft_positive_evidence_sequence_"
+                "verified_exact_plus_soft_scene_canonical_sequence_"
                 "rigid_free_counterfactual_cleanup",
             ],
             "static_leaf_optical_mass": [
-                "positive_evidence_sequence_ray_free_space",
-                "positive_evidence_sequence_or_verified_consensus_ray_hit",
-                "exact_support_plus_soft_positive_evidence_sequence_"
+                "scene_canonical_sequence_ray_free_space",
+                "scene_canonical_sequence_ray_hit",
+                "exact_support_plus_soft_scene_canonical_sequence_"
                 "canonical_rgb_dc_mass",
-                "rigid_spill",
-                "positive_evidence_sequence_rigid_free_counterfactual_cleanup",
-                "positive_evidence_sequence_false_positive_and_complexity_priors",
+                "scene_canonical_rigid_spill",
+                "scene_canonical_native_mixed_harmful_contribution_cleanup",
+                "scene_canonical_false_positive_and_complexity_priors",
+                "post_topology_local_voxel_mass_trust_region_with_per_row_"
+                "upper_bound",
             ],
             "static_leaf_sh": [
                 "robust_canonical_rgb",
-                "verified_exact_plus_soft_same_sequence_high_frequency",
-                "verified_full_positive_evidence_sequence_volume_isolated_"
+                "verified_exact_plus_soft_scene_canonical_high_frequency",
+                "verified_scene_canonical_volume_isolated_"
                 "intrinsic_rgb_high_frequency",
+                "persistent_multiview_only_high_order_norm_bounded",
             ],
-            "uncertainty": ["photometric_likelihood_only"],
+            "uncertainty": [],
         },
         # The method schedule is resolved independently of an early
         # diagnostic stop. Checkpoints may therefore be resumed to a later
@@ -15649,6 +21485,7 @@ def main():
             "width": int(views[0].image_width) if views else 0,
             "height": int(views[0].image_height) if views else 0,
         },
+        "mixed_visibility_sort_contract": MIXED_VISIBILITY_SORT_CONTRACT,
         "rgb_source": training_rgb_source,
         "dynamic_replacement_contract": (
             SURFACE_OWNERSHIP_REPAIR_TARGET[
@@ -15695,14 +21532,14 @@ def main():
         "appearance_grid_policy": "disabled_no_camera_plane_grid",
         "static_spatial_uncertainty": {
             "contract": (
-                "training_only_per_image_degree2_legendre_"
-                "heteroscedastic_canopy_sky_field"
+                "disabled_for_static_scene_snapshot__fixed_canonical_"
+                "known_unknown_contract_owns_rgb_authority"
             ),
-            "active_after_static_detail_visibility": True,
+            "active_after_static_detail_visibility": False,
             "rgb_residual": False,
             "geometry_or_opacity_owner": False,
-            "canonical_weight_uses_detached_sigma": True,
-            "likelihood_uses_detached_render": True,
+            "canonical_weight_uses_detached_sigma": False,
+            "likelihood_uses_detached_render": False,
             "deployment_parameter": False,
             "camera_plane_grid": False,
         },
@@ -15753,7 +21590,16 @@ def main():
             "optical_responsibility_prior": (
                 deployment_optical_responsibility_prior
             ),
-            "training_and_deployment_image_formation_identical": True,
+            "detail_visibility": (
+                "persistent_global__measured_exact_camera__factorized_"
+                "pending_and_rejected_hidden"
+            ),
+            "training_and_deployment_image_formation_identical": False,
+            "image_formation_difference": (
+                "training_exposes_pending_proposals_and_factorized_receivers_"
+                "only_in_exact_candidate_cameras_to_collect_witnesses__"
+                "deployment_excludes_both_until_verified"
+            ),
             "persistent_handoff_is_parameter_lifecycle": True,
         },
         "dynamic_optical_mass_contract": (
@@ -15886,8 +21732,23 @@ def main():
             "retirement_until_iteration": int(
                 args.volume_opacity_retirement_until_iteration
             ),
+            "static_detail_optical_trust_lower": float(
+                args.static_detail_optical_trust_lower
+            ),
+            "static_detail_optical_trust_upper": float(
+                args.static_detail_optical_trust_upper
+            ),
+            "static_detail_optical_trust_voxel_size": float(
+                args.static_detail_optical_trust_voxel_size
+            ),
+            "static_detail_optical_trust_maximum_group_size": int(
+                args.static_detail_optical_trust_maximum_group_size
+            ),
             "trainable_after_settle": (
-                "geometry_scale_rotation_sh_and_dynamic_deformation_feature"
+                "persistent_static_detail_bidirectional_optical_mass_inside_"
+                "immutable_per_row_lower_and_upper_source_barriers_without_"
+                "post_adam_restoration__geometry_scale_rotation_sh_and_dynamic_"
+                "deformation_feature"
             ),
         },
         "volume_topology_ramp_iterations": int(
@@ -15910,6 +21771,56 @@ def main():
             args.bootstrap_evidence_opacity_ceiling
         ),
         "geometry_weight": float(args.geometry_weight),
+        "moge3_rigid_depth": {
+            "weight": float(args.moge3_rigid_depth_weight),
+            "runtime_enabled": bool(moge3_runtime_enabled),
+            "ownership": "rigid_pixels_without_plane_or_chart_metric_owner",
+            "camera_contract": "metric_camera_z_reprojected_with_exact_K",
+            "canopy_geometry_authority": False,
+        },
+        "moge3_rigid_normal": {
+            "weight": float(args.moge3_rigid_normal_weight),
+            "runtime_enabled": bool(moge3_runtime_enabled),
+            "ownership": "rigid_pixels_without_plane_or_chart_metric_owner",
+            "camera_contract": (
+                "direct_camera_normal_rotated_by_exact_renderer_"
+                "world_from_camera_rotation"
+            ),
+            "confidence": (
+                "refinement_stability_x_direct_depth_normal_agreement_x_"
+                "continuous_depth_boundary_precision"
+            ),
+            "normal_sign": "orientation_ambiguous_absolute_cosine",
+            "canopy_geometry_authority": False,
+        },
+        "moge3_canopy_optical": {
+            "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+            "weight": float(args.moge3_canopy_optical_weight),
+            "every": int(args.moge3_canopy_optical_every),
+            "prehit_weight": float(args.moge3_canopy_prehit_weight),
+            "maximum_birth_proposals_per_view": int(
+                args.moge3_canopy_maximum_birth_proposals
+            ),
+            "active_sequences": "selected_scene_canonical_only",
+            "active_phases": "foliage_through_ownership_cleanup_not_polish",
+            "renderer": (
+                "native_per_pixel_volume_product_transmittance_depth_query"
+            ),
+            "positive_owner": (
+                "persistent_multiview_static_detail_on_current_metric_ray_"
+                "plus_exact_camera_measured_single_detail"
+            ),
+            "hit_loss": "one_sided_relative_log_alpha_smooth_l1",
+            "negative_owner": (
+                "persistent_non_skeleton_plus_exact_camera_measured_detail"
+            ),
+            "missing_hit_topology": (
+                "all_owner_read_only_hit_query_to_two_exact_camera_same_"
+                "canonical_sequence_voxel_consensus_then_low_mass_"
+                "verification_bounded_static_ray_birth"
+            ),
+            "surface_and_behind_gradient": False,
+        },
         "projected_rigid_geometry": {
             "weight": float(args.projected_rigid_depth_weight),
             "contract": PROJECTED_OCCLUDED_RIGID_GEOMETRY_CONTRACT,
@@ -15939,6 +21850,7 @@ def main():
             "representation": (
                 "bounded_coarse_fine_inverse_depth_residual"
             ),
+            "base_source": str(args.chart_base_source),
             "configured_learning_rate": float(args.chart_atlas_lr),
             "effective_learning_rate": float(
                 chart_atlas_learning_rate
@@ -15969,8 +21881,16 @@ def main():
             args.conditioned_ownership_weight
         ),
         "counterfactual_transparency": {
-            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
-            "weight": float(args.counterfactual_transparency_weight),
+            "contract": (
+                STATIC_COUNTERFACTUAL_TRANSPARENCY_CONTRACT
+                if args.reconstruction_target == "static"
+                else COUNTERFACTUAL_TRANSPARENCY_CONTRACT
+            ),
+            "weight": (
+                0.0
+                if args.reconstruction_target == "static"
+                else float(args.counterfactual_transparency_weight)
+            ),
             "margin": float(args.counterfactual_transparency_margin),
             "temperature": float(
                 args.counterfactual_transparency_temperature
@@ -15980,6 +21900,86 @@ def main():
             ),
             "gradient_owner": "volume_opacity_only",
             "responsibility_gradient": "detached",
+        },
+        "canonical_occlusion_completion": {
+            "contract": CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+            "weight": float(args.canonical_occlusion_completion_weight),
+            "start_iteration": int(
+                args.canonical_occlusion_start_iteration
+            ),
+            "until_iteration": int(
+                args.canonical_occlusion_until_iteration
+            ),
+            "every": int(args.canonical_occlusion_every),
+            "view_schedule": static_detail_schedule_audit,
+            "activation_contract": (
+                CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+            ),
+            "maximum_optical_scale": float(
+                args.canonical_occlusion_maximum_scale
+            ),
+            "surface_leakage_tolerance": float(
+                args.canonical_occlusion_surface_leakage_tolerance
+            ),
+            "advantage_margin": float(
+                args.canonical_occlusion_advantage_margin
+            ),
+            "advantage_temperature": float(
+                args.canonical_occlusion_advantage_temperature
+            ),
+            "positive_pixel_authority": "scene_canonical_only",
+            "gradient_owner": "volume_opacity_only",
+            "unverified_positive_authority": (
+                "exact_owner_ray_factor_only__completion_gradient_blocked"
+            ),
+            "stage3_envelope_permission": (
+                "source_separated_bounded_coverage_gradient_only"
+            ),
+            "surface_in_front_policy": (
+                "strictly_zero_completion_gradient__separate_order_loss_"
+                "owns_local_geometry__topology_owns_missing_optical_"
+                "existence"
+            ),
+            "volume_source": "surface_zero_intrinsic_envelope_only_layer",
+            "forward_population_authority": (
+                "resolved_verified_envelope_equals_live_opacity_owner"
+            ),
+        },
+        "canonical_occlusion_order": {
+            "contract": CANONICAL_OCCLUSION_ORDER_CONTRACT,
+            "weight": float(args.canonical_occlusion_order_weight),
+            "start_iteration": int(
+                args.canonical_occlusion_start_iteration
+            ),
+            "until_iteration": int(
+                args.canonical_occlusion_until_iteration
+            ),
+            "every": int(args.canonical_occlusion_every),
+            "view_schedule": static_detail_schedule_audit,
+            "activation_contract": (
+                CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+            ),
+            "clearance": float(args.canonical_occlusion_order_clearance),
+            "maximum_forward_shift": float(
+                args.canonical_occlusion_order_maximum_forward_shift
+            ),
+            "positive_pixel_authority": "scene_canonical_only",
+            "gradient_owner": "volume_xyz_only",
+            "volume_population_authority": (
+                "resolved_verified_multiview_local_xyz_owner_only"
+            ),
+            "nonlocal_depth_policy": "reject_without_gradient",
+            "surface_policy": (
+                "preserve_structural_surface_and_repair_volume_depth_order"
+            ),
+            "source_render": (
+                "independent_same_camera_surface_zero_intrinsic_volume_"
+                "layer__forward_population_equals_live_xyz_owner"
+            ),
+            "optimizer_geometry_policy": (
+                "order_gradient_projected_to_camera_ray__post_adam_hard_"
+                "initialization_ball_and_outward_momentum_clear"
+            ),
         },
         "occupancy_weight": float(args.occupancy_weight),
         "dynamic_weight": float(args.dynamic_weight),
@@ -16005,6 +22005,17 @@ def main():
             args.maximum_volume_splits
         ),
         "volume_densify_every": int(args.volume_densify_every),
+        "post_growth_verification_maintenance": {
+            "contract": (
+                "same_cadence_after_volume_growth_end__strong_"
+                "contradiction_prune_and_expired_failed_family_rollback__"
+                "zero_birth_split_receiver_materialization_capacity"
+            ),
+            "cadence": int(args.volume_densify_every),
+            "starts_strictly_after_iteration": int(
+                args.volume_densify_until_iteration
+            ),
+        },
         "volume_densify_until_iteration": int(
             args.volume_densify_until_iteration
         ),
@@ -16028,6 +22039,9 @@ def main():
             args.maximum_volume_family_rollbacks_per_event
         ),
         "ray_posterior_every": int(args.ray_posterior_every),
+        "static_canonical_ray_every": int(
+            args.static_canonical_ray_every
+        ),
         "ray_posterior_maximum_rays": int(
             effective_ray_posterior_maximum_rays
         ),
@@ -16123,12 +22137,43 @@ def main():
         "training_evidence": _file_sha256(
             REPO_ROOT / "outdoor/training_evidence.py"
         ),
+        "moge3_evidence": _file_sha256(
+            REPO_ROOT / "outdoor/moge3_evidence.py"
+        ),
         "static_ray_birth": _file_sha256(
             REPO_ROOT / "outdoor/static_ray_birth.py"
+        ),
+        "directional_sky": _file_sha256(
+            REPO_ROOT / "outdoor/directional_sky.py"
+        ),
+        "foliage_view_graph": _file_sha256(
+            REPO_ROOT / "outdoor/foliage_view_graph.py"
+        ),
+        "evidence_store": _file_sha256(
+            REPO_ROOT / "outdoor/evidence_store.py"
+        ),
+        "runtime_provenance": _file_sha256(
+            REPO_ROOT / "outdoor/runtime_provenance.py"
+        ),
+        "surfel_arguments": _file_sha256(
+            SURFEL_ROOT / "arguments/__init__.py"
+        ),
+        "loss_utils": _file_sha256(
+            SURFEL_ROOT / "utils/loss_utils.py"
         ),
         "hybrid_renderer": _file_sha256(
             REPO_ROOT / "outdoor/hybrid_gaussian_renderer.py"
         ),
+        "mixed_extension_source_tree": _source_tree_sha256(
+            SURFEL_ROOT / "submodules/diff-surfel-rasterization"
+        ),
+        "mixed_extension_binary": _loaded_module_binary_sha256(
+            "diff_surfel_rasterization._C"
+        ),
+        "simple_knn_source_tree": _source_tree_sha256(
+            SURFEL_ROOT / "submodules/simple-knn"
+        ),
+        "simple_knn_binary": _loaded_module_binary_sha256("simple_knn._C"),
         "mixed_forward_cuda": _file_sha256(
             SURFEL_ROOT
             / "submodules/diff-surfel-rasterization/"
@@ -16158,6 +22203,7 @@ def main():
             "outdoor.hybrid_gaussian_renderer",
             "outdoor.foliage_geometry",
             "outdoor.role_aware_initialization",
+            "outdoor.moge3_evidence",
             "outdoor.projected_role_posterior",
             "outdoor.task_fields",
             "outdoor.appearance_uncertainty",
@@ -16276,6 +22322,21 @@ def main():
                     for key, value in VOLUME_SPLIT_REPAIR_PREDECESSOR.items()
                 )
             )
+            split_transaction_repair = (
+                args.allow_split_transaction_repair_resume
+                and changed == {"trainer", "hybrid_renderer"}
+                and int(resume.get("iteration", -1))
+                == SPLIT_TRANSACTION_REPAIR_PREDECESSOR["iteration"]
+                and resume.get("protocol")
+                == SPLIT_TRANSACTION_REPAIR_PREDECESSOR["protocol"]
+                and all(
+                    resume_hashes.get(key) == value
+                    for key, value in (
+                        SPLIT_TRANSACTION_REPAIR_PREDECESSOR.items()
+                    )
+                    if key not in {"protocol", "iteration"}
+                )
+            )
             surface_split_repair = (
                 args.allow_surface_split_repair_resume
                 and changed == {"trainer", "gaussian_model"}
@@ -16300,6 +22361,31 @@ def main():
                     if key not in {"protocol", "iteration"}
                 )
             )
+            v100_front_clipped_cleanup_repair = (
+                v100_front_clipped_cleanup_resume
+                and changed == {"trainer", "hybrid_teacher_api"}
+            )
+            v102_optical_trust_repair = (
+                v102_optical_trust_resume
+                and changed
+                == {"trainer", "hybrid_renderer", "hybrid_teacher_api"}
+            )
+            v103_local_optical_redistribution_repair = (
+                v103_local_optical_redistribution_resume
+                and changed == {"trainer", "hybrid_teacher_api"}
+            )
+            v105_late_optical_convergence_repair = (
+                v105_late_optical_convergence_resume
+                and changed == {"trainer", "hybrid_teacher_api"}
+            )
+            v107_global_negative_cleanup_repair = (
+                v107_global_negative_cleanup_resume
+                and changed == {"trainer", "hybrid_teacher_api"}
+            )
+            v108_evidence_bounded_completion_repair = (
+                v108_evidence_bounded_completion_resume
+                and changed == {"trainer"}
+            )
             if (
                 not performance_only
                 and not trainer_repair
@@ -16308,8 +22394,15 @@ def main():
                 and not volume_capacity_repair
                 and not surface_ownership_repair
                 and not volume_split_repair
+                and not split_transaction_repair
                 and not surface_split_repair
                 and not surface_screen_evidence_repair
+                and not v100_front_clipped_cleanup_repair
+                and not v102_optical_trust_repair
+                and not v103_local_optical_redistribution_repair
+                and not v105_late_optical_convergence_repair
+                and not v107_global_negative_cleanup_repair
+                and not v108_evidence_bounded_completion_repair
             ):
                 raise RuntimeError(
                     "Resume implementation/CUDA hash mismatch; start a new "
@@ -16368,6 +22461,13 @@ def main():
                     "mass-safe sqrt(2) volume split repair; evidence, "
                     "schedules, optimizers and CUDA kernels are identical."
                 )
+            elif split_transaction_repair:
+                print(
+                    "Resuming the exact v95 iteration-3000 checkpoint across "
+                    "the atomic skeleton split-rollback repair; ordinary "
+                    "skeleton pruning remains forbidden and all evidence, "
+                    "schedules, optimizers and CUDA kernels are identical."
+                )
             elif volume_capacity_repair:
                 print(
                     "Resuming the exact retained v82 8k checkpoint across "
@@ -16379,6 +22479,44 @@ def main():
                 print(
                     "Resuming across an explicit trainer-only causal repair; "
                     "all evidence/model/CUDA hashes remain identical."
+                )
+            elif v100_front_clipped_cleanup_repair:
+                print(
+                    "Resuming the content-addressed v99 21k checkpoint into "
+                    "v100: only owner-isolated front-depth-clipped global "
+                    "negative cleanup changes; model, optimizer, evidence, "
+                    "schedules, renderer and CUDA hashes are identical."
+                )
+            elif v103_local_optical_redistribution_repair:
+                print(
+                    "Resuming the content-addressed v102 24k checkpoint into "
+                    "v103: future detail cleanup uses the dedicated canonical "
+                    "snapshot schedule and exact native mixed per-pixel "
+                    "volume contribution; local voxel mass bounds replace "
+                    "the contradictory per-row lower bound. Model, optimizer, "
+                    "evidence, schedules, renderer and CUDA state are exact."
+                )
+            elif v105_late_optical_convergence_repair:
+                print(
+                    "Resuming content-addressed v104 into v105: lower mass "
+                    "restoration and polish handoff are disabled, late "
+                    "high-order detail SH is frozen, and canonical order "
+                    "uses a bounded primitive responsibility budget."
+                )
+            elif v107_global_negative_cleanup_repair:
+                print(
+                    "Resuming the content-addressed v106 18k checkpoint into "
+                    "v107: positive detail updates remain exact-support "
+                    "owned, while future strict negative cleanup uniformly "
+                    "covers every authoritative canonical camera."
+                )
+            elif v108_evidence_bounded_completion_repair:
+                print(
+                    "Resuming the content-addressed v107 21k checkpoint into "
+                    "v108: persistent multiview detail cleanup is bounded by "
+                    "its immutable existence evidence, and exact-camera "
+                    "detail replaces its envelope group in positive "
+                    "occlusion completion."
                 )
             else:
                 print(
@@ -16418,6 +22556,7 @@ def main():
             "static_replacement": static_replacement_schedule,
             "static_skeleton": static_skeleton_schedule,
             "static_volume": static_volume_schedule,
+            "static_canonical_ray": static_canonical_ray_schedule,
         }
         changed_non_conditioned = [
             name
@@ -16449,6 +22588,9 @@ def main():
             allow_trainer_repair_migration=bool(
                 args.allow_trainer_repair_resume
             ),
+            allow_canonical_occlusion_weight_ablation=bool(
+                args.allow_canonical_occlusion_weight_ablation_resume
+            ),
             allow_conditioned_schedule_repair_migration=bool(
                 args.allow_conditioned_schedule_repair_resume
             ),
@@ -16476,14 +22618,59 @@ def main():
             allow_surface_screen_evidence_repair_migration=bool(
                 args.allow_surface_screen_evidence_repair_resume
             ),
+            allow_v100_front_clipped_cleanup_migration=bool(
+                v100_front_clipped_cleanup_resume
+            ),
+            allow_v102_optical_trust_migration=bool(
+                v102_optical_trust_resume
+            ),
+            allow_v103_local_optical_redistribution_migration=bool(
+                v103_local_optical_redistribution_resume
+            ),
+            allow_v105_late_optical_convergence_migration=bool(
+                v105_late_optical_convergence_resume
+            ),
+            allow_v107_global_negative_cleanup_migration=bool(
+                v107_global_negative_cleanup_resume
+            ),
+            allow_v108_evidence_bounded_completion_migration=bool(
+                v108_evidence_bounded_completion_resume
+            ),
         )
         if resume is not None
         else set()
     )
     if contract_differences:
+        difference_details = {
+            key: {
+                "saved": resume.get("training_contract", {}).get(key),
+                "current": training_contract.get(key),
+            }
+            for key in sorted(contract_differences)
+        }
         raise RuntimeError(
             "Resume optimization/evidence-ownership contract changed "
-            f"({', '.join(sorted(contract_differences))}); start a clean run"
+            f"({', '.join(sorted(contract_differences))}): "
+            f"{json.dumps(difference_details, sort_keys=True)}; start a clean run"
+        )
+    if (
+        resume is not None
+        and args.allow_canonical_occlusion_weight_ablation_resume
+    ):
+        prior_completion_weight = resume["training_contract"][
+            "canonical_occlusion_completion"
+        ]["weight"]
+        prior_order_weight = resume["training_contract"][
+            "canonical_occlusion_order"
+        ]["weight"]
+        print(
+            "Resuming an explicit canonical-occlusion loss-weight ablation: "
+            "completion "
+            f"{prior_completion_weight} -> "
+            f"{args.canonical_occlusion_completion_weight}; order "
+            f"{prior_order_weight} -> "
+            f"{args.canonical_occlusion_order_weight}. Every other "
+            "optimization/evidence contract field is identical."
         )
     # Contract comparison above intentionally uses the clean immutable
     # evidence preflight. Runtime counters are cumulative state and are
@@ -16739,7 +22926,18 @@ def main():
         random.setstate(resume["python_rng_state"])
         np.random.set_state(resume["numpy_rng_state"])
         torch.set_rng_state(resume["torch_rng_state"])
-        torch.cuda.set_rng_state_all(resume["cuda_rng_state"])
+        cuda_rng_restore_audit = _restore_cuda_rng_states(
+            resume["cuda_rng_state"]
+        )
+        if (
+            cuda_rng_restore_audit["saved_device_count"]
+            != cuda_rng_restore_audit["visible_device_count"]
+        ):
+            print(
+                "Restored the checkpoint CUDA RNG for the common logical "
+                "device prefix: "
+                f"{cuda_rng_restore_audit}"
+            )
     sequence_names = sorted(
         {sequence_id(view.image_name) for view in views}
     )
@@ -16791,6 +22989,22 @@ def main():
         "resume_iteration": int(start_step),
         "requested_stop_iteration": int(args.iterations),
     }
+    static_detail_sh_trust_audit = {
+        "contract": "not_executed_no_optimization_steps",
+        "persistent_rows": 0,
+        "nonpersistent_rows_zeroed": 0,
+        "projected_rows": 0,
+        "maximum_norm_before": 0.0,
+        "maximum_norm_after": 0.0,
+        "maximum_high_order_norm": float(
+            args.static_detail_high_order_sh_norm_ceiling
+        ),
+    }
+    static_detail_evidence_tier_audit = (
+        _static_detail_evidence_tier_audit(foliage)
+        if args.reconstruction_target == "static"
+        else {"contract": "not_static", "detail_rows": 0}
+    )
     static_replacement_audit = {
         "contract": (
             "persistent_distinct_view_real_ray_expected_coverage_ema"
@@ -16946,6 +23160,9 @@ def main():
 
     prefetch_training_images(start_step)
     for step in progress:
+        # Record a per-step peak instead of one process-lifetime maximum so a
+        # later OOM can be tied to the actual scheduled pass combination.
+        torch.cuda.reset_peak_memory_stats()
         if (
             not anchors_released
             and (step + 1) >= anchor_release_iteration
@@ -17027,6 +23244,10 @@ def main():
             torch.device("cuda"),
         )
         target = view.original_image.cuda(non_blocking=True)
+        static_scene_view_is_canonical = bool(
+            static_canonical_sequence is None
+            or sequence_id(view.image_name) == static_canonical_sequence
+        )
         canopy_topology_signal = _canopy_topology_signal(
             target, task
         )
@@ -17034,12 +23255,21 @@ def main():
         # current forward/backward passes.
         prefetch_training_images(step + 1)
         static_training_gate = None
-        if (
-            args.reconstruction_target == "static"
-            and not static_detail_active
-        ):
-            static_training_gate = torch.ones_like(foliage.opacities)
-            static_training_gate[foliage.static_leaf_mask] = 0.0
+        if args.reconstruction_target == "static":
+            if not static_detail_active:
+                static_training_gate = torch.ones_like(foliage.opacities)
+                static_training_gate[foliage.static_leaf_mask] = 0.0
+            else:
+                # Training and inference share the same evidence-tier forward
+                # visibility. Persistent detail is global; measured/proposal
+                # rows are visible only in an exact witness camera. Pending
+                # rows are included here solely so real renders can verify or
+                # reject them and remain excluded from deployment.
+                static_training_gate = static_detail_forward_visibility_gate(
+                    foliage,
+                    int(view.colmap_id),
+                    include_pending_exact=True,
+                )
         static_detail_gradient_gate = None
         static_detail_positive_evidence_sequence_gate = None
         static_detail_appearance_gradient_gate = None
@@ -17051,7 +23281,7 @@ def main():
             "camera_id": int(view.colmap_id),
             "owned_detail_rows": 0,
             "total_detail_rows": int(foliage.static_leaf_mask.sum()),
-            "forward_visibility": "unconditional_static",
+            "forward_visibility": "persistent_plus_exact_measured_or_pending",
             "owned_positive_signals": (
                 "exact_geometry_opacity_sh_hit_topology__soft_verified_"
                 "positive_sequence_geometry"
@@ -17169,7 +23399,9 @@ def main():
                     same_sequence_non_support_rows
                 ),
                 "total_detail_rows": int(foliage.static_leaf_mask.sum()),
-                "forward_visibility": "unconditional_static",
+                "forward_visibility": (
+                    "persistent_plus_exact_measured_or_pending"
+                ),
                 "owned_positive_signals": (
                     "exact_geometry_opacity_sh_hit_topology__soft_verified_"
                     "positive_sequence_geometry"
@@ -17253,6 +23485,24 @@ def main():
                 ] = static_detail_geometry_gradient_gate[
                     foliage.static_leaf_mask
                 ]
+            if not static_scene_view_is_canonical:
+                # The full static map remains visible, but a different
+                # traversal owns no leaf-detail parameter update at all. This
+                # primitive gate complements the pixel-level unknown mask and
+                # prevents auxiliary rigid/free losses from bypassing it.
+                detail = foliage.static_leaf_mask
+                if static_detail_optical_gradient_gate is not None:
+                    static_detail_optical_gradient_gate = (
+                        static_detail_optical_gradient_gate.clone()
+                    )
+                    static_detail_optical_gradient_gate[detail] = 0
+                for gradient_gate in (
+                    canonical_volume_geometry_gate,
+                    canonical_volume_appearance_gate,
+                    canonical_volume_opacity_gate,
+                ):
+                    if gradient_gate is not None:
+                        gradient_gate[detail] = 0
         static_replacement_lifecycle_enabled = bool(
             args.reconstruction_target == "static"
             and foliage_active
@@ -17334,6 +23584,391 @@ def main():
             # entire rigid pretrain, roughly halving throughput without
             # changing either the image or any gradient.
             structural_package = package
+        moge3_canopy_optical_package_prehit = None
+        moge3_canopy_optical_package_hit = None
+        moge3_canopy_optical_package_coverage = None
+        moge3_canopy_optical = package.volume_alpha.sum() * 0.0
+        moge3_canopy_optical_gradient = None
+        moge3_canopy_optical_update_rows = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
+        moge3_canopy_optical_owner_rows = {
+            "prehit": 0,
+            "hit": 0,
+        }
+        moge3_canopy_optical_audit: dict[str, object] = {
+            "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+            "scheduled": False,
+            "reason": "cadence_or_evidence_inactive",
+            "prehit_supported_pixels": 0,
+            "hit_supported_pixels": 0,
+            "prehit_owner_rows": 0,
+            "hit_owner_rows": 0,
+            "noncanonical_positive_updates_blocked": not bool(
+                static_scene_view_is_canonical
+            ),
+            "birth": {
+                "candidate_pixels": 0,
+                "selected_proposals": 0,
+                "accumulator_accepted": 0,
+                "direct_append": False,
+            },
+        }
+        moge3_view_stem = Path(str(view.image_name)).stem
+        moge3_canopy_optical_scheduled = bool(
+            args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+            and static_scene_view_is_canonical
+            and foliage_active
+            and static_detail_active
+            and phase != "canonical_polish"
+            and args.moge3_canopy_optical_weight > 0.0
+            and args.moge3_canopy_optical_every > 0
+            and (step + 1) % args.moge3_canopy_optical_every == 0
+            and moge3_view_stem in geometry.moge3_records
+        )
+        if moge3_canopy_optical_scheduled:
+            moge3_current_fields = geometry.fields(
+                view.image_name,
+                device=torch.device("cuda"),
+                shape=(view.image_height, view.image_width),
+            )
+            (
+                moge3_prehit_query_bounds,
+                moge3_hit_query_bounds,
+                moge3_query_valid,
+                moge3_query_reliability,
+                moge3_query_audit,
+            ) = _moge3_depth_query_bounds(
+                moge3_current_fields,
+                global_log_scale_sigma=moge3_global_log_scale_sigma,
+            )
+            exact_camera = _static_detail_canonical_ownership_gate(
+                foliage,
+                int(view.colmap_id),
+                camera_sequence_lookup,
+            ) > 0
+            hit_owner_mask = _moge3_canopy_hit_owner_mask(
+                foliage, exact_camera
+            )
+            prehit_owner_mask = (
+                (
+                    _persistent_static_evidence_mask(foliage)
+                    & ~foliage.static_skeleton_mask
+                )
+                | hit_owner_mask
+            )
+            prehit_owner = prehit_owner_mask.to(foliage.xyz.dtype)
+            hit_owner = hit_owner_mask.to(foliage.xyz.dtype)
+            moge3_canopy_optical_owner_rows = {
+                "prehit": int(prehit_owner_mask.sum()),
+                "hit": int(hit_owner_mask.sum()),
+            }
+            read_only_volume = torch.zeros_like(foliage.opacities)
+            surface_zero = torch.zeros_like(
+                surface.get_opacity.reshape(-1)
+            )
+            if bool(prehit_owner_mask.any()) and bool(
+                moge3_query_valid.any()
+            ):
+                moge3_canopy_optical_package_prehit = render_hybrid(
+                    view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=surface_zero,
+                    volume_gate=prehit_owner,
+                    volume_geometry_gradient_gate=read_only_volume,
+                    volume_appearance_gradient_gate=read_only_volume,
+                    volume_opacity_gradient_gate=prehit_owner,
+                    volume_depth_query_bounds=moge3_prehit_query_bounds,
+                    volume_opacity_scale=1.0,
+                    optical_replacement_policy="disabled",
+                    structural_trainable_start=None,
+                )
+            if bool(hit_owner_mask.any()) and bool(moge3_query_valid.any()):
+                moge3_canopy_optical_package_hit = render_hybrid(
+                    view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=surface_zero,
+                    volume_gate=hit_owner,
+                    volume_geometry_gradient_gate=read_only_volume,
+                    volume_appearance_gradient_gate=read_only_volume,
+                    volume_opacity_gradient_gate=hit_owner,
+                    volume_depth_query_bounds=moge3_hit_query_bounds,
+                    volume_opacity_scale=1.0,
+                    optical_replacement_policy="disabled",
+                    structural_trainable_start=None,
+                )
+            if bool(prehit_owner_mask.any()) and bool(
+                moge3_query_valid.any()
+            ):
+                # Coverage for birth is a detached all-owner question. It
+                # must use the thin hit interval, but cannot grant a gradient
+                # to any persistent envelope or exact detail row.
+                moge3_canopy_optical_package_coverage = render_hybrid(
+                    view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=surface_zero,
+                    volume_gate=prehit_owner,
+                    volume_geometry_gradient_gate=read_only_volume,
+                    volume_appearance_gradient_gate=read_only_volume,
+                    volume_opacity_gradient_gate=read_only_volume,
+                    volume_depth_query_bounds=moge3_hit_query_bounds,
+                    volume_opacity_scale=1.0,
+                    optical_replacement_policy="disabled",
+                    structural_trainable_start=None,
+                )
+            prehit_alpha = (
+                moge3_canopy_optical_package_prehit.volume_prehit_alpha
+                if moge3_canopy_optical_package_prehit is not None
+                else package.volume_alpha.detach() * 0.0
+            )
+            hit_alpha = (
+                moge3_canopy_optical_package_hit.volume_hit_interval_alpha
+                if moge3_canopy_optical_package_hit is not None
+                else package.volume_alpha.detach() * 0.0
+            )
+            coverage_hit_alpha = (
+                moge3_canopy_optical_package_coverage.volume_hit_interval_alpha
+                if moge3_canopy_optical_package_coverage is not None
+                else package.volume_alpha.detach() * 0.0
+            )
+            (
+                moge3_canopy_optical,
+                moge3_loss_audit,
+            ) = _moge3_canopy_optical_loss(
+                prehit_alpha,
+                hit_alpha,
+                task,
+                moge3_query_valid,
+                moge3_query_reliability,
+                prehit_weight=args.moge3_canopy_prehit_weight,
+            )
+            moge3_birth_proposals = None
+            moge3_birth_audit: dict[str, object] = {
+                "candidate_pixels": 0,
+                "selected_proposals": 0,
+                "accumulator_accepted": 0,
+                "direct_append": False,
+                "reason": "topology_inactive",
+            }
+            if _volume_topology_active(step, args, phase):
+                (
+                    moge3_birth_proposals,
+                    moge3_birth_audit,
+                ) = _moge3_uncovered_hit_proposals(
+                    view,
+                    moge3_hit_query_bounds,
+                    coverage_hit_alpha,
+                    task,
+                    moge3_query_valid,
+                    moge3_query_reliability,
+                    maximum_proposals=(
+                        args.moge3_canopy_maximum_birth_proposals
+                    ),
+                )
+                accepted_moge3_birth_proposals = static_ray_births.add(
+                    moge3_birth_proposals,
+                    sequence_id=static_canonical_sequence,
+                )
+                moge3_birth_audit.update(
+                    {
+                        "accumulator_accepted": int(
+                            accepted_moge3_birth_proposals
+                        ),
+                        "reason": "canonical_two_camera_consensus_pending",
+                    }
+                )
+            moge3_canopy_optical_audit = {
+                **moge3_query_audit,
+                **moge3_loss_audit,
+                "scheduled": bool(
+                    moge3_canopy_optical_package_prehit is not None
+                    or moge3_canopy_optical_package_hit is not None
+                ),
+                "reason": "active",
+                "prehit_owner_rows": int(prehit_owner_mask.sum()),
+                "hit_owner_rows": int(hit_owner_mask.sum()),
+                "coverage_forward_rows": int(prehit_owner_mask.sum()),
+                "coverage_gradient_rows": 0,
+                "forward_rows_equal_live_owner_rows": True,
+                "surface_forward_rows": 0,
+                "noncanonical_positive_updates_blocked": False,
+                "birth": moge3_birth_audit,
+            }
+        canonical_occlusion_active = bool(
+            args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+            and foliage_active
+            and _canonical_occlusion_schedule_active(step, args)
+            and len(static_detail_view_indices) > 0
+        )
+        canonical_occlusion_view = None
+        canonical_occlusion_target = None
+        canonical_occlusion_task = None
+        canonical_occlusion_structural_package = None
+        canonical_occlusion_structural_prediction = None
+        canonical_occlusion_view_index = None
+        canonical_occlusion_completion_package = None
+        canonical_occlusion_order_package = None
+        canonical_occlusion_forward_rows = 0
+        canonical_occlusion_completion_owner_rows = 0
+        canonical_occlusion_completion_detail_owner_rows = 0
+        canonical_occlusion_completion_envelope_owner_rows = 0
+        canonical_occlusion_order_owner_rows = 0
+        canonical_occlusion_order_trust_rows = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
+        if (
+            args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+            and foliage_active
+            and _canonical_occlusion_schedule_active(step, args)
+        ):
+            canonical_occlusion_order_trust_rows = (
+                _persistent_static_evidence_mask(foliage)
+                & ~foliage.static_skeleton_mask
+            )
+        if canonical_occlusion_active:
+            canonical_occlusion_view_index = int(
+                static_detail_schedule[
+                    _periodic_schedule_index(
+                        step, args.canonical_occlusion_every
+                    )
+                ]
+            )
+            canonical_occlusion_view = views[
+                canonical_occlusion_view_index
+            ]
+            canonical_occlusion_target = (
+                canonical_occlusion_view.original_image.cuda(
+                    non_blocking=True
+                )
+            )
+            canonical_occlusion_task = fields.fields(
+                canonical_occlusion_view.image_name,
+                (
+                    canonical_occlusion_view.image_height,
+                    canonical_occlusion_view.image_width,
+                ),
+                torch.device("cuda"),
+            )
+            # The structural branch is immutable evidence for these two
+            # source-separated factors. A dedicated canonical camera must not
+            # create a second surface/sky optimizer owner.
+            with torch.no_grad():
+                canonical_occlusion_structural_package = render_hybrid(
+                    canonical_occlusion_view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    volume_opacity_scale=0.0,
+                    structural_trainable_start=None,
+                    optical_replacement_policy="disabled",
+                )
+                canonical_occlusion_structural_prediction = (
+                    composite_white_background(
+                        canonical_occlusion_structural_package.render,
+                        canonical_occlusion_structural_package.alpha,
+                        sky(canonical_occlusion_view),
+                    )
+                )
+            # Occlusion evidence must exist independently of the current
+            # mixed sort.  Both source-separated passes remove the surface
+            # from the forward renderer and include only durable canopy
+            # evidence; single-view detail and pending proposals cannot grant
+            # whole-image opacity/geometry authority.
+            persistent_static = _persistent_static_evidence_mask(foliage)
+            persistent_canopy = (
+                persistent_static & ~foliage.static_skeleton_mask
+            )
+            read_only_gate = torch.zeros_like(foliage.opacities)
+            surface_zero_gate = torch.zeros_like(
+                surface.get_opacity.reshape(-1)
+            )
+            if args.canonical_occlusion_completion_weight > 0:
+                completion_owner_mask = (
+                    _canonical_occlusion_completion_owner_mask(
+                        foliage,
+                        int(canonical_occlusion_view.colmap_id),
+                        camera_sequence_lookup,
+                    )
+                )
+                completion_owner = completion_owner_mask.to(
+                    foliage.xyz.dtype
+                )
+                canonical_occlusion_completion_owner_rows = int(
+                    (completion_owner > 0).sum()
+                )
+                canonical_occlusion_completion_detail_owner_rows = int(
+                    (completion_owner_mask & foliage.static_leaf_mask).sum()
+                )
+                canonical_occlusion_completion_envelope_owner_rows = int(
+                    (
+                        completion_owner_mask
+                        & foliage.persistent_envelope_mask
+                    ).sum()
+                )
+                canonical_occlusion_forward_rows = int(
+                    (completion_owner > 0).sum()
+                )
+                canonical_occlusion_completion_package = render_hybrid(
+                    canonical_occlusion_view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=surface_zero_gate,
+                    # Forward evidence and live opacity owner are identical.
+                    # A read-only detail row must not authorize an envelope
+                    # behind the facade to absorb its residual.
+                    volume_gate=completion_owner,
+                    volume_geometry_gradient_gate=read_only_gate,
+                    volume_appearance_gradient_gate=read_only_gate,
+                    volume_opacity_gradient_gate=completion_owner,
+                    volume_opacity_scale=1.0,
+                    optical_replacement_policy="disabled",
+                    structural_trainable_start=None,
+                )
+            if args.canonical_occlusion_order_weight > 0:
+                displacement = (
+                    foliage.xyz.detach() - foliage.initialization_center
+                ).norm(dim=1)
+                order_owner = canonical_occlusion_order_trust_rows & (
+                    displacement
+                    < float(
+                        args.canonical_occlusion_order_maximum_forward_shift
+                    )
+                )
+                order_owner_gate = order_owner.to(foliage.xyz.dtype)
+                canonical_occlusion_order_owner_rows = int(order_owner.sum())
+                canonical_occlusion_order_package = render_hybrid(
+                    canonical_occlusion_view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=surface_zero_gate,
+                    # The order counterfactual is formed only from rows that
+                    # this pass can actually move. Frozen/out-of-trust rows
+                    # cannot transfer their evidence to a different owner.
+                    volume_gate=order_owner_gate,
+                    volume_geometry_gradient_gate=order_owner_gate,
+                    volume_appearance_gradient_gate=read_only_gate,
+                    volume_opacity_gradient_gate=read_only_gate,
+                    volume_opacity_scale=1.0,
+                    optical_replacement_policy="disabled",
+                    structural_trainable_start=None,
+                )
         canonical = composite_white_background(
             package.render, package.alpha, sky(view)
         )
@@ -17362,6 +23997,86 @@ def main():
             * canonical_canopy_weight
             * task["p_canopy"]
         )
+        canonical_volume_footprint_alpha = package.volume_alpha
+        if (
+            args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+            and foliage_active
+            and not static_scene_view_is_canonical
+        ):
+            # Mixed ``volume_alpha`` is a contribution alpha (T_before*a), so
+            # a nearly opaque facade sorted first can erase the projected
+            # canonical crown from the unknown mask.  Measure the footprint
+            # in a read-only surface-zero render; changing the foreground
+            # structure can no longer grant RGB/deletion authority behind it.
+            persistent_footprint = (
+                _canonical_static_unknown_protection_mask(foliage)
+            )
+            zero_volume_gate = torch.zeros_like(foliage.opacities)
+            with torch.no_grad():
+                footprint_package = render_hybrid(
+                    view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    surface_gate=torch.zeros_like(
+                        surface.get_opacity.reshape(-1)
+                    ),
+                    volume_gate=persistent_footprint.to(
+                        foliage.xyz.dtype
+                    ),
+                    volume_geometry_gradient_gate=zero_volume_gate,
+                    volume_appearance_gradient_gate=zero_volume_gate,
+                    volume_opacity_gradient_gate=zero_volume_gate,
+                    volume_opacity_scale=1.0,
+                    structural_trainable_start=None,
+                    optical_replacement_policy="disabled",
+                )
+            canonical_volume_footprint_alpha = (
+                footprint_package.volume_alpha.detach()
+            )
+        (
+            background_weight,
+            canopy_weight,
+            static_scene_unknown,
+            static_scene_is_canonical,
+        ) = _static_scene_rgb_ownership(
+            background_weight,
+            canopy_weight,
+            task["p_canopy"],
+            canonical_volume_footprint_alpha,
+            reconstruction_target=args.reconstruction_target,
+            canonical_sequence_policy=(
+                "disabled_rigid_placeholder"
+                if rigid_placeholder
+                else args.static_canonical_sequence_policy
+            ),
+            canonical_sequence=static_canonical_sequence,
+            view_sequence=sequence_id(view.image_name),
+            view_is_canonical_snapshot=None,
+        )
+        static_scene_known = 1.0 - static_scene_unknown
+        static_tree_cleanup_task = task
+        if not static_scene_is_canonical:
+            # Keep the original task fields immutable because the structural
+            # branch may still learn a facade revealed by seasonal foliage.
+            # Only tree/volume ownership and deletion factors see the
+            # canonical known/unknown contract.
+            static_tree_cleanup_task = dict(task)
+            for field_name in (
+                "p_rigid",
+                "p_sky",
+                "p_canopy",
+                "p_canopy_core",
+                "p_tree_surface",
+                "p_transient",
+            ):
+                if field_name in static_tree_cleanup_task:
+                    static_tree_cleanup_task[field_name] = (
+                        static_tree_cleanup_task[field_name]
+                        * static_scene_known
+                    )
         static_confidence_mean = owner_weight.new_tensor(1.0)
         static_sigma_mean = owner_weight.new_zeros(())
         canonical_sigma = None
@@ -17438,6 +24153,7 @@ def main():
         static_detail_isolated_soft_geometry_gate = None
         static_detail_isolated_qualified_rows = 0
         static_detail_isolated_appearance_rows = 0
+        static_detail_isolated_opacity_rows = 0
         static_detail_isolated_view = None
         static_detail_isolated_photo = canonical.new_zeros(())
         static_detail_isolated_high_frequency = canonical.new_zeros(())
@@ -17517,14 +24233,40 @@ def main():
                     fallback_weight=1.0,
                 )
             )
+            static_detail_isolated_positive_sequence_gate = (
+                _static_detail_positive_evidence_sequence_gate(
+                    foliage,
+                    int(static_detail_isolated_view.colmap_id),
+                    camera_sequence_lookup,
+                )
+            )
+            static_detail_isolated_optical_gate = (
+                _static_detail_same_sequence_optical_gate(
+                    foliage,
+                    int(static_detail_isolated_view.colmap_id),
+                    camera_sequence_lookup,
+                    static_detail_isolated_ownership_gate,
+                    fallback_weight=(
+                        args.static_detail_same_sequence_optical_weight
+                    ),
+                    positive_evidence_sequence_gate=(
+                        static_detail_isolated_positive_sequence_gate
+                    ),
+                )
+            )
+            # The isolated occlusion residual is a high-bandwidth owner.  Keep
+            # it on real multiview-verified detail just like geometry; new or
+            # displaced candidates must first earn render witnesses.
+            static_detail_isolated_optical_gate = (
+                _static_detail_refinement_gate(
+                    foliage, static_detail_isolated_optical_gate
+                )
+            )
             static_detail_isolated_qualified_rows = int(
                 (
                     foliage.static_leaf_mask
                     & (static_detail_isolated_soft_geometry_gate > 0)
                 ).sum()
-            )
-            static_detail_gate = foliage.static_leaf_mask.to(
-                dtype=foliage.opacities.dtype
             )
             (
                 static_detail_isolated_geometry_gate,
@@ -17533,11 +24275,26 @@ def main():
             ) = _static_detail_isolated_gradient_gates(
                 static_detail_isolated_soft_geometry_gate,
                 static_detail_isolated_appearance_gate,
+                static_detail_isolated_optical_gate,
             )
+            static_detail_gate = (
+                foliage.static_leaf_mask
+                & (
+                    (static_detail_isolated_geometry_gate > 0)
+                    | (static_detail_isolated_opacity_gate > 0)
+                    | (static_detail_isolated_appearance_gate > 0)
+                )
+            ).to(dtype=foliage.opacities.dtype)
             static_detail_isolated_appearance_rows = int(
                 (
                     foliage.static_leaf_mask
                     & (static_detail_isolated_appearance_gate > 0)
+                ).sum()
+            )
+            static_detail_isolated_opacity_rows = int(
+                (
+                    foliage.static_leaf_mask
+                    & (static_detail_isolated_opacity_gate > 0)
                 ).sum()
             )
             static_detail_isolated_package = render_hybrid(
@@ -17589,13 +24346,15 @@ def main():
                 static_detail_isolated_weight,
                 opt.lambda_dssim,
             )
-            static_detail_isolated_high_frequency = _high_frequency_loss(
+            static_detail_isolated_high_frequency = (
+                _oriented_multiscale_high_frequency_loss(
                 static_detail_isolated_prediction,
                 static_detail_isolated_target,
                 static_detail_isolated_task["p_canopy"]
                 * (1.0 - static_detail_isolated_task["p_transient"])
                 * static_detail_isolated_task["w_rgb"]
                 * _boundary_evidence_weight(static_detail_isolated_task),
+                )
             )
         static_skeleton_isolated_package = None
         static_skeleton_isolated_photo = canonical.new_zeros(())
@@ -17688,7 +24447,7 @@ def main():
                 0.10,
             )
             static_skeleton_isolated_high_frequency = (
-                _high_frequency_loss(
+                _oriented_multiscale_high_frequency_loss(
                     skeleton_prediction,
                     skeleton_target,
                     skeleton_weight,
@@ -17753,23 +24512,12 @@ def main():
                 else None
             )
             static_volume_appearance_ownership_gate = (
-                _static_detail_same_sequence_appearance_gate(
-                    foliage,
-                    int(static_volume_isolated_view.colmap_id),
-                    camera_sequence_lookup,
-                    static_volume_ownership_gate,
-                    fallback_weight=1.0,
-                )
+                static_volume_ownership_gate
                 if static_volume_ownership_gate is not None
                 else None
             )
             static_volume_soft_geometry_gate = (
-                _static_detail_same_sequence_geometry_gate(
-                    foliage,
-                    int(static_volume_isolated_view.colmap_id),
-                    camera_sequence_lookup,
-                    static_volume_ownership_gate,
-                )
+                static_volume_ownership_gate
                 if static_volume_ownership_gate is not None
                 else None
             )
@@ -17789,11 +24537,22 @@ def main():
                 foliage, static_volume_ownership_gate
             )
             static_volume_isolated_qualified_rows = int(
-                (static_volume_refinement_gate > 0).sum()
+                (
+                    foliage.static_leaf_mask
+                    & (static_volume_refinement_gate > 0)
+                ).sum()
             )
             static_volume_isolated_appearance_rows = int(
                 (static_volume_appearance_gate > 0).sum()
             )
+            static_volume_forward_gate = (
+                foliage.static_leaf_mask
+                & (
+                    (static_volume_geometry_gate > 0)
+                    | (static_volume_appearance_gate > 0)
+                    | (static_volume_opacity_gate > 0)
+                )
+            ).to(dtype=foliage.opacities.dtype)
             static_volume_isolated_package = render_hybrid(
                 static_volume_isolated_view,
                 surface,
@@ -17804,6 +24563,7 @@ def main():
                     surface.get_opacity.reshape(-1)
                 ),
                 volume_role_mask=foliage.static_leaf_mask,
+                volume_gate=static_volume_forward_gate,
                 volume_geometry_gradient_gate=(
                     static_volume_geometry_gate
                 ),
@@ -17839,16 +24599,24 @@ def main():
                 static_volume_isolated_weight,
                 0.10,
             )
-            static_volume_isolated_high_frequency = _high_frequency_loss(
+            static_volume_isolated_high_frequency = (
+                _oriented_multiscale_high_frequency_loss(
                 isolated_intrinsic_rgb,
                 static_volume_isolated_target,
                 static_volume_isolated_weight
                 * _boundary_evidence_weight(
                     static_volume_isolated_task
                 ),
+                )
             )
         static_detail_global_cleanup_package = None
         static_detail_global_cleanup = canonical.new_zeros(())
+        static_detail_cleanup_opacity_gradient = torch.zeros_like(
+            foliage.opacity_logits
+        )
+        static_detail_cleanup_update_rows = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
         static_detail_global_cleanup_audit: dict[str, object] = {
             "contract": STATIC_DETAIL_GLOBAL_CLEANUP_CONTRACT,
             "scheduled": False,
@@ -17858,26 +24626,40 @@ def main():
                 args.static_detail_global_counterfactual_weight
             ),
             "counterfactual": {
-                "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+                "contract": (
+                    "detached_mixed_minus_surface_rgb_harm_exact_zero_when_"
+                    "beneficial_or_neutral"
+                ),
                 "supported_pixels": 0,
                 "mean_responsibility": 0.0,
-                "mean_relative_rgb_advantage": 0.0,
-                "mean_volume_alpha_on_support": 0.0,
-                "canopy_rgb_retirement_blocked_pixels": 0,
-                "canopy_rgb_retirement_blocked_mass": 0.0,
             },
             "gradient_permissions": {
-                "verified_exact_static_detail_xyz_scale_rotation": True,
-                "positive_evidence_sequence_static_detail_optical_mass": True,
+                "static_detail_xyz_scale_rotation": False,
+                "persistent_static_detail_global_negative_optical_mass": True,
                 "static_detail_sh": False,
                 "surface_sky_uncertainty": False,
                 "topology_statistics": False,
             },
-            "evidence_sequence_rows": 0,
-            "unrelated_sequence_rows_blocked": 0,
+            "persistent_global_negative_owner_rows": 0,
+            "nonpersistent_rows_blocked": 0,
             "geometry_gradient_rows": 0,
             "optical_gradient_rows": 0,
             "optical_gradient_weight_sum": 0.0,
+            "source_retirement_gradient_rows": 0,
+            "source_retirement_gradient_magnitude": 0.0,
+            "source_growth_gradient_rows_blocked": 0,
+            "source_growth_gradient_magnitude_blocked": 0.0,
+            "post_policy_total_owner_gradient_rows": 0,
+            "post_policy_retirement_direction_rows": 0,
+            "post_policy_growth_direction_rows": 0,
+            "post_adam_retirement_rows": 0,
+            "post_adam_growth_rows": 0,
+            "post_adam_delta_semantics": (
+                "total_parameter_delta_on_cleanup_source_rows__may_include_"
+                "independent_positive_exact_owner_losses_and_adam_momentum"
+            ),
+            "post_projection_retirement_rows": 0,
+            "post_projection_growth_rows": 0,
         }
         static_detail_global_cleanup_scheduled = bool(
             args.reconstruction_target == "static"
@@ -17890,27 +24672,41 @@ def main():
             % args.static_detail_global_cleanup_every
             == 0
             and bool(foliage.static_leaf_mask.any())
+            and len(static_detail_cleanup_view_indices) > 0
         )
         if static_detail_global_cleanup_scheduled:
-            # A missing leaf in an unrelated traversal is seasonal absence,
-            # not calibrated free space for this primitive. Route negative
-            # cleanup through exactly the same persisted positive-evidence
-            # sequences that may restore optical coverage. Surface and SH
-            # values participate in the forward comparison but are read-only;
-            # this package remains excluded from densification statistics.
-            detail_rows = foliage.static_leaf_mask
-            if args.static_detail_canonical_ownership:
-                cleanup_rows = (
-                    _static_detail_positive_evidence_sequence_gate(
-                        foliage,
-                        int(view.colmap_id),
-                        camera_sequence_lookup,
+            # Consume a contiguous epoch over the authoritative canonical
+            # snapshots. The predecessor used the unrelated current RGB view,
+            # then zeroed all detail gates on almost every nominal cleanup
+            # event because that traversal was noncanonical.
+            cleanup_view_index = int(
+                static_detail_cleanup_schedule[
+                    _periodic_schedule_index(
+                        step, args.static_detail_global_cleanup_every
                     )
-                )
-            else:
-                cleanup_rows = detail_rows
-            detail_gate = cleanup_rows.to(
-                dtype=foliage.opacities.dtype
+                ]
+            )
+            cleanup_view = views[cleanup_view_index]
+            cleanup_task = fields.fields(
+                cleanup_view.image_name,
+                (cleanup_view.image_height, cleanup_view.image_width),
+                torch.device("cuda"),
+            )
+            cleanup_target = cleanup_view.original_image.cuda(
+                non_blocking=True
+            )
+            detail_rows = foliage.static_leaf_mask
+            # Persistent detail is globally visible at deployment.  Hence
+            # every authoritative canonical rigid/sky observation may veto
+            # only its harmful, natively front-sorted contribution.  This is
+            # deliberately broader than positive exact-camera ownership.
+            # Pending/measured-single/rejected rows remain fail-closed.
+            cleanup_rows = _static_detail_global_negative_owner_mask(
+                foliage
+            )
+            cleanup_optical_owner = cleanup_rows.to(foliage.xyz.dtype)
+            cleanup_geometry_owner = torch.zeros_like(
+                cleanup_optical_owner
             )
             (
                 cleanup_geometry_gradient_gate,
@@ -17918,15 +24714,24 @@ def main():
                 cleanup_opacity_gradient_gate,
             ) = _static_detail_cleanup_gradient_gates(
                 foliage,
-                canonical_volume_geometry_gate,
-                canonical_volume_opacity_gate,
+                cleanup_geometry_owner,
+                cleanup_optical_owner,
             )
+            detail_gate = (
+                detail_rows
+                & cleanup_rows
+                & (
+                    (cleanup_geometry_gradient_gate > 0)
+                    | (cleanup_opacity_gradient_gate > 0)
+                )
+            ).to(dtype=foliage.opacities.dtype)
             static_detail_global_cleanup_package = render_hybrid(
-                view,
+                cleanup_view,
                 surface,
                 foliage,
                 background=background,
                 include_dynamic=False,
+                volume_role_mask=detail_rows,
                 volume_gate=detail_gate,
                 volume_geometry_gradient_gate=(
                     cleanup_geometry_gradient_gate
@@ -17937,25 +24742,43 @@ def main():
                 ),
                 volume_opacity_scale=1.0,
                 optical_replacement_policy="disabled",
-                structural_trainable_start=None,
+                structural_trainable_start=0,
             )
-            static_detail_global_cleanup_prediction = (
-                composite_white_background(
-                    static_detail_global_cleanup_package.render,
-                    static_detail_global_cleanup_package.alpha,
-                    sky(view).detach(),
+            # The same-camera surface is detached evidence. The exact native
+            # mixed ``sum(T_before * alpha)`` volume attribution is support,
+            # never intrinsic optical depth. The live mixed RGB derivative
+            # assigns a signed opacity effect to each contributing primitive.
+            with torch.no_grad():
+                cleanup_surface_package = render_hybrid(
+                    cleanup_view,
+                    surface,
+                    foliage,
+                    background=background,
+                    include_dynamic=False,
+                    volume_opacity_scale=0.0,
+                    structural_trainable_start=0,
+                    optical_replacement_policy="disabled",
                 )
+                cleanup_surface_prediction = composite_white_background(
+                    cleanup_surface_package.render,
+                    cleanup_surface_package.alpha,
+                    sky(cleanup_view),
+                )
+            del cleanup_surface_package
+            cleanup_mixed_prediction = composite_white_background(
+                static_detail_global_cleanup_package.render,
+                static_detail_global_cleanup_package.alpha,
+                sky(cleanup_view).detach(),
             )
             (
                 static_detail_global_cleanup,
                 static_detail_global_cleanup_audit,
             ) = _static_detail_global_cleanup_loss(
-                static_detail_global_cleanup_prediction,
-                structural_prediction,
-                target,
+                cleanup_mixed_prediction,
+                cleanup_surface_prediction,
+                cleanup_target,
                 static_detail_global_cleanup_package.volume_alpha,
-                structural_package.surface_alpha,
-                task,
+                cleanup_task,
                 counterfactual_weight=(
                     args.static_detail_global_counterfactual_weight
                 ),
@@ -17963,11 +24786,17 @@ def main():
                 temperature=args.counterfactual_transparency_temperature,
             )
             static_detail_global_cleanup_audit["scheduled"] = True
+            static_detail_global_cleanup_audit["view_index"] = int(
+                cleanup_view_index
+            )
+            static_detail_global_cleanup_audit["image_name"] = str(
+                cleanup_view.image_name
+            )
             static_detail_global_cleanup_audit[
-                "evidence_sequence_rows"
+                "persistent_global_negative_owner_rows"
             ] = int(cleanup_rows.sum())
             static_detail_global_cleanup_audit[
-                "unrelated_sequence_rows_blocked"
+                "nonpersistent_rows_blocked"
             ] = int((detail_rows & ~cleanup_rows).sum())
             static_detail_global_cleanup_audit[
                 "geometry_gradient_rows"
@@ -17980,6 +24809,12 @@ def main():
             ] = float(cleanup_opacity_gradient_gate.sum())
         persistent_envelope_global_cleanup_package = None
         persistent_envelope_global_cleanup = canonical.new_zeros(())
+        persistent_envelope_cleanup_opacity_gradient = torch.zeros_like(
+            foliage.opacity_logits
+        )
+        persistent_envelope_cleanup_update_rows = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
         persistent_envelope_global_cleanup_audit: dict[str, object] = {
             "contract": PERSISTENT_ENVELOPE_GLOBAL_CLEANUP_CONTRACT,
             "scheduled": False,
@@ -17989,21 +24824,30 @@ def main():
                 args.persistent_envelope_global_counterfactual_weight
             ),
             "counterfactual": {
-                "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+                "contract": (
+                    "native_mixed_signed_rgb_opacity_responsibility"
+                ),
                 "supported_pixels": 0,
+                "front_pixels": 0,
+                "behind_or_invalid_pixels_rejected": 0,
                 "mean_responsibility": 0.0,
                 "mean_relative_rgb_advantage": 0.0,
                 "mean_volume_alpha_on_support": 0.0,
-                "canopy_rgb_retirement_blocked_pixels": 0,
-                "canopy_rgb_retirement_blocked_mass": 0.0,
+                "gradient_owner": "envelope_opacity_only",
             },
             "gradient_permissions": {
-                "persistent_envelope_xyz_scale_rotation": True,
+                "persistent_envelope_xyz_scale_rotation": False,
                 "persistent_envelope_optical_mass": True,
                 "persistent_envelope_sh": False,
                 "surface_sky_uncertainty": False,
                 "topology_statistics": False,
             },
+            "source_retirement_gradient_rows": 0,
+            "source_retirement_gradient_magnitude": 0.0,
+            "source_growth_gradient_rows_blocked": 0,
+            "source_growth_gradient_magnitude_blocked": 0.0,
+            "post_policy_retirement_gradient_rows": 0,
+            "post_adam_retirement_rows": 0,
         }
         persistent_envelope_global_cleanup_scheduled = bool(
             args.reconstruction_target == "static"
@@ -18019,10 +24863,14 @@ def main():
         )
         if persistent_envelope_global_cleanup_scheduled:
             # The envelope is globally visible, so every calibrated camera
-            # owns negative evidence against it.  Isolating the role prevents
-            # leaf/detail alpha from hiding the envelope's responsibility and
-            # prevents the same pass from eroding verified leaf coverage.
-            envelope_gate = foliage.persistent_envelope_mask.to(
+            # owns negative evidence against it. Keep the structural surface
+            # in the same native mixed render: its exact per-pixel ordering
+            # makes a facade-hidden envelope contribution identically zero.
+            # Detail remains absent, preventing cross-role blame transfer.
+            envelope_gate = (
+                foliage.persistent_envelope_mask
+                & _resolved_static_owner_mask(foliage)
+            ).to(
                 dtype=foliage.opacities.dtype
             )
             envelope_no_appearance_gradient = torch.zeros_like(
@@ -18034,33 +24882,33 @@ def main():
                 foliage,
                 background=background,
                 include_dynamic=False,
+                volume_role_mask=foliage.persistent_envelope_mask,
                 volume_gate=envelope_gate,
-                volume_geometry_gradient_gate=None,
+                volume_geometry_gradient_gate=(
+                    envelope_no_appearance_gradient
+                ),
                 volume_appearance_gradient_gate=(
                     envelope_no_appearance_gradient
                 ),
-                volume_opacity_gradient_gate=None,
+                volume_opacity_gradient_gate=envelope_gate,
                 volume_opacity_scale=1.0,
                 optical_replacement_policy="disabled",
                 structural_trainable_start=None,
             )
-            persistent_envelope_global_cleanup_prediction = (
-                composite_white_background(
-                    persistent_envelope_global_cleanup_package.render,
-                    persistent_envelope_global_cleanup_package.alpha,
-                    sky(view).detach(),
-                )
+            persistent_envelope_mixed_prediction = composite_white_background(
+                persistent_envelope_global_cleanup_package.render,
+                persistent_envelope_global_cleanup_package.alpha,
+                sky(view).detach(),
             )
             (
                 persistent_envelope_global_cleanup,
                 persistent_envelope_global_cleanup_audit,
             ) = _persistent_envelope_global_cleanup_loss(
-                persistent_envelope_global_cleanup_prediction,
+                persistent_envelope_mixed_prediction,
                 structural_prediction,
                 target,
                 persistent_envelope_global_cleanup_package.volume_alpha,
-                structural_package.surface_alpha,
-                task,
+                static_tree_cleanup_task,
                 counterfactual_weight=(
                     args.persistent_envelope_global_counterfactual_weight
                 ),
@@ -18090,13 +24938,29 @@ def main():
                 dav2_patch_uv,
             )
         )
-        surface_in_canopy = _soft_surface_canopy_conflict(
-            package,
-            task,
-        )
+        if (
+            args.reconstruction_target == "static"
+            and args.static_canonical_sequence_policy == "scene"
+        ):
+            # A facade behind the canonical crown is still valid persistent
+            # geometry and must reappear in other traversals or leaf gaps.
+            # The former semantic conflict term reduced surface alpha when it
+            # happened to sort in front, deleting the building instead of
+            # fixing the foliage depth order.  Preserve the structural map;
+            # the evidence-qualified order loss below owns this conflict.
+            surface_in_canopy = package.surface_alpha.sum() * 0.0
+        else:
+            surface_in_canopy = _soft_surface_canopy_conflict(
+                package,
+                static_tree_cleanup_task,
+            )
         counterfactual_transparency = canonical.new_zeros(())
         counterfactual_transparency_audit = {
-            "contract": COUNTERFACTUAL_TRANSPARENCY_CONTRACT,
+            "contract": (
+                STATIC_COUNTERFACTUAL_TRANSPARENCY_CONTRACT
+                if args.reconstruction_target == "static"
+                else COUNTERFACTUAL_TRANSPARENCY_CONTRACT
+            ),
             "supported_pixels": 0,
             "mean_responsibility": 0.0,
             "mean_relative_rgb_advantage": 0.0,
@@ -18107,6 +24971,7 @@ def main():
         if (
             foliage_active
             and args.counterfactual_transparency_weight > 0
+            and args.reconstruction_target != "static"
         ):
             (
                 counterfactual_transparency,
@@ -18117,23 +24982,203 @@ def main():
                 target,
                 package.volume_alpha,
                 structural_package.surface_alpha,
-                task,
+                static_tree_cleanup_task,
                 margin=args.counterfactual_transparency_margin,
                 temperature=args.counterfactual_transparency_temperature,
             )
+        if canonical_occlusion_completion_package is None:
+            canonical_occlusion_completion = package.volume_alpha.sum() * 0.0
+            canonical_occlusion_completion_audit = {
+                "contract": CANONICAL_OCCLUSION_COMPLETION_CONTRACT,
+                "canonical_view": bool(canonical_occlusion_active),
+                "supported_pixels": 0,
+                "directional_supported_pixels": 0,
+                "visibility_floor_supported_pixels": 0,
+                "ordering_conflict_pixels": 0,
+                "mean_responsibility": 0.0,
+                "mean_optical_scale": 1.0,
+                "mean_current_alpha": 0.0,
+                "mean_target_alpha": 0.0,
+                "mean_volume_front_probability": 0.0,
+                "maximum_optical_scale": float(
+                    args.canonical_occlusion_maximum_scale
+                ),
+                "surface_leakage_tolerance": float(
+                    args.canonical_occlusion_surface_leakage_tolerance
+                ),
+                "mean_visibility_floor_alpha": 0.0,
+                "gradient_owner": "volume_opacity_only",
+                "volume_source": "surface_zero_intrinsic_layer",
+                "geometry_order_conflict_gradient": False,
+                "noncanonical_positive_updates_blocked": not bool(
+                    canonical_occlusion_active
+                ),
+            }
+        else:
+            (
+                canonical_occlusion_completion,
+                canonical_occlusion_completion_audit,
+            ) = _canonical_occlusion_completion_loss(
+                canonical_occlusion_completion_package.render,
+                canonical_occlusion_structural_prediction,
+                canonical_occlusion_target,
+                canonical_occlusion_completion_package.volume_alpha,
+                canonical_occlusion_structural_package.surface_alpha,
+                canonical_occlusion_structural_package.surface_depth,
+                canonical_occlusion_completion_package.volume_depth,
+                canonical_occlusion_task,
+                canonical_view=True,
+                maximum_optical_scale=(
+                    args.canonical_occlusion_maximum_scale
+                ),
+                surface_leakage_tolerance=(
+                    args.canonical_occlusion_surface_leakage_tolerance
+                ),
+                advantage_margin=(
+                    args.canonical_occlusion_advantage_margin
+                ),
+                advantage_temperature=(
+                    args.canonical_occlusion_advantage_temperature
+                ),
+            )
+        canonical_occlusion_completion_audit["scheduled"] = bool(
+            canonical_occlusion_completion_package is not None
+        )
+        canonical_occlusion_completion_audit["start_iteration"] = int(
+            args.canonical_occlusion_start_iteration
+        )
+        canonical_occlusion_completion_audit["until_iteration"] = int(
+            args.canonical_occlusion_until_iteration
+        )
+        canonical_occlusion_completion_audit["every"] = int(
+            args.canonical_occlusion_every
+        )
+        canonical_occlusion_completion_audit["view_index"] = (
+            canonical_occlusion_view_index
+        )
+        canonical_occlusion_completion_audit["image_name"] = (
+            None
+            if canonical_occlusion_view is None
+            else str(canonical_occlusion_view.image_name)
+        )
+        canonical_occlusion_completion_audit["activation_contract"] = (
+            CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+        )
+        canonical_occlusion_completion_audit[
+            "envelope_opacity_gradient_rows"
+        ] = int(canonical_occlusion_completion_envelope_owner_rows)
+        canonical_occlusion_completion_audit[
+            "exact_detail_opacity_gradient_rows"
+        ] = int(canonical_occlusion_completion_detail_owner_rows)
+        canonical_occlusion_completion_audit[
+            "single_optical_owner_rows"
+        ] = int(canonical_occlusion_completion_owner_rows)
+        canonical_occlusion_completion_audit[
+            "forward_evidence_rows"
+        ] = int(canonical_occlusion_forward_rows)
+        if canonical_occlusion_order_package is None:
+            canonical_occlusion_order = package.volume_depth.sum() * 0.0
+            canonical_occlusion_order_audit = {
+                "contract": CANONICAL_OCCLUSION_ORDER_CONTRACT,
+                "canonical_view": bool(canonical_occlusion_active),
+                "supported_pixels": 0,
+                "mean_depth_violation": 0.0,
+                "mean_requested_forward_shift": 0.0,
+                "out_of_trust_region_pixels": 0,
+                "mean_rejected_forward_shift": 0.0,
+                "mean_optical_scale": 1.0,
+                "clearance": float(
+                    args.canonical_occlusion_order_clearance
+                ),
+                "maximum_forward_shift": float(
+                    args.canonical_occlusion_order_maximum_forward_shift
+                ),
+                "surface_leakage_tolerance": float(
+                    args.canonical_occlusion_surface_leakage_tolerance
+                ),
+                "gradient_owner": "volume_xyz_only",
+                "volume_source": "surface_zero_intrinsic_layer",
+                "surface_retirement_authorized": False,
+                "opacity_gradient_authorized": False,
+                "noncanonical_geometry_updates_blocked": not bool(
+                    canonical_occlusion_active
+                ),
+            }
+        else:
+            (
+                canonical_occlusion_order,
+                canonical_occlusion_order_audit,
+            ) = _canonical_occlusion_order_loss(
+                canonical_occlusion_order_package.render,
+                canonical_occlusion_structural_prediction,
+                canonical_occlusion_target,
+                canonical_occlusion_order_package.volume_alpha,
+                canonical_occlusion_structural_package.surface_alpha,
+                canonical_occlusion_structural_package.surface_depth,
+                canonical_occlusion_order_package.volume_depth,
+                canonical_occlusion_task,
+                canonical_view=True,
+                clearance=args.canonical_occlusion_order_clearance,
+                maximum_forward_shift=(
+                    args.canonical_occlusion_order_maximum_forward_shift
+                ),
+                maximum_optical_scale=(
+                    args.canonical_occlusion_maximum_scale
+                ),
+                surface_leakage_tolerance=(
+                    args.canonical_occlusion_surface_leakage_tolerance
+                ),
+                advantage_margin=(
+                    args.canonical_occlusion_advantage_margin
+                ),
+                advantage_temperature=(
+                    args.canonical_occlusion_advantage_temperature
+                ),
+            )
+        canonical_occlusion_order_audit["scheduled"] = bool(
+            canonical_occlusion_order_package is not None
+        )
+        canonical_occlusion_order_audit["start_iteration"] = int(
+            args.canonical_occlusion_start_iteration
+        )
+        canonical_occlusion_order_audit["until_iteration"] = int(
+            args.canonical_occlusion_until_iteration
+        )
+        canonical_occlusion_order_audit["every"] = int(
+            args.canonical_occlusion_every
+        )
+        canonical_occlusion_order_audit["view_index"] = (
+            canonical_occlusion_view_index
+        )
+        canonical_occlusion_order_audit["image_name"] = (
+            None
+            if canonical_occlusion_view is None
+            else str(canonical_occlusion_view.image_name)
+        )
+        canonical_occlusion_order_audit["activation_contract"] = (
+            CANONICAL_OCCLUSION_ACTIVATION_CONTRACT
+        )
+        canonical_occlusion_order_audit["forward_evidence_rows"] = int(
+            canonical_occlusion_forward_rows
+        )
+        canonical_occlusion_order_audit["geometry_owner_rows"] = int(
+            canonical_occlusion_order_owner_rows
+        )
+        if canonical_occlusion_structural_package is not None:
+            del canonical_occlusion_structural_package
         volume_in_rigid = _weighted_mean(
             package.volume_alpha,
-            task["p_rigid"],
+            static_tree_cleanup_task["p_rigid"],
         )
         finite_in_sky = _weighted_mean(
             package.surface_alpha + package.volume_alpha,
-            task["p_sky"],
+            static_tree_cleanup_task["p_sky"],
         )
         finite_in_transient = _weighted_mean(
             package.surface_alpha + package.volume_alpha,
-            task["p_transient"]
-            * task["w_rgb"]
-            * _boundary_evidence_weight(task),
+            static_tree_cleanup_task["p_transient"]
+            * static_tree_cleanup_task["w_rgb"]
+            * _boundary_evidence_weight(static_tree_cleanup_task),
         )
         ownership = (
             surface_in_canopy
@@ -18143,8 +25188,11 @@ def main():
         )
         alpha = package.volume_alpha[0].clamp(1e-5, 1 - 1e-5)
         negative = (
-            task["p_rigid"] + 0.35 * task["p_sky"]
-        ).clamp(0, 1) * _boundary_evidence_weight(task)
+            static_tree_cleanup_task["p_rigid"]
+            + 0.35 * static_tree_cleanup_task["p_sky"]
+        ).clamp(0, 1) * _boundary_evidence_weight(
+            static_tree_cleanup_task
+        )
         free = (
             (-torch.log1p(-alpha) * negative).sum()
             / negative.sum().clamp_min(1)
@@ -18239,6 +25287,21 @@ def main():
                 ray_hit_opacity_gradient_scale
             ),
         }
+        canonical_detail_ray_loss = package.depth.new_zeros(())
+        canonical_detail_ray_audit = {
+            "scheduled": False,
+            "rays": 0,
+            "candidate_evaluations": 0,
+            "canonical_candidate_evaluations": 0,
+            "canonical_hit_candidate_evaluations": 0,
+            "confirmed_free_rays": 0,
+            "hit_rays": 0,
+            "unknown_rays": 0,
+            "free": 0.0,
+            "hit": 0.0,
+            "camera_id": None,
+            "image_name": None,
+        }
         if (
             foliage_active
             and (step + 1) % args.ray_posterior_every == 0
@@ -18256,6 +25319,14 @@ def main():
                     phase=phase,
                     camera_id=int(ray_camera_id),
                     camera_sequence_lookup=camera_sequence_lookup,
+                    canonical_sequence_index=(
+                        static_canonical_sequence_index
+                    ),
+                    canonical_snapshot_camera_ids=(
+                        canonical_sequence_camera_ids
+                        if static_canonical_sequence is not None
+                        else None
+                    ),
                 )
                 ray_loss, ray_audit = foliage_rays.interval_factor(
                     view_by_camera_id[ray_camera_id],
@@ -18272,17 +25343,113 @@ def main():
                     ),
                 )
                 if args.reconstruction_target == "static":
-                    # Consensus construction is independent of render phase.
-                    # New detail remains hidden until static_foliage, but the
-                    # first ray epoch must already contribute proposals.
                     proposals = foliage_rays.pop_uncovered_hit_proposals()
-                    static_ray_births.add(
-                        proposals,
-                        sequence_id=sequence_id(
-                            view_by_camera_id[ray_camera_id].image_name
-                        ),
-                    )
+                    if (
+                        static_canonical_sequence is None
+                        or int(ray_camera_id)
+                        in canonical_sequence_camera_ids
+                    ):
+                        # Online leaf births are part of the selected snapshot.
+                        # Noncanonical proposals were popped above and are
+                        # deliberately discarded rather than leaking into the
+                        # next canonical ray epoch under the wrong sequence id.
+                        static_ray_births.add(
+                            proposals,
+                            sequence_id=sequence_id(
+                                view_by_camera_id[ray_camera_id].image_name
+                            ),
+                        )
+        canonical_detail_ray_scheduled = bool(
+            args.reconstruction_target == "static"
+            and foliage_active
+            and bool(static_canonical_ray_view_indices)
+            and args.static_canonical_ray_every > 0
+            and (step + 1) % args.static_canonical_ray_every == 0
+        )
+        if canonical_detail_ray_scheduled:
+            canonical_ray_update = (
+                (step + 1) // args.static_canonical_ray_every - 1
+            )
+            canonical_ray_view = views[
+                int(static_canonical_ray_schedule[step])
+            ]
+            canonical_ray_camera_id = int(canonical_ray_view.colmap_id)
+            (
+                canonical_detail_free_mask,
+                canonical_detail_hit_mask,
+            ) = _static_ray_candidate_masks(
+                args,
+                foliage,
+                active_canonical_volume,
+                phase=phase,
+                camera_id=canonical_ray_camera_id,
+                camera_sequence_lookup=camera_sequence_lookup,
+                canonical_sequence_index=static_canonical_sequence_index,
+            )
+            # This supplemental epoch exists only to close the static-detail
+            # calibration budget. Envelope/skeleton retain their original
+            # all-camera factor and therefore are not counted twice.
+            detail_rows = foliage.static_leaf_mask
+            canonical_detail_free_mask &= detail_rows
+            canonical_detail_hit_mask &= detail_rows
+            (
+                canonical_detail_ray_loss,
+                canonical_detail_ray_audit,
+            ) = foliage_rays.interval_factor(
+                canonical_ray_view,
+                foliage,
+                maximum_rays=effective_ray_posterior_maximum_rays,
+                maximum_candidates_per_ray=(
+                    args.ray_posterior_maximum_candidates
+                ),
+                sample_update=(
+                    primary_ray_factor_calls + canonical_ray_update
+                ),
+                canonical_candidate_mask=canonical_detail_free_mask,
+                canonical_hit_candidate_mask=canonical_detail_hit_mask,
+                hit_opacity_gradient_scale=(
+                    ray_hit_opacity_gradient_scale
+                ),
+            )
+            proposals = foliage_rays.pop_uncovered_hit_proposals()
+            static_ray_births.add(
+                proposals,
+                sequence_id=static_canonical_sequence,
+            )
+            canonical_detail_ray_audit.update(
+                {
+                    "scheduled": True,
+                    "camera_id": canonical_ray_camera_id,
+                    "image_name": str(canonical_ray_view.image_name),
+                    "candidate_scope": "static_detail_only",
+                }
+            )
+            ray_loss = ray_loss + canonical_detail_ray_loss
+        ray_audit["canonical_detail_supplement"] = (
+            canonical_detail_ray_audit
+        )
         ray_free_hit = free + ray_loss
+        exact_owner_ray_opacity_gradient = None
+        if (
+            foliage_active
+            and ray_loss.requires_grad
+            and bool(
+                (
+                    foliage.static_leaf_mask
+                    & ~_persistent_static_evidence_mask(foliage)
+                ).any()
+            )
+        ):
+            exact_owner_ray_opacity_gradient = torch.autograd.grad(
+                ray_loss,
+                foliage.opacity_logits,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if exact_owner_ray_opacity_gradient is not None:
+                exact_owner_ray_opacity_gradient = (
+                    exact_owner_ray_opacity_gradient.detach()
+                )
         global_posterior_complexity = (
             0.05 * false_positive_opacity
             + 0.002 * opacity_complexity
@@ -18360,6 +25527,18 @@ def main():
                     "counterfactual_transparency": (
                         counterfactual_transparency
                     ),
+                    "canonical_occlusion_completion": (
+                        args.canonical_occlusion_completion_weight
+                        * canonical_occlusion_completion
+                    ),
+                    "canonical_occlusion_order": (
+                        args.canonical_occlusion_order_weight
+                        * canonical_occlusion_order
+                    ),
+                    "moge3_canopy_optical": (
+                        args.moge3_canopy_optical_weight
+                        * moge3_canopy_optical
+                    ),
                     "global_static_detail_negative_cleanup": (
                         static_detail_global_cleanup
                     ),
@@ -18376,20 +25555,228 @@ def main():
         # Canopy RGB is differentiated only with respect to the foliage
         # branch.  This keeps the exact same jointly sorted image formation,
         # but prevents tree pixels from painting structural surfels or sky.
-        canonical_loss.backward(retain_graph=foliage_active)
         canonical_evidence_opacity_gradient = (
-            foliage.opacity_logits.grad.detach().clone()
-            if foliage_active
-            and foliage.opacity_logits.grad is not None
-            else None
-        )
-        if foliage_active:
-            torch.autograd.backward(
+            _backward_canonical_with_foliage_supplement(
+                canonical_loss,
                 canopy_photo
                 + args.high_frequency_weight
                 * static_canopy_high_frequency,
-                inputs=tuple(foliage.parameters()),
+                foliage,
+                foliage_active=foliage_active,
             )
+        )
+        canonical_occlusion_opacity_gradient = None
+        if bool(moge3_canopy_optical_audit.get("scheduled", False)):
+            opacity_before_moge3 = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            torch.autograd.backward(
+                args.moge3_canopy_optical_weight
+                * moge3_canopy_optical,
+                inputs=(foliage.opacity_logits,),
+            )
+            opacity_after_moge3 = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            moge3_canopy_optical_gradient = (
+                opacity_after_moge3 - opacity_before_moge3
+            )
+            moge3_canopy_optical_update_rows = (
+                moge3_canopy_optical_gradient.abs().flatten(1).any(dim=1)
+            )
+            owner_union = torch.zeros(
+                len(foliage), dtype=torch.bool, device=foliage.xyz.device
+            )
+            if moge3_canopy_optical_package_prehit is not None:
+                owner_union |= prehit_owner_mask
+            if moge3_canopy_optical_package_hit is not None:
+                owner_union |= hit_owner_mask
+            off_owner = ~owner_union
+            off_owner_gradient = moge3_canopy_optical_gradient[off_owner]
+            if bool((off_owner_gradient != 0).any()):
+                raise RuntimeError(
+                    "MoGe3 canopy optical pass produced an off-owner gradient"
+                )
+            source_growth = moge3_canopy_optical_gradient < 0
+            source_retirement = moge3_canopy_optical_gradient > 0
+            moge3_canopy_optical_audit.update(
+                {
+                    "source_growth_rows": int(
+                        source_growth.flatten(1).any(dim=1).sum()
+                    ),
+                    "source_growth_magnitude": float(
+                        (-moge3_canopy_optical_gradient)
+                        .clamp_min(0.0)
+                        .sum()
+                    ),
+                    "source_retirement_rows": int(
+                        source_retirement.flatten(1).any(dim=1).sum()
+                    ),
+                    "source_retirement_magnitude": float(
+                        moge3_canopy_optical_gradient.clamp_min(0.0).sum()
+                    ),
+                    "off_owner_gradient_rows": 0,
+                }
+            )
+            del moge3_canopy_optical_package_prehit
+            del moge3_canopy_optical_package_hit
+            del moge3_canopy_optical_package_coverage
+        else:
+            moge3_canopy_optical_audit.update(
+                {
+                    "source_growth_rows": 0,
+                    "source_growth_magnitude": 0.0,
+                    "source_retirement_rows": 0,
+                    "source_retirement_magnitude": 0.0,
+                    "off_owner_gradient_rows": 0,
+                }
+            )
+        canonical_occlusion_completion_update_rows = torch.zeros(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
+        canonical_occlusion_order_update_rows = torch.zeros_like(
+            canonical_occlusion_completion_update_rows
+        )
+        if bool(canonical_occlusion_completion_audit["scheduled"]):
+            opacity_before_completion = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            torch.autograd.backward(
+                args.canonical_occlusion_completion_weight
+                * canonical_occlusion_completion,
+                inputs=(foliage.opacity_logits,),
+            )
+            opacity_after_completion = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            canonical_occlusion_opacity_gradient = (
+                opacity_after_completion - opacity_before_completion
+            )
+            unverified_completion = (
+                foliage.verification_state == VERIFICATION_UNVERIFIED
+            )
+            blocked_completion_gradient = (
+                canonical_occlusion_opacity_gradient[
+                    unverified_completion
+                ].detach().clone()
+            )
+            canonical_occlusion_opacity_gradient[
+                unverified_completion
+            ] = 0
+            # Restore the live accumulated gradient as well as the separated
+            # audit tensor. Otherwise the policy would report the component
+            # as blocked while Adam still consumed the original backward.
+            foliage.opacity_logits.grad.copy_(
+                opacity_before_completion
+                + canonical_occlusion_opacity_gradient
+            )
+            canonical_occlusion_completion_audit[
+                "unverified_gradient_rows_blocked"
+            ] = int(
+                blocked_completion_gradient.abs()
+                .flatten(1)
+                .any(dim=1)
+                .sum()
+            )
+            canonical_occlusion_completion_audit[
+                "unverified_gradient_magnitude_blocked"
+            ] = float(blocked_completion_gradient.abs().sum())
+            completion_growth = (
+                -canonical_occlusion_opacity_gradient
+            ).clamp_min(0.0)
+            canonical_occlusion_completion_update_rows = (
+                completion_growth.flatten(1).any(dim=1)
+            )
+            canonical_occlusion_completion_audit[
+                "positive_gradient_rows"
+            ] = int(
+                completion_growth.flatten(1).any(dim=1).sum()
+            )
+            canonical_occlusion_completion_audit[
+                "positive_gradient_magnitude"
+            ] = float(completion_growth.sum())
+            del canonical_occlusion_completion_package
+        else:
+            canonical_occlusion_completion_audit[
+                "positive_gradient_rows"
+            ] = 0
+            canonical_occlusion_completion_audit[
+                "positive_gradient_magnitude"
+            ] = 0.0
+            canonical_occlusion_completion_audit[
+                "unverified_gradient_rows_blocked"
+            ] = 0
+            canonical_occlusion_completion_audit[
+                "unverified_gradient_magnitude_blocked"
+            ] = 0.0
+        if bool(canonical_occlusion_order_audit["scheduled"]):
+            xyz_before_order = (
+                foliage.xyz.grad.detach().clone()
+                if foliage.xyz.grad is not None
+                else torch.zeros_like(foliage.xyz)
+            )
+            torch.autograd.backward(
+                args.canonical_occlusion_order_weight
+                * canonical_occlusion_order,
+                inputs=(foliage.xyz,),
+            )
+            xyz_after_order = (
+                foliage.xyz.grad.detach().clone()
+                if foliage.xyz.grad is not None
+                else torch.zeros_like(foliage.xyz)
+            )
+            raw_order_gradient = xyz_after_order - xyz_before_order
+            camera_center = view.camera_center.to(
+                device=foliage.xyz.device,
+                dtype=foliage.xyz.dtype,
+            ).reshape(1, 3)
+            camera_ray = foliage.xyz.detach() - camera_center
+            camera_ray = camera_ray / camera_ray.norm(
+                dim=1, keepdim=True
+            ).clamp_min(1.0e-8)
+            order_gradient = (
+                raw_order_gradient * camera_ray
+            ).sum(dim=1, keepdim=True) * camera_ray
+            supported_pixels = int(
+                canonical_occlusion_order_audit.get("supported_pixels", 0)
+            )
+            order_gradient, order_responsibility_audit = (
+                _cap_canonical_occlusion_order_gradient_responsibility(
+                    order_gradient,
+                    supported_pixels=supported_pixels,
+                )
+            )
+            canonical_occlusion_order_audit.update(
+                order_responsibility_audit
+            )
+            order_gradient_norm = order_gradient.norm(dim=1)
+            projected_total = xyz_before_order + order_gradient
+            if foliage.xyz.grad is None:
+                foliage.xyz.grad = projected_total
+            else:
+                foliage.xyz.grad.copy_(projected_total)
+            canonical_occlusion_order_audit[
+                "transverse_gradient_magnitude_blocked"
+            ] = float((raw_order_gradient - order_gradient).norm(dim=1).sum())
+            canonical_occlusion_order_update_rows = order_gradient_norm > 0
+            canonical_occlusion_order_audit["gradient_rows"] = int(
+                (order_gradient_norm > 0).sum()
+            )
+            canonical_occlusion_order_audit["gradient_magnitude"] = float(
+                order_gradient_norm.sum()
+            )
+            del canonical_occlusion_order_package
+        else:
+            canonical_occlusion_order_audit["gradient_rows"] = 0
+            canonical_occlusion_order_audit["gradient_magnitude"] = 0.0
         if static_detail_isolated_package is not None:
             static_detail_isolated_objective = (
                 args.static_detail_isolated_weight
@@ -18457,32 +25844,120 @@ def main():
                 inputs=static_volume_isolated_inputs,
             )
         if static_detail_global_cleanup_package is not None:
+            detail_cleanup_phase_scale = (
+                float(args.static_detail_global_cleanup_polish_scale)
+                if phase == "canonical_polish"
+                else 1.0
+            )
+            static_detail_global_cleanup_audit["phase_scale"] = float(
+                detail_cleanup_phase_scale
+            )
+            opacity_before_detail_cleanup = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
             torch.autograd.backward(
                 args.static_detail_global_cleanup_weight
+                * detail_cleanup_phase_scale
                 * static_detail_global_cleanup,
-                inputs=(
-                    foliage.xyz,
-                    foliage.log_scales,
-                    foliage.quaternions,
-                    foliage.opacity_logits,
-                ),
+                inputs=(foliage.opacity_logits,),
             )
+            opacity_after_detail_cleanup = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            detail_cleanup_opacity_gradient = (
+                opacity_after_detail_cleanup
+                - opacity_before_detail_cleanup
+            )
+            # A negative gradient would make Adam grow opacity, contradicting
+            # the semantics of this negative-only evidence stream. Native
+            # compositing interactions are allowed to redistribute forward
+            # responsibility, but never to turn cleanup into a growth owner.
+            source_growth = detail_cleanup_opacity_gradient < 0
+            static_detail_global_cleanup_audit[
+                "source_growth_gradient_rows_blocked"
+            ] = int(source_growth.flatten(1).any(dim=1).sum())
+            static_detail_global_cleanup_audit[
+                "source_growth_gradient_magnitude_blocked"
+            ] = float(
+                detail_cleanup_opacity_gradient[source_growth].abs().sum()
+            )
+            detail_cleanup_opacity_gradient.clamp_min_(0)
+            static_detail_cleanup_opacity_gradient = (
+                detail_cleanup_opacity_gradient
+            )
+            foliage.opacity_logits.grad.copy_(
+                opacity_before_detail_cleanup
+                + detail_cleanup_opacity_gradient
+            )
+            static_detail_cleanup_update_rows = (
+                detail_cleanup_opacity_gradient > 0
+            ).flatten(1).any(dim=1)
+            static_detail_global_cleanup_audit[
+                "source_retirement_gradient_rows"
+            ] = int(static_detail_cleanup_update_rows.sum())
+            static_detail_global_cleanup_audit[
+                "source_retirement_gradient_magnitude"
+            ] = float(detail_cleanup_opacity_gradient.sum())
             # This evidence stream is deliberately absent from
             # ``_accumulate_volume_stats``: a rigid/free-space contradiction
             # may move, shrink or retire detail, but can never request a
             # split/birth or spend topology capacity.
             del static_detail_global_cleanup_package
         if persistent_envelope_global_cleanup_package is not None:
+            opacity_before_envelope_cleanup = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
             torch.autograd.backward(
                 args.persistent_envelope_global_cleanup_weight
                 * persistent_envelope_global_cleanup,
-                inputs=(
-                    foliage.xyz,
-                    foliage.log_scales,
-                    foliage.quaternions,
-                    foliage.opacity_logits,
-                ),
+                inputs=(foliage.opacity_logits,),
             )
+            opacity_after_envelope_cleanup = (
+                foliage.opacity_logits.grad.detach().clone()
+                if foliage.opacity_logits.grad is not None
+                else torch.zeros_like(foliage.opacity_logits)
+            )
+            persistent_envelope_cleanup_opacity_gradient = (
+                opacity_after_envelope_cleanup
+                - opacity_before_envelope_cleanup
+            )
+            envelope_source_growth = (
+                persistent_envelope_cleanup_opacity_gradient < 0
+            )
+            persistent_envelope_global_cleanup_audit[
+                "source_growth_gradient_rows_blocked"
+            ] = int(envelope_source_growth.flatten(1).any(dim=1).sum())
+            persistent_envelope_global_cleanup_audit[
+                "source_growth_gradient_magnitude_blocked"
+            ] = float(
+                persistent_envelope_cleanup_opacity_gradient[
+                    envelope_source_growth
+                ].abs().sum()
+            )
+            # Negative evidence may only retire opacity. A locally beneficial
+            # primitive gets a negative RGB derivative; blocking it here
+            # prevents cleanup from becoming a hidden growth owner without
+            # assigning the neighbouring harmful primitive's blame to it.
+            persistent_envelope_cleanup_opacity_gradient.clamp_min_(0)
+            foliage.opacity_logits.grad.copy_(
+                opacity_before_envelope_cleanup
+                + persistent_envelope_cleanup_opacity_gradient
+            )
+            persistent_envelope_cleanup_update_rows = (
+                persistent_envelope_cleanup_opacity_gradient > 0
+            ).flatten(1).any(dim=1)
+            persistent_envelope_global_cleanup_audit[
+                "source_retirement_gradient_rows"
+            ] = int(persistent_envelope_cleanup_update_rows.sum())
+            persistent_envelope_global_cleanup_audit[
+                "source_retirement_gradient_magnitude"
+            ] = float(persistent_envelope_cleanup_opacity_gradient.sum())
             # This role-isolated contradiction stream is excluded from all
             # screen-gradient/topology statistics. It can only clean the
             # current envelope population, never create replacement demand.
@@ -18544,14 +26019,27 @@ def main():
             )
         )
         del structural_package, structural_prediction
+        canonical_topology_ownership_gate = (
+            static_detail_refinement_gradient_gate
+            if static_detail_active
+            else static_detail_gradient_gate
+        )
+        if not static_scene_view_is_canonical:
+            canonical_topology_ownership_gate = (
+                torch.ones_like(foliage.opacities)
+                if canonical_topology_ownership_gate is None
+                else canonical_topology_ownership_gate.clone()
+            )
+            # Cross-sequence ray/depth factors may still calibrate stable
+            # macro geometry, but image residuals from a different foliage
+            # state cannot spend canonical crown topology capacity.
+            canonical_topology_ownership_gate[
+                foliage.canonical_crown_mask
+            ] = 0
         _accumulate_volume_stats(
             volume_stats,
             package,
-            (
-                static_detail_refinement_gradient_gate
-                if static_detail_active
-                else static_detail_gradient_gate
-            ),
+            canonical_topology_ownership_gate,
         )
         if static_detail_isolated_package is not None:
             _accumulate_volume_stats(
@@ -18587,8 +26075,15 @@ def main():
                 camera_id=int(view.colmap_id),
                 camera_sequence_lookup=camera_sequence_lookup,
                 volume_optimizer=volume_optimizer,
+                required_sequence_count=(
+                    1
+                    if args.static_canonical_sequence_policy == "scene"
+                    else None
+                ),
             )
-            if args.reconstruction_target == "static" and foliage_active
+            if args.reconstruction_target == "static"
+            and foliage_active
+            and static_scene_view_is_canonical
             else {
                 "contract": "real_ray_child_reverification",
                 "candidate_rows": 0,
@@ -18999,14 +26494,16 @@ def main():
                 + 0.02 * dynamic_presence
                 + 0.10 * dynamic_observation_loss
             )
+            torch.autograd.backward(
+                conditioned_loss,
+                inputs=_trainable_parameters(appearance),
+                retain_graph=True,
+            )
             _backward_conditioned_foliage(
                 foliage_conditioned_loss,
                 foliage,
                 conditioned_package.volume_means2d,
-            )
-            torch.autograd.backward(
-                conditioned_loss,
-                inputs=_trainable_parameters(appearance),
+                retain_graph=False,
             )
             dynamic_gate_audit.update(
                 {
@@ -19157,6 +26654,9 @@ def main():
                         plane_task_weight=geometry_task["w_plane"],
                         native_chart_factor_active=(
                             "chart_depth" in source_fields
+                        ),
+                        world_from_camera_rotation=(
+                            geometry_view.world_view_transform[:3, :3].T
                         ),
                     )
                     geometry_values.update(source_geometry_values)
@@ -19606,23 +27106,163 @@ def main():
         _apply_volume_role_gradients(
             foliage, phase, dynamic_active=dynamic_active
         )
-        volume_opacity_settle_audit = (
-            _apply_static_optical_policy(
+        if args.reconstruction_target == "static":
+            volume_opacity_settle_audit = _apply_static_optical_policy(
                 foliage,
                 volume_optimizer,
                 phase,
                 canonical_evidence_opacity_gradient=(
                     canonical_evidence_opacity_gradient
                 ),
+                canonical_occlusion_opacity_gradient=(
+                    canonical_occlusion_opacity_gradient
+                ),
+                canonical_occlusion_xyz_gradient=(
+                    order_gradient
+                    if canonical_occlusion_order_audit["scheduled"]
+                    else None
+                ),
+                exact_owner_ray_opacity_gradient=(
+                    exact_owner_ray_opacity_gradient
+                ),
+                moge3_canopy_optical_opacity_gradient=(
+                    moge3_canopy_optical_gradient
+                ),
+                persistent_envelope_cleanup_opacity_gradient=(
+                    persistent_envelope_cleanup_opacity_gradient
+                ),
             )
-            if args.reconstruction_target == "static"
-            else _apply_volume_opacity_settle_policy(
+            volume_opacity_settle_audit[
+                "static_detail_opacity_settle"
+            ] = _apply_static_detail_opacity_settle_policy(
+                foliage,
+                volume_optimizer,
+                step,
+                args,
+                exact_measured_cleanup_gradient=(
+                    static_detail_cleanup_opacity_gradient
+                ),
+                exact_measured_optical_gradient=(
+                    moge3_canopy_optical_gradient
+                ),
+            )
+        else:
+            volume_opacity_settle_audit = _apply_volume_opacity_settle_policy(
                 foliage,
                 volume_optimizer,
                 step,
                 args,
             )
+        if bool(canonical_occlusion_completion_update_rows.any()):
+            post_policy_opacity = foliage.opacity_logits.grad[
+                canonical_occlusion_completion_update_rows
+            ]
+            canonical_occlusion_completion_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = int(
+                post_policy_opacity.abs().flatten(1).any(dim=1).sum()
+            )
+            canonical_occlusion_completion_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = float(post_policy_opacity.abs().sum())
+        else:
+            canonical_occlusion_completion_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = 0
+            canonical_occlusion_completion_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = 0.0
+        if bool(canonical_occlusion_order_update_rows.any()):
+            post_policy_xyz = foliage.xyz.grad[
+                canonical_occlusion_order_update_rows
+            ]
+            canonical_occlusion_order_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = int((post_policy_xyz.norm(dim=1) > 0).sum())
+            canonical_occlusion_order_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = float(post_policy_xyz.norm(dim=1).sum())
+        else:
+            canonical_occlusion_order_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = 0
+            canonical_occlusion_order_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = 0.0
+        if bool(moge3_canopy_optical_update_rows.any()):
+            post_policy_moge3 = foliage.opacity_logits.grad[
+                moge3_canopy_optical_update_rows
+            ]
+            moge3_canopy_optical_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = int(post_policy_moge3.abs().flatten(1).any(dim=1).sum())
+            moge3_canopy_optical_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = float(post_policy_moge3.abs().sum())
+        else:
+            moge3_canopy_optical_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = 0
+            moge3_canopy_optical_audit[
+                "post_policy_total_owner_gradient_magnitude"
+            ] = 0.0
+        if bool(persistent_envelope_cleanup_update_rows.any()):
+            post_policy_envelope_cleanup = foliage.opacity_logits.grad[
+                persistent_envelope_cleanup_update_rows
+            ].clamp_min(0.0)
+            persistent_envelope_global_cleanup_audit[
+                "post_policy_retirement_gradient_rows"
+            ] = int(
+                post_policy_envelope_cleanup.flatten(1).any(dim=1).sum()
+            )
+            persistent_envelope_global_cleanup_audit[
+                "post_policy_retirement_gradient_magnitude"
+            ] = float(post_policy_envelope_cleanup.sum())
+        if bool(static_detail_cleanup_update_rows.any()):
+            post_policy_detail_cleanup = foliage.opacity_logits.grad[
+                static_detail_cleanup_update_rows
+            ]
+            static_detail_global_cleanup_audit[
+                "post_policy_total_owner_gradient_rows"
+            ] = int(
+                post_policy_detail_cleanup.abs().flatten(1).any(dim=1).sum()
+            )
+            static_detail_global_cleanup_audit[
+                "post_policy_retirement_direction_rows"
+            ] = int(
+                (post_policy_detail_cleanup > 0).flatten(1).any(dim=1).sum()
+            )
+            static_detail_global_cleanup_audit[
+                "post_policy_growth_direction_rows"
+            ] = int(
+                (post_policy_detail_cleanup < 0).flatten(1).any(dim=1).sum()
+            )
+        pre_step_completion_logits = foliage.opacity_logits.detach()[
+            canonical_occlusion_completion_update_rows
+        ].clone()
+        pre_step_order_xyz = foliage.xyz.detach()[
+            canonical_occlusion_order_update_rows
+        ].clone()
+        pre_step_moge3_logits = foliage.opacity_logits.detach()[
+            moge3_canopy_optical_update_rows
+        ].clone()
+        static_detail_settle_active = bool(
+            args.reconstruction_target == "static"
+            and volume_opacity_settle_audit.get(
+                "static_detail_opacity_settle", {}
+            ).get("active", False)
         )
+        pre_step_static_detail_logits = (
+            foliage.opacity_logits.detach()[foliage.static_leaf_mask].clone()
+            if static_detail_settle_active
+            else foliage.opacity_logits.new_empty((0, 1))
+        )
+        pre_step_detail_cleanup_logits = foliage.opacity_logits.detach()[
+            static_detail_cleanup_update_rows
+        ].clone()
+        pre_step_envelope_cleanup_logits = foliage.opacity_logits.detach()[
+            persistent_envelope_cleanup_update_rows
+        ].clone()
         # The parameter-space handoff must be applied after Adam and all
         # scale/mass compensation below.  Applying it here changed the logit
         # and cleared Adam state, but ``volume_optimizer.step()`` immediately
@@ -19648,6 +27288,13 @@ def main():
                 residual_start=rigid_surface_residual_start,
             )
         )
+        _assert_finite_foliage_optimization_state(
+            foliage,
+            volume_optimizer,
+            iteration=step + 1,
+            stage="post_policy_pre_optimizer",
+            check_gradients=True,
+        )
         pre_step_optical_area = (
             projected_gaussian_cross_section(foliage.scales.detach())
             if args.integrated_optical_mass_compensation
@@ -19656,6 +27303,138 @@ def main():
         )
         surface.optimizer.step()
         volume_optimizer.step()
+        static_detail_sh_trust_audit = (
+            _enforce_static_detail_sh_trust_region(
+                foliage,
+                volume_optimizer,
+                maximum_high_order_norm=(
+                    args.static_detail_high_order_sh_norm_ceiling
+                ),
+            )
+            if args.reconstruction_target == "static"
+            else {
+                "contract": "not_static",
+                "persistent_rows": 0,
+                "nonpersistent_rows_zeroed": 0,
+                "projected_rows": 0,
+                "maximum_norm_before": 0.0,
+                "maximum_norm_after": 0.0,
+                "maximum_high_order_norm": float(
+                    args.static_detail_high_order_sh_norm_ceiling
+                ),
+            }
+        )
+        canonical_occlusion_trust_audit = (
+            _enforce_canonical_occlusion_order_trust_region(
+                foliage,
+                volume_optimizer,
+                canonical_occlusion_order_trust_rows,
+                maximum_displacement=(
+                    args.canonical_occlusion_order_maximum_forward_shift
+                ),
+            )
+            if bool(canonical_occlusion_order_trust_rows.any())
+            else {
+                "contract": (
+                    "hard_initialization_ball_and_outward_adam_moment_clear"
+                ),
+                "owner_rows": 0,
+                "projected_rows": 0,
+                "outward_momentum_rows_cleared": 0,
+                "maximum_displacement_before_projection": 0.0,
+                "maximum_displacement_after_projection": 0.0,
+                "maximum_displacement": float(
+                    args.canonical_occlusion_order_maximum_forward_shift
+                ),
+            }
+        )
+        post_adam_completion_delta = foliage.opacity_logits.detach()[
+            canonical_occlusion_completion_update_rows
+        ] - pre_step_completion_logits
+        post_adam_order_delta = foliage.xyz.detach()[
+            canonical_occlusion_order_update_rows
+        ] - pre_step_order_xyz
+        post_adam_moge3_delta = foliage.opacity_logits.detach()[
+            moge3_canopy_optical_update_rows
+        ] - pre_step_moge3_logits
+        post_adam_envelope_cleanup_delta = foliage.opacity_logits.detach()[
+            persistent_envelope_cleanup_update_rows
+        ] - pre_step_envelope_cleanup_logits
+        canonical_occlusion_completion_audit[
+            "post_adam_parameter_delta_rows"
+        ] = int(
+            post_adam_completion_delta.abs().flatten(1).any(dim=1).sum()
+        )
+        canonical_occlusion_completion_audit[
+            "post_adam_parameter_delta_magnitude"
+        ] = float(post_adam_completion_delta.abs().sum())
+        canonical_occlusion_order_audit[
+            "post_adam_parameter_delta_rows"
+        ] = int((post_adam_order_delta.norm(dim=1) > 0).sum())
+        canonical_occlusion_order_audit[
+            "post_adam_parameter_delta_magnitude"
+        ] = float(post_adam_order_delta.norm(dim=1).sum())
+        moge3_canopy_optical_audit["post_adam_parameter_delta_rows"] = int(
+            post_adam_moge3_delta.abs().flatten(1).any(dim=1).sum()
+        )
+        moge3_canopy_optical_audit[
+            "post_adam_parameter_delta_magnitude"
+        ] = float(post_adam_moge3_delta.abs().sum())
+        moge3_canopy_optical_audit["post_adam_growth_rows"] = int(
+            (post_adam_moge3_delta > 0).flatten(1).any(dim=1).sum()
+        )
+        moge3_canopy_optical_audit["post_adam_retirement_rows"] = int(
+            (post_adam_moge3_delta < 0).flatten(1).any(dim=1).sum()
+        )
+        persistent_envelope_global_cleanup_audit[
+            "post_adam_retirement_rows"
+        ] = int((post_adam_envelope_cleanup_delta < 0).flatten(1).any(dim=1).sum())
+        persistent_envelope_global_cleanup_audit[
+            "post_adam_growth_rows"
+        ] = int((post_adam_envelope_cleanup_delta > 0).flatten(1).any(dim=1).sum())
+        if static_detail_settle_active:
+            static_detail_delta = foliage.opacity_logits.detach()[
+                foliage.static_leaf_mask
+            ] - pre_step_static_detail_logits
+            static_settle_audit = volume_opacity_settle_audit[
+                "static_detail_opacity_settle"
+            ]
+            static_settle_audit["post_adam_changed_rows"] = int(
+                static_detail_delta.abs().flatten(1).any(dim=1).sum()
+            )
+            static_settle_audit["post_adam_growth_rows"] = int(
+                (static_detail_delta > 0).flatten(1).any(dim=1).sum()
+            )
+            static_settle_audit["post_adam_retirement_rows"] = int(
+                (static_detail_delta < 0).flatten(1).any(dim=1).sum()
+            )
+            static_settle_audit["post_adam_delta_magnitude"] = float(
+                static_detail_delta.abs().sum()
+            )
+            if static_settle_audit["effective_policy"] in {
+                "retirement_only",
+                "freeze",
+            } and static_settle_audit["post_adam_growth_rows"] != 0:
+                raise RuntimeError(
+                    "Static detail opacity grew after the Adam-safe settle "
+                    "policy"
+                )
+        post_adam_detail_cleanup_delta = foliage.opacity_logits.detach()[
+            static_detail_cleanup_update_rows
+        ] - pre_step_detail_cleanup_logits
+        static_detail_global_cleanup_audit[
+            "post_adam_retirement_rows"
+        ] = int(
+            (post_adam_detail_cleanup_delta < 0).flatten(1).any(dim=1).sum()
+        )
+        static_detail_global_cleanup_audit[
+            "post_adam_growth_rows"
+        ] = int(
+            (post_adam_detail_cleanup_delta > 0).flatten(1).any(dim=1).sum()
+        )
+        canonical_occlusion_order_audit[
+            "trust_region"
+        ] = canonical_occlusion_trust_audit
         if args.mature_handoff_surface_policy in {"joint", "atlas_residual"}:
             chart_atlas_optimizer.step()
         surface.optimizer.zero_grad(set_to_none=True)
@@ -19904,6 +27683,61 @@ def main():
                     foliage.dynamic_leaf_mask,
                     dynamic_opacity_ceiling,
                 )
+            if (
+                args.reconstruction_target == "static"
+                and static_detail_settle_active
+                and volume_opacity_settle_audit[
+                    "static_detail_opacity_settle"
+                ]["effective_policy"]
+                == "evidence_trust_region"
+            ):
+                volume_opacity_settle_audit[
+                    "static_detail_opacity_settle"
+                ]["trust_region_projection"] = (
+                    _enforce_static_detail_optical_mass_trust_region(
+                        foliage,
+                        volume_optimizer,
+                        args,
+                    )
+                )
+                final_static_detail_delta = (
+                    foliage.opacity_logits.detach()[foliage.static_leaf_mask]
+                    - pre_step_static_detail_logits
+                )
+                final_settle_audit = volume_opacity_settle_audit[
+                    "static_detail_opacity_settle"
+                ]
+                final_settle_audit["post_projection_changed_rows"] = int(
+                    final_static_detail_delta.abs().flatten(1).any(dim=1).sum()
+                )
+                final_settle_audit["post_projection_growth_rows"] = int(
+                    (final_static_detail_delta > 0).flatten(1).any(dim=1).sum()
+                )
+                final_settle_audit["post_projection_retirement_rows"] = int(
+                    (final_static_detail_delta < 0).flatten(1).any(dim=1).sum()
+                )
+            post_projection_detail_cleanup_delta = (
+                foliage.opacity_logits.detach()[
+                    static_detail_cleanup_update_rows
+                ]
+                - pre_step_detail_cleanup_logits
+            )
+            static_detail_global_cleanup_audit[
+                "post_projection_retirement_rows"
+            ] = int(
+                (post_projection_detail_cleanup_delta < 0)
+                .flatten(1)
+                .any(dim=1)
+                .sum()
+            )
+            static_detail_global_cleanup_audit[
+                "post_projection_growth_rows"
+            ] = int(
+                (post_projection_detail_cleanup_delta > 0)
+                .flatten(1)
+                .any(dim=1)
+                .sum()
+            )
             # First fold this iteration's legitimate hit/opacity update into
             # the unretired reference.  Then apply the local transfer after
             # Adam and scale compensation so it cannot be undone by a stale
@@ -19917,7 +27751,19 @@ def main():
                     maximum_fraction_per_event=(
                         args.static_replacement_mass_fraction_per_event
                     ),
+                    # Ownership transfer is a topology/settlement operation.
+                    # Continuing it in appearance polish changed thousands of
+                    # opacity rows after the last trustworthy ownership phase
+                    # and reintroduced the late tree/building regression.
+                    allow_mass_transfer=(phase != "canonical_polish"),
                 )
+            )
+            _assert_finite_foliage_optimization_state(
+                foliage,
+                volume_optimizer,
+                iteration=step + 1,
+                stage="post_optimizer_constraints_and_mass_handoff",
+                check_gradients=False,
             )
 
         topology_event = None
@@ -20028,25 +27874,67 @@ def main():
             # deliberately scheduled before ordinary detail splits: otherwise
             # the same ~14k represented groups repeatedly consume capacity
             # while the remaining crown stays envelope-only forever.
+            configured_receiver_limit = int(
+                args.maximum_static_detail_materializations_per_event
+            )
+            receiver_verification_debt_fraction = 0.0
+            receiver_verification_capacity_scale = 1.0
+            effective_receiver_limit = configured_receiver_limit
+            if args.reconstruction_target == "static":
+                receiver_verification_debt_fraction = float(
+                    _verification_debt_mask(foliage).float().mean()
+                )
+                # A receiver has candidate cameras but no independent leaf
+                # witness yet.  Unlike a strict multiview ray birth it needs
+                # no exploration floor: at hard debt, verification must catch
+                # up before another factorization transaction is opened.
+                receiver_verification_capacity_scale = (
+                    _verification_debt_capacity_scale(
+                        receiver_verification_debt_fraction,
+                        soft_fraction=float(
+                            args.volume_verification_debt_soft_fraction
+                        ),
+                        hard_fraction=float(
+                            args.volume_verification_debt_hard_fraction
+                        ),
+                        minimum_scale=0.0,
+                    )
+                )
+                effective_receiver_limit = int(
+                    np.floor(
+                        configured_receiver_limit
+                        * receiver_verification_capacity_scale
+                        + 1.0e-6
+                    )
+                )
             receiver_audit = {
                 "contract": "inactive_outside_static_detail_stage",
                 "selected": 0,
                 "materialized": 0,
+                "configured_limit": configured_receiver_limit,
+                "effective_limit": effective_receiver_limit,
+                "verification_debt_fraction_before": (
+                    receiver_verification_debt_fraction
+                ),
+                "verification_capacity_scale": (
+                    receiver_verification_capacity_scale
+                ),
             }
             if (
                 args.reconstruction_target == "static"
                 and _static_detail_stage_trainable(phase)
-                and args.maximum_static_detail_materializations_per_event > 0
+                and effective_receiver_limit > 0
             ):
                 receiver_parents, receiver_selection = (
                     _select_missing_static_detail_receiver_parents(
                         foliage,
                         volume_stats,
                         min(
-                            int(
-                                args.maximum_static_detail_materializations_per_event
-                            ),
+                            effective_receiver_limit,
                             max(int(volume_budget) - len(foliage), 0),
+                        ),
+                        eligible_camera_ids=(
+                            static_detail_verification_camera_ids
                         ),
                     )
                 )
@@ -20083,15 +27971,21 @@ def main():
                 receiver_audit = {
                     **receiver_selection,
                     **receiver_event,
-                    "configured_limit": int(
-                        args.maximum_static_detail_materializations_per_event
+                    "configured_limit": configured_receiver_limit,
+                    "effective_limit": effective_receiver_limit,
+                    "verification_debt_fraction_before": (
+                        receiver_verification_debt_fraction
+                    ),
+                    "verification_capacity_scale": (
+                        receiver_verification_capacity_scale
                     ),
                     "optical_mass_fraction": float(
                         args.static_detail_materialization_mass_fraction
                     ),
                     "capacity_contract": (
-                        "global_volume_budget_before_ray_birth_and_ordinary_"
-                        "split"
+                        "unresolved_verification_debt_backpressure_to_zero_"
+                        "at_hard_threshold_then_global_volume_budget_before_"
+                        "ray_birth_and_ordinary_split"
                     ),
                 }
             # Allocate newly confirmed uncovered rays before ordinary
@@ -20109,18 +28003,8 @@ def main():
             effective_birth_limit = 0
             verification_capacity_scale = 1.0
             if args.reconstruction_target == "static":
-                current_verification_state = getattr(
-                    foliage,
-                    "verification_state",
-                    torch.full_like(
-                        foliage.layer_role, VERIFICATION_VERIFIED
-                    ),
-                )
                 current_verification_debt = float(
-                    (
-                        current_verification_state
-                        == VERIFICATION_UNVERIFIED
-                    ).float().mean()
+                    _verification_debt_mask(foliage).float().mean()
                 )
                 verification_capacity_scale = (
                     _verification_debt_capacity_scale(
@@ -20158,7 +28042,11 @@ def main():
                     maximum_births=min(
                         effective_birth_limit,
                         max(int(volume_budget) - len(foliage), 0),
-                    )
+                    ),
+                    minimum_cameras=2,
+                    minimum_sequences=(
+                        1 if static_canonical_sequence is not None else 2
+                    ),
                 )
                 if len(birth_centers):
                     birth_event = foliage.append_static_ray_births(
@@ -20252,6 +28140,7 @@ def main():
                 split_capacity_scale=ordinary_topology_scale,
                 camera_forward_lookup=camera_forward_lookup,
                 view_by_camera_id=view_by_camera_id,
+                canonical_rgb_sequence=static_canonical_sequence,
                 geometry_evidence=geometry,
                 foliage_ray_evidence=foliage_rays,
                 current_iteration=step + 1,
@@ -20300,6 +28189,9 @@ def main():
                     "verification_capacity_scale": (
                         verification_capacity_scale
                     ),
+                    "verification_debt_fraction_before": (
+                        current_verification_debt
+                    ),
                     "capacity_contract": (
                         "cross_sequence_uncovered_birth_before_ordinary_"
                         "split__strict_evidence_birth_has_independent_nonzero_"
@@ -20319,6 +28211,81 @@ def main():
                 # though both mutations reached the final result list, making
                 # per-step causal audits falsely report only volume growth.
                 topology_event["volume"] = event
+        if (
+            foliage_active
+            and len(foliage)
+            and (step + 1) > int(args.volume_densify_until_iteration)
+            and (step + 1) % args.volume_densify_every == 0
+        ):
+            # Support growth is frozen, but proposal verification is a state
+            # machine that must still terminate. Previously this call lived
+            # only inside the densification branch: children born at the last
+            # topology event could time out after the branch had disappeared
+            # and therefore remained unverified forever. Run the same atomic
+            # mutation with exactly zero split capacity. It may reject strong
+            # contradictions, prune expired zero-witness low-utility rows, or
+            # merge a wholly failed split family; it cannot birth, split, or
+            # materialize a receiver.
+            maintenance_event = _adapt_volume(
+                args,
+                foliage,
+                volume_stats,
+                volume_budget=volume_budget,
+                phase=phase,
+                split_capacity_scale=0.0,
+                camera_forward_lookup=camera_forward_lookup,
+                view_by_camera_id=view_by_camera_id,
+                canonical_rgb_sequence=static_canonical_sequence,
+                geometry_evidence=geometry,
+                foliage_ray_evidence=foliage_rays,
+                current_iteration=step + 1,
+                prune_only_maintenance=True,
+            )
+            rollback_old_rows = maintenance_event.pop(
+                "_rollback_old_rows",
+                torch.empty(
+                    0, dtype=torch.long, device=foliage.xyz.device
+                ),
+            )
+            new_to_old = maintenance_event.pop("_new_to_old", None)
+            if (
+                int(maintenance_event.get("split_parents", 0)) != 0
+                or int(maintenance_event.get("children", 0)) != 0
+                or int(maintenance_event.get("net_growth", 0)) > 0
+                or int(maintenance_event.get("new_count", 0))
+                > int(maintenance_event.get("old_count", 0))
+            ):
+                raise RuntimeError(
+                    "Post-topology verification maintenance created volume "
+                    "support"
+                )
+            if new_to_old is not None:
+                volume_optimizer = _migrate_volume_optimizer(
+                    args,
+                    foliage,
+                    appearance,
+                    sky,
+                    volume_optimizer,
+                    new_to_old,
+                )
+                if len(rollback_old_rows):
+                    rollback_new_rows = torch.nonzero(
+                        torch.isin(new_to_old, rollback_old_rows),
+                        as_tuple=False,
+                    ).flatten()
+                    _zero_volume_optimizer_rows(
+                        volume_optimizer, rollback_new_rows
+                    )
+            maintenance_event["contract"] = (
+                "post_growth_prune_or_failed_family_rollback_only__zero_"
+                "birth_split_and_materialization_capacity"
+            )
+            volume_stats = _volume_stats(foliage)
+            maintenance_trace = {
+                "iteration": step + 1,
+                "volume_verification_maintenance": maintenance_event,
+            }
+            topology_events.append(maintenance_trace)
         if (
             _surface_topology_active(step, args)
             and anchors_released
@@ -20358,6 +28325,12 @@ def main():
             * static_detail_global_cleanup.detach()
             + args.persistent_envelope_global_cleanup_weight
             * persistent_envelope_global_cleanup.detach()
+            + args.canonical_occlusion_completion_weight
+            * canonical_occlusion_completion.detach()
+            + args.canonical_occlusion_order_weight
+            * canonical_occlusion_order.detach()
+            + args.moge3_canopy_optical_weight
+            * moge3_canopy_optical.detach()
             + conditioned_loss.detach()
             + args.counterfactual_transparency_weight
             * conditioned_counterfactual_transparency.detach()
@@ -20365,6 +28338,26 @@ def main():
             + 0.20 * topology_loss.detach()
         )
         if step == 0 or (step + 1) % args.log_every == 0:
+            cuda_memory_audit = {
+                "contract": "per_step_cuda_allocator_peak",
+                "allocated_mib": float(
+                    torch.cuda.memory_allocated() / (1024.0**2)
+                ),
+                "reserved_mib": float(
+                    torch.cuda.memory_reserved() / (1024.0**2)
+                ),
+                "maximum_allocated_mib": float(
+                    torch.cuda.max_memory_allocated() / (1024.0**2)
+                ),
+                "maximum_reserved_mib": float(
+                    torch.cuda.max_memory_reserved() / (1024.0**2)
+                ),
+            }
+            static_detail_evidence_tier_audit = (
+                _static_detail_evidence_tier_audit(foliage)
+                if args.reconstruction_target == "static"
+                else {"contract": "not_static", "detail_rows": 0}
+            )
             public_phase = _public_phase_name(
                 phase,
                 args.reconstruction_target,
@@ -20441,7 +28434,9 @@ def main():
                     ),
                     "every": int(args.static_detail_isolated_every),
                     "weight": float(args.static_detail_isolated_weight),
-                    "opacity_gradient_permission": False,
+                    "opacity_gradient_permission": bool(
+                        static_detail_isolated_opacity_rows > 0
+                    ),
                     # Snapshot before any topology mutation changes the row
                     # count later in this iteration.
                     "qualified_detail_rows": int(
@@ -20449,6 +28444,9 @@ def main():
                     ),
                     "appearance_detail_rows": int(
                         static_detail_isolated_appearance_rows
+                    ),
+                    "opacity_detail_rows": int(
+                        static_detail_isolated_opacity_rows
                     ),
                     "view_index": (
                         None
@@ -20590,6 +28588,20 @@ def main():
                 "canonical_canopy_confidence": float(
                     static_confidence_mean.detach()
                 ),
+                "static_scene_canonical_rgb": {
+                    "contract": STATIC_SCENE_CANONICAL_RGB_CONTRACT,
+                    "canonical_sequence": static_canonical_sequence,
+                    "view_sequence": sequence_id(view.image_name),
+                    "is_canonical_view": bool(
+                        static_scene_is_canonical
+                    ),
+                    "unknown_pixel_equivalent": float(
+                        static_scene_unknown.detach().sum()
+                    ),
+                    "unknown_pixel_fraction": float(
+                        static_scene_unknown.detach().mean()
+                    ),
+                },
                 "canonical_canopy_sigma": float(
                     static_sigma_mean.detach()
                 ),
@@ -20600,6 +28612,26 @@ def main():
                 "counterfactual_transparency": {
                     "loss": float(counterfactual_transparency.detach()),
                     **counterfactual_transparency_audit,
+                },
+                "canonical_occlusion_completion": {
+                    "loss": float(
+                        canonical_occlusion_completion.detach()
+                    ),
+                    "weight": float(
+                        args.canonical_occlusion_completion_weight
+                    ),
+                    **canonical_occlusion_completion_audit,
+                },
+                "canonical_occlusion_order": {
+                    "loss": float(canonical_occlusion_order.detach()),
+                    "weight": float(args.canonical_occlusion_order_weight),
+                    **canonical_occlusion_order_audit,
+                },
+                "moge3_canopy_optical": {
+                    "loss": float(moge3_canopy_optical.detach()),
+                    "weight": float(args.moge3_canopy_optical_weight),
+                    "every": int(args.moge3_canopy_optical_every),
+                    **moge3_canopy_optical_audit,
                 },
                 "conditioned_ownership": float(
                     conditioned_ownership.detach()
@@ -20624,6 +28656,10 @@ def main():
                     parameter_loss_gradient_audit
                 ),
                 "volume_opacity_settle": volume_opacity_settle_audit,
+                "static_detail_sh_trust": static_detail_sh_trust_audit,
+                "static_detail_evidence_tiers": (
+                    static_detail_evidence_tier_audit
+                ),
                 "static_local_replacement": static_replacement_audit,
                 "static_optical_mass_handoff": static_mass_handoff_audit,
                 "static_child_verification": (
@@ -20671,6 +28707,7 @@ def main():
                 ),
                 "topology_event": topology_event,
                 "replacement_event": replacement_event,
+                "cuda_memory": cuda_memory_audit,
                 "elapsed_sec": time.time() - started,
             }
             with trace.open("a", encoding="utf-8") as handle:
@@ -20732,6 +28769,9 @@ def main():
                         "static_replacement": static_replacement_schedule,
                         "static_skeleton": static_skeleton_schedule,
                         "static_volume": static_volume_schedule,
+                        "static_canonical_ray": (
+                            static_canonical_ray_schedule
+                        ),
                     },
                     "conditioned_visit_counts": (
                         conditioned_visit_counts.copy()
@@ -20833,7 +28873,29 @@ def main():
                 128 + int(graceful_stop["signal_number"])
             )
 
-    (output / "interrupted_training_state.json").unlink(missing_ok=True)
+    final_checkpoint = output / "hybrid_teacher_checkpoint.pth"
+    if not final_checkpoint.is_file():
+        raise RuntimeError(
+            "Final rolling checkpoint is missing before model finalization"
+        )
+    final_checkpoint_sha256 = _file_sha256(final_checkpoint)
+    finalization_state_path = output / "finalization_state.json"
+    finalization_started_at = time.time()
+    _write_json_atomic(
+        finalization_state_path,
+        {
+            "status": "in_progress",
+            "protocol": PROTOCOL,
+            "iteration": int(args.iterations),
+            "checkpoint": str(final_checkpoint.resolve()),
+            "checkpoint_sha256": final_checkpoint_sha256,
+            "resume_contract": (
+                "reload_exact_final_checkpoint_and_rerun_idempotent_"
+                "finalization"
+            ),
+            "started_at_unix": finalization_started_at,
+        },
+    )
 
     # Bootstrap centre-prior samplers stop being authoritative after renderer
     # witnesses are released.  Audit the permanent observation-level factors
@@ -21041,7 +29103,8 @@ def main():
         }
 
     teacher_state = output / "hybrid_teacher_state.pth"
-    torch.save(
+    _atomic_torch_save(
+        teacher_state,
         {
             "protocol": PROTOCOL,
             "iteration": args.iterations,
@@ -21073,6 +29136,7 @@ def main():
                 "static_replacement": static_replacement_schedule,
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
+                "static_canonical_ray": static_canonical_ray_schedule,
             },
             "conditioned_visit_counts": (
                 conditioned_visit_counts.copy()
@@ -21112,13 +29176,18 @@ def main():
                 geometry_topology_primitive_updates
             ),
         },
-        teacher_state,
     )
-    scene.save(args.iterations)
+    final_surface_ply = (
+        output
+        / "point_cloud"
+        / f"iteration_{args.iterations}"
+        / "point_cloud.ply"
+    )
+    _save_surface_ply_atomic(surface, final_surface_ply)
     rigid_surface_handoff = None
     if args.training_profile == "hybrid_rigid_stage1":
         chart_surface_state = output / "chart_surface_state.pth"
-        torch.save(chart_surface.capture(), chart_surface_state)
+        _atomic_torch_save(chart_surface_state, chart_surface.capture())
         geometry_audit_for_handoff = geometry.audit()
         geometry_audit_for_handoff.update(
             {
@@ -21171,6 +29240,14 @@ def main():
             and args.reconstruction_target
             == "sequence_conditioned_legacy"
         ),
+        reconstruction_target=args.reconstruction_target,
+        canonical_sequence_policy=(
+            "disabled_rigid_placeholder"
+            if rigid_placeholder
+            else args.static_canonical_sequence_policy
+        ),
+        canonical_sequence=static_canonical_sequence,
+        canonical_snapshot_frames=canonical_snapshot_frame_ids,
         training_optical_replacement_policy=(
             "disabled"
             if args.reconstruction_target == "static"
@@ -21201,19 +29278,48 @@ def main():
         ),
         "maximum_volume_gaussians": volume_budget,
         "maximum_volume_splits_per_event": args.maximum_volume_splits,
+        "volume_topology_settlement": {
+            "densify_until_iteration": int(
+                args.volume_densify_until_iteration
+            ),
+            "settlement_iterations": max(
+                int(args.iterations)
+                - int(args.volume_densify_until_iteration),
+                0,
+            ),
+            "final_checkpoint_allows_topology_mutation": bool(
+                int(args.iterations)
+                <= int(args.volume_densify_until_iteration)
+                and _volume_topology_active(
+                    int(args.iterations) - 1,
+                    args,
+                    _phase(
+                        int(args.iterations) - 1,
+                        int(args.phase_schedule_horizon),
+                        args.training_profile,
+                    ),
+                )
+            ),
+            "quality_gate": False,
+            "interpretation": (
+                "audit_only__zero_means_the_checkpoint_may_contain_children_"
+                "created_on_its_final_iteration"
+            ),
+        },
         "evidence_hash": evidence_store["evidence_hash"],
         "training_contract": training_contract,
         "teacher_state": str(teacher_state),
         "teacher_state_sha256": _file_sha256(teacher_state),
+        "final_checkpoint": str(final_checkpoint.resolve()),
+        "final_checkpoint_sha256": final_checkpoint_sha256,
+        "finalization_contract": (
+            "teacher_state_surface_ply_renderer_manifest_result_json_"
+            "atomic__result_json_is_commit_marker"
+        ),
         "authoritative_final_model": "native_hybrid_teacher",
         "deployment_render_mode": "canonical_static",
         "standard_student_trained": False,
-        "surface_ply": str(
-            output
-            / "point_cloud"
-            / f"iteration_{args.iterations}"
-            / "point_cloud.ply"
-        ),
+        "surface_ply": str(final_surface_ply),
         "surface_initialization": surface_audit,
         "surface_warmstart": surface_warmstart,
         "rigid_surface_handoff": (
@@ -21273,6 +29379,12 @@ def main():
         "surface_spatial_confidence": surface_spatial_confidence_audit,
         "foliage_ray_evidence_audit": foliage_rays.audit(),
         "volume_opacity_settle": volume_opacity_settle_audit,
+        "static_detail_sh_trust": static_detail_sh_trust_audit,
+        "static_detail_evidence_tiers": (
+            _static_detail_evidence_tier_audit(foliage)
+            if args.reconstruction_target == "static"
+            else {"contract": "not_static", "detail_rows": 0}
+        ),
         "static_local_replacement": static_replacement_audit,
         "static_optical_mass_handoff": static_mass_handoff_audit,
         "static_child_verification": static_child_verification_audit,
@@ -21299,6 +29411,26 @@ def main():
             ),
             "canopy_quality_valid": (
                 args.training_profile != "hybrid_rigid_stage1"
+                and any(
+                    row.get("tree_rgb_authority")
+                    == "authoritative_scene_canonical"
+                    for row in evaluation
+                )
+            ),
+            "canonical_sequence": static_canonical_sequence,
+            "authoritative_canopy_view_count": sum(
+                row.get("tree_rgb_authority")
+                == "authoritative_scene_canonical"
+                for row in evaluation
+            ),
+            "unknown_cross_sequence_view_count": sum(
+                row.get("tree_rgb_authority")
+                == "unknown_cross_sequence"
+                for row in evaluation
+            ),
+            "building_metric_semantics": (
+                "rigid_tree_interface_hard_is_semantic_rigid_proxy_near_"
+                "authoritative_canopy_boundary__not_building_instance_gt"
             ),
         },
         "historical_parent_ply_used": False,
@@ -21313,9 +29445,6 @@ def main():
         "canopy_volume_topology_gradient": True,
         "elapsed_sec": time.time() - started,
     }
-    (output / "result.json").write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
     renderer_manifest = {
         "version": "native-hybrid-teacher-renderer-manifest-v2",
         "protocol": PROTOCOL,
@@ -21379,8 +29508,9 @@ def main():
             ),
         },
         "mixed_kernel": (
-            "native perspective-correct 2D surfel and 3D EWA in one "
-            "tile list and one depth/alpha compositing order"
+            "native 2D surfel and 3D EWA in one tile list; volume keys use "
+            "centre depth, surfel keys use perspective ray depth at each "
+            "tile centre, and the pixel loop recomputes exact surfel depth"
         ),
         "implementation_hashes": implementation_hashes,
         "downstream_contract": (
@@ -21388,10 +29518,31 @@ def main():
             "surface_ply alone as the complete scene"
         ),
     }
-    (output / "renderer_manifest.json").write_text(
-        json.dumps(renderer_manifest, indent=2) + "\n",
-        encoding="utf-8",
+    renderer_manifest_path = output / "renderer_manifest.json"
+    _write_json_atomic(renderer_manifest_path, renderer_manifest)
+    result_path = output / "result.json"
+    _write_json_atomic(result_path, result)
+    _write_json_atomic(
+        finalization_state_path,
+        {
+            "status": "complete",
+            "protocol": PROTOCOL,
+            "iteration": int(args.iterations),
+            "checkpoint": str(final_checkpoint.resolve()),
+            "checkpoint_sha256": final_checkpoint_sha256,
+            "teacher_state": str(teacher_state.resolve()),
+            "teacher_state_sha256": result["teacher_state_sha256"],
+            "surface_ply": str(final_surface_ply.resolve()),
+            "surface_ply_sha256": _file_sha256(final_surface_ply),
+            "renderer_manifest": str(renderer_manifest_path.resolve()),
+            "renderer_manifest_sha256": _file_sha256(renderer_manifest_path),
+            "result": str(result_path.resolve()),
+            "result_sha256": _file_sha256(result_path),
+            "started_at_unix": finalization_started_at,
+            "completed_at_unix": time.time(),
+        },
     )
+    _durable_unlink(output / "interrupted_training_state.json")
     print(json.dumps(result, indent=2))
 
 

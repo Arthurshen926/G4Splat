@@ -111,6 +111,192 @@ __global__ void duplicateWithKeys(
 	}
 }
 
+// Return a conservative depth interval for one surfel over one image tile.
+// Ray/plane depth is fractional-linear in image coordinates. When the
+// projective denominator has one sign over the tile, its extrema occur at the
+// four corners. The low-pass fallback uses Tw.z, so include that value too.
+// Horizon ambiguity falls back to the complete finite 3-sigma patch range;
+// mixed preprocessing has already rejected patches whose own support crosses
+// the camera plane.
+__device__ __forceinline__ float2 mixedSurfaceTileDepthInterval(
+	int id,
+	int tile_x,
+	int tile_y,
+	int width,
+	int height,
+	const float* surface_transMats)
+{
+	const float3 Tu = {
+		surface_transMats[9 * id + 0],
+		surface_transMats[9 * id + 1],
+		surface_transMats[9 * id + 2]};
+	const float3 Tv = {
+		surface_transMats[9 * id + 3],
+		surface_transMats[9 * id + 4],
+		surface_transMats[9 * id + 5]};
+	const float3 Tw = {
+		surface_transMats[9 * id + 6],
+		surface_transMats[9 * id + 7],
+		surface_transMats[9 * id + 8]};
+	const float x0 = float(tile_x * BLOCK_X);
+	const float y0 = float(tile_y * BLOCK_Y);
+	const float x1 = min(float(width - 1), x0 + float(BLOCK_X - 1));
+	const float y1 = min(float(height - 1), y0 + float(BLOCK_Y - 1));
+	const float xs[4] = {x0, x1, x0, x1};
+	const float ys[4] = {y0, y0, y1, y1};
+	float minimum = Tw.z;
+	float maximum = Tw.z;
+	float denominator_sign = 0.0f;
+	bool bounded = isfinite(Tw.z);
+	for (int corner = 0; corner < 4; ++corner)
+	{
+		const float3 k = xs[corner] * Tw - Tu;
+		const float3 l = ys[corner] * Tw - Tv;
+		const float3 p = cross(k, l);
+		if (!isfinite(p.z) || fabsf(p.z) < 1.0e-8f)
+		{
+			bounded = false;
+			break;
+		}
+		const float sign = p.z > 0.0f ? 1.0f : -1.0f;
+		if (corner == 0)
+			denominator_sign = sign;
+		else if (sign != denominator_sign)
+		{
+			bounded = false;
+			break;
+		}
+		const float u = p.x / p.z;
+		const float v = p.y / p.z;
+		const float depth = u * Tw.x + v * Tw.y + Tw.z;
+		if (!isfinite(depth))
+		{
+			bounded = false;
+			break;
+		}
+		minimum = min(minimum, depth);
+		maximum = max(maximum, depth);
+	}
+	if (!bounded)
+	{
+		const float span = 3.0f * (fabsf(Tw.x) + fabsf(Tw.y));
+		minimum = Tw.z - span;
+		maximum = Tw.z + span;
+	}
+	const float padding = 1.0e-5f
+		* max(1.0f, max(fabsf(minimum), fabsf(maximum)));
+	return {
+		max(near_n, minimum - padding),
+		max(near_n, maximum + padding)};
+}
+
+// Mixed 2D/3D binning sorts by a conservative lower depth bound rather than
+// by a primitive or tile-centre sample. A later component pass groups every
+// overlapping interval; only primitives inside one component can exchange
+// order at a pixel, and forward/backward sort that component by exact ray
+// depth. Volumes have the degenerate interval [centre_z, centre_z].
+__global__ void mixedDuplicateWithKeys(
+	int primitive_count,
+	int surface_count,
+	int width,
+	int height,
+	const float2* points_xy,
+	const float* center_depths,
+	const float* surface_transMats,
+	const uint32_t* offsets,
+	uint64_t* keys_unsorted,
+	uint64_t* upper_keys_unsorted,
+	uint32_t* values_unsorted,
+	int* radii,
+	dim3 grid)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= primitive_count || radii[idx] <= 0)
+		return;
+
+	uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+	uint2 rect_min, rect_max;
+	getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+	for (int y = rect_min.y; y < rect_max.y; ++y)
+	{
+		for (int x = rect_min.x; x < rect_max.x; ++x)
+		{
+			float key_depth = center_depths[idx];
+			float upper_depth = center_depths[idx];
+			if (idx < surface_count)
+			{
+				const float2 interval = mixedSurfaceTileDepthInterval(
+					idx, x, y, width, height, surface_transMats);
+				key_depth = interval.x;
+				upper_depth = interval.y;
+			}
+			uint64_t key = y * grid.x + x;
+			key <<= 32;
+			key |= *((uint32_t*)&key_depth);
+			uint64_t upper_key = y * grid.x + x;
+			upper_key <<= 32;
+			upper_key |= *((uint32_t*)&upper_depth);
+			keys_unsorted[off] = key;
+			upper_keys_unsorted[off] = upper_key;
+			values_unsorted[off] = idx;
+			++off;
+		}
+	}
+}
+
+// Mark the end of every connected conservative depth-interval component.
+// One thread owns one tile, so component construction is deterministic and
+// its boundary array is replayed unchanged by the backward pass.
+__global__ void identifyMixedIntervalGroups(
+	int tile_count,
+	int surface_count,
+	int width,
+	int height,
+	dim3 grid,
+	const uint2* ranges,
+	const uint64_t* sorted_keys,
+	const uint32_t* point_list,
+	const float* center_depths,
+	const float* surface_transMats,
+	uint8_t* group_end)
+{
+	const int tile = cg::this_grid().thread_rank();
+	if (tile >= tile_count)
+		return;
+	const uint2 range = ranges[tile];
+	if (range.x >= range.y)
+		return;
+	const int tile_x = tile % int(grid.x);
+	const int tile_y = tile / int(grid.x);
+	uint32_t cursor = range.x;
+	while (cursor < range.y)
+	{
+		const uint32_t first_id = point_list[cursor];
+		float component_max = first_id < uint32_t(surface_count)
+			? mixedSurfaceTileDepthInterval(
+				int(first_id), tile_x, tile_y, width, height,
+				surface_transMats).y
+			: center_depths[first_id];
+		++cursor;
+		while (cursor < range.y)
+		{
+			const uint32_t lower_bits = uint32_t(sorted_keys[cursor]);
+			const float lower = __uint_as_float(lower_bits);
+			if (lower > component_max)
+				break;
+			const uint32_t id = point_list[cursor];
+			const float upper = id < uint32_t(surface_count)
+				? mixedSurfaceTileDepthInterval(
+					int(id), tile_x, tile_y, width, height,
+					surface_transMats).y
+				: center_depths[id];
+			component_max = max(component_max, upper);
+			++cursor;
+		}
+		group_end[cursor - 1] = uint8_t(1);
+	}
+}
+
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
@@ -389,6 +575,8 @@ int CudaRasterizer::Rasterizer::mixedForward(
 	const float* surface_gate_atlas,
 	const int gate_count,
 	const int gate_size,
+	const float* depth_query_bounds,
+	const bool has_depth_query,
 	const float scale_modifier,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -521,7 +709,6 @@ int CudaRasterizer::Rasterizer::mixedForward(
 		num_rendered,
 		0,
 		32 + bit), debug)
-
 	CHECK_CUDA(cudaMemset(
 		imgState.ranges,
 		0,
@@ -534,12 +721,12 @@ int CudaRasterizer::Rasterizer::mixedForward(
 			imgState.ranges);
 	}
 	CHECK_CUDA(, debug)
-
 	CHECK_CUDA(FORWARD::mixed_render(
 		tile_grid,
 		block,
 		imgState.ranges,
 		binningState.point_list,
+		binningState.point_list_keys,
 		surface_count,
 		width,
 		height,
@@ -550,6 +737,8 @@ int CudaRasterizer::Rasterizer::mixedForward(
 		surface_gate_atlas,
 		gate_count,
 		gate_size,
+		depth_query_bounds,
+		has_depth_query,
 		geomState.surface_transMat,
 		geomState.surface_normals,
 		geomState.volume_conic,
@@ -689,7 +878,10 @@ void CudaRasterizer::Rasterizer::mixedBackward(
 	const float* opacities,
 	const int* surface_gate_indices,
 	const float* surface_gate_atlas,
+	const int gate_count,
 	const int gate_size,
+	const float* depth_query_bounds,
+	const bool has_depth_query,
 	const float scale_modifier,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -701,6 +893,7 @@ void CudaRasterizer::Rasterizer::mixedBackward(
 	char* image_buffer,
 	const float* dL_dpixels,
 	const float* dL_dothers,
+	const float* forward_others,
 	float* dL_dmean2D,
 	float* dL_dsurface_normal,
 	float* dL_dsurface_transMat,
@@ -742,6 +935,7 @@ void CudaRasterizer::Rasterizer::mixedBackward(
 		block,
 		imageState.ranges,
 		binningState.point_list,
+		binningState.point_list_keys,
 		surface_count,
 		width,
 		height,
@@ -751,7 +945,10 @@ void CudaRasterizer::Rasterizer::mixedBackward(
 		opacities,
 		surface_gate_indices,
 		surface_gate_atlas,
+		gate_count,
 		gate_size,
+		depth_query_bounds,
+		has_depth_query,
 		geomState.surface_transMat,
 		geomState.surface_normals,
 		geomState.volume_conic,
@@ -760,6 +957,7 @@ void CudaRasterizer::Rasterizer::mixedBackward(
 		imageState.n_contrib,
 		dL_dpixels,
 		dL_dothers,
+		forward_others,
 		dL_dsurface_transMat,
 		reinterpret_cast<float3*>(dL_dmean2D),
 		reinterpret_cast<float3*>(dL_dsurface_normal),

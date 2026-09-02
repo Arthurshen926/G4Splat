@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
+    PROPOSAL_RAY_BIRTH,
     VERIFICATION_UNVERIFIED,
     VERIFICATION_VERIFIED,
     VolumetricFoliageModel,
@@ -17,6 +18,8 @@ from scripts.distill_standard_3dgs import _adapt_student_topology
 from scripts.train_unified_outdoor_teacher import (
     _adapt_volume,
     _balanced_evidence_fraction,
+    _has_two_distinct_supported_camera_ids,
+    _has_two_distinct_camera_ids_across_tables,
     _migrate_volume_optimizer,
     _volume_optimizer,
 )
@@ -94,6 +97,41 @@ def test_conditioned_sampling_balances_per_view_exposure():
 
     assert abs(per_evidence_view / per_other_view - 12.0) < 1e-6
     assert 0.55 < fraction < 0.62
+
+
+def test_wide_camera_support_scan_is_duplicate_safe_and_dtype_preserving():
+    # The production initialization has 105 support slots. Exercise that
+    # width directly: duplicate canonical IDs are one witness, invalid and
+    # noncanonical IDs do not count, and no int64 table/sort is required.
+    support = torch.full((5, 105), -1, dtype=torch.int32)
+    support[0, :3] = torch.tensor([2, 2, 2])
+    support[1, :4] = torch.tensor([2, 2, 7, 7])
+    support[2, :4] = torch.tensor([2, 5, 7, 9])
+    support[3, :3] = torch.tensor([7, 9, 11])
+    support[4, :4] = torch.tensor([-5, 2, 99, 7])
+    canonical = torch.zeros(12, dtype=torch.bool)
+    canonical[2] = True
+    canonical[7] = True
+
+    result = _has_two_distinct_supported_camera_ids(
+        support, canonical
+    )
+
+    assert result.tolist() == [False, True, True, False, True]
+    assert support.dtype == torch.int32
+
+
+def test_support_and_verified_camera_tables_form_one_exact_evidence_set():
+    support = torch.tensor([[2, -1], [2, -1], [2, 7]], dtype=torch.int32)
+    verified = torch.tensor([[7, -1], [2, 2], [7, 7]], dtype=torch.int32)
+    canonical = torch.zeros(8, dtype=torch.bool)
+    canonical[[2, 7]] = True
+
+    result = _has_two_distinct_camera_ids_across_tables(
+        (support, verified), canonical
+    )
+
+    assert result.tolist() == [True, False, True]
 
 
 def test_teacher_prunes_then_splits_and_migrates_adam_state():
@@ -194,6 +232,55 @@ def test_teacher_can_split_static_skeleton_and_canonical_crown():
     assert int(model.static_skeleton_mask.sum()) == 2
 
 
+def test_scene_canonical_split_filters_every_role_before_mutation():
+    model = _model(3)
+    model.layer_role.copy_(
+        torch.tensor([1, 0, 2], dtype=torch.int8)
+    )
+    # Only row 1 has two distinct cameras in the canonical sequence.  Rows 0
+    # and 2 each have a second candidate camera, but it belongs to seq1 and is
+    # therefore unreachable by the scene-canonical verification lifecycle.
+    model.support_camera_ids = torch.tensor(
+        [[0, 1], [0, 2], [0, 1]], dtype=torch.int32
+    )
+    model.proposal_parent_support_camera_ids = torch.empty(
+        0, 2, dtype=torch.int32
+    )
+    model.observation_camera_ids.fill_(-1)
+    views = {
+        0: SimpleNamespace(image_name="seq0/frame000.png"),
+        1: SimpleNamespace(image_name="seq1/frame000.png"),
+        2: SimpleNamespace(image_name="seq0/frame001.png"),
+    }
+    args = SimpleNamespace(
+        maximum_volume_splits=3,
+        maximum_volume_gaussians=16,
+        volume_split_radius=3.0,
+        reconstruction_target="static",
+        static_canonical_sequence_policy="scene",
+        canonical_child_support_color_refresh=False,
+    )
+
+    event = _adapt_volume(
+        args,
+        model,
+        _exact_conditioned_stats(3),
+        view_by_camera_id=views,
+        canonical_rgb_sequence="seq0",
+        current_iteration=100,
+    )
+
+    assert event["role_split_parents"] == {
+        "static_skeleton": 0,
+        "canonical_crown": 1,
+        "dynamic_leaf": 0,
+    }
+    child = model.proposal_kind != 0
+    assert int(child.sum()) == 4
+    assert bool((model.support_view_count[child] == 2).all())
+    assert set(model.support_camera_ids[child].flatten().tolist()) == {0, 2}
+
+
 def test_teacher_volume_budget_caps_net_growth():
     model = _model(4)
     args = SimpleNamespace(
@@ -280,6 +367,97 @@ def test_teacher_retires_only_expired_zero_witness_low_utility_child():
     lifecycle = event["child_verification_lifecycle"]
     assert lifecycle["expired_candidates"] == 1
     assert lifecycle["expired_zero_witness_low_utility_pruned"] == 1
+
+
+def test_post_growth_maintenance_rolls_back_expired_partial_witness_family():
+    model = _model(1)
+    model.evidence_primitive_id[0] = 17
+    parent_mass = model.integrated_optical_mass().sum().clone()
+    model.split_adaptive(
+        torch.tensor([0]), torch.tensor([2]), birth_iteration=100
+    )
+    # One visit is useful evidence, but it is not the required independent
+    # two-camera verification and must not make a failed split permanent.
+    model.verified_camera_count.fill_(1)
+    stats = _stats(len(model))
+    event = _adapt_volume(
+        SimpleNamespace(
+            maximum_volume_splits=20,
+            maximum_volume_gaussians=8,
+            volume_split_radius=3.0,
+            child_verification_grace_iterations=500,
+            child_verification_timeout_iterations=3000,
+            maximum_volume_family_rollbacks_per_event=8,
+            skeleton_opacity_ceiling=0.40,
+            dynamic_leaf_opacity_ceiling=0.40,
+            canonical_crown_opacity_ceiling=0.20,
+        ),
+        model,
+        stats,
+        current_iteration=3100,
+        split_capacity_scale=0.0,
+        prune_only_maintenance=True,
+    )
+
+    assert event["prune_only_maintenance"]
+    assert event["split_parents"] == 0
+    assert event["children"] == 0
+    assert event["new_count"] == 1
+    assert event["child_verification_lifecycle"][
+        "failed_family_rollback"
+    ]["rolled_back_families"] == 1
+    torch.testing.assert_close(
+        model.integrated_optical_mass().sum(),
+        parent_mass,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+
+
+def test_expired_skeleton_split_rollback_removes_transaction_siblings():
+    model = _model(1)
+    model.layer_role.fill_(1)
+    parent_mass = model.integrated_optical_mass().sum().clone()
+    model.split_adaptive(
+        torch.tensor([0]),
+        torch.tensor([4]),
+        birth_iteration=100,
+        allow_static_skeleton=True,
+    )
+    assert int(model.static_skeleton_mask.sum()) == 4
+
+    event = _adapt_volume(
+        SimpleNamespace(
+            maximum_volume_splits=0,
+            maximum_volume_gaussians=8,
+            volume_split_radius=3.0,
+            child_verification_grace_iterations=500,
+            child_verification_timeout_iterations=3000,
+            maximum_volume_family_rollbacks_per_event=8,
+            skeleton_opacity_ceiling=0.40,
+            dynamic_leaf_opacity_ceiling=0.40,
+            canonical_crown_opacity_ceiling=0.20,
+        ),
+        model,
+        _stats(len(model)),
+        current_iteration=3100,
+        split_capacity_scale=0.0,
+        prune_only_maintenance=True,
+    )
+
+    assert event["new_count"] == 1
+    assert int(model.static_skeleton_mask.sum()) == 1
+    assert int((model.proposal_kind != 0).sum()) == 0
+    assert len(model.split_parent_snapshot_family_id) == 0
+    assert event["child_verification_lifecycle"][
+        "failed_family_rollback"
+    ]["removed_children"] == 3
+    torch.testing.assert_close(
+        model.integrated_optical_mass().sum(),
+        parent_mass,
+        rtol=1e-5,
+        atol=1e-7,
+    )
 
 
 def test_teacher_dynamic_split_requires_screen_bandwidth_deficit():
@@ -383,6 +561,59 @@ def test_full_budget_settle_preserves_physical_role_capacity():
     assert int(model.canonical_crown_mask.sum()) == before["canonical"]
     assert int(model.dynamic_leaf_mask.sum()) == before["dynamic"]
     assert second["saturated_budget_settle"] is True
+
+
+def test_expired_ray_birth_reaches_terminal_rejection_even_if_it_paints():
+    model = _model(1)
+    model.static_detail.fill_(True)
+    model.proposal_kind.fill_(PROPOSAL_RAY_BIRTH)
+    model.verification_state.fill_(VERIFICATION_UNVERIFIED)
+    model.verified_camera_count.zero_()
+    model.birth_iteration.fill_(0)
+    args = SimpleNamespace(
+        maximum_volume_splits=0,
+        maximum_volume_gaussians=1,
+        volume_split_radius=3.0,
+        child_verification_timeout_iterations=10,
+    )
+    stats = _stats(1)
+    # High contribution/opactity used to keep a one-witness proposal alive
+    # forever. Lifecycle timeout is now terminal for a ray-birth proposal.
+    stats["contribution"].fill_(100.0)
+    model.opacity_logits.data.fill_(0.0)
+
+    event = _adapt_volume(
+        args,
+        model,
+        stats,
+        current_iteration=10,
+    )
+
+    assert (
+        event["child_verification_lifecycle"][
+            "expired_ray_birth_terminally_rejected"
+        ]
+        == 1
+    )
+    assert event["new_count"] == 0
+
+
+def test_lineage_allocator_never_reuses_pruned_highest_id_across_restore():
+    model = _model(2)
+    model.append_dynamic_leaves(torch.tensor([1]))
+    first_new_id = int(model.lineage_id.max())
+    remove = torch.zeros(len(model), dtype=torch.bool)
+    remove[-1] = True
+    model.prune(remove)
+    assert first_new_id not in model.lineage_id.tolist()
+
+    state = model.capture()
+    restored = VolumetricFoliageModel(0, dynamic_rank=1, device="cpu")
+    restored.restore(state)
+    restored.append_dynamic_leaves(torch.tensor([1]))
+
+    assert int(restored.lineage_id.max()) > first_new_id
+    assert len(torch.unique(restored.lineage_id)) == len(restored)
 
 
 def test_student_density_control_protects_sky_and_splits_crown():

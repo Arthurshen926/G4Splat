@@ -5,6 +5,8 @@ from outdoor.hybrid_gaussian_renderer import (
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     LAYER_STATIC_SKELETON,
+    PROPOSAL_SPLIT,
+    VERIFICATION_MEASURED_SINGLE,
     VERIFICATION_UNVERIFIED,
     VolumetricFoliageModel,
     view_depth_local_optical_replacement,
@@ -109,15 +111,15 @@ def test_sequence_observations_fuse_to_one_static_model():
     )
     assert not bool((payload["layer_role"] == LAYER_DYNAMIC_LEAF).any())
     # Group 0 has two cameras; group 1 has only camera 0. Both calibrated
-    # occupancy cells survive, while the ownerless cross-sequence voxel
-    # becomes a separate ray birth.
+    # occupancy cells survive.  The ownerless voxel has only one observation
+    # in the selected scene-canonical sequence, so the other traversal is
+    # unknown and cannot manufacture a static-map seed.
     assert audit["fused_static_leaf_clusters"] == 2
-    assert audit["ownerless_static_births"] == 1
-    assert int(payload["static_detail"].sum()) == 3
+    assert audit["ownerless_static_births"] == 0
+    assert int(payload["static_detail"].sum()) == 2
     assert payload["replacement_group"][payload["static_detail"]].tolist() == [
         0,
         1,
-        -1,
     ]
     # Tree 0 has a tie between seq0 and seq1. Stable canonical selection uses
     # seq0 rather than averaging the two incompatible leaf positions.
@@ -133,28 +135,48 @@ def test_sequence_observations_fuse_to_one_static_model():
     assert int(payload["support_sequence_count"][detail][0]) == 1
     assert int(payload["verified_sequence_count"][detail][0]) == 1
     assert int(payload["verified_camera_count"][detail][0]) == 1
-    assert int(payload["verification_state"][detail][0]) == 1
+    assert int(payload["verification_state"][detail][0]) == (
+        VERIFICATION_MEASURED_SINGLE
+    )
     # A single-view mode remains exact-owner/DC-only, but receives a small
     # mass-conserving share from its envelope instead of being born invisible.
     assert float(payload["opacities"][detail][0]) > 0.0
-    ownerless = payload["static_detail"] & (
-        payload["replacement_group"] < 0
-    )
-    # The promoted ownerless voxel must retain the complete calibrated
-    # camera union.  support_view_count without these ids cannot route exact
-    # hit/RGB supervision back to both observations.
-    assert payload["support_camera_ids"][ownerless][0].tolist() == [0, 1]
-    assert payload["observation_camera_ids"][ownerless][0].tolist() == [0, 1]
-    assert payload["verified_camera_ids"][ownerless][0].tolist() == [-1, -1]
-    assert int(payload["verified_camera_count"][ownerless][0]) == 0
-    assert int(payload["verified_sequence_count"][ownerless][0]) == 0
-    assert int(payload["verification_state"][ownerless][0]) == 0
-    assert float(payload["opacities"][ownerless][0]) == pytest.approx(0.04)
     assert audit["canonical_sequence_tree_count"] == 2
     assert audit["canonical_sequence_policy"] == "scene"
     assert audit["canonical_scene_sequence"] == "seq0"
     assert audit["canonical_sequence_histogram"] == {"seq0": 2}
     assert audit["maximum_modes_per_group"] == 2
+
+
+def test_scene_canonical_ownerless_seed_requires_two_canonical_cameras():
+    payload = _payload()
+    # Camera 2 is a second calibrated view in seq0.  Move the second
+    # ownerless observation from non-canonical seq1 to this camera.
+    payload["support_camera_ids"][8, 0] = 2
+    payload["observation_camera_ids"][8, 0] = 2
+    payload["audit"]["selected_views"].append(
+        {"image_id": 2, "sequence_id": "seq0"}
+    )
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload,
+        canonical_sequence_policy="scene",
+        fixed_camera_sequences=[
+            {"image_id": 0, "sequence_id": "seq0"},
+            {"image_id": 1, "sequence_id": "seq1"},
+            {"image_id": 2, "sequence_id": "seq0"},
+        ],
+    )
+    ownerless = fused["static_detail"] & (
+        fused["replacement_group"] < 0
+    )
+    assert audit["ownerless_static_births"] == 1
+    assert audit["ownerless_camera_scope"] == "explicit_canonical_sequence"
+    assert fused["support_camera_ids"][ownerless][0].tolist() == [0, 2]
+    assert fused["verified_camera_ids"][ownerless][0].tolist() == [0, 2]
+    assert int(fused["verified_camera_count"][ownerless][0]) == 2
+    assert int(fused["verified_sequence_count"][ownerless][0]) == 1
+    assert int(fused["verification_state"][ownerless][0]) == 1
+    assert float(fused["opacities"][ownerless][0]) == pytest.approx(0.04)
 
 
 def test_static_fusion_uses_complete_fixed_camera_sequence_contract():
@@ -164,6 +186,7 @@ def test_static_fusion_uses_complete_fixed_camera_sequence_contract():
     ]
     fused, audit = fuse_sequence_evidence_into_static_leaves(
         payload,
+        canonical_sequence_policy="per_tree",
         fixed_camera_sequences=[
             {"image_id": 0, "sequence_id": "seq0"},
             {"image_id": 1, "sequence_id": "seq1"},
@@ -224,6 +247,7 @@ def test_cross_sequence_verified_cell_gets_local_canonical_fallback():
     payload["observation_camera_ids"][6, 0] = 3
     fused, audit = fuse_sequence_evidence_into_static_leaves(
         payload,
+        canonical_sequence_policy="per_tree",
         fixed_camera_sequences=[
             {"image_id": 0, "sequence_id": "seq0"},
             {"image_id": 1, "sequence_id": "seq0"},
@@ -259,6 +283,7 @@ def test_single_view_cell_missing_from_tree_snapshot_remains_static_occupancy():
     payload["observation_camera_ids"][5:7, 0] = 2
     fused, audit = fuse_sequence_evidence_into_static_leaves(
         payload,
+        canonical_sequence_policy="per_tree",
         fixed_camera_sequences=[
             {"image_id": 0, "sequence_id": "seq0"},
             {"image_id": 1, "sequence_id": "seq0"},
@@ -291,7 +316,9 @@ def test_canonical_camera_quality_breaks_equal_support_tie():
             "canonical_quality": 2.0,
         },
     ]
-    fused, audit = fuse_sequence_evidence_into_static_leaves(payload)
+    fused, audit = fuse_sequence_evidence_into_static_leaves(
+        payload, canonical_sequence_policy="per_tree"
+    )
     detail = fused["static_detail"] & (
         fused["replacement_group"] == 0
     )
@@ -307,16 +334,17 @@ def test_canonical_camera_quality_breaks_equal_support_tie():
     )
 
 
-def test_per_tree_snapshot_is_static_production_default():
-    _, scene = fuse_sequence_evidence_into_static_leaves(
-        _payload(), canonical_sequence_policy="scene"
-    )
+def test_scene_snapshot_is_static_production_default():
     _, production = fuse_sequence_evidence_into_static_leaves(_payload())
-    assert scene["canonical_scene_sequence"] == "seq0"
-    assert scene["canonical_sequence_histogram"] == {"seq0": 2}
-    assert production["canonical_scene_sequence"] is None
-    assert production["canonical_sequence_policy"] == "per_tree"
-    assert "per_tree_canonical_sequence" in production["contract"]
+    _, mosaic = fuse_sequence_evidence_into_static_leaves(
+        _payload(), canonical_sequence_policy="per_tree"
+    )
+    assert production["canonical_scene_sequence"] == "seq0"
+    assert production["canonical_sequence_histogram"] == {"seq0": 2}
+    assert production["canonical_sequence_policy"] == "scene"
+    assert mosaic["canonical_scene_sequence"] is None
+    assert mosaic["canonical_sequence_policy"] == "per_tree"
+    assert "per_tree_canonical_sequence" in mosaic["contract"]
 
 
 def test_integrated_mass_survives_scale_refinement():
@@ -356,6 +384,33 @@ def test_split_children_drop_parent_proof_and_keep_mass_and_lineage():
         mass_before,
         rtol=2e-5,
         atol=2e-7,
+    )
+
+
+def test_unresolved_split_sparse_parent_snapshot_survives_checkpoint_restore():
+    payload, _ = fuse_sequence_evidence_into_static_leaves(_payload())
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    parent = torch.nonzero(
+        foliage.persistent_envelope_mask, as_tuple=False
+    ).flatten()[:1]
+    parent_support = foliage.support_camera_ids[parent].clone()
+    foliage.split(parent, birth_iteration=17)
+
+    state = foliage.capture()
+    restored = VolumetricFoliageModel(1, device="cpu")
+    restored.restore(state)
+
+    assert int((restored.proposal_kind == PROPOSAL_SPLIT).sum()) == 2
+    assert len(restored.split_parent_snapshot_family_id) == 1
+    assert restored.proposal_parent_support_camera_ids.shape[0] == 1
+    torch.testing.assert_close(
+        restored.proposal_parent_support_camera_ids,
+        parent_support,
+    )
+    assert (
+        int(restored.next_split_proposal_family_id)
+        > int(restored.split_parent_snapshot_family_id.max())
     )
 
 
@@ -476,6 +531,32 @@ def test_uncovered_hits_require_cross_sequence_consensus_before_birth():
     assert torch.isfinite(colors).all()
     assert cameras.shape == (1, 2)
     assert int(sequences[0]) == 2
+    assert audit["born"] == 1
+
+
+def test_scene_snapshot_birth_accepts_two_cameras_in_canonical_sequence():
+    accumulator = StaticRayBirthAccumulator(voxel_size=0.15)
+    for camera_id, center in (
+        (0, [2.00, 0.00, 3.00]),
+        (1, [2.03, 0.02, 3.01]),
+    ):
+        accumulator.add(
+            {
+                "centers": torch.tensor([center]),
+                "colors": torch.tensor([[0.10, 0.20, 0.30]]),
+                "confidence": torch.tensor([0.8]),
+                "camera_id": camera_id,
+            },
+            sequence_id="seq0",
+        )
+    centers, _, cameras, sequences, audit = accumulator.drain(
+        maximum_births=8,
+        minimum_cameras=2,
+        minimum_sequences=1,
+    )
+    assert len(centers) == 1
+    assert int((cameras[0] >= 0).sum()) == 2
+    assert int(sequences[0]) == 1
     assert audit["born"] == 1
 
 
@@ -678,8 +759,18 @@ def test_runtime_ray_birth_without_same_tree_envelope_remains_ownerless():
     payload, _ = fuse_sequence_evidence_into_static_leaves(_payload())
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(payload)
+    # Give the nearest structural skeleton its own tree identity without an
+    # envelope. Runtime births inherit tree identity from the nearest static
+    # scaffold; absence of an envelope in that same tree must leave the birth
+    # unassociated.
+    skeleton = torch.nonzero(
+        foliage.layer_role == LAYER_STATIC_SKELETON,
+        as_tuple=False,
+    ).flatten()
+    assert len(skeleton) == 1
+    foliage.tree_instance_id[skeleton] = 99
     event = foliage.append_static_ray_births(
-        torch.tensor([[3.0, 0.0, 3.0]])
+        foliage.xyz[skeleton].detach().clone()
     )
     assert foliage.replacement_group[-1] == -1
     assert event["replacement_group_association"]["assigned"] == 0

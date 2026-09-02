@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import importlib
 from pathlib import Path
 import sys
 
@@ -24,6 +26,7 @@ from outdoor.hybrid_gaussian_renderer import (  # noqa: E402
     VolumetricFoliageModel,
     dynamic_visibility_gate,
     render_hybrid,
+    static_detail_forward_visibility_gate,
 )
 from scene import GaussianModel  # noqa: E402
 
@@ -136,13 +139,80 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v86_sequence_geometry_optical_handoff",
     "cambridge_native_hybrid_teacher_v87_static_optical_ownership_calibration",
     "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule",
+    "cambridge_native_hybrid_teacher_v89_canonical_occlusion_completion",
+    "cambridge_native_hybrid_teacher_v90_normalized_canonical_occlusion_completion",
+    "cambridge_native_hybrid_teacher_v91_canonical_occlusion_depth_order",
+    "cambridge_native_hybrid_teacher_v92_canonical_visibility_floor",
+    "cambridge_native_hybrid_teacher_v93_post_topology_canonical_occlusion",
+    "cambridge_native_hybrid_teacher_v94_verified_local_occlusion_lifecycle",
+    "cambridge_native_hybrid_teacher_v95_atomic_split_intrinsic_occlusion",
+    "cambridge_native_hybrid_teacher_v96_pixel_exact_mixed_depth_order",
+    "cambridge_native_hybrid_teacher_v97_static_evidence_tier_settle",
+    "cambridge_native_hybrid_teacher_v98_static_evidence_tier_finite_hf",
+    "cambridge_native_hybrid_teacher_v99_static_evidence_debt_closed",
+    "cambridge_native_hybrid_teacher_v100_front_clipped_optical_cleanup",
+    "cambridge_native_hybrid_teacher_v101_snapshot_owned_static_detail",
+    "cambridge_native_hybrid_teacher_v102_bidirectional_optical_trust",
+    "cambridge_native_hybrid_teacher_v103_local_optical_redistribution",
+    "cambridge_native_hybrid_teacher_v104_signed_occlusion_responsibility",
+    "cambridge_native_hybrid_teacher_v105_late_optical_convergence",
+    "cambridge_native_hybrid_teacher_v106_exact_support_canonical_coverage",
+    "cambridge_native_hybrid_teacher_v107_global_canonical_negative_cleanup",
+    "cambridge_native_hybrid_teacher_v108_evidence_bounded_detail_completion",
+    "cambridge_native_hybrid_teacher_v109_moge3_exact_k_front_hit",
+    "cambridge_native_hybrid_teacher_v110_moge3_native_depth_query_optical",
+    "cambridge_native_hybrid_teacher_v111_moge3_chart_normal_static_canopy",
+    "cambridge_native_hybrid_teacher_v112_moge3_scene_scale_authority",
+    "cambridge_native_hybrid_teacher_v113_moge3_thin_hit_interval",
+    "cambridge_native_hybrid_teacher_v117_persistent_thin_hit_ownership",
     "unified_outdoor_mixed_teacher_v1",
+}
+
+MIXED_PIXEL_DEPTH_REPAIR_PREDECESSOR = {
+    "protocol": (
+        "cambridge_native_hybrid_teacher_v95_atomic_split_intrinsic_occlusion"
+    ),
+    "mixed_forward_cuda": (
+        "89432313e3f5f58bd0f7df586ba52050f8211c351e57930c4d365114303500bc"
+    ),
+    "mixed_backward_cuda": (
+        "cb871d0a883031c6a78527d4da49bd53e2f931147bbd07f9d391645ffd336fc4"
+    ),
+    "mixed_rasterizer_impl_cuda": (
+        "715d3c3182e825870fd06b101c58e8721ac09d7b592bec0591909eb148323245"
+    ),
+    "mixed_extension_source_tree": (
+        "6d11444d3dc3c8acb5c488a8cc780f5b099544828d15a052499649d868f0df5a"
+    ),
+    "mixed_extension_binary": (
+        "a1a4286a4ee337656a91e74aac83eb002f5e2d00ce8b119a643ac4ce3c693210"
+    ),
+}
+MIXED_PIXEL_DEPTH_REPAIR_TARGET = {
+    "mixed_forward_cuda": (
+        "2c83aae8320cb831ae9f2bcf514e314cd175702ea481a732fd10a71273ff049d"
+    ),
+    "mixed_backward_cuda": (
+        "9b463046c92b7aeb743f4de82cb471975ba630171d71c0dabef58337f5734645"
+    ),
+    "mixed_rasterizer_impl_cuda": (
+        "fe1971cc2e34add7eb31477b82ec6293955da47f512b0d41783555fca13c8a13"
+    ),
+    "mixed_extension_source_tree": (
+        "b27b3d0a462aa1e91e3c57da0c973c9b66754b75df162f59d3e6f1b37fed8699"
+    ),
+    "mixed_extension_binary": (
+        "39532d9c03f0de333b9eec23f893389b6dc902bfdf11cc1dda5832a01be6800d"
+    ),
 }
 
 
 STATIC_RAY_NORMALIZED_OPTICAL_POLICY = "ray_normalized_two_pass"
 STATIC_RAY_SURFACE_EVIDENCE_POLICY = (
     "ray_normalized_surface_evidence_three_pass"
+)
+STATIC_DEPTH_ORDERED_LAYER_POLICY = (
+    "static_depth_ordered_surface_volume_two_pass"
 )
 STATIC_DEPLOYMENT_OPTICAL_PRIOR = 0.25
 SUPPORTED_OPTICAL_REPLACEMENT_POLICIES = {
@@ -151,6 +221,7 @@ SUPPORTED_OPTICAL_REPLACEMENT_POLICIES = {
     "disabled",
     STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
     STATIC_RAY_SURFACE_EVIDENCE_POLICY,
+    STATIC_DEPTH_ORDERED_LAYER_POLICY,
 }
 
 
@@ -446,6 +517,150 @@ def _static_surface_evidence_mixture(
     )
     return mixed, surface_weight
 
+
+def _static_depth_ordered_surface_volume_mixture(
+    surface: HybridRenderOutput,
+    volume: HybridRenderOutput,
+    *,
+    background: torch.Tensor | None = None,
+    clearance: float = 0.0,
+    epsilon: float = 1.0e-6,
+) -> tuple[HybridRenderOutput, torch.Tensor]:
+    """Compose isolated rigid/foliage layers in per-pixel metric order.
+
+    This is a diagnostic counterfactual, not the deployment compositor.  The
+    native mixed rasterizer now keys a 2D surfel by its ray-intersection depth
+    at each tile centre and recomputes the exact intersection in its pixel
+    loop.  This helper instead collapses each isolated layer to one mean depth
+    per pixel, so it cannot represent a V-near -> surface -> V-far stack.
+    It is useful for measuring coarse layer-order disagreement only.
+
+    The order decision is detached and uses no RGB, semantic mask, sequence,
+    view id or target image.  Gradients still flow through both ordinary
+    alpha-compositing equations to the layer parameters that own them.
+    """
+    if float(clearance) < 0.0:
+        raise ValueError("Static layer depth clearance cannot be negative")
+    if surface.render.shape != volume.render.shape:
+        raise ValueError("Static surface/volume RGB shapes differ")
+    if surface.alpha.shape != volume.alpha.shape:
+        raise ValueError("Static surface/volume alpha shapes differ")
+    if background is None:
+        background = torch.ones(
+            3,
+            device=surface.render.device,
+            dtype=surface.render.dtype,
+        )
+    background = torch.as_tensor(
+        background,
+        device=surface.render.device,
+        dtype=surface.render.dtype,
+    )
+    if background.numel() != 3:
+        raise ValueError("Static layer background must contain three RGB values")
+    background = background.reshape(3, 1, 1)
+
+    surface_alpha = surface.alpha.clamp(0.0, 1.0)
+    volume_alpha = volume.alpha.clamp(0.0, 1.0)
+    surface_present = surface_alpha > float(epsilon)
+    volume_present = volume_alpha > float(epsilon)
+    surface_depth = surface.depth
+    volume_depth = volume.depth
+    both_valid = (
+        surface_present
+        & volume_present
+        & torch.isfinite(surface_depth)
+        & torch.isfinite(volume_depth)
+        & (surface_depth > 0)
+        & (volume_depth > 0)
+    )
+    volume_in_front = torch.where(
+        both_valid,
+        volume_depth + float(clearance) < surface_depth,
+        volume_present & ~surface_present,
+    ).detach()
+
+    volume_front_rgb = volume.render + (1.0 - volume_alpha) * (
+        surface.render - background
+    )
+    surface_front_rgb = surface.render + (1.0 - surface_alpha) * (
+        volume.render - background
+    )
+    render = torch.where(
+        volume_in_front.expand_as(volume_front_rgb),
+        volume_front_rgb,
+        surface_front_rgb,
+    )
+    total_alpha = 1.0 - (1.0 - surface_alpha) * (1.0 - volume_alpha)
+    surface_contribution = torch.where(
+        volume_in_front,
+        (1.0 - volume_alpha) * surface_alpha,
+        surface_alpha,
+    )
+    volume_contribution = torch.where(
+        volume_in_front,
+        volume_alpha,
+        (1.0 - surface_alpha) * volume_alpha,
+    )
+    depth = torch.nan_to_num(
+        (
+            surface_contribution * surface_depth
+            + volume_contribution * volume_depth
+        )
+        / total_alpha.clamp_min(float(epsilon)),
+        0.0,
+        0.0,
+    )
+
+    def row_union(a: torch.Tensor | None, b: torch.Tensor | None):
+        if a is None or b is None:
+            return a if b is None else b
+        if a.shape != b.shape:
+            raise ValueError("Static layer primitive fields no longer align")
+        return torch.maximum(a, b)
+
+    mixed = HybridRenderOutput(
+        render=render,
+        alpha=total_alpha,
+        depth=depth,
+        normal_world=(
+            surface_contribution * surface.normal_world
+            + volume_contribution * volume.normal_world
+        ) / total_alpha.clamp_min(float(epsilon)),
+        median_depth=torch.where(
+            volume_in_front, volume.median_depth, surface.median_depth
+        ),
+        distortion=surface.distortion + volume.distortion,
+        radii=row_union(surface.radii, volume.radii),
+        means2d=None,
+        structural_count=surface.structural_count,
+        responsibility=row_union(
+            surface.responsibility, volume.responsibility
+        ),
+        gate_responsibility=row_union(
+            surface.gate_responsibility, volume.gate_responsibility
+        ),
+        surface_alpha=surface_contribution,
+        volume_alpha=volume_contribution,
+        surface_depth=surface_depth,
+        volume_depth=volume_depth,
+        surface_means2d=None,
+        volume_means2d=None,
+        volume_replacement=row_union(
+            surface.volume_replacement, volume.volume_replacement
+        ),
+        volume_replacement_candidate=row_union(
+            surface.volume_replacement_candidate,
+            volume.volume_replacement_candidate,
+        ),
+    )
+    # The public diagnostic field is explicitly *surface* responsibility.
+    # Returning ``volume_in_front`` here inverted that meaning and made a
+    # foreground leaf look like foreground-surface evidence.  Empty pixels
+    # own neither layer, so do not use the tempting ``1-volume_in_front``.
+    surface_in_front = surface_present & (~volume_present | ~volume_in_front)
+    return mixed, surface_in_front.to(render.dtype)
+
 # These pairs are audited render-equivalent, not a general stale-code escape
 # hatch.  The newer VolumetricFoliageModel revision only adds split-time
 # evidence bookkeeping and changes how *future training* creates children.
@@ -711,12 +926,40 @@ STATIC_OPTICAL_HANDOFF_REPAIR_PREDECESSOR = {
 }
 
 
+def _source_tree_sha256(root: Path) -> str:
+    root = Path(root).resolve()
+    suffixes = {".cu", ".cuh", ".h", ".hpp", ".cpp", ".py"}
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in suffixes
+        and "build" not in path.relative_to(root).parts
+        and "__pycache__" not in path.relative_to(root).parts
+    )
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return digest.hexdigest()
+
+
+def _loaded_module_binary_sha256(module_name: str) -> str:
+    module = importlib.import_module(module_name)
+    origin = getattr(module, "__file__", None)
+    if not origin:
+        raise RuntimeError(f"Loaded module {module_name} has no binary origin")
+    return sha256_file(Path(origin).resolve())
+
+
 def _validate_render_implementation(
     state: dict,
     *,
     allow_projected_optical_footprint_repair: bool = False,
     allow_static_foliage_render_repair: bool = False,
     allow_static_optical_handoff_repair: bool = False,
+    allow_mixed_pixel_depth_repair: bool = False,
 ) -> dict:
     """Reject silently reinterpreting a state with different render code."""
     expected = state.get("implementation_hashes")
@@ -739,6 +982,21 @@ def _validate_render_implementation(
         "mixed_forward_cuda": SURFEL_ROOT
         / "submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu",
     }
+    optional_paths = {
+        "mixed_backward_cuda": SURFEL_ROOT
+        / "submodules/diff-surfel-rasterization/cuda_rasterizer/mixed_backward.cu",
+        "mixed_rasterizer_impl_cuda": SURFEL_ROOT
+        / "submodules/diff-surfel-rasterization/cuda_rasterizer/rasterizer_impl.cu",
+        "mixed_cuda_config": SURFEL_ROOT
+        / "submodules/diff-surfel-rasterization/cuda_rasterizer/config.h",
+    }
+    paths.update(
+        {
+            name: path
+            for name, path in optional_paths.items()
+            if name in expected
+        }
+    )
     changed = []
     equivalent = {}
     actual_hashes = {}
@@ -759,6 +1017,22 @@ def _validate_render_implementation(
                 "runtime_hash": actual,
                 "reason": migration,
             }
+    extension_root = (
+        SURFEL_ROOT / "submodules/diff-surfel-rasterization"
+    )
+    derived_hashes = {}
+    if "mixed_extension_source_tree" in expected:
+        derived_hashes["mixed_extension_source_tree"] = (
+            _source_tree_sha256(extension_root)
+        )
+    if "mixed_extension_binary" in expected:
+        derived_hashes["mixed_extension_binary"] = (
+            _loaded_module_binary_sha256("diff_surfel_rasterization._C")
+        )
+    for name, actual in derived_hashes.items():
+        actual_hashes[name] = actual
+        if expected.get(name) != actual:
+            changed.append(name)
     causal_repair = None
     deployment_static = state.get("training_contract", {}).get(
         "deployment_static_contract", {}
@@ -787,6 +1061,39 @@ def _validate_render_implementation(
             "reason": (
                 "v59 ray-normalized deployment is unchanged; v60 modifies "
                 "only future training evidence/lifecycle and adds metadata"
+            ),
+        }
+        changed.clear()
+    if (
+        allow_mixed_pixel_depth_repair
+        and state.get("protocol")
+        == MIXED_PIXEL_DEPTH_REPAIR_PREDECESSOR["protocol"]
+        and set(changed)
+        == set(MIXED_PIXEL_DEPTH_REPAIR_TARGET)
+        and all(
+            expected.get(name)
+            == MIXED_PIXEL_DEPTH_REPAIR_PREDECESSOR[name]
+            for name in MIXED_PIXEL_DEPTH_REPAIR_TARGET
+        )
+        and all(
+            actual_hashes.get(name) == target
+            for name, target in MIXED_PIXEL_DEPTH_REPAIR_TARGET.items()
+        )
+    ):
+        causal_repair = {
+            "kind": "mixed_pixel_depth_order",
+            "state_hashes": {
+                name: expected[name]
+                for name in MIXED_PIXEL_DEPTH_REPAIR_TARGET
+            },
+            "runtime_hashes": {
+                name: actual_hashes[name]
+                for name in MIXED_PIXEL_DEPTH_REPAIR_TARGET
+            },
+            "reason": (
+                "explicit zero-training v95 diagnostic: replace tile-centre "
+                "surface ordering with unbounded-total-capacity exact "
+                "per-pixel top-k batch ordering in forward and backward"
             ),
         }
         changed.clear()
@@ -863,7 +1170,10 @@ def _validate_render_implementation(
         )
     return {
         "status": (
-            "static_foliage_render_causal_repair"
+            "mixed_pixel_depth_order_causal_repair"
+            if causal_repair is not None
+            and causal_repair.get("kind") == "mixed_pixel_depth_order"
+            else "static_foliage_render_causal_repair"
             if causal_repair is not None
             and state.get("protocol")
             == STATIC_FOLIAGE_RENDER_REPAIR_PREDECESSOR["protocol"]
@@ -1076,25 +1386,28 @@ class HybridTeacher:
             STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
             STATIC_RAY_SURFACE_EVIDENCE_POLICY,
         }
+        depth_ordered_static = (
+            optical_replacement_policy == STATIC_DEPTH_ORDERED_LAYER_POLICY
+        )
         surface_evidence_static = (
             optical_replacement_policy
             == STATIC_RAY_SURFACE_EVIDENCE_POLICY
         )
-        if ray_normalized_static:
+        if ray_normalized_static or depth_ordered_static:
             if conditioned:
                 raise ValueError(
-                    "ray_normalized_two_pass is a single-static-map policy; "
+                    "Multi-pass static compositing is a single-static-map policy; "
                     "it cannot render a sequence-conditioned branch"
                 )
             if self.state.get("training_contract", {}).get(
                 "reconstruction_target"
             ) != "static":
                 raise ValueError(
-                    "ray_normalized_two_pass requires a static Teacher"
+                    "Multi-pass static compositing requires a static Teacher"
                 )
             if volume_layer != "all":
                 raise ValueError(
-                    "ray_normalized_two_pass owns the envelope/detail split; "
+                    "Multi-pass static compositing owns the volume layers; "
                     "explicit volume_layer counterfactuals must use a "
                     "single-pass replacement policy"
                 )
@@ -1150,6 +1463,24 @@ class HybridTeacher:
                 volume_gate = dynamic_visibility_gate(
                     self.foliage, int(camera.colmap_id), None, None
                 )
+        training_contract = self.state.get("training_contract", {})
+        deployment_contract = training_contract.get(
+            "deployment_static_contract", {}
+        )
+        if (
+            training_contract.get("reconstruction_target") == "static"
+            and deployment_contract.get("detail_visibility") is not None
+        ):
+            static_gate = static_detail_forward_visibility_gate(
+                self.foliage,
+                int(camera.colmap_id),
+                include_pending_exact=False,
+            )
+            volume_gate = (
+                static_gate
+                if volume_gate is None
+                else volume_gate * static_gate
+            )
         def render_package(
             role_mask: torch.Tensor | None,
             replacement_policy: str,
@@ -1185,7 +1516,41 @@ class HybridTeacher:
 
         optical_detail_responsibility = None
         optical_surface_responsibility = None
-        if ray_normalized_static and not surface_only:
+        if depth_ordered_static and not surface_only and not volume_only:
+            surface_package = render_package(
+                torch.zeros_like(
+                    self.foliage.layer_role, dtype=torch.bool
+                ),
+                "disabled",
+            )
+            # ``render_package`` only exposes the public counterfactual flags;
+            # issue the complementary surface-zero pass explicitly here.
+            volume_package = render_hybrid(
+                camera,
+                self.surface,
+                self.foliage,
+                background=background,
+                temporal_code=None,
+                include_dynamic=False,
+                volume_opacity_scale=(
+                    1.0 if bool(validity["canonical_canopy"]) else 0.0
+                ),
+                surface_gate=torch.zeros_like(
+                    self.surface.get_opacity.reshape(-1)
+                ),
+                exact_ray_render_aspect_limit=(
+                    exact_ray_render_aspect_limit
+                ),
+                optical_replacement_policy="disabled",
+            )
+            package, optical_surface_responsibility = (
+                _static_depth_ordered_surface_volume_mixture(
+                    surface_package,
+                    volume_package,
+                    background=background,
+                )
+            )
+        elif ray_normalized_static and not surface_only:
             skeleton = self.foliage.static_skeleton_mask
             envelope_package = render_package(
                 skeleton | self.foliage.persistent_envelope_mask,
@@ -1273,10 +1638,10 @@ class HybridTeacher:
             "surface_alpha": package.surface_alpha,
             "volume_alpha": package.volume_alpha,
             # Expose footprint diagnostics without changing the rendered
-            # representation. Mixed tile order is keyed by centre depth,
-            # while a 2D surfel's final ray-intersection depth is pixel
-            # dependent. Large projected surfels are therefore the subset
-            # for which that standard approximation deserves explicit audit.
+            # representation.  The native mixed kernel now orders every 2D
+            # surfel by its pixel-local ray-intersection depth; radii remain
+            # useful footprint diagnostics, but no longer identify a
+            # centre-depth ordering approximation.
             "surface_radii": package_radii[:structural_count],
             "volume_radii": package_radii[structural_count:],
             "volume_means2d": getattr(package, "volume_means2d", None),
@@ -1388,6 +1753,7 @@ def load_hybrid_teacher(
     allow_projected_optical_footprint_repair: bool = False,
     allow_static_foliage_render_repair: bool = False,
     allow_static_optical_handoff_repair: bool = False,
+    allow_mixed_pixel_depth_repair: bool = False,
 ) -> HybridTeacher:
     """Load a Teacher state. No student conversion or COLMAP geometry is used."""
     try:
@@ -1410,6 +1776,7 @@ def load_hybrid_teacher(
         allow_static_optical_handoff_repair=(
             allow_static_optical_handoff_repair
         ),
+        allow_mixed_pixel_depth_repair=allow_mixed_pixel_depth_repair,
     )
     state["_render_implementation_validation"] = implementation_validation
     surface = GaussianModel(sh_degree)

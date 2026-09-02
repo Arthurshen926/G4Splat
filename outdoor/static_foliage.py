@@ -9,6 +9,7 @@ import torch
 from outdoor.hybrid_gaussian_renderer import (
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
+    VERIFICATION_MEASURED_SINGLE,
     VERIFICATION_UNVERIFIED,
     VERIFICATION_VERIFIED,
     projected_gaussian_cross_section,
@@ -523,8 +524,19 @@ def _append_ownerless_static_ray_births(
     minimum_supporting_views: int = 2,
     minimum_supporting_sequences: int = 2,
     initial_opacity: float = 0.04,
+    allowed_camera_ids: torch.Tensor | None = None,
+    camera_sequence_by_id: torch.Tensor | None = None,
 ) -> tuple[dict, dict[str, int | float]]:
-    """Promote only cross-sequence consensus from ownerless hit births."""
+    """Promote calibrated multi-view consensus from ownerless hit rows.
+
+    Scene-canonical reconstruction passes only cameras from the selected
+    acquisition.  A leaf observed only in another traversal is unknown at the
+    canonical instant and must not become a speculative static-map proposal.
+    Every emitted cell already has the required independent calibrated camera
+    observations, so it enters as a verified seed with the exact camera table;
+    runtime topology proposals remain unverified and use the bounded proposal
+    lifecycle instead.
+    """
     centers = torch.as_tensor(original["centers"]).float().cpu()
     count = len(centers)
     layer = torch.as_tensor(original["layer_role"]).cpu()
@@ -540,6 +552,27 @@ def _append_ownerless_static_ray_births(
     support = torch.as_tensor(original["support_camera_ids"]).cpu()
     camera = _first_valid_camera(support)[rows]
     valid_camera = camera >= 0
+    if allowed_camera_ids is not None:
+        allowed_camera_ids = torch.as_tensor(
+            allowed_camera_ids, dtype=torch.int64
+        ).cpu()
+        if allowed_camera_ids.ndim != 1:
+            raise ValueError("allowed ownerless camera ids must be one-dimensional")
+        maximum_allowed_camera = max(
+            int(camera.max()) if len(camera) else -1,
+            int(allowed_camera_ids.max()) if len(allowed_camera_ids) else -1,
+        )
+        allowed_lookup = torch.zeros(
+            maximum_allowed_camera + 1, dtype=torch.bool
+        )
+        if len(allowed_camera_ids):
+            if bool((allowed_camera_ids < 0).any()):
+                raise ValueError("allowed ownerless camera ids must be non-negative")
+            allowed_lookup[allowed_camera_ids] = True
+        in_range = camera < len(allowed_lookup)
+        allowed = torch.zeros_like(valid_camera)
+        allowed[in_range] = allowed_lookup[camera[in_range]]
+        valid_camera &= allowed
     rows = rows[valid_camera]
     camera = camera[valid_camera]
     if not len(rows):
@@ -564,19 +597,31 @@ def _append_ownerless_static_ray_births(
     view_count.index_add_(
         0, pair_cell, torch.ones_like(pair_cell, dtype=torch.int64)
     )
-    selected_views = original.get("audit", {}).get("selected_views", [])
-    sequence_name_to_id: dict[str, int] = {}
-    camera_sequence = torch.full(
-        (maximum_camera - 1,), -1, dtype=torch.int64
-    )
-    for record in selected_views:
-        image_id = int(record.get("image_id", -1))
-        if image_id < 0 or image_id >= len(camera_sequence):
-            continue
-        name = str(record.get("sequence_id", ""))
-        if name not in sequence_name_to_id:
-            sequence_name_to_id[name] = len(sequence_name_to_id)
-        camera_sequence[image_id] = sequence_name_to_id[name]
+    if camera_sequence_by_id is not None:
+        supplied_camera_sequence = torch.as_tensor(
+            camera_sequence_by_id, dtype=torch.int64
+        ).cpu()
+        if supplied_camera_sequence.ndim != 1:
+            raise ValueError("ownerless camera sequence table must be one-dimensional")
+        camera_sequence = torch.full(
+            (maximum_camera - 1,), -1, dtype=torch.int64
+        )
+        retained = min(len(camera_sequence), len(supplied_camera_sequence))
+        camera_sequence[:retained] = supplied_camera_sequence[:retained]
+    else:
+        selected_views = original.get("audit", {}).get("selected_views", [])
+        sequence_name_to_id: dict[str, int] = {}
+        camera_sequence = torch.full(
+            (maximum_camera - 1,), -1, dtype=torch.int64
+        )
+        for record in selected_views:
+            image_id = int(record.get("image_id", -1))
+            if image_id < 0 or image_id >= len(camera_sequence):
+                continue
+            name = str(record.get("sequence_id", ""))
+            if name not in sequence_name_to_id:
+                sequence_name_to_id[name] = len(sequence_name_to_id)
+            camera_sequence[image_id] = sequence_name_to_id[name]
     sequence = camera_sequence[camera.clamp(0, len(camera_sequence) - 1)]
     valid_sequence = sequence >= 0
     if bool(valid_sequence.any()):
@@ -756,14 +801,22 @@ def _append_ownerless_static_ray_births(
             "unknown_view_count",
             "split_generation",
             "replacement_observation_count",
-            "verified_camera_count",
-            "verified_sequence_count",
         }:
             detail.zero_()
         elif name == "verification_state":
-            detail.fill_(VERIFICATION_UNVERIFIED)
+            detail.fill_(VERIFICATION_VERIFIED)
         elif name == "verified_camera_ids":
-            detail.fill_(-1)
+            detail = birth_support_camera_ids[
+                :, : existing.shape[1]
+            ].to(existing.dtype)
+        elif name == "verified_camera_count":
+            detail = (birth_support_camera_ids >= 0).sum(dim=1).clamp_max(
+                torch.iinfo(existing.dtype).max
+            ).to(existing.dtype)
+        elif name == "verified_sequence_count":
+            detail = sequence_count[valid_cells].clamp_max(
+                torch.iinfo(existing.dtype).max
+            ).to(existing.dtype)
         elif name in {"replacement_overlap_ema"}:
             detail.zero_()
         elif name == "static_detail":
@@ -781,6 +834,12 @@ def _append_ownerless_static_ray_births(
         "ownerless_support_camera_pairs_truncated": int(
             len(camera_pairs) - int(within_width.sum())
         ),
+        "ownerless_camera_scope": (
+            "explicit_canonical_sequence"
+            if allowed_camera_ids is not None
+            else "all_available_sequences"
+        ),
+        "ownerless_seed_lifecycle": "input_multiview_verified",
         "voxel_size": float(voxel_size),
         "minimum_supporting_views": int(minimum_supporting_views),
         "minimum_supporting_sequences": int(minimum_supporting_sequences),
@@ -794,7 +853,7 @@ def fuse_sequence_evidence_into_static_leaves(
     initial_opacity: float = 0.05,
     canonical_mode_voxel_size: float = 0.08,
     maximum_modes_per_group: int = 2,
-    canonical_sequence_policy: str = "per_tree",
+    canonical_sequence_policy: str = "scene",
     fixed_camera_sequences: list[dict] | None = None,
 ) -> tuple[dict, dict[str, int | float | str]]:
     """Fuse camera observations into a coherent multi-mode static snapshot.
@@ -1502,11 +1561,10 @@ def fuse_sequence_evidence_into_static_leaves(
         & (geometry_mode_sequence_count >= 2)
     )
     # Initialization rows are real calibrated evidence, not speculative split
-    # children.  Accept every emitted canonical mode into the seed lifecycle;
-    # the explicit camera counts below still reserve geometry/high-order SH
-    # refinement for multiview modes, while single-view rows receive only
-    # exact-owner DC/opacity/ray supervision.  This keeps global child debt
-    # from treating 56k real one-view leaf observations as failed topology.
+    # children.  A one-camera measurement is nevertheless not a persistent
+    # map element.  Give it a terminal measured tier, distinct from both the
+    # proposal debt lifecycle and multiview verification, so downstream code
+    # cannot turn "accepted seed" into whole-sequence SH/opacity authority.
     detail_seed_accepted = valid_mode_support.any(dim=1)
     parent_rows = envelope_rows[mode_groups]
 
@@ -1589,9 +1647,19 @@ def fuse_sequence_evidence_into_static_leaves(
         (len(static_detail),), VERIFICATION_VERIFIED, dtype=torch.int8
     )
     verification_state[prefix_count:] = torch.where(
-        detail_seed_accepted,
+        detail_geometry_retirement_authorized,
         torch.full((mode_count,), VERIFICATION_VERIFIED, dtype=torch.int8),
-        torch.full((mode_count,), VERIFICATION_UNVERIFIED, dtype=torch.int8),
+        torch.where(
+            detail_seed_accepted,
+            torch.full(
+                (mode_count,),
+                VERIFICATION_MEASURED_SINGLE,
+                dtype=torch.int8,
+            ),
+            torch.full(
+                (mode_count,), VERIFICATION_UNVERIFIED, dtype=torch.int8
+            ),
+        ),
     )
     result["verification_state"] = verification_state
     result["verified_camera_ids"] = result["observation_camera_ids"].clone()
@@ -1645,10 +1713,23 @@ def fuse_sequence_evidence_into_static_leaves(
         )
     )
     pre_ownerless_count = len(result["centers"])
+    ownerless_allowed_camera_ids = None
+    ownerless_minimum_sequences = 2
+    if canonical_sequence_policy == "scene":
+        ownerless_allowed_camera_ids = torch.nonzero(
+            camera_sequence == int(scene_sequence), as_tuple=False
+        ).flatten()
+        # Two calibrated cameras in the selected coherent acquisition are
+        # sufficient to triangulate a canonical static seed. Other
+        # acquisitions are deliberately unknown, not extra foliage owners.
+        ownerless_minimum_sequences = 1
     result, ownerless_audit = _append_ownerless_static_ray_births(
         result,
         payload,
         minimum_supporting_views=minimum_supporting_views,
+        minimum_supporting_sequences=ownerless_minimum_sequences,
+        allowed_camera_ids=ownerless_allowed_camera_ids,
+        camera_sequence_by_id=camera_sequence,
     )
     # Ownerless cross-sequence visual-hull births have no envelope donor.  They
     # retain their own mass as a reference but never inherit a retirement
