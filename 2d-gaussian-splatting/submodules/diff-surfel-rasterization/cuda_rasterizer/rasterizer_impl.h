@@ -45,7 +45,8 @@ namespace CudaRasterizer
 
 	// Storage used by the native mixed rasterizer. Surface and volume
 	// primitives share screen-space/depth/tile arrays so that a single
-	// radix sort produces the exact visibility order. Representation-
+	// radix sort uses volume-centre and per-tile surfel-intersection keys.
+	// Representation-
 	// specific data stays compact and is indexed with either the global
 	// surface id or (global id - surface_count).
 	struct MixedGeometryState

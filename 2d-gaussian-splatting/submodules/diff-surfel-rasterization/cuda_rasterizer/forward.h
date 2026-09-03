@@ -114,9 +114,10 @@ namespace FORWARD
 
 	void mixed_render(
 		const dim3 grid, dim3 block,
-		const uint2* ranges,
-		const uint32_t* point_list,
-		int surface_count,
+			const uint2* ranges,
+			const uint32_t* point_list,
+			const uint64_t* point_list_keys,
+			int surface_count,
 		int W, int H,
 		const float2* means2D,
 		const float* colors,
@@ -125,6 +126,8 @@ namespace FORWARD
 		const float* surface_gate_atlas,
 		int gate_count,
 		int gate_size,
+		const float* depth_query_bounds,
+		bool has_depth_query,
 		const float* surface_transMats,
 		const float3* surface_normals,
 		const float4* volume_conic,

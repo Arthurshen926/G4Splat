@@ -1,6 +1,9 @@
 import torch
 
-from outdoor.hybrid_gaussian_renderer import projected_gaussian_cross_section
+from outdoor.hybrid_gaussian_renderer import (
+    VERIFICATION_MEASURED_SINGLE,
+    projected_gaussian_cross_section,
+)
 from outdoor.static_foliage import (
     fuse_sequence_evidence_into_static_leaves,
     _initialize_static_detail_group_mass_handoff,
@@ -207,7 +210,9 @@ def test_parent_cross_sequence_count_does_not_verify_a_different_detail_cell():
     # traversal does not verify this exact leaf cell. It may be born as a
     # bounded one-camera occupancy hypothesis but cannot retire envelope mass
     # or use multiview refinement.
-    assert int(fused["verification_state"][detail][0]) == 1
+    assert int(fused["verification_state"][detail][0]) == (
+        VERIFICATION_MEASURED_SINGLE
+    )
     assert int(fused["verified_camera_count"][detail][0]) == 1
     assert float(fused["opacities"][detail][0]) > 0.0
     fused_mass = _mass(fused)

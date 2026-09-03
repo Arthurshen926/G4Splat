@@ -7,9 +7,11 @@ from outdoor.evidence_store import sha256_file
 from scripts.run_cambridge_hybrid_teacher import (
     PIPELINE_VERSION,
     PROFILES,
+    UNIFIED_TEACHER_PROTOCOL,
     _evaluation_is_current,
     _teacher_command,
     _teacher_evaluation_mode,
+    _teacher_finalization_is_recoverable,
     _teacher_result_is_current,
     _trainer_implementation_hashes,
 )
@@ -44,6 +46,29 @@ def test_scene_contract_entrypoint_imports_repo_from_any_working_directory(
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_only_in_progress_hash_bound_finalization_is_recoverable(tmp_path):
+    checkpoint = tmp_path / "hybrid_teacher_checkpoint.pth"
+    checkpoint.write_bytes(b"final-checkpoint")
+    sidecar = tmp_path / "finalization_state.json"
+    state = {
+        "status": "in_progress",
+        "protocol": UNIFIED_TEACHER_PROTOCOL,
+        "iteration": 30_000,
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+    }
+    sidecar.write_text(json.dumps(state), encoding="utf-8")
+
+    assert _teacher_finalization_is_recoverable(
+        tmp_path, iterations=30_000
+    )
+    state["checkpoint_sha256"] = "0" * 64
+    sidecar.write_text(json.dumps(state), encoding="utf-8")
+    assert not _teacher_finalization_is_recoverable(
+        tmp_path, iterations=30_000
+    )
 
 
 def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
@@ -101,7 +126,7 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
     assert profile["surface_densify_until_fraction"] == 0.40
     assert profile["mature_handoff_surface_policy"] == "atlas_residual"
     assert profile["maximum_rigid_completion_seeds"] == 20_000
-    assert profile["volume_opacity_lr"] == 4.0e-3
+    assert profile["volume_opacity_lr"] == 2.0e-3
     assert (
         profile[
             "surface_retirement_optical_mass_fraction_per_event"
@@ -118,6 +143,20 @@ def test_quality_profile_decouples_foliage_coverage_from_ray_bandwidth():
     assert "TEMPORAL_DAV2_AUGMENTATION_VERSION" in runner
     assert "rebuild_foliage_with_rigid_depth.py" in runner
     assert "RIGID_CALIBRATED_INITIALIZATION_VERSION" in runner
+
+
+def test_moge3_profile_explicitly_owns_depth_query_optics_and_births():
+    profile = PROFILES["moge3_static_quality"]
+    assert profile["monocular_geometry_source"] == "moge3"
+    assert profile["maximum_dav2_rigid_seeds"] == 0
+    assert profile["use_temporal_dav2_witnesses"] is False
+    assert profile["moge3_canopy_optical_weight"] == 0.20
+    assert profile["moge3_canopy_optical_every"] == 2
+    assert profile["moge3_canopy_prehit_weight"] == 0.25
+    assert profile["moge3_canopy_maximum_birth_proposals"] == 256
+    assert profile["moge3_rigid_depth_weight"] == 0.04
+    assert profile["moge3_rigid_normal_weight"] == 0.02
+    assert profile["chart_base_source"] == "moge3_adaptive"
 
 
 def test_fast_profile_shortens_training_without_halving_foliage_evidence():
@@ -179,6 +218,12 @@ def test_staged_teacher_command_closes_scale_and_rigid_lr_contract(tmp_path):
     )
     assert command[command.index("--reconstruction-target") + 1] == "static"
     assert (
+        command[
+            command.index("--static-canonical-sequence-policy") + 1
+        ]
+        == "scene"
+    )
+    assert (
         command[command.index("--geometry-gradient-ratio") + 1]
         == "0.25"
     )
@@ -235,6 +280,75 @@ def test_staged_teacher_command_closes_scale_and_rigid_lr_contract(tmp_path):
         == "0.0025"
     )
 
+    static_command = _teacher_command(
+        **{**common, "training_profile": "static_handoff_quality"},
+        moge3_canopy_optical_weight=0.20,
+        moge3_canopy_optical_every=2,
+        moge3_canopy_prehit_weight=0.25,
+        moge3_canopy_maximum_birth_proposals=256,
+        moge3_rigid_depth_weight=0.04,
+        moge3_rigid_normal_weight=0.02,
+        chart_base_source="moge3_adaptive",
+    )
+    assert (
+        static_command[
+            static_command.index(
+                "--canonical-occlusion-completion-weight"
+            )
+            + 1
+        ]
+        == "1.0"
+    )
+    assert (
+        static_command[
+            static_command.index("--canonical-occlusion-order-weight")
+            + 1
+        ]
+        == "0.1"
+    )
+    assert (
+        static_command[
+            static_command.index("--moge3-canopy-optical-weight") + 1
+        ]
+        == "0.2"
+    )
+    assert (
+        static_command[
+            static_command.index("--moge3-canopy-optical-every") + 1
+        ]
+        == "2"
+    )
+    assert (
+        static_command[
+            static_command.index(
+                "--moge3-canopy-maximum-birth-proposals"
+            )
+            + 1
+        ]
+        == "256"
+    )
+    assert (
+        static_command[
+            static_command.index("--moge3-rigid-depth-weight") + 1
+        ]
+        == "0.04"
+    )
+    assert (
+        static_command[
+            static_command.index("--moge3-rigid-normal-weight") + 1
+        ]
+        == "0.02"
+    )
+    assert "--moge3-rigid-depth-weight" not in command
+    assert "--moge3-rigid-normal-weight" not in command
+    assert (
+        static_command[
+            static_command.index("--chart-base-source") + 1
+        ]
+        == "moge3_adaptive"
+    )
+    assert command[command.index("--chart-base-source") + 1] == "matcha"
+
 
 def test_completed_teacher_requires_current_inputs_code_and_state(tmp_path):
     initialization = tmp_path / "initialization"
@@ -275,11 +389,20 @@ def test_completed_teacher_requires_current_inputs_code_and_state(tmp_path):
                     "rigid_background_completion": {
                         "maximum_seeds": 20_000,
                     },
-                    "volume_opacity_lr": 4.0e-3,
-                    "surface_retirement_optical_mass_fraction_per_event": (
-                        0.0025
-                    ),
-                    "initialization_version": "test-init-v1",
+                    "volume_opacity_lr": 2.0e-3,
+                        "surface_retirement_optical_mass_fraction_per_event": (
+                            0.0025
+                        ),
+                        "chart_atlas": {"base_source": "matcha"},
+                        "moge3_rigid_depth": {"weight": 0.0},
+                        "moge3_rigid_normal": {"weight": 0.0},
+                        "moge3_canopy_optical": {
+                            "weight": 0.0,
+                            "every": 0,
+                            "prehit_weight": 0.25,
+                            "maximum_birth_proposals_per_view": 256,
+                        },
+                        "initialization_version": "test-init-v1",
                     "initialization_manifest_sha256": sha256_file(
                         manifest_path
                     ),
@@ -363,10 +486,19 @@ def test_completed_teacher_binds_the_exact_rigid_handoff(tmp_path):
                         "maximum_seeds": 0,
                     },
                     "volume_opacity_lr": 4.0e-3,
-                    "surface_retirement_optical_mass_fraction_per_event": (
-                        0.0025
-                    ),
-                    "initialization_version": "test-init-v1",
+                        "surface_retirement_optical_mass_fraction_per_event": (
+                            0.0025
+                        ),
+                        "chart_atlas": {"base_source": "matcha"},
+                        "moge3_rigid_depth": {"weight": 0.0},
+                        "moge3_rigid_normal": {"weight": 0.0},
+                        "moge3_canopy_optical": {
+                            "weight": 0.0,
+                            "every": 0,
+                            "prehit_weight": 0.25,
+                            "maximum_birth_proposals_per_view": 256,
+                        },
+                        "initialization_version": "test-init-v1",
                     "initialization_manifest_sha256": sha256_file(
                         manifest_path
                     ),

@@ -13,6 +13,7 @@
 
 #include "mixed_backward.h"
 #include "auxiliary.h"
+#include "mixed_sort.cuh"
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
@@ -21,6 +22,7 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 mixedRenderBackwardCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
+	const uint64_t* __restrict__ point_list_keys,
 	int surface_count,
 	int W,
 	int H,
@@ -30,7 +32,10 @@ mixedRenderBackwardCUDA(
 	const float* __restrict__ opacities,
 	const int* __restrict__ surface_gate_indices,
 	const float* __restrict__ surface_gate_atlas,
+	int gate_count,
 	int gate_size,
+	const float* __restrict__ depth_query_bounds,
+	bool has_depth_query,
 	const float* __restrict__ surface_transMats,
 	const float3* __restrict__ surface_normals,
 	const float4* __restrict__ volume_conic,
@@ -39,6 +44,7 @@ mixedRenderBackwardCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dothers,
+	const float* __restrict__ forward_others,
 	float* __restrict__ dL_dsurface_transMat,
 	float3* __restrict__ dL_dmean2D,
 	float3* __restrict__ dL_dsurface_normal,
@@ -66,26 +72,44 @@ mixedRenderBackwardCUDA(
 	const bool inside = pix.x < W && pix.y < H;
 	const uint2 range =
 		ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-	const int rounds =
-		(range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
 	bool done = !inside;
-	int toDo = range.y - range.x;
-
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_shape[BLOCK_SIZE];
-	__shared__ float3 collected_Tu[BLOCK_SIZE];
-	__shared__ float3 collected_Tv[BLOCK_SIZE];
-	__shared__ float3 collected_Tw[BLOCK_SIZE];
-	__shared__ float3 collected_normal[BLOCK_SIZE];
-	__shared__ float collected_colors[C * BLOCK_SIZE];
 
 	const float T_final = inside ? final_Ts[pix_id] : 0.0f;
 	float T = T_final;
-	uint32_t contributor = toDo;
-	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-	const int median_contributor =
-		inside ? n_contrib[pix_id + H * W] : 0;
+	const uint32_t last_contributor =
+		inside ? n_contrib[pix_id] : UINT32_MAX;
+	const uint32_t median_contributor =
+		inside ? n_contrib[pix_id + H * W] : UINT32_MAX;
+	float last_contributor_depth = -CUDART_INF_F;
+	if (!done && last_contributor != UINT32_MAX)
+	{
+		const MixedPrimitiveData primitive = mixedLoadPrimitive(
+			last_contributor,
+			surface_count,
+			points_xy,
+			opacities,
+			surface_transMats,
+			surface_normals,
+			volume_conic,
+			depths);
+		const MixedPixelCandidate candidate = mixedEvaluateCandidate(
+			primitive,
+			surface_count,
+			pix,
+			pixf,
+			surface_gate_indices,
+			surface_gate_atlas,
+			gate_count,
+			gate_size);
+		if (!candidate.valid)
+			done = true;
+		else
+			last_contributor_depth = candidate.depth;
+	}
+	else
+	{
+		done = true;
+	}
 
 	float dL_dpixel[C] = {0};
 	float dL_dnormal2D[3] = {0};
@@ -97,6 +121,13 @@ mixedRenderBackwardCUDA(
 	float dL_dvolume_alpha = 0;
 	float dL_dsurface_depth = 0;
 	float dL_dvolume_depth = 0;
+	float dL_dvolume_prehit_alpha = 0;
+	float dL_dvolume_hit_interval_alpha = 0;
+	float volume_prehit_T_final = 1.0f;
+	float volume_hit_interval_T_final = 1.0f;
+	float query_near = 0.0f;
+	float query_far = 0.0f;
+	bool query_valid = false;
 	if (inside)
 	{
 		for (int ch = 0; ch < C; ++ch)
@@ -117,6 +148,24 @@ mixedRenderBackwardCUDA(
 			dL_dothers[SURFACE_DEPTH_OFFSET * H * W + pix_id];
 		dL_dvolume_depth =
 			dL_dothers[VOLUME_DEPTH_OFFSET * H * W + pix_id];
+		dL_dvolume_prehit_alpha =
+			dL_dothers[VOLUME_PREHIT_ALPHA_OFFSET * H * W + pix_id];
+		dL_dvolume_hit_interval_alpha =
+			dL_dothers[VOLUME_HIT_INTERVAL_ALPHA_OFFSET * H * W + pix_id];
+		if (has_depth_query)
+		{
+			query_near = depth_query_bounds[pix_id];
+			query_far = depth_query_bounds[H * W + pix_id];
+			query_valid = isfinite(query_near) && isfinite(query_far)
+				&& query_near > 0.0f && query_far >= query_near;
+			if (query_valid)
+			{
+				volume_prehit_T_final = 1.0f - forward_others[
+					VOLUME_PREHIT_ALPHA_OFFSET * H * W + pix_id];
+				volume_hit_interval_T_final = 1.0f - forward_others[
+					VOLUME_HIT_INTERVAL_ALPHA_OFFSET * H * W + pix_id];
+			}
+		}
 		for (int ch = 0; ch < 3; ++ch)
 			dL_dnormal2D[ch] =
 				dL_dothers[(NORMAL_OFFSET + ch) * H * W + pix_id];
@@ -147,167 +196,148 @@ mixedRenderBackwardCUDA(
 	const float ddelx_dx = 0.5f * W;
 	const float ddely_dy = 0.5f * H;
 
-	for (int round = 0; round < rounds; ++round, toDo -= BLOCK_SIZE)
+	// Replay the forward order in exact, bounded batches.  Capacity controls
+	// scan granularity, not the number of supported overlapping surfaces.
+	constexpr int MIXED_ACTIVE_CAPACITY = 256;
+	MixedDepthHeapItem heap[MIXED_ACTIVE_CAPACITY];
+	int heap_size = 0;
+	uint32_t volume_cursor = range.y;
+	bool surface_exhausted = false;
+	bool replay_bound_inclusive = true;
+	MixedDepthHeapItem replay_bound = {
+		last_contributor_depth, last_contributor};
+	while (!done)
 	{
-		block.sync();
-		const int progress = round * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
+		if (heap_size == 0 && !surface_exhausted)
 		{
-			const int id = point_list[range.y - progress - 1];
-			const int lane = block.thread_rank();
-			collected_id[lane] = id;
-			collected_xy[lane] = points_xy[id];
-			for (int ch = 0; ch < C; ++ch)
-				collected_colors[ch * BLOCK_SIZE + lane] =
-					colors[id * C + ch];
-			if (id < surface_count)
+			// Keep the k largest eligible surface tuples in a min heap and
+			// convert it in-place to a max heap for reverse compositing.
+			for (uint32_t offset = range.x; offset < range.y; ++offset)
 			{
-				collected_shape[lane] = {0, 0, 0, opacities[id]};
-				collected_Tu[lane] = {
-					surface_transMats[9 * id + 0],
-					surface_transMats[9 * id + 1],
-					surface_transMats[9 * id + 2]
-				};
-				collected_Tv[lane] = {
-					surface_transMats[9 * id + 3],
-					surface_transMats[9 * id + 4],
-					surface_transMats[9 * id + 5]
-				};
-				collected_Tw[lane] = {
-					surface_transMats[9 * id + 6],
-					surface_transMats[9 * id + 7],
-					surface_transMats[9 * id + 8]
-				};
-				collected_normal[lane] = surface_normals[id];
-			}
-			else
-			{
-				const int volume_id = id - surface_count;
-				const float4 conic = volume_conic[volume_id];
-				collected_shape[lane] = {
-					conic.x,
-					conic.y,
-					conic.z,
-					opacities[id]
-				};
-				collected_Tu[lane] = {0, 0, 0};
-				collected_Tv[lane] = {0, 0, 0};
-				collected_Tw[lane] = {0, 0, depths[id]};
-				collected_normal[lane] = {0, 0, 0};
-			}
-		}
-		block.sync();
-
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); ++j)
-		{
-			--contributor;
-			if (contributor >= last_contributor)
-				continue;
-			const int id = collected_id[j];
-			const bool is_surface = id < surface_count;
-			const float2 xy = collected_xy[j];
-			const float4 shape = collected_shape[j];
-			const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-			float3 Tu = collected_Tu[j];
-			float3 Tv = collected_Tv[j];
-			float3 Tw = collected_Tw[j];
-			float3 k = {0, 0, 0};
-			float3 l = {0, 0, 0};
-			float3 p = {0, 0, 1};
-			float2 s = {0, 0};
-			float rho3d = 0;
-			float rho2d = 0;
-			float rho = 0;
-			float depth;
-			float power;
-			if (is_surface)
-			{
-				k = pix.x * Tw - Tu;
-				l = pix.y * Tw - Tv;
-				p = cross(k, l);
-				if (p.z == 0.0f)
+				const uint32_t id = point_list[offset];
+				if (id >= static_cast<uint32_t>(surface_count))
 					continue;
-				s = {p.x / p.z, p.y / p.z};
-				rho3d = s.x * s.x + s.y * s.y;
-				rho2d =
-					FilterInvSquare * (d.x * d.x + d.y * d.y);
-				rho = min(rho3d, rho2d);
-				depth = rho3d <= rho2d
-					? s.x * Tw.x + s.y * Tw.y + Tw.z
-					: Tw.z;
-				power = -0.5f * rho;
-			}
-			else
-			{
-				power = -0.5f *
-					(shape.x * d.x * d.x + shape.z * d.y * d.y)
-					- shape.y * d.x * d.y;
-				depth = depths[id];
-			}
-			if (depth < near_n || power > 0.0f)
-				continue;
-			const float G = exp(power);
-			int gate_index = -1;
-			int gx0 = 0;
-			int gy0 = 0;
-			int gx1 = 0;
-			int gy1 = 0;
-			float gate_w00 = 1.0f;
-			float gate_w10 = 0.0f;
-			float gate_w01 = 0.0f;
-			float gate_w11 = 0.0f;
-			float gate_value = 1.0f;
-			if (is_surface && gate_size > 0)
-			{
-				gate_index = surface_gate_indices[id];
-				if (gate_index >= 0)
+				const MixedPrimitiveData primitive = mixedLoadPrimitive(
+					id, surface_count, points_xy, opacities,
+					surface_transMats, surface_normals, volume_conic, depths);
+				const MixedPixelCandidate candidate = mixedEvaluateCandidate(
+					primitive, surface_count, pix, pixf,
+					surface_gate_indices, surface_gate_atlas,
+					gate_count, gate_size);
+				if (!candidate.valid)
+					continue;
+				const MixedDepthHeapItem item = {candidate.depth, candidate.id};
+				const bool before_bound = mixedHeapBefore(item, replay_bound);
+				const bool equals_bound = item.depth == replay_bound.depth
+					&& item.id == replay_bound.id;
+				if (!before_bound
+						&& !(replay_bound_inclusive && equals_bound))
+					continue;
+				if (heap_size < MIXED_ACTIVE_CAPACITY)
 				{
-					const float atlas_x = min(
-						float(gate_size - 1),
-						max(
-							0.0f,
-							(s.x / 3.0f + 1.0f)
-								* 0.5f * float(gate_size - 1)));
-					const float atlas_y = min(
-						float(gate_size - 1),
-						max(
-							0.0f,
-							(s.y / 3.0f + 1.0f)
-								* 0.5f * float(gate_size - 1)));
-					gx0 = int(floorf(atlas_x));
-					gy0 = int(floorf(atlas_y));
-					gx1 = min(gx0 + 1, gate_size - 1);
-					gy1 = min(gy0 + 1, gate_size - 1);
-					const float tx = atlas_x - float(gx0);
-					const float ty = atlas_y - float(gy0);
-					gate_w00 = (1.0f - tx) * (1.0f - ty);
-					gate_w10 = tx * (1.0f - ty);
-					gate_w01 = (1.0f - tx) * ty;
-					gate_w11 = tx * ty;
-					const int base = gate_index * gate_size * gate_size;
-					gate_value =
-						gate_w00 * surface_gate_atlas[
-							base + gy0 * gate_size + gx0]
-						+ gate_w10 * surface_gate_atlas[
-							base + gy0 * gate_size + gx1]
-						+ gate_w01 * surface_gate_atlas[
-							base + gy1 * gate_size + gx0]
-						+ gate_w11 * surface_gate_atlas[
-							base + gy1 * gate_size + gx1];
-					gate_value = min(1.0f, max(0.0f, gate_value));
+					mixedHeapPush<MIXED_ACTIVE_CAPACITY, true>(
+						heap, heap_size, item);
+				}
+				else if (mixedHeapBefore(heap[0], item))
+				{
+					(void)mixedHeapPop<MIXED_ACTIVE_CAPACITY, true>(
+						heap, heap_size);
+					mixedHeapPush<MIXED_ACTIVE_CAPACITY, true>(
+						heap, heap_size, item);
 				}
 			}
-			const float alpha = min(
-				0.99f, shape.w * G * gate_value);
-			if (alpha < 1.0f / 255.0f)
+			surface_exhausted = heap_size < MIXED_ACTIVE_CAPACITY;
+			mixedMinHeapToMaxHeap<MIXED_ACTIVE_CAPACITY>(heap, heap_size);
+		}
+
+		MixedDepthHeapItem volume_item = {0.0f, 0};
+		bool has_volume = false;
+		while (volume_cursor > range.x)
+		{
+			const uint32_t offset = volume_cursor - 1;
+			if (point_list[offset] < static_cast<uint32_t>(surface_count))
+			{
+				--volume_cursor;
 				continue;
+			}
+			const MixedPrimitiveData primitive = mixedLoadPrimitive(
+				point_list[offset], surface_count, points_xy, opacities,
+				surface_transMats, surface_normals, volume_conic, depths);
+			const MixedPixelCandidate candidate = mixedEvaluateCandidate(
+				primitive, surface_count, pix, pixf,
+				surface_gate_indices, surface_gate_atlas,
+				gate_count, gate_size);
+			if (!candidate.valid)
+			{
+				--volume_cursor;
+				continue;
+			}
+			const MixedDepthHeapItem item = {candidate.depth, candidate.id};
+			const bool before_bound = mixedHeapBefore(item, replay_bound);
+			const bool equals_bound = item.depth == replay_bound.depth
+				&& item.id == replay_bound.id;
+			if (before_bound || (replay_bound_inclusive && equals_bound))
+			{
+				volume_item = item;
+				has_volume = true;
+				break;
+			}
+			--volume_cursor;
+		}
+		if (!has_volume && heap_size == 0)
+			break;
+
+		const bool choose_surface = heap_size > 0
+			&& (!has_volume || mixedHeapBefore(volume_item, heap[0]));
+		const MixedDepthHeapItem item = choose_surface
+			? mixedHeapPop<MIXED_ACTIVE_CAPACITY, false>(heap, heap_size)
+			: volume_item;
+		if (!choose_surface)
+			--volume_cursor;
+		replay_bound = item;
+		replay_bound_inclusive = false;
+		const MixedPrimitiveData best_primitive = mixedLoadPrimitive(
+			item.id, surface_count, points_xy, opacities,
+			surface_transMats, surface_normals, volume_conic, depths);
+		const MixedPixelCandidate best = mixedEvaluateCandidate(
+			best_primitive, surface_count, pix, pixf,
+			surface_gate_indices, surface_gate_atlas,
+			gate_count, gate_size);
+		if (!best.valid || best.id != item.id || best.depth != item.depth)
+			asm("trap;");
+			const int id = int(best.id);
+			const bool is_surface = best.is_surface;
+			const float4 shape = best_primitive.shape;
+			const float2 d = best.d;
+			const float3 Tu = best_primitive.Tu;
+			const float3 Tv = best_primitive.Tv;
+			const float3 Tw = best_primitive.Tw;
+			const float3 k = best.k;
+			const float3 l = best.l;
+			const float3 p = best.p;
+			const float2 s = best.surface_uv;
+			const float rho3d = best.rho3d;
+			const float rho2d = best.rho2d;
+			const float depth = best.depth;
+			const float G = best.G;
+			const int gate_index = best.gate_index;
+			const int gx0 = best.gx0;
+			const int gy0 = best.gy0;
+			const int gx1 = best.gx1;
+			const int gy1 = best.gy1;
+			const float gate_w00 = best.gate_w00;
+			const float gate_w10 = best.gate_w10;
+			const float gate_w01 = best.gate_w01;
+			const float gate_w11 = best.gate_w11;
+			const float gate_value = best.gate_value;
+			const float alpha = best.alpha;
 
 			T /= 1.0f - alpha;
 			const float w = alpha * T;
 			float dL_dalpha = 0;
 			for (int ch = 0; ch < C; ++ch)
 			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
+				const float c = colors[id * C + ch];
 				accum_rec[ch] =
 					last_alpha * last_color[ch]
 					+ (1.0f - last_alpha) * accum_rec[ch];
@@ -326,7 +356,7 @@ mixedRenderBackwardCUDA(
 			const float dmd_dd =
 				(far_n * near_n)
 				/ ((far_n - near_n) * depth * depth);
-			if (contributor == median_contributor - 1)
+			if (best.id == median_contributor)
 				dL_dz += dL_dmedian_depth;
 #if !DETACH_WEIGHT
 			dL_dweight +=
@@ -385,7 +415,7 @@ mixedRenderBackwardCUDA(
 			last_surface_depth = current_surface_depth;
 			last_volume_depth = current_volume_depth;
 
-			const float3 normal = collected_normal[j];
+			const float3 normal = best_primitive.normal;
 			const float normal_values[3] = {
 				normal.x,
 				normal.y,
@@ -410,6 +440,26 @@ mixedRenderBackwardCUDA(
 			}
 
 			dL_dalpha *= T;
+			// Conditional volume optical alpha in detached target-depth
+			// intervals.  Membership is not differentiated, while opacity and
+			// footprint receive the exact product-transmittance derivative.
+			if (!is_surface && query_valid)
+			{
+				const float inv_one_minus_alpha =
+					1.0f / max(1.0f - alpha, 1.0e-6f);
+				if (depth < query_near)
+				{
+					dL_dalpha += volume_prehit_T_final
+						* inv_one_minus_alpha
+						* dL_dvolume_prehit_alpha;
+				}
+				else if (depth <= query_far)
+				{
+					dL_dalpha += volume_hit_interval_T_final
+						* inv_one_minus_alpha
+						* dL_dvolume_hit_interval_alpha;
+				}
+			}
 			last_alpha = alpha;
 			float bg_dot_dpixel = 0;
 			for (int ch = 0; ch < C; ++ch)
@@ -527,7 +577,6 @@ mixedRenderBackwardCUDA(
 						base + gy1 * gate_size + gx1],
 					gate_w11 * dL_dgate);
 			}
-		}
 	}
 }
 
@@ -536,6 +585,7 @@ void MIXED_BACKWARD::render(
 	dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
+	const uint64_t* point_list_keys,
 	int surface_count,
 	int W,
 	int H,
@@ -545,7 +595,10 @@ void MIXED_BACKWARD::render(
 	const float* opacities,
 	const int* surface_gate_indices,
 	const float* surface_gate_atlas,
+	int gate_count,
 	int gate_size,
+	const float* depth_query_bounds,
+	bool has_depth_query,
 	const float* surface_transMats,
 	const float3* surface_normals,
 	const float4* volume_conic,
@@ -554,6 +607,7 @@ void MIXED_BACKWARD::render(
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dothers,
+	const float* forward_others,
 	float* dL_dsurface_transMat,
 	float3* dL_dmean2D,
 	float3* dL_dsurface_normal,
@@ -566,6 +620,7 @@ void MIXED_BACKWARD::render(
 	mixedRenderBackwardCUDA<NUM_CHANNELS><<<grid, block>>>(
 		ranges,
 		point_list,
+		point_list_keys,
 		surface_count,
 		W,
 		H,
@@ -575,7 +630,10 @@ void MIXED_BACKWARD::render(
 		opacities,
 		surface_gate_indices,
 		surface_gate_atlas,
+		gate_count,
 		gate_size,
+		depth_query_bounds,
+		has_depth_query,
 		surface_transMats,
 		surface_normals,
 		volume_conic,
@@ -584,6 +642,7 @@ void MIXED_BACKWARD::render(
 		n_contrib,
 		dL_dpixels,
 		dL_dothers,
+		forward_others,
 		dL_dsurface_transMat,
 		dL_dmean2D,
 		dL_dsurface_normal,

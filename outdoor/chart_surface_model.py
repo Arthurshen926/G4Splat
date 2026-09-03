@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
 
+from outdoor.moge3_chart_base import (
+    MOGE3_CHART_BASE_SOURCES,
+    load_chart_base,
+)
 from outdoor.training_evidence import EvidenceEpochSampler
 
 
@@ -28,11 +32,17 @@ class ChartSurfaceModel:
         surface_seed: Path,
         *,
         evidence_store: Path | None = None,
+        chart_base_source: str = "matcha",
         seed: int = 3253,
         maximum_tangent_scale: float = float("inf"),
     ):
         if maximum_tangent_scale <= 0:
             raise ValueError("maximum_tangent_scale must be positive")
+        if chart_base_source not in MOGE3_CHART_BASE_SOURCES:
+            raise ValueError(
+                f"Unsupported Chart base source: {chart_base_source!r}"
+            )
+        self.chart_base_source = str(chart_base_source)
         with np.load(surface_seed, allow_pickle=False) as archive:
             source = archive["source_type"].astype(np.int8)
             all_selected = source == 2
@@ -64,6 +74,25 @@ class ChartSurfaceModel:
                         np.ones(len(source), dtype=bool),
                     ).astype(bool)
                 ).sum()
+            )
+        atlas_payload = None
+        if evidence_store is not None:
+            atlas_payload = LearnableInverseDepthAtlas._load_payload(
+                Path(evidence_store),
+                chart_base_source=self.chart_base_source,
+            )
+        if atlas_payload is not None and self.chart_base_source != "matcha":
+            all_xyz = LearnableInverseDepthAtlas._seed_xyz_from_payload(
+                atlas_payload,
+                all_chart_id,
+                all_uv,
+                all_xyz,
+            )
+            self.xyz = LearnableInverseDepthAtlas._seed_xyz_from_payload(
+                atlas_payload,
+                self.chart_id,
+                self.uv,
+                self.xyz,
             )
         if len(self.xyz) and (
             np.any(self.evidence_id >= -1)
@@ -120,6 +149,8 @@ class ChartSurfaceModel:
                 uv=all_uv,
                 tangent_scale=all_scales,
                 maximum_tangent_scale=maximum_tangent_scale,
+                chart_base_source=self.chart_base_source,
+                payload=atlas_payload,
             )
             if evidence_store is not None
             else None
@@ -448,6 +479,7 @@ class ChartSurfaceModel:
             "anchor_count": len(self.xyz),
             "coverage_only_seed_count": self.coverage_only_seed_count,
             "chart_count": int(len(np.unique(self.chart_id))),
+            "chart_base_source": self.chart_base_source,
             "uv_bound": True,
             "uv_edge_count": int(len(self.edges)),
             "coverage": self.sampler.audit(),
@@ -491,11 +523,18 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         uv: np.ndarray,
         tangent_scale: np.ndarray,
         maximum_tangent_scale: float = float("inf"),
+        chart_base_source: str = "matcha",
+        payload: dict | None = None,
     ):
         super().__init__()
         if maximum_tangent_scale <= 0:
             raise ValueError("maximum_tangent_scale must be positive")
         self.maximum_tangent_scale = float(maximum_tangent_scale)
+        if chart_base_source not in MOGE3_CHART_BASE_SOURCES:
+            raise ValueError(
+                f"Unsupported Chart base source: {chart_base_source!r}"
+            )
+        self.chart_base_source = str(chart_base_source)
         if len(evidence_id) and (
             np.any(evidence_id >= -1)
             or len(np.unique(evidence_id)) != len(evidence_id)
@@ -503,7 +542,14 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
             raise RuntimeError(
                 "Every Chart UV cell needs a unique evidence id below -1"
             )
-        payload = self._load_payload(evidence_store)
+        payload = (
+            self._load_payload(
+                evidence_store,
+                chart_base_source=self.chart_base_source,
+            )
+            if payload is None
+            else payload
+        )
         self.register_buffer(
             "base_inverse_depth",
             torch.from_numpy(payload["inverse_depth"]),
@@ -561,7 +607,12 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         raise KeyError(f"Evidence store has no {name!r} artifact")
 
     @classmethod
-    def _load_payload(cls, evidence_store: Path) -> dict:
+    def _load_payload(
+        cls,
+        evidence_store: Path,
+        *,
+        chart_base_source: str = "matcha",
+    ) -> dict:
         manifest_path = (
             evidence_store / "evidence_manifest.json"
             if evidence_store.is_dir()
@@ -595,6 +646,21 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
         chart_cameras = json.loads(
             chart_camera_path.read_text(encoding="utf-8")
         )
+        if chart_base_source != "matcha":
+            chart_base_path = cls._artifact(manifest, "moge3_chart_base")
+            base = load_chart_base(
+                chart_base_path,
+                source=chart_base_source,
+                expected_names=chart_cameras["filepaths"],
+            )
+            if base["depth"].shape != depth.shape:
+                raise RuntimeError(
+                    "MoGe3 Chart base shape does not match MAtCha"
+                )
+            depth = base["depth"]
+            valid = base["validity"] & np.isfinite(depth) & (depth > 0.0)
+            inverse_depth = np.zeros_like(depth, dtype=np.float32)
+            inverse_depth[valid] = 1.0 / depth[valid]
         scene = json.loads(
             Path(manifest["scene_contract"]).read_text(encoding="utf-8")
         )
@@ -631,7 +697,51 @@ class LearnableInverseDepthAtlas(torch.nn.Module):
             "validity": valid.astype(np.float32),
             "camera_to_world": np.stack(transforms),
             "intrinsics": np.asarray(intrinsics, dtype=np.float32),
+            "chart_base_source": str(chart_base_source),
         }
+
+    @staticmethod
+    def _seed_xyz_from_payload(
+        payload: dict,
+        chart_id: np.ndarray,
+        uv: np.ndarray,
+        fallback_xyz: np.ndarray,
+    ) -> np.ndarray:
+        """Move Chart bootstrap anchors onto the selected immutable base."""
+        if not len(chart_id):
+            return np.asarray(fallback_xyz, dtype=np.float32).copy()
+        chart = torch.from_numpy(np.asarray(chart_id, dtype=np.int64))
+        coordinates = torch.from_numpy(np.asarray(uv, dtype=np.float32))
+        inverse = torch.from_numpy(payload["inverse_depth"])
+        validity = torch.from_numpy(payload["validity"])
+        rho = LearnableInverseDepthAtlas._bilinear(
+            inverse, chart, coordinates
+        )
+        supported = LearnableInverseDepthAtlas._bilinear(
+            validity, chart, coordinates
+        ) > 0.25
+        intrinsics = torch.from_numpy(payload["intrinsics"])[chart]
+        height, width = inverse.shape[-2:]
+        pixel_x = coordinates[:, 0] * width - 0.5
+        pixel_y = coordinates[:, 1] * height - 0.5
+        depth = rho.clamp_min(1.0e-8).reciprocal()
+        camera = torch.stack(
+            [
+                (pixel_x - intrinsics[:, 2]) * depth / intrinsics[:, 0],
+                (pixel_y - intrinsics[:, 3]) * depth / intrinsics[:, 1],
+                depth,
+            ],
+            dim=-1,
+        )
+        transform = torch.from_numpy(payload["camera_to_world"])[chart]
+        world = torch.bmm(
+            transform[:, :3, :3], camera[:, :, None]
+        ).squeeze(-1) + transform[:, :3, 3]
+        fallback = torch.from_numpy(
+            np.asarray(fallback_xyz, dtype=np.float32)
+        )
+        world = torch.where(supported[:, None], world, fallback)
+        return world.numpy().astype(np.float32)
 
     @staticmethod
     def _initial_half_uv(chart_id: np.ndarray) -> np.ndarray:

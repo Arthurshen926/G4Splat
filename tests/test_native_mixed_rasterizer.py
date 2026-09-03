@@ -103,8 +103,191 @@ def test_zero_volume_is_exactly_the_native_surfel_path():
     assert torch.allclose(mixed_aux[:7], legacy_aux, atol=2e-7, rtol=0)
     assert torch.allclose(mixed_aux[7:8], legacy_aux[1:2], atol=1e-7, rtol=0)
     assert torch.allclose(mixed_aux[9:10], legacy_aux[0:1], atol=2e-7, rtol=0)
-    assert torch.count_nonzero(mixed_aux[[8, 10]]).item() == 0
+    assert torch.count_nonzero(mixed_aux[[8, 10, 11, 12]]).item() == 0
     assert gate_audit.numel() == 0
+
+
+def test_volume_depth_query_separates_prehit_hit_and_behind_alpha():
+    """The query is intrinsic volume alpha, not mixed layer contribution."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings()
+    volume = torch.tensor(
+        [[0.0, 0.0, 2.0], [0.0, 0.0, 3.0], [0.0, 0.0, 4.0]],
+        device="cuda",
+    )
+    opacity = torch.tensor([[0.15], [0.20], [0.25]], device="cuda")
+    scales = torch.full((3, 3), 0.15, device="cuda")
+    rotations = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0]] * 3, device="cuda"
+    )
+    colors = torch.tensor(
+        [[0.8, 0.2, 0.1], [0.2, 0.8, 0.1], [0.1, 0.2, 0.8]],
+        device="cuda",
+    )
+    bounds = torch.empty(
+        (2, settings.image_height, settings.image_width), device="cuda"
+    )
+    bounds[0].fill_(2.5)
+    bounds[1].fill_(3.5)
+    _, _, queried, _, _ = MixedGaussianRasterizer(settings)(
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 2),
+        _empty(0, 4),
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        scales,
+        rotations,
+        colors,
+        opacity,
+        depth_query_bounds=bounds,
+    )
+
+    # A one-row render provides the exact EWA alpha at this sub-pixel sample.
+    isolated_alpha = []
+    for row in range(3):
+        _, _, isolated, _, _ = MixedGaussianRasterizer(settings)(
+            _empty(0, 3),
+            _empty(0, 3),
+            _empty(0, 2),
+            _empty(0, 4),
+            volume[row : row + 1],
+            torch.zeros_like(volume[row : row + 1], requires_grad=True),
+            scales[row : row + 1],
+            rotations[row : row + 1],
+            colors[row : row + 1],
+            opacity[row : row + 1],
+        )
+        isolated_alpha.append(isolated[1, 20, 34])
+
+    assert torch.allclose(queried[11, 20, 34], isolated_alpha[0])
+    assert torch.allclose(queried[12, 20, 34], isolated_alpha[1])
+    assert float(queried[11, 20, 34]) > 0
+    assert float(queried[12, 20, 34]) > 0
+    # The z=4 row is behind the target interval and contributes to neither
+    # query channel, even though it remains visible in ordinary volume alpha.
+    expected_total = 1.0
+    for alpha in isolated_alpha:
+        expected_total = expected_total * (1.0 - alpha)
+    assert torch.allclose(queried[8, 20, 34], 1.0 - expected_total)
+
+
+def test_volume_depth_query_backward_matches_finite_difference_and_excludes_behind():
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings()
+    volume = torch.tensor(
+        [[0.0, 0.0, 2.0], [0.0, 0.0, 3.0], [0.0, 0.0, 4.0]],
+        device="cuda",
+    )
+    scales = torch.full((3, 3), 0.15, device="cuda")
+    rotations = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0]] * 3, device="cuda"
+    )
+    colors = torch.full((3, 3), 0.4, device="cuda")
+    bounds = torch.empty(
+        (2, settings.image_height, settings.image_width), device="cuda"
+    )
+    bounds[0].fill_(2.5)
+    bounds[1].fill_(3.5)
+
+    def objective(opacity):
+        _, _, aux, _, _ = MixedGaussianRasterizer(settings)(
+            _empty(0, 3),
+            _empty(0, 3),
+            _empty(0, 2),
+            _empty(0, 4),
+            volume,
+            torch.zeros_like(volume, requires_grad=True),
+            scales,
+            rotations,
+            colors,
+            opacity,
+            depth_query_bounds=bounds,
+        )
+        return aux[11, 20, 34] + 2.0 * aux[12, 20, 34]
+
+    opacity = torch.tensor(
+        [[0.15], [0.20], [0.25]], device="cuda", requires_grad=True
+    )
+    objective(opacity).backward()
+    analytic = opacity.grad.detach().reshape(-1)
+    epsilon = 1.0e-3
+    finite_difference = []
+    for row in range(3):
+        plus = opacity.detach().clone()
+        minus = opacity.detach().clone()
+        plus[row] += epsilon
+        minus[row] -= epsilon
+        finite_difference.append(
+            (objective(plus) - objective(minus)) / (2.0 * epsilon)
+        )
+    finite_difference = torch.stack(finite_difference)
+
+    assert torch.allclose(analytic[:2], finite_difference[:2], atol=2e-4, rtol=2e-3)
+    assert analytic[0] > 0
+    assert analytic[1] > 0
+    assert analytic[2].item() == 0.0
+    assert finite_difference[2].item() == 0.0
+
+
+def test_dense_surface_stack_crosses_multiple_exact_sort_batches():
+    """More than one 256-row batch must remain exact in both directions."""
+    _, GaussianRasterizer, MixedGaussianRasterizer = _api()
+    settings = _settings()
+    count = 300
+    depths = torch.linspace(2.0, 5.0, count, device="cuda")
+    xyz = torch.stack(
+        [torch.zeros_like(depths), torch.zeros_like(depths), depths], dim=1
+    )
+    scales = torch.full((count, 2), 0.12, device="cuda")
+    rotations = torch.zeros(count, 4, device="cuda")
+    rotations[:, 0] = 1.0
+    colors = torch.stack(
+        [
+            torch.linspace(0.1, 0.9, count, device="cuda"),
+            torch.linspace(0.8, 0.2, count, device="cuda"),
+            torch.full((count,), 0.35, device="cuda"),
+        ],
+        dim=1,
+    )
+    native_opacity = torch.full(
+        (count, 1), 0.008, device="cuda", requires_grad=True
+    )
+    mixed_opacity = native_opacity.detach().clone().requires_grad_(True)
+
+    native_rgb, native_radii, native_aux = GaussianRasterizer(settings)(
+        xyz,
+        torch.zeros_like(xyz, requires_grad=True),
+        native_opacity,
+        colors_precomp=colors,
+        scales=scales,
+        rotations=rotations,
+    )
+    mixed_rgb, mixed_radii, mixed_aux, _, _ = MixedGaussianRasterizer(settings)(
+        xyz,
+        torch.zeros_like(xyz, requires_grad=True),
+        scales,
+        rotations,
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 4),
+        colors,
+        mixed_opacity,
+    )
+
+    assert torch.all(native_radii > 0)
+    assert torch.equal(mixed_radii, native_radii)
+    assert torch.allclose(mixed_rgb, native_rgb, atol=2e-6, rtol=0)
+    assert torch.allclose(mixed_aux[:7], native_aux, atol=2e-6, rtol=0)
+
+    native_loss = native_rgb[:, 20, 34].sum() + 0.01 * native_aux[0, 20, 34]
+    mixed_loss = mixed_rgb[:, 20, 34].sum() + 0.01 * mixed_aux[0, 20, 34]
+    native_loss.backward()
+    mixed_loss.backward()
+    assert torch.allclose(
+        mixed_opacity.grad, native_opacity.grad, atol=2e-6, rtol=2e-5
+    )
 
 
 def test_zero_opacity_volume_is_removed_before_tile_emission():
@@ -144,6 +327,32 @@ def test_zero_opacity_volume_is_removed_before_tile_emission():
     assert radii[-1].item() == 0
     assert torch.equal(rgb, reference)
     assert torch.equal(aux, reference_aux)
+
+
+def test_low_opacity_volume_keeps_forward_and_backward_recovery_path():
+    """A live parameter floor must not sit below the rasterizer cutoff."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings()
+    volume = torch.tensor([[0.0, 0.0, 2.0]], device="cuda")
+    opacity = torch.tensor([[1.0e-5]], device="cuda", requires_grad=True)
+    rgb, radii, _, _, _ = MixedGaussianRasterizer(settings)(
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 2),
+        _empty(0, 4),
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        torch.tensor([[0.25, 0.25, 0.25]], device="cuda"),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda"),
+        torch.tensor([[0.8, 0.4, 0.2]], device="cuda"),
+        opacity,
+    )
+
+    assert radii.item() > 0
+    assert float(rgb.max()) > 0.0
+    rgb.sum().backward()
+    assert opacity.grad is not None
+    assert float(opacity.grad.abs().sum()) > 0.0
 
 
 def test_surface_whose_cutoff_support_crosses_projective_horizon_is_culled():
@@ -199,6 +408,139 @@ def test_surface_and_volume_share_one_depth_order(surface_depth, volume_depth, e
     assert bool((centre[0] > centre[1]).item()) == bool(expected_red)
     assert aux[5, 20, 34].item() == pytest.approx(2.0, abs=1e-5)
     assert torch.allclose(aux[7] + aux[8], aux[1], atol=2e-6)
+
+
+def test_oblique_surfel_uses_exact_pixel_depth_within_one_tile():
+    """A facade/volume order crossing inside one tile must be pixel exact."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings(width=80, height=47)
+    surface = torch.tensor([[0.0, 0.0, 2.5]], device="cuda")
+    volume = torch.tensor([[0.0, 0.0, 2.5]], device="cuda")
+    angle = torch.tensor(30.0 * torch.pi / 180.0, device="cuda")
+    surface_rotation = torch.stack(
+        [
+            torch.cos(angle / 2.0),
+            torch.zeros_like(angle),
+            torch.sin(angle / 2.0),
+            torch.zeros_like(angle),
+        ]
+    )[None]
+    rgb, radii, aux, _, _ = MixedGaussianRasterizer(settings)(
+        surface,
+        torch.zeros_like(surface, requires_grad=True),
+        torch.tensor([[0.7, 0.5]], device="cuda"),
+        surface_rotation,
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        torch.tensor([[0.7, 0.7, 0.7]], device="cuda"),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda"),
+        torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], device="cuda"),
+        torch.tensor([[0.99], [0.99]], device="cuda"),
+    )
+
+    assert torch.all(radii > 0)
+    y = 20
+    volume_front_x = 32  # Both probes are in tile [32, 48).
+    surface_front_x = 42  # tile [32, 48)
+    assert volume_front_x // 16 == surface_front_x // 16
+    for x in (volume_front_x, surface_front_x):
+        assert aux[7, y, x] > 0.005
+        assert aux[8, y, x] > 0.005
+    surface_depth_left = aux[9, y, volume_front_x] / aux[7, y, volume_front_x]
+    surface_depth_right = aux[9, y, surface_front_x] / aux[7, y, surface_front_x]
+    assert surface_depth_left > 2.5
+    assert surface_depth_right < 2.5
+    assert rgb[0, y, volume_front_x] > 4.0 * rgb[1, y, volume_front_x]
+    assert rgb[1, y, surface_front_x] > 4.0 * rgb[0, y, surface_front_x]
+
+
+def test_exact_pixel_order_backward_matches_finite_difference():
+    """Backward must replay the same order on both sides of a tile crossing."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings(width=80, height=47)
+    surface = torch.tensor([[0.0, 0.0, 2.5]], device="cuda")
+    volume = torch.tensor([[0.0, 0.0, 2.5]], device="cuda")
+    angle = torch.tensor(30.0 * torch.pi / 180.0, device="cuda")
+    rotation = torch.stack(
+        [
+            torch.cos(angle / 2.0),
+            torch.zeros_like(angle),
+            torch.sin(angle / 2.0),
+            torch.zeros_like(angle),
+        ]
+    )[None]
+    opacity = torch.tensor(
+        [[0.73], [0.67]], device="cuda", requires_grad=True
+    )
+
+    def render_loss():
+        rgb, _, aux, _, _ = MixedGaussianRasterizer(settings)(
+            surface,
+            torch.zeros_like(surface, requires_grad=True),
+            torch.tensor([[0.7, 0.5]], device="cuda"),
+            rotation,
+            volume,
+            torch.zeros_like(volume, requires_grad=True),
+            torch.tensor([[0.7, 0.7, 0.7]], device="cuda"),
+            torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda"),
+            torch.tensor(
+                [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], device="cuda"
+            ),
+            opacity,
+        )
+        # x=32 and x=42 share a tile but have opposite exact depth order.
+        return (
+            0.8 * rgb[0, 20, 32]
+            + 0.6 * rgb[1, 20, 42]
+            + 0.03 * aux[0, 20, 32]
+            + 0.02 * aux[0, 20, 42]
+        )
+
+    render_loss().backward()
+    analytic = opacity.grad.detach().clone().flatten()
+    numeric = []
+    epsilon = 1.0e-3
+    with torch.no_grad():
+        for row in range(2):
+            original = opacity[row, 0].item()
+            opacity[row, 0] = original + epsilon
+            plus = render_loss().item()
+            opacity[row, 0] = original - epsilon
+            minus = render_loss().item()
+            opacity[row, 0] = original
+            numeric.append((plus - minus) / (2.0 * epsilon))
+    for actual, expected in zip(analytic.tolist(), numeric):
+        assert actual == pytest.approx(expected, rel=2e-2, abs=2e-4)
+
+
+def test_volume_only_auxiliary_maps_are_intrinsic_layer_maps():
+    """With the surface gate empty, mixed role maps equal the volume layer."""
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings(width=35, height=29)
+    volume = torch.tensor(
+        [[-0.08, 0.02, 2.1], [0.11, -0.04, 2.8]], device="cuda"
+    )
+    rgb, _, aux, _, _ = MixedGaussianRasterizer(settings)(
+        _empty(0, 3),
+        _empty(0, 3),
+        _empty(0, 2),
+        _empty(0, 4),
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        torch.tensor([[0.3, 0.2, 0.25], [0.24, 0.31, 0.2]], device="cuda"),
+        torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.97, 0.1, -0.15, 0.12]],
+            device="cuda",
+        ),
+        torch.tensor([[0.2, 0.8, 0.1], [0.9, 0.15, 0.1]], device="cuda"),
+        torch.tensor([[0.7], [0.6]], device="cuda"),
+    )
+
+    assert torch.count_nonzero(rgb).item() > 0
+    assert torch.count_nonzero(aux[7]).item() == 0
+    assert torch.count_nonzero(aux[9]).item() == 0
+    assert torch.allclose(aux[8], aux[1], atol=2e-7, rtol=0)
+    assert torch.allclose(aux[10], aux[0], atol=2e-7, rtol=0)
 
 
 def test_volume_backward_matches_finite_difference():

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from outdoor.hybrid_gaussian_renderer import (
+    ADAPTIVE_SPLIT_CHILD_SCALE_FRACTION,
     LAYER_CANONICAL_CROWN,
     LAYER_DYNAMIC_LEAF,
     VolumetricFoliageModel,
@@ -441,24 +442,48 @@ def test_volume_split_preserves_integrated_projected_optical_depth():
     }
     model = VolumetricFoliageModel(1, device="cpu")
     model.initialize_from_volume_state(payload)
-    before_tau = -torch.log1p(-model.opacities)
-    before_mass = before_tau * model.scales[:, 0] * model.scales[:, 1]
+    before_mass = model.integrated_optical_mass().sum()
     before_opacity = model.opacities.detach().clone()
 
     model.split(torch.tensor([0]))
 
-    after_tau = -torch.log1p(-model.opacities)
-    after_mass = (
-        after_tau * model.scales[:, 0] * model.scales[:, 1]
-    ).sum()
-    torch.testing.assert_close(after_mass, before_mass.sum())
-    # The default two-way split must not create opacity above the parent:
-    # role ceilings applied by the trainer would otherwise destroy the mass
-    # that this split just conserved.
-    torch.testing.assert_close(
-        model.opacities,
-        before_opacity.repeat_interleave(2, dim=0),
+    torch.testing.assert_close(model.integrated_optical_mass().sum(), before_mass)
+    # Mass is divided between overlapping children, so a topology event
+    # cannot copy the parent's peak opacity into multiple sharper dots.
+    assert bool((model.opacities < before_opacity).all())
+    expected_scale = torch.tensor([[0.12, 0.20, 0.24]]).repeat(2, 1)
+    torch.testing.assert_close(model.scales, expected_scale)
+    assert ADAPTIVE_SPLIT_CHILD_SCALE_FRACTION == 0.8
+
+
+def test_quaternary_split_is_pointwise_near_render_preserving():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.ones(1, 3),
+        "colors": torch.tensor([[0.2, 0.4, 0.6]]),
+        "opacities": torch.tensor([[0.08]]),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+    }
+    model = VolumetricFoliageModel(1, device="cpu")
+    model.initialize_from_volume_state(payload)
+    parent_tau = -torch.log1p(-model.opacities[0])
+    model.split_adaptive(torch.tensor([0]), torch.tensor([4]))
+
+    coordinates = torch.linspace(-3.0, 3.0, 241)
+    y, x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    parent = parent_tau * torch.exp(-0.5 * (x.square() + y.square()))
+    child_tau = -torch.log1p(-model.opacities)
+    child = torch.zeros_like(parent)
+    for row in range(4):
+        dx = (x - model.xyz[row, 0]) / model.scales[row, 0]
+        dy = (y - model.xyz[row, 1]) / model.scales[row, 1]
+        child += child_tau[row] * torch.exp(-0.5 * (dx.square() + dy.square()))
+    relative_l2 = torch.sqrt(((child - parent).square()).mean()) / torch.sqrt(
+        parent.square().mean()
     )
+    assert float(relative_l2) < 0.08
+    assert float(child.max() / parent.max()) < 1.05
 
 
 def test_volume_split_preserves_consistent_evidence_mass_and_generation():
@@ -505,7 +530,8 @@ def test_dense_ray_bandwidth_ceiling_is_inherited_by_split():
 
     model.split(torch.tensor([0]))
 
-    expected = (before / (2.0**0.5)).repeat_interleave(2, dim=0)
+    expected = before.repeat_interleave(2, dim=0)
+    expected[:, 2] *= 0.8
     torch.testing.assert_close(model.scale_ceiling, expected)
     assert torch.isfinite(model.scale_ceiling).all()
 

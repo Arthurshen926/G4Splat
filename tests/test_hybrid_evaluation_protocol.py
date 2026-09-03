@@ -22,6 +22,7 @@ from scripts.evaluate_hybrid_teacher import (
     _historical_static_comparison_is_valid,
     _mean_layer_counterfactual_protocol,
     _protocol_metrics,
+    _protocol_aggregate_for_rows,
     _projected_radius_diagnostics,
     _query_representation_contract,
     _resolve_evaluation_mode,
@@ -169,6 +170,47 @@ def test_layer_counterfactual_aggregate_is_per_view_mean():
         "rmse": pytest.approx(0.3),
         "evaluated_view_count": 2,
     }
+
+
+def test_protocol_aggregate_uses_only_explicitly_selected_sequence_rows():
+    def row(sequence, mae):
+        metric = {
+            "psnr": 10.0,
+            "ssim": 0.5,
+            "mae": mae,
+            "rmse": 0.3,
+        }
+        regions = {
+            name: dict(metric)
+            for name in (
+                "raw",
+                "dynamic_valid",
+                "static_valid",
+                "non_tree_static",
+                "tree_static",
+                "tree_boundary_inside_static",
+                "tree_boundary_outside_static",
+            )
+        }
+        return {
+            "sequence_id": sequence,
+            "canonical": {
+                "protocol": regions,
+                "historical_uint8_protocol": regions,
+            },
+        }
+
+    rows = [row("seq2", 0.1), row("seq1", 0.9)]
+    canonical_rows = [value for value in rows if value["sequence_id"] == "seq2"]
+    aggregate = _protocol_aggregate_for_rows(
+        canonical_rows, ("canonical",), historical=True
+    )
+    assert aggregate["canonical"]["tree_static"]["mae"] == pytest.approx(
+        0.1
+    )
+    assert aggregate["canonical"]["tree_static"][
+        "evaluated_view_count"
+    ] == 1
 
 
 def test_high_frequency_metric_detects_blurred_edge():

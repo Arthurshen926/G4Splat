@@ -1,4 +1,6 @@
+import ast
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,16 +9,25 @@ import torch
 import outdoor.hybrid_teacher_api as api
 from outdoor.hybrid_teacher_api import (
     HybridTeacher,
+    STATIC_DEPTH_ORDERED_LAYER_POLICY,
     STATIC_RAY_NORMALIZED_OPTICAL_POLICY,
     SUPPORTED_TEACHER_PROTOCOLS,
     _apply_deployment_surface_geometry,
     _static_ray_normalized_optical_mixture,
+    _static_depth_ordered_surface_volume_mixture,
     _static_surface_evidence_mixture,
     resolve_deployment_optical_contract,
     teacher_branch_validity,
 )
 from scene.gaussian_model import GaussianModel
-from outdoor.hybrid_gaussian_renderer import HybridRenderOutput
+from outdoor.hybrid_gaussian_renderer import (
+    HybridRenderOutput,
+    PROPOSAL_NONE,
+    PROPOSAL_RAY_BIRTH,
+    VERIFICATION_MEASURED_SINGLE,
+    VERIFICATION_UNVERIFIED,
+    VERIFICATION_VERIFIED,
+)
 
 
 def _optical_test_output(
@@ -229,6 +240,82 @@ def test_static_api_uses_checkpoint_deployment_compositor_by_default(
     assert not rendered["optical_compositing_contract"]["explicit_override"]
 
 
+def test_v97_deployment_hides_pending_and_nonowner_single_view_detail(
+    monkeypatch,
+):
+    gates = []
+
+    def fake_render(*_args, **kwargs):
+        gates.append(kwargs["volume_gate"].clone())
+        return _optical_test_output(0.5, 0.2)
+
+    monkeypatch.setattr(api, "render_hybrid", fake_render)
+    monkeypatch.setattr(
+        api,
+        "composite_white_background",
+        lambda image, _alpha, _sky: image,
+    )
+
+    class Foliage(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = Foliage(
+        xyz=torch.zeros(4, 3),
+        layer_role=torch.zeros(4, dtype=torch.int8),
+        static_skeleton_mask=torch.zeros(4, dtype=torch.bool),
+        persistent_envelope_mask=torch.tensor([True, False, False, False]),
+        static_leaf_mask=torch.tensor([False, True, True, True]),
+        dynamic_leaf_mask=torch.zeros(4, dtype=torch.bool),
+        verification_state=torch.tensor(
+            [
+                VERIFICATION_VERIFIED,
+                VERIFICATION_VERIFIED,
+                VERIFICATION_MEASURED_SINGLE,
+                VERIFICATION_UNVERIFIED,
+            ],
+            dtype=torch.int8,
+        ),
+        verified_camera_count=torch.tensor([2, 2, 1, 0]),
+        verified_sequence_count=torch.tensor([1, 1, 1, 0]),
+        proposal_kind=torch.tensor(
+            [PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_NONE, PROPOSAL_RAY_BIRTH],
+            dtype=torch.int8,
+        ),
+        support_camera_ids=torch.tensor(
+            [[-1], [1], [7], [7]], dtype=torch.int32
+        ),
+    )
+    teacher = HybridTeacher(
+        surface=SimpleNamespace(get_xyz=torch.zeros(1, 3)),
+        foliage=foliage,
+        sky=lambda _camera: torch.ones(3, 2, 3),
+        appearance=object(),
+        state={
+            "protocol": (
+                "cambridge_native_hybrid_teacher_v97_static_evidence_tier_settle"
+            ),
+            "iteration": 2,
+            "training_contract": {
+                "reconstruction_target": "static",
+                "branch_activation": {"foliage_iteration": 1},
+                "deployment_static_contract": {
+                    "optical_replacement_policy": "disabled",
+                    "optical_responsibility_prior": 0.0,
+                    "detail_visibility": "evidence_tiered",
+                },
+            },
+        },
+    )
+
+    teacher.render(SimpleNamespace(colmap_id=8), conditioned=False)
+    torch.testing.assert_close(gates[0], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+
+    gates.clear()
+    teacher.render(SimpleNamespace(colmap_id=7), conditioned=False)
+    torch.testing.assert_close(gates[0], torch.tensor([1.0, 1.0, 1.0, 0.0]))
+
+
 def test_static_surface_evidence_is_soft_and_depth_ordered():
     canopy = _optical_test_output(0.0, 0.5)
     canopy.volume_depth.fill_(2.0)
@@ -253,6 +340,77 @@ def test_static_surface_evidence_preserves_unopposed_surface():
     mixed, weight = _static_surface_evidence_mixture(canopy, surface)
     torch.testing.assert_close(weight, torch.ones_like(weight))
     torch.testing.assert_close(mixed.render, surface.render)
+
+
+def test_static_depth_ordered_layers_use_per_pixel_metric_order():
+    surface = _optical_test_output(0.2, 0.0)
+    surface.alpha.fill_(0.8)
+    surface.surface_alpha.fill_(0.8)
+    surface.depth.fill_(4.0)
+    volume = _optical_test_output(0.6, 0.5)
+    volume.depth.fill_(2.0)
+    volume.volume_depth.fill_(2.0)
+
+    mixed, surface_front = _static_depth_ordered_surface_volume_mixture(
+        surface, volume
+    )
+    expected = volume.render + (1.0 - volume.alpha) * (
+        surface.render - 1.0
+    )
+    torch.testing.assert_close(mixed.render, expected)
+    assert not bool(surface_front.any())
+    torch.testing.assert_close(
+        mixed.surface_alpha,
+        (1.0 - volume.alpha) * surface.alpha,
+    )
+    torch.testing.assert_close(mixed.volume_alpha, volume.alpha)
+
+    surface.depth.fill_(1.0)
+    mixed, surface_front = _static_depth_ordered_surface_volume_mixture(
+        surface, volume
+    )
+    expected = surface.render + (1.0 - surface.alpha) * (
+        volume.render - 1.0
+    )
+    torch.testing.assert_close(mixed.render, expected)
+    assert bool(surface_front.all())
+
+
+def test_static_depth_ordered_policy_is_public_and_target_independent():
+    assert (
+        STATIC_DEPTH_ORDERED_LAYER_POLICY
+        in api.SUPPORTED_OPTICAL_REPLACEMENT_POLICIES
+    )
+    parameters = inspect.signature(
+        _static_depth_ordered_surface_volume_mixture
+    ).parameters
+    assert set(parameters) == {
+        "surface",
+        "volume",
+        "background",
+        "clearance",
+        "epsilon",
+    }
+
+
+def test_static_depth_ordered_layers_respect_nonwhite_background():
+    background = torch.tensor([0.1, 0.2, 0.3])
+    surface = _optical_test_output(0.2, 0.0)
+    surface.alpha.fill_(0.8)
+    surface.depth.fill_(4.0)
+    volume = _optical_test_output(0.6, 0.5)
+    volume.depth.fill_(2.0)
+
+    mixed, surface_front = _static_depth_ordered_surface_volume_mixture(
+        surface,
+        volume,
+        background=background,
+    )
+    expected = volume.render + (1.0 - volume.alpha) * (
+        surface.render - background[:, None, None]
+    )
+    torch.testing.assert_close(mixed.render, expected)
+    assert not bool(surface_front.any())
 
 
 def test_causal_repair_teacher_protocol_is_publicly_loadable():
@@ -488,6 +646,75 @@ def test_causal_repair_teacher_protocol_is_publicly_loadable():
         "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule"
         in SUPPORTED_TEACHER_PROTOCOLS
     )
+    assert (
+        "cambridge_native_hybrid_teacher_v89_canonical_occlusion_completion"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v90_normalized_canonical_occlusion_completion"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v94_verified_local_occlusion_lifecycle"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v101_snapshot_owned_static_detail"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v106_exact_support_canonical_coverage"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v107_global_canonical_negative_cleanup"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v108_evidence_bounded_detail_completion"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v110_moge3_native_depth_query_optical"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v111_moge3_chart_normal_static_canopy"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v112_moge3_scene_scale_authority"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v113_moge3_thin_hit_interval"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+    assert (
+        "cambridge_native_hybrid_teacher_v114_exact_rigid_front_optical_ownership"
+        in SUPPORTED_TEACHER_PROTOCOLS
+    )
+
+
+def test_api_accepts_the_current_trainer_protocol():
+    trainer = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "train_unified_outdoor_teacher.py"
+    )
+    module = ast.parse(trainer.read_text())
+    protocol = None
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == "PROTOCOL"
+            for target in node.targets
+        ):
+            protocol = ast.literal_eval(node.value)
+            break
+    assert isinstance(protocol, str)
+    assert protocol in SUPPORTED_TEACHER_PROTOCOLS
 
 
 def test_teacher_api_distinguishes_surface_only_from_canonical_mixed_render():
@@ -606,6 +833,51 @@ def test_projected_optical_footprint_repair_requires_explicit_exact_predecessor(
     with pytest.raises(RuntimeError, match="hybrid_renderer"):
         api._validate_render_implementation(
             wrong, allow_projected_optical_footprint_repair=True
+        )
+
+
+def test_historical_v95_repair_cannot_cross_the_v110_cuda_contract():
+    predecessor = api.MIXED_PIXEL_DEPTH_REPAIR_PREDECESSOR
+    hashes = {
+        "appearance_uncertainty": api.sha256_file(
+            api.REPO_ROOT / "outdoor/appearance_uncertainty.py"
+        ),
+        "dataset_reader": api.sha256_file(
+            api.SURFEL_ROOT / "scene/dataset_readers.py"
+        ),
+        "gaussian_model": api.sha256_file(
+            api.SURFEL_ROOT / "scene/gaussian_model.py"
+        ),
+        "hybrid_renderer": api.sha256_file(
+            api.REPO_ROOT / "outdoor/hybrid_gaussian_renderer.py"
+        ),
+        **{
+            name: predecessor[name]
+            for name in api.MIXED_PIXEL_DEPTH_REPAIR_TARGET
+        },
+    }
+    state = {
+        "protocol": predecessor["protocol"],
+        "implementation_hashes": hashes,
+    }
+    with pytest.raises(RuntimeError, match="mixed_forward_cuda"):
+        api._validate_render_implementation(state)
+
+    # The v95 repair flag names one exact historical target.  The v110
+    # extension adds target-depth query channels and a different binary ABI;
+    # it must not be relabelled as that older zero-training migration even
+    # though an empty query preserves ordinary RGB image formation.
+    with pytest.raises(RuntimeError, match="mixed_forward_cuda"):
+        api._validate_render_implementation(
+            state, allow_mixed_pixel_depth_repair=True
+        )
+
+    wrong_hashes = dict(hashes)
+    wrong_hashes["mixed_backward_cuda"] = "not-the-v95-binary-source"
+    with pytest.raises(RuntimeError, match="mixed_backward_cuda"):
+        api._validate_render_implementation(
+            {**state, "implementation_hashes": wrong_hashes},
+            allow_mixed_pixel_depth_repair=True,
         )
 
 

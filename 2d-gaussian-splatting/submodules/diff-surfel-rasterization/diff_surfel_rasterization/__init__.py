@@ -235,6 +235,7 @@ def rasterize_mixed_gaussians(
     opacities,
     surface_gate_indices,
     surface_gate_atlas,
+    depth_query_bounds,
     audit_fields,
     raster_settings,
 ):
@@ -242,7 +243,9 @@ def rasterize_mixed_gaussians(
 
     Primitive ids ``[0, N_surface)`` are 2D surfels and the remaining ids
     are 3D volumes. Both representations emit into one tile list and are
-    radix-sorted together by camera-space center depth before compositing.
+    radix-sorted together. Volumes use camera-space centre depth; surfels use
+    the perspective-correct ray/plane intersection at each touched tile
+    centre so an oblique facade is not assigned one global depth key.
     """
     return _RasterizeMixedGaussians.apply(
         surface_means3D,
@@ -257,6 +260,7 @@ def rasterize_mixed_gaussians(
         opacities,
         surface_gate_indices,
         surface_gate_atlas,
+        depth_query_bounds,
         audit_fields,
         raster_settings,
     )
@@ -278,6 +282,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
         opacities,
         surface_gate_indices,
         surface_gate_atlas,
+        depth_query_bounds,
         audit_fields,
         raster_settings,
     ):
@@ -293,6 +298,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             opacities,
             surface_gate_indices,
             surface_gate_atlas,
+            depth_query_bounds,
             raster_settings.scale_modifier,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
@@ -345,7 +351,9 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             opacities,
             surface_gate_indices,
             surface_gate_atlas,
+            depth_query_bounds,
             radii,
+            others,
             geom_buffer,
             binning_buffer,
             image_buffer,
@@ -380,7 +388,9 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             opacities,
             surface_gate_indices,
             surface_gate_atlas,
+            depth_query_bounds,
             radii,
+            forward_others,
             geom_buffer,
             binning_buffer,
             image_buffer,
@@ -393,7 +403,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             )
         if grad_others is None:
             grad_others = torch.zeros(
-                (11, settings.image_height, settings.image_width),
+                (13, settings.image_height, settings.image_width),
                 dtype=colors.dtype,
                 device=colors.device,
             )
@@ -409,6 +419,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             opacities,
             surface_gate_indices,
             surface_gate_atlas,
+            depth_query_bounds,
             settings.scale_modifier,
             settings.viewmatrix,
             settings.projmatrix,
@@ -417,6 +428,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             radii,
             grad_color,
             grad_others,
+            forward_others,
             geom_buffer,
             ctx.rendered,
             binning_buffer,
@@ -464,6 +476,7 @@ class _RasterizeMixedGaussians(torch.autograd.Function):
             grad_surface_gate_atlas,
             None,
             None,
+            None,
         )
 
 
@@ -488,6 +501,7 @@ class MixedGaussianRasterizer(nn.Module):
         opacities,
         surface_gate_indices=None,
         surface_gate_atlas=None,
+        depth_query_bounds=None,
         audit_fields=None,
     ):
         expected = surface_means3D.shape[0] + volume_means3D.shape[0]
@@ -503,6 +517,11 @@ class MixedGaussianRasterizer(nn.Module):
             )
         if audit_fields is None:
             audit_fields = colors.new_empty(
+                (0, self.raster_settings.image_height,
+                 self.raster_settings.image_width)
+            )
+        if depth_query_bounds is None:
+            depth_query_bounds = colors.new_empty(
                 (0, self.raster_settings.image_height,
                  self.raster_settings.image_width)
             )
@@ -535,6 +554,19 @@ class MixedGaussianRasterizer(nn.Module):
             raise ValueError("surface_gate_atlas must be on the render device")
         if surface_gate_atlas.dtype != colors.dtype:
             raise ValueError("surface_gate_atlas must match the render dtype")
+        if depth_query_bounds.shape not in {
+            (0, self.raster_settings.image_height,
+             self.raster_settings.image_width),
+            (2, self.raster_settings.image_height,
+             self.raster_settings.image_width),
+        }:
+            raise ValueError(
+                "depth_query_bounds must be empty or have shape (2,H,W)"
+            )
+        if depth_query_bounds.device != surface_means3D.device:
+            raise ValueError("depth_query_bounds must be on the render device")
+        if depth_query_bounds.dtype != colors.dtype:
+            raise ValueError("depth_query_bounds must match the render dtype")
         if surface_gate_indices.numel():
             minimum = int(surface_gate_indices.min())
             maximum = int(surface_gate_indices.max())
@@ -555,6 +587,7 @@ class MixedGaussianRasterizer(nn.Module):
             opacities,
             surface_gate_indices,
             surface_gate_atlas,
+            depth_query_bounds,
             audit_fields,
             self.raster_settings,
         )

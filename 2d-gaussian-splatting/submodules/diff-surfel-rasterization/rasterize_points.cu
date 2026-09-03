@@ -146,6 +146,7 @@ RasterizeMixedGaussiansCUDA(
 	const torch::Tensor& opacities,
 	const torch::Tensor& surface_gate_indices,
 	const torch::Tensor& surface_gate_atlas,
+	const torch::Tensor& depth_query_bounds,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -187,6 +188,12 @@ RasterizeMixedGaussiansCUDA(
 		(surface_gate_atlas.ndimension() != 3 ||
 		 surface_gate_atlas.size(2) != gate_size))
 		AT_ERROR("surface_gate_atlas must have shape (K, G, G)");
+	if (depth_query_bounds.numel() > 0 &&
+		(depth_query_bounds.ndimension() != 3 ||
+		 depth_query_bounds.size(0) != 2 ||
+		 depth_query_bounds.size(1) != image_height ||
+		 depth_query_bounds.size(2) != image_width))
+		AT_ERROR("depth_query_bounds must be empty or have shape (2, H, W)");
 	const int audit_field_count =
 		audit_fields.numel() == 0 ? 0 : audit_fields.size(0);
 	if (audit_field_count > 8)
@@ -208,6 +215,7 @@ RasterizeMixedGaussiansCUDA(
 	CHECK_INPUT(opacities);
 	CHECK_INPUT(surface_gate_indices);
 	CHECK_INPUT(surface_gate_atlas);
+	CHECK_INPUT(depth_query_bounds);
 	CHECK_INPUT(viewmatrix);
 	CHECK_INPUT(projmatrix);
 	CHECK_INPUT(audit_fields);
@@ -218,9 +226,10 @@ RasterizeMixedGaussiansCUDA(
 		colors.options().dtype(torch::kFloat32);
 	torch::Tensor out_color =
 		torch::zeros({NUM_CHANNELS, H, W}, float_opts);
-	// Seven legacy auxiliary maps plus surface/volume alpha and depth.
+	// Seven legacy maps, surface/volume alpha/depth, and two exact
+	// per-pixel volume depth-query optical maps.
 	torch::Tensor out_others =
-		torch::zeros({11, H, W}, float_opts);
+		torch::zeros({MIXED_AUX_CHANNELS, H, W}, float_opts);
 	torch::Tensor radii = torch::zeros(
 		{primitive_count},
 		colors.options().dtype(torch::kInt32));
@@ -268,6 +277,8 @@ RasterizeMixedGaussiansCUDA(
 			surface_gate_atlas.contiguous().data_ptr<float>(),
 			gate_count,
 			gate_size,
+			depth_query_bounds.contiguous().data_ptr<float>(),
+			depth_query_bounds.numel() > 0,
 			scale_modifier,
 			viewmatrix.contiguous().data_ptr<float>(),
 			projmatrix.contiguous().data_ptr<float>(),
@@ -318,6 +329,7 @@ RasterizeMixedGaussiansBackwardCUDA(
 	const torch::Tensor& opacities,
 	const torch::Tensor& surface_gate_indices,
 	const torch::Tensor& surface_gate_atlas,
+	const torch::Tensor& depth_query_bounds,
 	const float scale_modifier,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -326,6 +338,7 @@ RasterizeMixedGaussiansBackwardCUDA(
 	const torch::Tensor& radii,
 	const torch::Tensor& dL_dout_color,
 	const torch::Tensor& dL_dout_others,
+	const torch::Tensor& forward_others,
 	const torch::Tensor& geomBuffer,
 	const int rendered_count,
 	const torch::Tensor& binningBuffer,
@@ -343,11 +356,13 @@ RasterizeMixedGaussiansBackwardCUDA(
 	CHECK_INPUT(opacities);
 	CHECK_INPUT(surface_gate_indices);
 	CHECK_INPUT(surface_gate_atlas);
+	CHECK_INPUT(depth_query_bounds);
 	CHECK_INPUT(viewmatrix);
 	CHECK_INPUT(projmatrix);
 	CHECK_INPUT(radii);
 	CHECK_INPUT(dL_dout_color);
 	CHECK_INPUT(dL_dout_others);
+	CHECK_INPUT(forward_others);
 	CHECK_INPUT(geomBuffer);
 	CHECK_INPUT(binningBuffer);
 	CHECK_INPUT(imageBuffer);
@@ -409,7 +424,12 @@ RasterizeMixedGaussiansBackwardCUDA(
 			surface_gate_atlas.contiguous().data_ptr<float>(),
 			surface_gate_atlas.numel() == 0
 				? 0
+				: surface_gate_atlas.size(0),
+			surface_gate_atlas.numel() == 0
+				? 0
 				: surface_gate_atlas.size(1),
+			depth_query_bounds.contiguous().data_ptr<float>(),
+			depth_query_bounds.numel() > 0,
 			scale_modifier,
 			viewmatrix.contiguous().data_ptr<float>(),
 			projmatrix.contiguous().data_ptr<float>(),
@@ -421,6 +441,7 @@ RasterizeMixedGaussiansBackwardCUDA(
 			reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 			dL_dout_color.contiguous().data_ptr<float>(),
 			dL_dout_others.contiguous().data_ptr<float>(),
+			forward_others.contiguous().data_ptr<float>(),
 			dL_dmean2D.contiguous().data_ptr<float>(),
 			dL_dsurface_normal.contiguous().data_ptr<float>(),
 			dL_dsurface_transMat.contiguous().data_ptr<float>(),

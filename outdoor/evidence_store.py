@@ -1,7 +1,7 @@
 """Unified, source-aware evidence contract for outdoor reconstruction.
 
-The store deliberately keeps COLMAP, MASt3R, Chart, plane and monocular
-measurements as separate artifacts.  A fused inverse-depth cache may be
+The store deliberately keeps COLMAP, MASt3R, Chart, plane, MoGe3 and legacy
+monocular measurements as separate artifacts.  A fused inverse-depth cache may be
 registered for efficient sampling, but it never replaces the source records.
 Every persisted artifact has an immutable content hash and every sparse track
 retains its source id, camera support, role posterior and uncertainty.
@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 from typing import Any, Iterable
@@ -30,9 +31,11 @@ from outdoor.scene_contract import sha256_file
 
 
 EVIDENCE_STORE_VERSION = (
-    "outdoor-hybrid-teacher-evidence-v7-all-camera-role-posterior"
+    "outdoor-hybrid-teacher-evidence-v9-moge3-compact-runtime"
 )
 LEGACY_EVIDENCE_STORE_VERSIONS = {
+    "outdoor-hybrid-teacher-evidence-v8-moge3-exact-k",
+    "outdoor-hybrid-teacher-evidence-v7-all-camera-role-posterior",
     "outdoor-hybrid-teacher-evidence-v6-static-role-posterior",
     "outdoor-hybrid-teacher-evidence-v5-target-raster-tracks",
     "outdoor-hybrid-teacher-evidence-v4-crossview-consensus",
@@ -504,6 +507,21 @@ class EvidenceStoreBuilder:
             artifact.payload()
             for artifact in sorted(self.artifacts, key=lambda value: value.name)
         ]
+        artifact_names = {artifact["name"] for artifact in artifact_payload}
+        if {"moge3_index", "dav2_index"} <= artifact_names:
+            raise RuntimeError(
+                "MoGe3 metric evidence and legacy DAV2 ordinal evidence must "
+                "not share one immutable production store"
+            )
+        if (
+            "moge3_index" in artifact_names
+            and "moge3_runtime_cache" not in artifact_names
+        ):
+            raise RuntimeError(
+                "A v9 MoGe3 production store requires the content-addressed "
+                "compact runtime cache; raw 149 GB archives are not a "
+                "per-step training interface"
+            )
         sfm_coverage = sfm_coverage_tracks_enabled(self.geometry_source)
         colmap_geometry_used = bool(
             sfm_coverage
@@ -552,6 +570,8 @@ class EvidenceStoreBuilder:
                 "source_measurements_retained": True,
                 "inverse_depth_fusion_is_cache_not_ground_truth": True,
                 "training_must_log_consumed_source_types": True,
+                "moge3_exact_k_fields_are_source_separated": True,
+                "legacy_dav2_may_not_override_moge3": True,
             },
             "ownership_contract": {
                 "rigid": "native_2d_surfel",
@@ -575,12 +595,31 @@ class EvidenceStoreBuilder:
                     True
                 ),
             },
+            "forbidden_inputs_audit": {
+                "points3D_bin_read": bool(sfm_coverage),
+                "colmap_tracks_read": bool(sfm_coverage),
+                "colmap_camera_or_pose_authority": False,
+                "colmap_dense_geometry_authority": False,
+                "sfm_track_usage_mode": (
+                    "coverage_only" if sfm_coverage else "disabled"
+                ),
+                "historical_gaussian_initialization": False,
+            },
         }
         payload["evidence_hash"] = _canonical_json_digest(payload)
         manifest = self.root / "evidence_manifest.json"
-        manifest.write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        temporary = manifest.with_name(
+            f".{manifest.name}.tmp-{os.getpid()}"
         )
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         return payload
 
 

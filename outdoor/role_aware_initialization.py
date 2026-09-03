@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,12 @@ from outdoor.foliage_view_graph import (
     sequence_id,
 )
 from outdoor.scene_contract import sha256_file
+from outdoor.moge3_evidence import (
+    exact_k_unproject_depth,
+    load_index as load_moge3_index,
+    load_runtime_cache as load_moge3_runtime_cache,
+    load_view as load_moge3_view,
+)
 from outdoor.projected_role_posterior import (
     PROJECTED_RIGID_MAX_CAMERA_DEPTH,
     PROJECTED_RIGID_POSTERIOR_VERSION,
@@ -60,12 +67,15 @@ SINGLE_SEQUENCE_POINTMAP_PRECISION = 0.03
 
 
 INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v84-renderer-visible-tree-occluded-"
+    "outdoor-role-aware-initialization-v86-moge3-compact-chart-scale-"
+    "renderer-visible-tree-occluded-"
     "rigid-geometry-with-exact-current-view-visibility-and-color-"
     "arbitration"
 )
 RIGID_CALIBRATED_INITIALIZATION_VERSION = (
-    "outdoor-role-aware-initialization-v77-native-rigid-depth-continuous-"
+    "outdoor-role-aware-initialization-v79-moge3-chart-scale-authority-"
+    "native-rigid-"
+    "depth-continuous-"
     "posterior-camera-dephased-blue-noise-full-rgb-anisotropic-ray-frame"
 )
 TEMPORAL_DAV2_AUGMENTATION_VERSION = (
@@ -83,6 +93,7 @@ SOURCE_CHART = 2
 SOURCE_DAV2 = 3
 SOURCE_DENSE_RAY = 4
 SOURCE_SURFACE_DAV2 = 4
+SOURCE_MOGE3 = 5
 
 
 def _bilinear_rgb_at_pixel_centres(
@@ -4976,6 +4987,631 @@ def _chart_foliage_samples(
     return selected[: int(maximum_samples)]
 
 
+def _robust_moge3_scene_scale(
+    log_ratios: np.ndarray,
+    view_ids: np.ndarray,
+    *,
+    minimum_pixels: int,
+    minimum_views: int = 2,
+    consensus_log_radius: float = 0.18,
+    maximum_log_sigma: float = 0.12,
+) -> dict[str, Any]:
+    """Fit one positive scene gauge from a cross-view consensus mode.
+
+    A rendered rigid z-buffer and monocular depth need not describe the same
+    surface at every nominally rigid pixel (thin geometry, mask boundaries
+    and genuine reconstruction holes are common).  Expanding a MAD gate to
+    include those mismatches makes their mixture variance look like metric
+    uncertainty and previously reduced every MoGe seed to near-zero trust.
+    Select the densest *fixed-width* log-scale mode instead, then require that
+    the selected mode is supported by multiple exact cameras.
+    """
+    values = np.asarray(log_ratios, dtype=np.float64).reshape(-1)
+    owners = np.asarray(view_ids, dtype=np.int64).reshape(-1)
+    if values.shape != owners.shape:
+        raise ValueError("MoGe3 scale ratios and view ids must align")
+    finite = np.isfinite(values)
+    values, owners = values[finite], owners[finite]
+    if len(values) < int(minimum_pixels):
+        return {
+            "accepted": False,
+            "reason": "insufficient_global_scale_support",
+            "scale_support_pixels": int(len(values)),
+            "scale_support_views": 0,
+        }
+    radius = float(consensus_log_radius)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("MoGe3 scale consensus radius must be positive")
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    left = 0
+    best_left = 0
+    best_right = 0
+    for right in range(len(sorted_values)):
+        while sorted_values[right] - sorted_values[left] > 2.0 * radius:
+            left += 1
+        if right + 1 - left > best_right - best_left:
+            best_left, best_right = left, right + 1
+    center = float(np.median(sorted_values[best_left:best_right]))
+    inlier = np.abs(values - center) <= radius
+    for _ in range(3):
+        if not bool(inlier.any()):
+            break
+        updated = float(np.median(values[inlier]))
+        if abs(updated - center) <= 1e-10:
+            center = updated
+            break
+        center = updated
+        inlier = np.abs(values - center) <= radius
+
+    # A camera with only an accidental pixel in the mode is not independent
+    # scale support.  Keep the threshold small for synthetic/unit fixtures,
+    # but require a real patch (up to 32 pixels) in production.
+    minimum_per_view = max(
+        1,
+        min(
+            32,
+            int(math.ceil(int(minimum_pixels) / max(8 * minimum_views, 1))),
+        ),
+    )
+    unique_views, counts = np.unique(owners[inlier], return_counts=True)
+    supported_views = unique_views[counts >= minimum_per_view]
+    inlier &= np.isin(owners, supported_views)
+    support_pixels = int(inlier.sum())
+    support_views = int(len(supported_views))
+    if (
+        support_pixels < int(minimum_pixels)
+        or support_views < int(minimum_views)
+    ):
+        return {
+            "accepted": False,
+            "reason": "insufficient_cross_view_scale_consensus",
+            "scale_support_pixels": support_pixels,
+            "scale_support_views": support_views,
+            "scale_consensus_log_radius": radius,
+            "scale_minimum_pixels_per_view": minimum_per_view,
+        }
+    center = float(np.median(values[inlier]))
+    residual = values[inlier] - center
+    log_sigma = float(1.4826 * np.median(np.abs(residual)))
+    if not np.isfinite(log_sigma) or log_sigma > float(maximum_log_sigma):
+        return {
+            "accepted": False,
+            "reason": "global_scale_consensus_too_broad",
+            # Preserve the independently supported mode centre for a strict
+            # consistency check against the immutable Chart scale. Its width
+            # is not allowed to become the scene-scale uncertainty.
+            "candidate_metric_to_cambridge_scale": float(math.exp(center)),
+            "scale_support_pixels": support_pixels,
+            "scale_support_views": support_views,
+            "global_log_scale_sigma": log_sigma,
+            "maximum_global_log_scale_sigma": float(maximum_log_sigma),
+            "scale_consensus_log_radius": radius,
+        }
+    return {
+        "accepted": True,
+        "metric_to_cambridge_scale": float(math.exp(center)),
+        "global_log_scale_sigma": log_sigma,
+        "scale_support_pixels": support_pixels,
+        "scale_support_views": support_views,
+        "scale_consensus_fraction": float(support_pixels / len(values)),
+        "scale_consensus_log_radius": radius,
+        "scale_minimum_pixels_per_view": minimum_per_view,
+        "scale_rejected_pixels": int(len(values) - support_pixels),
+    }
+
+
+def _resolve_moge3_foliage_scene_scale(
+    rigid_scale_fit: dict[str, Any],
+    chart_scale_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve one scene gauge while keeping rigid depth source-separated.
+
+    The cross-view MoGe/MAtCha Chart calibration is the scene-scale
+    authority. A trained rigid render is an independent front/behind layer
+    and may only reject that authority when its supported mode centre is
+    inconsistent. A broad rigid residual mixture must not erase all foliage
+    samples or inflate the authoritative scale uncertainty.
+    """
+    chart_scale = chart_scale_audit.get("metric_to_cambridge_scale")
+    if chart_scale is None:
+        return dict(rigid_scale_fit)
+    chart_scale = float(chart_scale)
+    chart_sigma = float(
+        chart_scale_audit.get("global_log_scale_sigma", float("nan"))
+    )
+    if (
+        not np.isfinite(chart_scale)
+        or chart_scale <= 0.0
+        or not np.isfinite(chart_sigma)
+        or chart_sigma < 0.0
+    ):
+        raise RuntimeError("MoGe3 Chart scene-scale contract is invalid")
+    candidate = rigid_scale_fit.get("metric_to_cambridge_scale")
+    if candidate is None:
+        candidate = rigid_scale_fit.get(
+            "candidate_metric_to_cambridge_scale"
+        )
+    disagreement = 0.0
+    if candidate is not None:
+        candidate = float(candidate)
+        if not np.isfinite(candidate) or candidate <= 0.0:
+            raise RuntimeError("Rigid-depth MoGe3 scale candidate is invalid")
+        disagreement = abs(math.log(candidate / chart_scale))
+        if disagreement > 0.18:
+            raise RuntimeError(
+                "Rigid-depth and MAtCha Chart MoGe3 scene scales disagree: "
+                f"rigid={candidate:.6f}, chart={chart_scale:.6f}"
+            )
+    return {
+        "accepted": True,
+        "metric_to_cambridge_scale": chart_scale,
+        "global_log_scale_sigma": max(chart_sigma, disagreement),
+        "scale_authority": "moge3_matcha_chart_scene_consensus",
+        "chart_scale_log_disagreement": disagreement,
+        "rigid_depth_fit_accepted": bool(
+            rigid_scale_fit.get("accepted", False)
+        ),
+        "rigid_depth_scale_audit": dict(rigid_scale_fit),
+    }
+
+
+def _moge3_foliage_samples(
+    store: dict,
+    images: dict[int, dict],
+    cameras: dict[int, dict],
+    masks: CambridgeMaskLookup,
+    rigid_xyz: np.ndarray,
+    *,
+    allowed_image_ids: set[int] | None = None,
+    rigid_depth_maps: dict[int, np.ndarray] | None = None,
+    samples_per_view: int = 384,
+    maximum_samples: int = 160_000,
+    minimum_global_scale_pixels: int = 256,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Create exact-camera tree hits from metric MoGe3 depth.
+
+    The only fitted gauge is one scene-wide positive scale between MoGe's
+    metric depth and the fixed Cambridge world.  Per-camera affine fitting is
+    forbidden.  A canopy observation may propose geometry only in front of a
+    known rigid hit; a depth behind that hit is unknown, never positive tree
+    mass.  Single-view rows remain exact-camera measured proposals and gain
+    persistent authority only through the existing multi-view voxel fusion.
+    """
+    index_path = artifact_path(store, "moge3_index", required=False)
+    if index_path is None:
+        return [], {
+            "schema": "moge3-exact-k-front-hit-v1",
+            "views": 0,
+            "accepted_views": 0,
+            "reason": "no_moge3_index",
+        }
+    index = load_moge3_index(index_path, verify_views=False)
+    records = dict(index["records"])
+    runtime_path = artifact_path(
+        store, "moge3_runtime_cache", required=False
+    )
+    runtime = (
+        load_moge3_runtime_cache(
+            runtime_path,
+            expected_source_index_sha256=sha256_file(index_path),
+            verify_arrays=True,
+        )
+        if runtime_path is not None
+        else None
+    )
+    chart_scale_audit: dict[str, Any] = {}
+    chart_base_path = artifact_path(
+        store, "moge3_chart_base", required=False
+    )
+    if chart_base_path is not None:
+        with np.load(chart_base_path, allow_pickle=False) as archive:
+            chart_metadata = json.loads(
+                str(archive["metadata_json"].item())
+            )
+        chart_scale_audit = dict(
+            chart_metadata.get("scale_calibration", {})
+        )
+    rigid_xyz = np.asarray(rigid_xyz, dtype=np.float64).reshape(-1, 3)
+    rigid_depth_maps = rigid_depth_maps or {}
+    if not rigid_depth_maps:
+        raise RuntimeError(
+            "MoGe3 canopy initialization requires dense rigid depth maps "
+            "from the trained fixed-camera rigid 2DGS. Sparse seed "
+            "projection is not a metric scale or occlusion authority."
+        )
+    dataset = Path(store["dataset"])
+    eligible_ids = (
+        {int(value) for value in allowed_image_ids}
+        if allowed_image_ids is not None
+        else {int(value) for value in images}
+    )
+
+    def resize_mask_channels(
+        image_record: dict, shape: tuple[int, int]
+    ) -> list[np.ndarray]:
+        key = masks.source_name_for(image_record["name"])
+        return [
+            torch.nn.functional.interpolate(
+                value.detach().float()[None, None],
+                size=shape,
+                mode="nearest",
+            )[0, 0]
+            .bool()
+            .numpy()
+            for value in masks.masks[key][:4]
+        ]
+
+    def rigid_zbuffer(
+        image_id: int,
+        image_record: dict,
+        camera: dict,
+        shape: tuple[int, int],
+    ) -> np.ndarray:
+        rendered = rigid_depth_maps.get(int(image_id))
+        if rendered is None:
+            raise RuntimeError(
+                "MoGe3 selected camera lacks its trained-rigid depth map: "
+                f"image_id={image_id}, image={image_record['name']}"
+            )
+        source = np.asarray(rendered, dtype=np.float32)
+        finite = np.isfinite(source) & (source > 0)
+        value = np.where(finite, source, 0.0)
+        if source.shape != shape:
+            value = torch.nn.functional.interpolate(
+                torch.from_numpy(value)[None, None],
+                size=shape,
+                mode="nearest",
+            )[0, 0].numpy()
+            finite = (
+                torch.nn.functional.interpolate(
+                    torch.from_numpy(finite.astype(np.float32))[None, None],
+                    size=shape,
+                    mode="nearest",
+                )[0, 0].numpy()
+                > 0.5
+            )
+        return np.where(finite, value, np.inf).astype(np.float32)
+
+    eligible: list[tuple[int, dict, dict, dict[str, Any]]] = []
+    scale_log_ratios: list[np.ndarray] = []
+    scale_view_ids: list[np.ndarray] = []
+    for image_id in sorted(images):
+        if int(image_id) not in eligible_ids:
+            continue
+        image_record = images[image_id]
+        stem = Path(str(image_record["name"])).stem
+        record = records.get(stem)
+        if record is None:
+            continue
+        if runtime is not None:
+            position = runtime["camera_index"].get(stem)
+            if position is None:
+                raise RuntimeError(
+                    f"MoGe3 runtime cache lacks selected camera {stem}"
+                )
+            view = {
+                name: np.asarray(value[position])
+                for name, value in runtime["arrays"].items()
+            }
+            view["refinement_valid_mask"] = view["valid_mask"]
+        else:
+            view = load_moge3_view(Path(record["path"]))
+        depth = np.asarray(view["depth_m"], dtype=np.float32)
+        camera = cameras[int(image_record["camera_id"])]
+        expected_shape = (int(camera["height"]), int(camera["width"]))
+        if runtime is None and depth.shape != expected_shape:
+            raise RuntimeError(
+                f"MoGe3/fixed camera shape mismatch for {stem}: "
+                f"{depth.shape} != {expected_shape}"
+            )
+        if runtime is not None and depth.shape != tuple(
+            runtime["raster_shape"]
+        ):
+            raise RuntimeError(
+                f"MoGe3 runtime raster shape mismatch for {stem}"
+            )
+        if runtime is not None:
+            if camera["model"] == "SIMPLE_PINHOLE":
+                raw_fx = raw_fy = float(camera["params"][0])
+                raw_cx, raw_cy = map(float, camera["params"][1:3])
+            else:
+                raw_fx, raw_fy, raw_cx, raw_cy = map(
+                    float, camera["params"][:4]
+                )
+            height_scale = depth.shape[0] / float(camera["height"])
+            width_scale = depth.shape[1] / float(camera["width"])
+            K_runtime = np.asarray(
+                [
+                    [raw_fx * width_scale, 0.0, raw_cx * width_scale],
+                    [0.0, raw_fy * height_scale, raw_cy * height_scale],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            view["pointmap_exact_k_camera"] = exact_k_unproject_depth(
+                depth, K_runtime
+            )
+        zbuffer = rigid_zbuffer(image_id, image_record, camera, depth.shape)
+        channels = resize_mask_channels(image_record, depth.shape)
+        rigid = channels[0] & channels[1] & channels[3]
+        valid = (
+            view["valid_mask"].astype(bool)
+            & view["refinement_valid_mask"].astype(bool)
+            & np.isfinite(depth)
+            & (depth > 0.05)
+        )
+        support = rigid & valid & np.isfinite(zbuffer) & (zbuffer > 0.05)
+        ratio = zbuffer[support] / depth[support]
+        ratio = ratio[np.isfinite(ratio) & (ratio > 1e-3) & (ratio < 1e3)]
+        if len(ratio):
+            if len(ratio) > 4096:
+                stride = max(1, len(ratio) // 4096)
+                ratio = ratio[::stride][:4096]
+            scale_log_ratios.append(np.log(ratio))
+            scale_view_ids.append(
+                np.full(len(ratio), int(image_id), dtype=np.int64)
+            )
+        eligible.append(
+            (int(image_id), image_record, camera, {"view": view, "z": zbuffer})
+        )
+    if scale_log_ratios:
+        rigid_scale_fit = _robust_moge3_scene_scale(
+            np.concatenate(scale_log_ratios),
+            np.concatenate(scale_view_ids),
+            minimum_pixels=int(minimum_global_scale_pixels),
+        )
+    else:
+        rigid_scale_fit = {
+            "accepted": False,
+            "reason": "no_rigid_scale_overlap",
+            "scale_support_pixels": 0,
+            "scale_support_views": 0,
+        }
+    scale_fit = _resolve_moge3_foliage_scene_scale(
+        rigid_scale_fit, chart_scale_audit
+    )
+    if not bool(scale_fit.get("accepted", False)):
+        return [], {
+            "schema": "moge3-exact-k-front-hit-v1",
+            "views": len(eligible),
+            "accepted_views": 0,
+            **scale_fit,
+        }
+    global_scale = float(scale_fit["metric_to_cambridge_scale"])
+    global_log_sigma = float(scale_fit["global_log_scale_sigma"])
+    if not np.isfinite(global_scale) or global_scale <= 0:
+        raise RuntimeError("MoGe3 global metric-to-Cambridge scale is invalid")
+
+    output: list[dict[str, Any]] = []
+    accepted_views = 0
+    rigid_front_pixels = 0
+    rigid_behind_rejected_pixels = 0
+    unknown_rigid_depth_pixels = 0
+    for image_id, image_record, camera, cached in eligible:
+        view = cached["view"]
+        zbuffer = cached["z"]
+        depth = np.asarray(view["depth_m"], dtype=np.float32) * global_scale
+        valid = (
+            view["valid_mask"].astype(bool)
+            & view["refinement_valid_mask"].astype(bool)
+            & np.isfinite(depth)
+            & (depth > 0.05)
+        )
+        log_std = np.asarray(
+            view["refinement_log_depth_std"], dtype=np.float32
+        )
+        final_delta = np.asarray(
+            view["refinement_final_delta_log_depth"], dtype=np.float32
+        )
+        valid &= (
+            np.isfinite(log_std)
+            & np.isfinite(final_delta)
+            & (log_std <= 0.35)
+            & (final_delta <= 0.35)
+        )
+        channels = resize_mask_channels(image_record, depth.shape)
+        canopy = channels[0] & channels[1] & ~channels[3]
+        rigid_known = np.isfinite(zbuffer) & (zbuffer > 0.05)
+        clearance = np.maximum(0.03, 0.01 * np.where(rigid_known, zbuffer, 0.0))
+        in_front = ~rigid_known | (depth < zbuffer - clearance)
+        candidates = np.flatnonzero(canopy & valid & in_front)
+        rigid_front_pixels += int((canopy & valid & rigid_known & in_front).sum())
+        rigid_behind_rejected_pixels += int(
+            (canopy & valid & rigid_known & ~in_front).sum()
+        )
+        unknown_rigid_depth_pixels += int((canopy & valid & ~rigid_known).sum())
+        if not len(candidates):
+            continue
+        sample_count = min(max(int(samples_per_view), 0), len(candidates))
+        if sample_count <= 0:
+            continue
+        accepted_views += 1
+        height, width = depth.shape
+        rows, columns = np.divmod(candidates, width)
+        image_path = dataset / "images" / image_record["name"]
+        with Image.open(image_path) as handle:
+            source_rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+        if source_rgb.shape[:2] != (height, width):
+            source_rgb = np.asarray(
+                Image.fromarray(source_rgb).resize(
+                    (width, height), resample=Image.Resampling.BILINEAR
+                ),
+                dtype=np.uint8,
+            )
+        luminance = (
+            0.2126 * source_rgb[..., 0].astype(np.float32)
+            + 0.7152 * source_rgb[..., 1].astype(np.float32)
+            + 0.0722 * source_rgb[..., 2].astype(np.float32)
+        )
+        gradient = np.zeros_like(luminance)
+        gradient[:, 1:-1] += np.abs(luminance[:, 2:] - luminance[:, :-2])
+        gradient[1:-1] += np.abs(luminance[2:] - luminance[:-2])
+        detail_score = np.zeros(height * width, dtype=np.float32)
+        detail_score[candidates] = gradient[rows, columns]
+        native_x = np.arange(width, dtype=np.float64)[None].repeat(height, 0).reshape(-1)
+        native_y = np.arange(height, dtype=np.float64)[:, None].repeat(width, 1).reshape(-1)
+        coverage_count = min((sample_count + 1) // 2, len(candidates))
+        stem = Path(str(image_record["name"])).stem
+        coverage = deterministic_blue_noise_rows(
+            candidates,
+            native_x,
+            native_y,
+            coverage_count,
+            seed=stable_sampling_seed("moge3", stem, image_id, "coverage"),
+        )
+        remaining = np.setdiff1d(candidates, coverage, assume_unique=True)
+        detail = deterministic_blue_noise_rows(
+            remaining,
+            native_x,
+            native_y,
+            sample_count - len(coverage),
+            seed=stable_sampling_seed("moge3", stem, image_id, "detail"),
+            score=detail_score,
+        )
+        selected = np.sort(np.concatenate((coverage, detail)))
+        is_detail = np.isin(selected, detail, assume_unique=True)
+        selected_rows, selected_columns = np.divmod(selected, width)
+        selected_depth = depth[selected_rows, selected_columns].astype(np.float64)
+        exact_points = np.asarray(
+            view["pointmap_exact_k_camera"], dtype=np.float64
+        )[selected_rows, selected_columns] * global_scale
+        rotation = quaternion_to_rotation(image_record["qvec"])
+        translation = np.asarray(image_record["tvec"], dtype=np.float64)
+        world_points = (exact_points - translation[None]) @ rotation
+        selected_rgb = source_rgb[selected_rows, selected_columns]
+        if camera["model"] == "SIMPLE_PINHOLE":
+            fx = fy = float(camera["params"][0])
+        else:
+            fx, fy = map(float, camera["params"][:2])
+        fx *= width / float(camera["width"])
+        fy *= height / float(camera["height"])
+        nominal_spacing = np.sqrt(
+            max(float(len(candidates)), 1.0) / max(sample_count, 1)
+        )
+        bandwidth = np.where(is_detail, 0.32, 0.72)
+        tangent_u = np.clip(
+            selected_depth * nominal_spacing / max(fx, 1e-6) * bandwidth,
+            0.004,
+            0.25,
+        )
+        tangent_v = np.clip(
+            selected_depth * nominal_spacing / max(fy, 1e-6) * bandwidth,
+            0.004,
+            0.25,
+        )
+        selected_relative_sigma = np.clip(
+            0.03
+            + 2.0 * log_std[selected_rows, selected_columns]
+            + final_delta[selected_rows, selected_columns]
+            + global_log_sigma,
+            0.03,
+            0.75,
+        )
+        confidence = 1.0 / np.sqrt(
+            1.0 + np.square(selected_relative_sigma / 0.12)
+        )
+        camera_frame_xyzw = Rotation.from_matrix(rotation.T).as_quat()
+        camera_frame_wxyz = np.asarray(
+            [
+                camera_frame_xyzw[3],
+                camera_frame_xyzw[0],
+                camera_frame_xyzw[1],
+                camera_frame_xyzw[2],
+            ],
+            dtype=np.float32,
+        )
+        for row_index in range(len(selected)):
+            relative_sigma = float(selected_relative_sigma[row_index])
+            depth_value = float(selected_depth[row_index])
+            absolute_sigma = float(
+                np.clip(relative_sigma * depth_value, 0.03, 2.0)
+            )
+            tangent_max = float(max(tangent_u[row_index], tangent_v[row_index]))
+            output.append(
+                {
+                    "id": -(30_000_000 + len(output)),
+                    "xyz": world_points[row_index].astype(np.float64),
+                    "rgb": selected_rgb[row_index],
+                    "error": relative_sigma,
+                    "position_sigma": absolute_sigma,
+                    "observation_depth_sigma": absolute_sigma,
+                    "image_ids": np.asarray([image_id], dtype=np.int64),
+                    "point2d_indices": np.asarray([-1], dtype=np.int64),
+                    "tree_image_ids": np.asarray([image_id], dtype=np.int32),
+                    "observation_camera_ids": np.asarray(
+                        [image_id], dtype=np.int32
+                    ),
+                    "observation_uv": np.asarray(
+                        [
+                            [
+                                (float(selected_columns[row_index]) + 0.5) / width,
+                                (float(selected_rows[row_index]) + 0.5) / height,
+                            ]
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "observation_depth": np.asarray(
+                        [depth_value], dtype=np.float32
+                    ),
+                    "tree_sequence_count": 1,
+                    "tree_fraction": float(confidence[row_index]),
+                    "ray_footprint_scale": tangent_max,
+                    "ray_tangent_scale_u": float(tangent_u[row_index]),
+                    "ray_tangent_scale_v": float(tangent_v[row_index]),
+                    "ray_render_depth_scale": float(
+                        np.clip(min(absolute_sigma, 2.0 * tangent_max), 0.004, 0.30)
+                    ),
+                    "ray_frame_quaternion": camera_frame_wxyz.copy(),
+                    "ray_depth_nll": float(
+                        np.square(relative_sigma / 0.12)
+                    ),
+                    "moge3_basis_role": (
+                        "frequency_residual" if is_detail[row_index] else "coverage"
+                    ),
+                    "moge3_sequence_local_sample": True,
+                    "moge3_refinement_log_depth_std": float(
+                        log_std[selected_rows[row_index], selected_columns[row_index]]
+                    ),
+                    "moge3_refinement_final_delta_log_depth": float(
+                        final_delta[
+                            selected_rows[row_index], selected_columns[row_index]
+                        ]
+                    ),
+                    "moge3_metric_to_cambridge_scale": global_scale,
+                    "moge3_rigid_ordering": (
+                        "front" if rigid_known[
+                            selected_rows[row_index], selected_columns[row_index]
+                        ] else "rigid_unknown"
+                    ),
+                }
+            )
+    output, budget_audit = _balanced_single_camera_sample_cap(
+        output, maximum_samples, source_name="MoGe3"
+    )
+    return output, {
+        "schema": "moge3-exact-k-front-hit-v1",
+        "pointmap_policy": "depth_reunprojected_with_exact_cambridge_K",
+        "scale_policy": "one_scene_wide_positive_scale_no_per_view_affine",
+        "accepted": True,
+        "metric_to_cambridge_scale": global_scale,
+        "global_log_scale_sigma": global_log_sigma,
+        **{
+            key: value
+            for key, value in scale_fit.items()
+            if key != "accepted"
+        },
+        "views": int(len(eligible)),
+        "accepted_views": int(accepted_views),
+        "rigid_front_candidate_pixels": int(rigid_front_pixels),
+        "rigid_behind_rejected_pixels": int(rigid_behind_rejected_pixels),
+        "rigid_unknown_candidate_pixels": int(unknown_rigid_depth_pixels),
+        "behind_policy": "unknown_never_positive_mass",
+        "single_view_policy": "exact_camera_measured_until_multiview_fusion",
+        **budget_audit,
+    }
+
+
 def _dav2_foliage_samples(
     store: dict,
     images: dict[int, dict],
@@ -5781,6 +6417,13 @@ def _merge_foliage(
         ],
         dtype=bool,
     )
+    moge3_local = np.asarray(
+        [
+            bool(point.get("moge3_sequence_local_sample", False))
+            for point in tracks
+        ],
+        dtype=bool,
+    )
     dense_ray_local = np.asarray(
         [
             bool(point.get("_dense_ray_dynamic_birth", False))
@@ -5854,7 +6497,7 @@ def _merge_foliage(
         ],
         dtype=np.float32,
     ).reshape(-1, 4)
-    ray_local = dav2_local | dense_ray_local
+    ray_local = dav2_local | moge3_local | dense_ray_local
     valid_ray_frame = (
         ray_local
         & np.isfinite(ray_frames).all(axis=1)
@@ -6034,6 +6677,7 @@ def _merge_foliage(
         (sequence_support >= 2)
         & ~chart_local
         & ~dav2_local
+        & ~moge3_local
         & ~dense_ray_local
         & (error <= maximum_reprojection_error)
     )
@@ -6057,7 +6701,9 @@ def _merge_foliage(
     # A single dense depth observation has no evidence for a canonical
     # trunk/branch identity. Even when its local neighbourhood looks linear,
     # it remains sequence-conditioned leaf evidence.
-    layer_role[chart_local | dav2_local | dense_ray_local] = 2
+    layer_role[
+        chart_local | dav2_local | moge3_local | dense_ray_local
+    ] = 2
     occupancy_probability = np.asarray(
         [point["tree_fraction"] for point in tracks],
         dtype=np.float32,
@@ -6115,6 +6761,11 @@ def _merge_foliage(
         0.01,
         0.08,
     )
+    initial_opacity[moge3_local] = np.clip(
+        0.01 + 0.07 * occupancy_probability[moge3_local],
+        0.01,
+        0.08,
+    )
     initial_opacity[dense_ray_local] = (
         dense_initial_opacity[dense_ray_local].numpy()
     )
@@ -6169,18 +6820,22 @@ def _merge_foliage(
         ),
         "tree_instance_id": track_instances.astype(np.int32),
         "initialization_source": np.where(
-            dav2_local,
-            SOURCE_DAV2,
+            moge3_local,
+            SOURCE_MOGE3,
             np.where(
-                dense_ray_local,
-                SOURCE_DENSE_RAY,
+                dav2_local,
+                SOURCE_DAV2,
                 np.where(
-                    chart_local,
-                    SOURCE_CHART,
+                    dense_ray_local,
+                    SOURCE_DENSE_RAY,
                     np.where(
-                        sfm_coverage_track,
-                        SOURCE_COLMAP,
-                        SOURCE_MAST3R,
+                        chart_local,
+                        SOURCE_CHART,
+                        np.where(
+                            sfm_coverage_track,
+                            SOURCE_COLMAP,
+                            SOURCE_MAST3R,
+                        ),
                     ),
                 ),
             ),
@@ -6776,7 +7431,7 @@ def build_foliage_seed(
             raise FileNotFoundError(rigid_calibration_ply)
         from outdoor.rigid_occlusion import ProtectedDepthRenderer
 
-        # This builder requests a DAV2-alignment batch first and may discover
+        # This builder requests a metric-depth batch first and may discover
         # extra posterior cameras afterwards.  Keep one immutable trained
         # surface resident across both batches instead of loading the same
         # large PLY twice.
@@ -6796,7 +7451,8 @@ def build_foliage_seed(
                 rigid_calibration_resolution_scale
             ),
             "role": (
-                "dav2_metric_alignment_and_rigid_occlusion_only"
+                "moge3_front_behind_occlusion_and_independent_scale_"
+                "consistency_audit__not_scene_scale_authority"
             ),
         }
 
@@ -6889,30 +7545,58 @@ def build_foliage_seed(
             *chart_foliage,
             *pointmap_foliage,
         ]
-        # DAV2 is a dense per-frame observation source, not a correspondence
-        # graph.  Aligning every near-duplicate video frame both dominates
-        # initialization time and lets long traversals overwhelm the
-        # posterior.  Reserve multiple sequence-balanced, spatially diverse
-        # views per requested hull camera and fit depth only there.
-        dav2_views, dav2_camera_contract = (
+        # Dense single-frame geometry is evaluated on one common,
+        # sequence-balanced camera pool. MoGe3 retains one scene-wide metric
+        # scale; legacy DAV2, when explicitly present, keeps its old
+        # per-camera ordinal alignment and never shares a source field.
+        dense_metric_views, dense_metric_camera_contract = (
             _select_dav2_foliage_views(
                 view_records, selected_view_count
             )
         )
-        ensure_rigid_calibration_depth(dav2_views)
-        dav2_foliage, dav2_audit = _dav2_foliage_samples(
+        ensure_rigid_calibration_depth(dense_metric_views)
+        moge3_foliage, moge3_audit = _moge3_foliage_samples(
             store,
             images,
             cameras,
             masks,
             rigid_xyz,
             allowed_image_ids={
-                int(view["image_id"]) for view in dav2_views
+                int(view["image_id"]) for view in dense_metric_views
             },
             rigid_depth_maps=rigid_calibration_depth_maps,
+            samples_per_view=max(
+                128, int(maximum_dynamic_births_per_view)
+            ),
         )
+        if artifact_path(store, "dav2_index", required=False) is None:
+            dav2_foliage = []
+            dav2_audit = {
+                "enabled": False,
+                "views": 0,
+                "accepted_views": 0,
+                "sampled_views": 0,
+                "reason": "no_dav2_artifact_in_production_evidence",
+            }
+            dav2_camera_contract = "disabled_no_artifact"
+        else:
+            # Historical A/B only. Production MoGe Evidence Stores reject a
+            # co-registered DAV2 artifact before initialization reaches here.
+            dav2_foliage, dav2_audit = _dav2_foliage_samples(
+                store,
+                images,
+                cameras,
+                masks,
+                rigid_xyz,
+                allowed_image_ids={
+                    int(view["image_id"]) for view in dense_metric_views
+                },
+                rigid_depth_maps=rigid_calibration_depth_maps,
+            )
+            dav2_camera_contract = dense_metric_camera_contract
+        moge3_camera_contract = dense_metric_camera_contract
         if dav2_camera_contract == "all_fixed_database_cameras":
-            expected_dav2_views = int(len(dav2_views))
+            expected_dav2_views = int(len(dense_metric_views))
             if int(dav2_audit.get("views", -1)) != expected_dav2_views:
                 raise RuntimeError(
                     "All-fixed DAV2 contract did not visit every selected "
@@ -6929,6 +7613,11 @@ def build_foliage_seed(
         dav2_foliage, dav2_envelope_rejected, _ = (
             _filter_sequence_local_scene_envelope(
                 dav2_foliage, rigid_xyz
+            )
+        )
+        moge3_foliage, moge3_envelope_rejected, _ = (
+            _filter_sequence_local_scene_envelope(
+                moge3_foliage, rigid_xyz
             )
         )
         if sfm_coverage:
@@ -6991,9 +7680,10 @@ def build_foliage_seed(
             *tracks,
             *sfm_static_tracks,
             *calibrated_pointmap_foliage,
+            *moge3_foliage,
             *dav2_foliage,
         ]
-        # Sequence-local Chart pointmaps and metrically aligned DAV2 samples
+        # Sequence-local Chart pointmaps and exact-K MoGe3 samples
         # are not correspondence tracks, but they are real ray/depth
         # observations in calibrated cameras. Feed both to the probabilistic
         # hull; a voxel still needs support from different traversals before
@@ -7008,6 +7698,7 @@ def build_foliage_seed(
         hull_candidate_tracks = [
             *hull_tracks,
             *calibrated_pointmap_foliage,
+            *moge3_foliage,
         ]
         hull_tracks = [
             *hull_candidate_tracks,
@@ -7032,6 +7723,13 @@ def build_foliage_seed(
         native_track_count = len(tracks)
         chart_foliage = []
         pointmap_foliage = []
+        moge3_foliage = []
+        moge3_camera_contract = "not_applicable"
+        moge3_audit = {
+            "views": 0,
+            "accepted_views": 0,
+            "reason": "non_mast3r_legacy_geometry",
+        }
         dav2_foliage = []
         dav2_camera_contract = "not_applicable"
         dav2_audit = {
@@ -7042,6 +7740,7 @@ def build_foliage_seed(
         }
         chart_envelope_rejected = 0
         pointmap_envelope_rejected = 0
+        moge3_envelope_rejected = 0
         dav2_envelope_rejected = 0
         envelope_audit = {
             "reference_radius": 0.0,
@@ -7052,7 +7751,12 @@ def build_foliage_seed(
     track_xyz = np.stack([point["xyz"] for point in tracks])
     if (
         mast3r_primary
-        and (chart_foliage or pointmap_foliage)
+        and (
+            chart_foliage
+            or pointmap_foliage
+            or moge3_foliage
+            or dav2_foliage
+        )
         and native_track_count
     ):
         native_xyz = track_xyz[:native_track_count]
@@ -7396,6 +8100,10 @@ def build_foliage_seed(
     scale_ceiling[dense_ray] = (
         merged["scales"][dense_ray] * 1.10
     ).astype(np.float32)
+    moge3_ray = merged["initialization_source"] == SOURCE_MOGE3
+    scale_ceiling[moge3_ray] = (
+        merged["scales"][moge3_ray] * 1.10
+    ).astype(np.float32)
     merged["scale_ceiling"] = scale_ceiling
     (
         merged["replacement_group"],
@@ -7601,6 +8309,7 @@ def build_foliage_seed(
                 "nonchart_pointmap_rejected": int(
                     pointmap_envelope_rejected
                 ),
+                "moge3_rejected": int(moge3_envelope_rejected),
                 "dav2_rejected": int(dav2_envelope_rejected),
             },
             "rigid_depth_view_count": rigid_depth_view_count,
@@ -7671,6 +8380,8 @@ def build_foliage_seed(
             "posterior_camera_contract": (
                 posterior_camera_contract
             ),
+            "moge3_camera_contract": moge3_camera_contract,
+            "moge3_exact_k_front_hit": moge3_audit,
             "dav2_camera_contract": dav2_camera_contract,
             "rigid_depth_calibration": rigid_calibration_audit,
             "selected_views": [
@@ -7726,6 +8437,8 @@ def build_foliage_seed(
         "all_pointmap_sequence_local_sample_count": int(
             len(chart_foliage) + len(pointmap_foliage)
         ),
+        "moge3_sequence_local_sample_count": int(len(moge3_foliage)),
+        "moge3_exact_k_front_hit": moge3_audit,
         "dav2_sequence_local_sample_count": int(len(dav2_foliage)),
         "dav2_depth_alignment": dav2_audit,
         "visual_hull_candidate_anchor_count": int(
