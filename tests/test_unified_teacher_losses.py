@@ -111,6 +111,9 @@ from scripts.train_unified_outdoor_teacher import (
     _apply_strict_rigid_front_opacity_policy,
     _apply_persistent_rigid_front_conflict_policy,
     _persistent_rigid_front_conflict_rows,
+    _persistent_optical_debt_active,
+    _persistent_optical_ownership_states,
+    _material_optical_source_gradient,
     _update_persistent_rigid_front_conflict_debt,
     _update_persistent_positive_optical_demand,
     _select_shared_envelope_localization_actions,
@@ -119,6 +122,7 @@ from scripts.train_unified_outdoor_teacher import (
     _shared_envelope_detail_split_plane_normals,
     _apply_shared_envelope_localization_model_transaction,
     _enforce_strict_rigid_front_post_step,
+    _enforce_shared_optical_owner_post_step,
     _static_detail_optical_trust_groups,
     _enforce_static_detail_optical_mass_trust_region,
     _apply_static_optical_policy,
@@ -9935,6 +9939,166 @@ def test_strict_rigid_front_priority_vetoes_growth_and_adam_momentum():
     assert audit["growth_rows_vetoed"] == 2
 
 
+def test_material_optical_source_rejects_numerical_ewa_tail():
+    opacity = torch.nn.Parameter(torch.zeros(4, 1))
+    foliage = SimpleNamespace(
+        xyz=torch.zeros(4, 3),
+        opacity_logits=opacity,
+        static_leaf_mask=torch.tensor([True, True, True, False]),
+        persistent_envelope_mask=torch.tensor([False, False, False, True]),
+    )
+    raw = torch.tensor([[1.0], [5.0e-4], [0.0], [2.0e-4]])
+
+    filtered, audit = _material_optical_source_gradient(
+        foliage,
+        raw,
+        direction="retirement",
+        relative_magnitude_threshold=1.0e-3,
+    )
+
+    torch.testing.assert_close(
+        filtered, torch.tensor([[1.0], [0.0], [0.0], [0.0]])
+    )
+    assert audit["raw_rows"] == 3
+    assert audit["material_rows"] == 1
+    assert audit["discarded_tail_rows"] == 2
+
+    stats = {}
+    owners, _ = _update_persistent_rigid_front_conflict_debt(
+        foliage,
+        stats,
+        raw,
+        relative_magnitude_threshold=1.0e-3,
+    )
+    assert owners.tolist() == [True, False, False, False]
+
+
+def test_shared_optical_owner_freezes_while_pure_conflict_retires():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    opacity = torch.nn.Parameter(torch.zeros(4, 1))
+    foliage = FoliageStub(
+        xyz=torch.zeros(4, 3),
+        opacity_logits=opacity,
+        static_leaf_mask=torch.tensor([False, True, False, True]),
+        dynamic_leaf_mask=torch.zeros(4, dtype=torch.bool),
+        persistent_envelope_mask=torch.tensor([True, False, True, False]),
+        replacement_group=torch.tensor([10, 10, 20, 30]),
+        proposal_kind=torch.zeros(4, dtype=torch.int8),
+        verification_state=torch.full(
+            (4,), VERIFICATION_VERIFIED, dtype=torch.int8
+        ),
+        verified_camera_count=torch.tensor([0, 2, 0, 2]),
+        verified_sequence_count=torch.tensor([0, 1, 0, 1]),
+        handoff_retired_fraction=torch.zeros(4),
+        handoff_reference_mass=torch.zeros(4),
+        integrated_optical_mass=lambda: torch.ones(4),
+    )
+    stats = {
+        "rigid_front_conflict_observations": torch.tensor(
+            [3, 0, 2, 0], dtype=torch.int16
+        ),
+        "positive_optical_demand_observations": torch.tensor(
+            [0, 0, 0, 0], dtype=torch.int16
+        ),
+    }
+    conflict, pure, shared = _persistent_optical_ownership_states(
+        foliage, stats
+    )
+    assert conflict.tolist() == [True, False, True, False]
+    assert pure.tolist() == [False, False, True, False]
+    assert shared.tolist() == [True, False, False, False]
+
+    opacity.grad = torch.tensor([[2.0], [-1.0], [-3.0], [-1.0]])
+    first_moment = torch.tensor([[1.0], [-1.0], [-2.0], [-1.0]])
+    optimizer = SimpleNamespace(state={opacity: {"exp_avg": first_moment}})
+    audit = _apply_persistent_rigid_front_conflict_policy(
+        foliage, optimizer, conflict, shared
+    )
+    # Shared row zero cannot be globally retired; pure-negative row two may
+    # retire but may never regrow.
+    torch.testing.assert_close(
+        opacity.grad, torch.tensor([[0.0], [-1.0], [0.0], [-1.0]])
+    )
+    torch.testing.assert_close(
+        first_moment, torch.tensor([[0.0], [-1.0], [0.0], [-1.0]])
+    )
+    assert audit["shared_retirement_rows_deferred"] == 1
+    assert audit["growth_rows_vetoed"] == 1
+
+
+def test_persistent_optical_debt_starts_after_volume_topology_settlement():
+    args = SimpleNamespace(volume_densify_until_iteration=18_000)
+    assert not _persistent_optical_debt_active(17_999, args)
+    assert not _persistent_optical_debt_active(18_000, args)
+    assert _persistent_optical_debt_active(18_001, args)
+
+
+def test_shared_optical_owner_post_step_restores_exact_pre_step_opacity():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.opacity_logits)
+
+    opacity = torch.nn.Parameter(torch.tensor([[0.4], [-0.2]]))
+    foliage = FoliageStub(
+        opacity_logits=opacity,
+        persistent_envelope_mask=torch.tensor([False, False]),
+    )
+    optimizer = SimpleNamespace(
+        state={opacity: {"exp_avg": torch.tensor([[2.0], [-3.0]])}}
+    )
+    shared = torch.tensor([True, False])
+    reference = torch.tensor([[0.1]])
+
+    audit = _enforce_shared_optical_owner_post_step(
+        foliage, optimizer, shared, reference
+    )
+
+    torch.testing.assert_close(opacity, torch.tensor([[0.1], [-0.2]]))
+    torch.testing.assert_close(
+        optimizer.state[opacity]["exp_avg"], torch.tensor([[0.0], [-3.0]])
+    )
+    assert audit["changed_rows_restored"] == 1
+
+
+def test_shared_optical_owner_preserves_only_local_handoff_retirement():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.opacity_logits)
+
+    opacity = torch.nn.Parameter(torch.tensor([[-0.3], [0.4], [-0.2]]))
+    foliage = FoliageStub(
+        opacity_logits=opacity,
+        persistent_envelope_mask=torch.tensor([True, True, False]),
+        handoff_retired_fraction=torch.tensor([0.2, 0.2, 0.0]),
+        handoff_reference_mass=torch.zeros(3),
+        integrated_optical_mass=lambda: torch.ones(3),
+    )
+    optimizer = SimpleNamespace(
+        state={opacity: {"exp_avg": torch.tensor([[1.0], [-2.0], [3.0]])}}
+    )
+    shared = torch.tensor([True, True, False])
+    pre_handoff = torch.tensor([[0.1], [0.1]])
+
+    audit = _enforce_shared_optical_owner_post_step(
+        foliage,
+        optimizer,
+        shared,
+        pre_handoff,
+        allow_handoff_retirement=True,
+    )
+
+    # A verified local receiver may take mass from row zero.  Row one's
+    # attempted restoration is forbidden while its rigid-front debt remains.
+    torch.testing.assert_close(
+        opacity, torch.tensor([[-0.3], [0.1], [-0.2]])
+    )
+    assert audit["handoff_retirement_rows_preserved"] == 1
+    assert audit["changed_rows_restored"] == 1
+
+
 def test_rigid_front_conflict_debt_persists_and_blocks_later_growth():
     opacity = torch.nn.Parameter(torch.zeros(3, 1))
     foliage = SimpleNamespace(
@@ -10333,6 +10497,101 @@ def test_shared_envelope_selector_localizes_group_with_demandless_detail_row():
     assert split_detail.tolist() == [1]
     assert audit["group_demand_fallback_detail_groups"] == 1
     assert audit["existing_unlocalizable_detail_groups_rejected"] == 0
+
+
+def test_shared_envelope_selector_splits_verified_debt_bearing_detail():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]),
+            "scales": torch.tensor([[0.3, 0.2, 0.1], [0.2, 0.1, 0.1]]),
+            "colors": torch.full((2, 3), 0.4),
+            "opacities": torch.full((2, 1), 0.2),
+            "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+            "layer_role": torch.zeros(2, dtype=torch.int8),
+            "static_detail": torch.tensor([False, True]),
+            "replacement_group": torch.tensor([0, 0]),
+            "support_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "support_view_count": torch.full((2,), 2, dtype=torch.int16),
+            "support_sequence_count": torch.ones(2, dtype=torch.int16),
+            "verified_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "verified_camera_count": torch.full((2,), 2, dtype=torch.int16),
+            "verified_sequence_count": torch.ones(2, dtype=torch.int16),
+        }
+    )
+    stats = {
+        "rigid_front_conflict_observations": torch.tensor([3, 2], dtype=torch.int16),
+        "rigid_front_conflict_camera_id": torch.tensor([7, 7], dtype=torch.int32),
+        "rigid_front_conflict_max_gradient": torch.tensor([0.7, 0.4]),
+        "positive_optical_demand_observations": torch.tensor([2, 3], dtype=torch.int16),
+        "positive_optical_demand_camera_id": torch.tensor([8, 8], dtype=torch.int32),
+        "positive_optical_demand_max_gradient": torch.tensor([0.5, 0.6]),
+    }
+
+    factorize, split_detail, audit = _select_shared_envelope_localization_actions(
+        foliage, stats, torch.tensor([7, 8]), maximum_groups=4
+    )
+
+    assert factorize.numel() == 0
+    assert split_detail.tolist() == [1]
+    assert audit["existing_unlocalizable_detail_groups_rejected"] == 0
+
+
+def test_shared_envelope_selector_does_not_oversplit_subpixel_detail():
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor([[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]),
+            "scales": torch.tensor([[0.3, 0.2, 0.1], [0.02, 0.01, 0.01]]),
+            "colors": torch.full((2, 3), 0.4),
+            "opacities": torch.full((2, 1), 0.2),
+            "quaternions": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]]
+            ).repeat(2, 1),
+            "static_detail": torch.tensor([False, True]),
+            "replacement_group": torch.tensor([0, 0]),
+            "support_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "support_view_count": torch.full((2,), 2, dtype=torch.int16),
+            "support_sequence_count": torch.ones(2, dtype=torch.int16),
+            "verified_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "verified_camera_count": torch.full((2,), 2, dtype=torch.int16),
+            "verified_sequence_count": torch.ones(2, dtype=torch.int16),
+        }
+    )
+    stats = {
+        "rigid_front_conflict_observations": torch.tensor(
+            [3, 0], dtype=torch.int16
+        ),
+        "rigid_front_conflict_camera_id": torch.tensor(
+            [7, -1], dtype=torch.int32
+        ),
+        "rigid_front_conflict_max_gradient": torch.tensor([0.7, 0.0]),
+        "positive_optical_demand_observations": torch.tensor(
+            [0, 3], dtype=torch.int16
+        ),
+        "positive_optical_demand_camera_id": torch.tensor(
+            [-1, 8], dtype=torch.int32
+        ),
+        "positive_optical_demand_max_gradient": torch.tensor([0.0, 0.6]),
+        "radius": torch.tensor([8.0, 0.8]),
+    }
+
+    factorize, split_detail, audit = (
+        _select_shared_envelope_localization_actions(
+            foliage,
+            stats,
+            torch.tensor([7, 8]),
+            maximum_groups=4,
+            minimum_detail_radius_pixels=2.0,
+        )
+    )
+
+    assert factorize.numel() == 0
+    assert split_detail.numel() == 0
+    assert audit["insufficient_detail_bandwidth_rows"] == 1
+    assert audit["existing_unlocalizable_detail_groups_rejected"] == 1
 
 
 def test_shared_envelope_open_transaction_rows_include_proposals_and_receivers():
@@ -10888,6 +11147,75 @@ def test_failed_split_family_rolls_back_without_optical_hole():
         rtol=1e-5,
         atol=1e-7,
     )
+
+
+def test_verified_localization_family_rearms_child_specific_ownership():
+    foliage = VolumetricFoliageModel(1, dynamic_rank=0, device="cpu")
+    foliage.initialize_from_volume_state(
+        {
+            "version": "independent_sfm_semantic_canopy_volume_v1",
+            "centers": torch.tensor(
+                [[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]
+            ),
+            "scales": torch.tensor(
+                [[0.3, 0.2, 0.1], [0.2, 0.1, 0.1]]
+            ),
+            "quaternions": torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]]
+            ).repeat(2, 1),
+            "opacities": torch.full((2, 1), 0.2),
+            "colors": torch.full((2, 3), 0.4),
+            "static_detail": torch.tensor([False, True]),
+            "replacement_group": torch.tensor([0, 0]),
+            "support_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "verified_camera_ids": torch.tensor([[7, 8], [7, 8]]),
+            "verified_camera_count": torch.tensor([2, 2], dtype=torch.int16),
+            "verified_sequence_count": torch.tensor([1, 1], dtype=torch.int16),
+        }
+    )
+    foliage.split_adaptive(
+        torch.tensor([1]), torch.tensor([2]), birth_iteration=100
+    )
+    foliage.verification_state.fill_(VERIFICATION_VERIFIED)
+    family_rows = foliage.proposal_kind == PROPOSAL_SPLIT
+    assert family_rows.tolist() == [False, True, True]
+    stats = {
+        "rigid_front_conflict_observations": torch.tensor(
+            [9, 4, 4], dtype=torch.int16
+        ),
+        "rigid_front_conflict_camera_id": torch.tensor(
+            [3, 7, 7], dtype=torch.int32
+        ),
+        "rigid_front_conflict_max_gradient": torch.tensor([0.9, 0.8, 0.8]),
+        "positive_optical_demand_observations": torch.tensor(
+            [8, 3, 3], dtype=torch.int16
+        ),
+        "positive_optical_demand_camera_id": torch.tensor(
+            [4, 8, 8], dtype=torch.int32
+        ),
+        "positive_optical_demand_max_gradient": torch.tensor([0.7, 0.6, 0.6]),
+    }
+
+    remove, representatives, audit = _rollback_failed_split_families(
+        SimpleNamespace(maximum_volume_family_rollbacks_per_event=0),
+        foliage,
+        torch.zeros(3, dtype=torch.bool),
+        persistent_stats=stats,
+    )
+
+    assert not bool(remove.any())
+    assert representatives.numel() == 0
+    assert audit["resolved_verified_families"] == 1
+    assert audit["resolved_child_ownership_ledgers_rearmed"] == 2
+    assert bool((foliage.proposal_kind == PROPOSAL_NONE).all())
+    assert bool((foliage.split_proposal_family_id == -1).all())
+    for key, value in stats.items():
+        expected = -1 if key.endswith("_camera_id") else 0
+        torch.testing.assert_close(
+            value[family_rows], torch.full_like(value[family_rows], expected)
+        )
+    assert stats["rigid_front_conflict_observations"][0].item() == 9
+    assert stats["positive_optical_demand_observations"][0].item() == 8
 
 
 def test_family_rollback_never_groups_ray_births_by_parent_lineage():

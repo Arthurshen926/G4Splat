@@ -168,6 +168,7 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "cambridge_native_hybrid_teacher_v115_persistent_rigid_front_ownership_debt",
     "cambridge_native_hybrid_teacher_v116_shared_envelope_ownership_localization",
     "cambridge_native_hybrid_teacher_v118_localized_canopy_ownership",
+    "cambridge_native_hybrid_teacher_v119_material_local_canopy_ownership",
     "unified_outdoor_mixed_teacher_v1",
 }
 

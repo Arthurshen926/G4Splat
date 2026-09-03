@@ -1150,6 +1150,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--canonical-volume-layer",
+        choices=("all", "skeleton", "envelope", "detail", "none"),
+        default="all",
+        help=(
+            "Labelled canonical single-pass representation ablation. The "
+            "default 'all' is the deployed Teacher. Other values retain the "
+            "same surface, sky, camera and native mixed renderer while "
+            "restricting the visible volume role; they are diagnostic only."
+        ),
+    )
+    parser.add_argument(
         "--evaluation-split",
         choices=("database_fit", "localization_query"),
         default="database_fit",
@@ -1477,6 +1488,7 @@ def main() -> None:
                 task=None,
                 conditioned=False,
                 surface_only=(evaluation_mode == "rigid"),
+                volume_layer=args.canonical_volume_layer,
                 exact_ray_render_aspect_limit=(
                     args.exact_ray_render_aspect_limit
                 ),
@@ -2039,6 +2051,10 @@ def main() -> None:
         ),
         "branch_validity": branch_validity,
         "evaluation_mode": evaluation_mode,
+        "canonical_volume_layer": args.canonical_volume_layer,
+        "canonical_representation_ablation": bool(
+            args.canonical_volume_layer != "all"
+        ),
         "valid_render_modes": list(modes),
         "conditioned_valid": (
             evaluation_mode == "hybrid"
@@ -2081,6 +2097,10 @@ def main() -> None:
         ),
         "optical_compositing_protocol": {
             **optical_compositing_contract,
+            "canonical_volume_layer": args.canonical_volume_layer,
+            "representation_ablation": bool(
+                args.canonical_volume_layer != "all"
+            ),
             "requested_deployment_policy": optical_replacement_policy,
             "policy": (
                 "surface_only_no_volume"

@@ -57,7 +57,7 @@ from scripts.build_crossview_chart_consensus import (  # noqa: E402
 
 
 PIPELINE_VERSION = (
-    "cambridge-native-hybrid-teacher-mainline-v54-v118-localized-canopy-"
+    "cambridge-native-hybrid-teacher-mainline-v54-v119-material-local-canopy-"
     "moge3-chart-normal-"
     "static-"
     "canopy-static-detail-birth-first-"
@@ -69,7 +69,7 @@ PIPELINE_VERSION = (
     "verification-debt-sequence-metric-depth"
 )
 UNIFIED_TEACHER_PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v118_localized_canopy_ownership"
+    "cambridge_native_hybrid_teacher_v119_material_local_canopy_ownership"
 )
 STAGES = (
     "prepare_cameras",
@@ -322,6 +322,13 @@ PROFILES["moge3_static_quality"] = {
     "moge3_rigid_depth_weight": 0.04,
     "moge3_rigid_normal_weight": 0.02,
     "chart_base_source": "moge3_adaptive",
+    # The rigid pretrain is a completed, independently evaluated geometry
+    # product. During canopy repair only its SH appearance may calibrate;
+    # xyz, tangent scale, rotation, opacity and Chart depth stay immutable.
+    # This makes every tree experiment causally incapable of buying a lower
+    # canopy loss by moving or thickening the building scaffold.
+    "mature_handoff_surface_policy": "appearance_only",
+    "maximum_rigid_completion_seeds": 0,
     # The broad envelope is temporary coverage, not the final optical owner.
     # Start localization as soon as generic topology freezes, but never let
     # new transactions outrun real-camera verification and settlement.
@@ -331,6 +338,11 @@ PROFILES["moge3_static_quality"] = {
     "shared_envelope_localization_start_iteration": 18_000,
     "shared_envelope_localization_until_iteration": 25_500,
     "static_detail_materialization_mass_fraction": 0.10,
+    # Persist only material exact-render sources.  The CUDA EWA kernel has
+    # intentionally smooth non-zero tails; treating every floating-point
+    # derivative as a physical wall/tree observation turns remote tails into
+    # permanent ownership debt after Adam normalization.
+    "persistent_optical_evidence_relative_threshold": 1.0e-3,
 }
 
 
@@ -466,6 +478,8 @@ def _teacher_result_is_current(
     shared_envelope_localization_start_iteration: int | None = None,
     shared_envelope_localization_until_iteration: int | None = None,
     static_detail_materialization_mass_fraction: float = 0.05,
+    persistent_optical_evidence_relative_threshold: float = 1.0e-3,
+    shared_envelope_minimum_detail_radius_pixels: float = 2.0,
 ) -> bool:
     """Accept a completed Teacher only when every causal input still matches."""
     if (surface_warmstart_ply is None) != (
@@ -653,7 +667,23 @@ def _teacher_result_is_current(
                         ),
                         float(static_detail_materialization_mass_fraction),
                     )
+                    and np.isclose(
+                        float(
+                            contract.get(
+                                "shared_envelope_ownership_localization", {}
+                            ).get("minimum_detail_radius_pixels", np.nan)
+                        ),
+                        float(shared_envelope_minimum_detail_radius_pixels),
+                    )
                 )
+            )
+            and np.isclose(
+                float(
+                    contract.get(
+                        "persistent_rigid_front_conflict_debt", {}
+                    ).get("event_relative_magnitude_threshold", np.nan)
+                ),
+                float(persistent_optical_evidence_relative_threshold),
             )
             and contract.get("initialization_version")
             == manifest.get("version")
@@ -1148,6 +1178,7 @@ def _teacher_command(
     shared_envelope_localization_start_iteration: int | None = None,
     shared_envelope_localization_until_iteration: int | None = None,
     static_detail_materialization_mass_fraction: float = 0.05,
+    persistent_optical_evidence_relative_threshold: float = 1.0e-3,
 ) -> list[str]:
     if (surface_warmstart_ply is None) != (
         surface_warmstart_manifest is None
@@ -1240,6 +1271,8 @@ def _teacher_command(
                 surface_retirement_optical_mass_fraction_per_event
             )
         ),
+        "--persistent-optical-evidence-relative-threshold",
+        str(float(persistent_optical_evidence_relative_threshold)),
     ]
     if int(early_checkpoint_every) > 0:
         command.extend(
@@ -3116,6 +3149,12 @@ def main() -> None:
             static_detail_materialization_mass_fraction=float(
                 profile.get("static_detail_materialization_mass_fraction", 0.05)
             ),
+            persistent_optical_evidence_relative_threshold=float(
+                profile.get(
+                    "persistent_optical_evidence_relative_threshold", 1.0e-3
+                )
+            ),
+            shared_envelope_minimum_detail_radius_pixels=2.0,
         )
         finalization_recoverable = _teacher_finalization_is_recoverable(
             teacher,
@@ -3231,6 +3270,12 @@ def main() -> None:
                 static_detail_materialization_mass_fraction=float(
                     profile.get(
                         "static_detail_materialization_mass_fraction", 0.05
+                    )
+                ),
+                persistent_optical_evidence_relative_threshold=float(
+                    profile.get(
+                        "persistent_optical_evidence_relative_threshold",
+                        1.0e-3,
                     )
                 ),
             )

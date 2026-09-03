@@ -290,6 +290,181 @@ def test_dense_surface_stack_crosses_multiple_exact_sort_batches():
     )
 
 
+def test_dense_surface_batches_merge_exactly_with_interleaved_volume_stream():
+    """A volume event must not skip or reorder a later exact-surface batch.
+
+    The mixed kernel scans dense surface candidates in bounded 256-row
+    batches while volumes stream from the tile-depth list.  A surface-only
+    regression does not exercise the merge boundary, so compare a 270-surface
+    stack with four interleaved volume events against an explicit ray-local
+    front-to-back composite.  The same expression also checks every opacity
+    derivative without relying on a second renderer implementation.
+    """
+
+    _, _, MixedGaussianRasterizer = _api()
+    settings = _settings(width=41, height=41)
+    surface_count = 270
+    surface_depth = torch.linspace(2.0, 5.0, surface_count, device="cuda")
+    volume_depth = torch.tensor(
+        [2.25, 3.25, 4.25, 4.75], device="cuda"
+    )
+    surface = torch.stack(
+        [
+            torch.zeros_like(surface_depth),
+            torch.zeros_like(surface_depth),
+            surface_depth,
+        ],
+        dim=1,
+    )
+    volume = torch.stack(
+        [
+            torch.zeros_like(volume_depth),
+            torch.zeros_like(volume_depth),
+            volume_depth,
+        ],
+        dim=1,
+    )
+    surface_scales = torch.full(
+        (surface_count, 2), 0.12, device="cuda"
+    )
+    volume_scales = torch.full((len(volume), 3), 0.12, device="cuda")
+    surface_rotation = torch.zeros(surface_count, 4, device="cuda")
+    volume_rotation = torch.zeros(len(volume), 4, device="cuda")
+    surface_rotation[:, 0] = 1.0
+    volume_rotation[:, 0] = 1.0
+    surface_color = torch.stack(
+        [
+            torch.linspace(0.05, 0.45, surface_count, device="cuda"),
+            torch.linspace(0.8, 0.2, surface_count, device="cuda"),
+            torch.full((surface_count,), 0.15, device="cuda"),
+        ],
+        dim=1,
+    )
+    volume_color = torch.tensor(
+        [
+            [0.9, 0.1, 0.2],
+            [0.7, 0.2, 0.4],
+            [0.5, 0.3, 0.6],
+            [0.3, 0.4, 0.8],
+        ],
+        device="cuda",
+    )
+    colors = torch.cat([surface_color, volume_color], dim=0)
+    opacity = torch.full(
+        (surface_count + len(volume), 1),
+        0.0015,
+        device="cuda",
+        requires_grad=True,
+    )
+
+    rgb, radii, aux, _, _ = MixedGaussianRasterizer(settings)(
+        surface,
+        torch.zeros_like(surface, requires_grad=True),
+        surface_scales,
+        surface_rotation,
+        volume,
+        torch.zeros_like(volume, requires_grad=True),
+        volume_scales,
+        volume_rotation,
+        colors,
+        opacity,
+    )
+    assert torch.all(radii > 0)
+
+    # Recover the fixed EWA coefficient of each primitive from an isolated
+    # render.  Alpha is linear in opacity here (well below the 0.99 clamp), so
+    # the explicit composite remains differentiable with respect to the same
+    # live opacity tensor.
+    probe_y, probe_x = 20, 34
+    coefficients = []
+    with torch.no_grad():
+        for row in range(surface_count):
+            _, _, isolated, _, _ = MixedGaussianRasterizer(settings)(
+                surface[row : row + 1],
+                torch.zeros_like(surface[row : row + 1]),
+                surface_scales[row : row + 1],
+                surface_rotation[row : row + 1],
+                _empty(0, 3),
+                _empty(0, 3),
+                _empty(0, 3),
+                _empty(0, 4),
+                surface_color[row : row + 1],
+                opacity.detach()[row : row + 1],
+            )
+            coefficients.append(
+                isolated[1, probe_y, probe_x] / opacity.detach()[row, 0]
+            )
+        for local_row in range(len(volume)):
+            row = surface_count + local_row
+            _, _, isolated, _, _ = MixedGaussianRasterizer(settings)(
+                _empty(0, 3),
+                _empty(0, 3),
+                _empty(0, 2),
+                _empty(0, 4),
+                volume[local_row : local_row + 1],
+                torch.zeros_like(volume[local_row : local_row + 1]),
+                volume_scales[local_row : local_row + 1],
+                volume_rotation[local_row : local_row + 1],
+                volume_color[local_row : local_row + 1],
+                opacity.detach()[row : row + 1],
+            )
+            coefficients.append(
+                isolated[1, probe_y, probe_x] / opacity.detach()[row, 0]
+            )
+    coefficients = torch.stack(coefficients)
+    all_depth = torch.cat([surface_depth, volume_depth])
+    primitive_id = torch.arange(len(all_depth), device="cuda")
+    # Depths are all distinct, but retain the production primitive-id tie
+    # break in the reference ordering.
+    order = sorted(
+        range(len(all_depth)),
+        key=lambda row: (float(all_depth[row]), int(primitive_id[row])),
+    )
+    transmittance = opacity.new_ones(())
+    expected_rgb = opacity.new_zeros(3)
+    expected_surface_alpha = opacity.new_zeros(())
+    expected_volume_alpha = opacity.new_zeros(())
+    for row in order:
+        alpha = opacity[row, 0] * coefficients[row]
+        contribution = transmittance * alpha
+        expected_rgb = expected_rgb + contribution * colors[row]
+        if row < surface_count:
+            expected_surface_alpha = expected_surface_alpha + contribution
+        else:
+            expected_volume_alpha = expected_volume_alpha + contribution
+        transmittance = transmittance * (1.0 - alpha)
+
+    torch.testing.assert_close(
+        rgb[:, probe_y, probe_x], expected_rgb, atol=3e-6, rtol=2e-5
+    )
+    torch.testing.assert_close(
+        aux[7, probe_y, probe_x],
+        expected_surface_alpha,
+        atol=3e-6,
+        rtol=2e-5,
+    )
+    torch.testing.assert_close(
+        aux[8, probe_y, probe_x],
+        expected_volume_alpha,
+        atol=3e-6,
+        rtol=2e-5,
+    )
+    mixed_objective = (
+        rgb[:, probe_y, probe_x]
+        * torch.tensor([0.7, 0.4, 0.2], device="cuda")
+    ).sum() + 0.03 * aux[8, probe_y, probe_x]
+    reference_objective = (
+        expected_rgb * torch.tensor([0.7, 0.4, 0.2], device="cuda")
+    ).sum() + 0.03 * expected_volume_alpha
+    mixed_gradient = torch.autograd.grad(
+        mixed_objective, opacity, retain_graph=True
+    )[0]
+    reference_gradient = torch.autograd.grad(reference_objective, opacity)[0]
+    torch.testing.assert_close(
+        mixed_gradient, reference_gradient, atol=3e-6, rtol=3e-5
+    )
+
+
 def test_zero_opacity_volume_is_removed_before_tile_emission():
     _, _, MixedGaussianRasterizer = _api()
     settings = _settings()

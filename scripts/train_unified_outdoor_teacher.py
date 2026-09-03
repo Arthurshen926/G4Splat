@@ -100,23 +100,26 @@ PREDECESSOR_PROTOCOL = (
     "optical_audit"
 )
 PROTOCOL = (
-    "cambridge_native_hybrid_teacher_v118_localized_canopy_ownership"
+    "cambridge_native_hybrid_teacher_v119_material_local_canopy_ownership"
 )
-V118_CAPABILITY_CONTRACT = (
+V119_CAPABILITY_CONTRACT = (
     "native_mixed_per_pixel_depth_sort_and_depth_clipped_queries__"
     "persistent_multiview_detail_consumes_current_canonical_moge_hit__"
     "measured_single_remains_exact_camera_only__rigid_front_negative_"
-    "ownership_overrides_all_growth__shared_envelope_groups_localize_"
-    "through_debt_free_persistent_detail_or_exact_mass_conserving_"
+    "ownership_uses_material_source_rows_not_numerical_ewa_tails__"
+    "pure_rigid_conflict_retires__shared_positive_negative_owner_freezes_"
+    "scalar_gradients_until_verified_local_handoff_can_retire_it__shared_"
+    "envelope_groups_localize_through_persistent_detail_or_exact_mass_conserving_"
     "receiver__group_positive_demand_authorizes_local_detail_bandwidth_"
     "without_forging_per_row_evidence__bounded_open_transactions_and_"
-    "verification_maintenance_precedence__ordinary_topology_remains_frozen"
+    "screen_bandwidth_gated_splits__verification_maintenance_precedence__"
+    "ordinary_topology_remains_frozen"
 )
 SHARED_ENVELOPE_OWNERSHIP_LOCALIZATION_CONTRACT = (
     "post_generic_topology_bounded_group_atomic_ownership_"
     "localization__persistent_rigid_front_conflict_and_"
     "canonical_positive_demand_required__debt_envelope_never_"
-    "split__debt_free_persistent_detail_in_a_demanded_group_camera_plane_"
+    "split__persistent_detail_in_a_demanded_group_camera_plane_"
     "split_else_exact_colocated_receiver_factorization__new_"
     "rows_require_real_camera_reverification__receiver_mass_and_"
     "owner_plane_extinction_conserved__failed_family_restores_"
@@ -2392,6 +2395,18 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--persistent-optical-evidence-relative-threshold",
+        type=float,
+        default=1.0e-3,
+        help=(
+            "Keep a persistent rigid-front conflict or canopy-demand row "
+            "only when its source-separated opacity-gradient magnitude is "
+            "at least this fraction of the strongest owner in that exact "
+            "render. This prevents numerical EWA tails from becoming "
+            "permanent optimizer authority."
+        ),
+    )
+    parser.add_argument(
         "--static-detail-exclusive-topology",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3155,6 +3170,15 @@ def _parse_args():
     if args.persistent_envelope_global_cleanup_weight < 0:
         parser.error(
             "--persistent-envelope-global-cleanup-weight must be >= 0"
+        )
+    if not (
+        0.0
+        <= args.persistent_optical_evidence_relative_threshold
+        <= 0.10
+    ):
+        parser.error(
+            "--persistent-optical-evidence-relative-threshold must lie in "
+            "[0, 0.10]"
         )
     if args.persistent_envelope_global_counterfactual_weight < 0:
         parser.error(
@@ -13385,6 +13409,7 @@ def _rollback_failed_split_families(
         "integrated_mass_before": 0.0,
         "integrated_mass_after": 0.0,
         "persistent_ownership_ledgers_merged": 0,
+        "resolved_child_ownership_ledgers_rearmed": 0,
     }
     persistent_keys = tuple(_PERSISTENT_VOLUME_STAT_DEFAULTS)
     if persistent_stats is not None:
@@ -13492,6 +13517,29 @@ def _rollback_failed_split_families(
         siblings = torch.nonzero(
             family == family_id, as_tuple=False
         ).flatten()
+        if persistent_stats is not None:
+            # Children inherited the parent's ledgers solely so an atomic
+            # rollback can restore them. Once all children have independent
+            # real-camera witnesses, those parent-wide facts are no longer a
+            # valid child classification. Re-arm each local child at zero;
+            # subsequent exact positive/negative renders will classify its
+            # own footprint. Keeping the inherited debt on both children
+            # made a successful split observationally identical to no split.
+            for key, (dtype, default) in (
+                _PERSISTENT_VOLUME_STAT_DEFAULTS.items()
+            ):
+                persistent_stats[key][siblings] = torch.as_tensor(
+                    default,
+                    dtype=dtype,
+                    device=persistent_stats[key].device,
+                )
+            base_audit[
+                "resolved_child_ownership_ledgers_rearmed"
+            ] = int(
+                base_audit[
+                    "resolved_child_ownership_ledgers_rearmed"
+                ]
+            ) + int(len(siblings))
         _clear_split_parent_snapshot(foliage, family_id[None])
         foliage.proposal_kind[siblings] = PROPOSAL_NONE
         foliage.split_proposal_family_id[siblings] = -1
@@ -16115,6 +16163,83 @@ def _persistent_rigid_front_conflict_rows(
     return (observations > 0) & optical_role
 
 
+def _persistent_optical_debt_active(iteration: int, args) -> bool:
+    """Persist ownership only after ordinary volume identity is stable."""
+
+    return int(iteration) > int(args.volume_densify_until_iteration)
+
+
+def _persistent_optical_ownership_states(
+    foliage,
+    volume_stats: dict[str, torch.Tensor],
+    *,
+    conflict_rows: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return conflict, pure-negative, and shared-owner row masks.
+
+    One Gaussian has one global opacity. A row proven in front of rigid
+    structure cannot be retired as a scalar when its replacement group also
+    carries material canopy demand *or already has a durable local detail
+    receiver*: doing so fixes the wall by opening a tree hole. Such rows are
+    frozen against scalar gradients while verified ray-local handoff moves
+    their mass to detail. Only groups with neither signal are safe one-sided
+    retirement owners.
+    """
+
+    conflict = (
+        _persistent_rigid_front_conflict_rows(foliage, volume_stats)
+        if conflict_rows is None
+        else torch.as_tensor(
+            conflict_rows, device=foliage.xyz.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    if conflict.shape != (len(foliage),):
+        raise ValueError("Optical conflict rows must align with foliage")
+    demand_observations = volume_stats.get(
+        "positive_optical_demand_observations"
+    )
+    if demand_observations is None:
+        return conflict, conflict, torch.zeros_like(conflict)
+    demand_observations = torch.as_tensor(
+        demand_observations, device=foliage.xyz.device
+    ).reshape(-1)
+    if demand_observations.shape != (len(foliage.xyz),):
+        raise RuntimeError(
+            "Positive optical demand ledger no longer aligns with foliage"
+        )
+    groups = foliage.replacement_group.to(torch.long).reshape(-1)
+    if groups.shape != conflict.shape:
+        raise RuntimeError(
+            "Replacement groups no longer align with optical ownership"
+        )
+    valid_group = groups >= 0
+    demanded = (
+        (demand_observations > 0)
+        & (foliage.static_leaf_mask | foliage.persistent_envelope_mask)
+        & valid_group
+    )
+    durable_local_detail = (
+        foliage.static_leaf_mask
+        & _persistent_static_evidence_mask(foliage)
+        & _resolved_static_owner_mask(foliage)
+        & valid_group
+    )
+    shared_evidence = demanded | durable_local_detail
+    shared_group = torch.zeros_like(conflict)
+    if bool(shared_evidence.any()) and bool((conflict & valid_group).any()):
+        maximum_group = int(groups[valid_group].max())
+        group_has_demand = torch.zeros(
+            maximum_group + 1,
+            dtype=torch.bool,
+            device=groups.device,
+        )
+        group_has_demand[groups[shared_evidence]] = True
+        shared_group[valid_group] = group_has_demand[groups[valid_group]]
+    shared = conflict & shared_group
+    pure_negative = conflict & ~shared
+    return conflict, pure_negative, shared
+
+
 @torch.no_grad()
 def _record_persistent_optical_evidence(
     foliage,
@@ -16124,6 +16249,7 @@ def _record_persistent_optical_evidence(
     gradient: torch.Tensor | None,
     direction: str,
     camera_id: int | None,
+    relative_magnitude_threshold: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, int | float | str]]:
     """Record a source-separated optical fact and its best camera.
 
@@ -16136,6 +16262,12 @@ def _record_persistent_optical_evidence(
         raise ValueError(f"Unknown persistent optical evidence {prefix!r}")
     if direction not in {"retirement", "growth"}:
         raise ValueError(f"Unknown optical evidence direction {direction!r}")
+    relative_magnitude_threshold = float(relative_magnitude_threshold)
+    if not 0.0 <= relative_magnitude_threshold <= 0.10:
+        raise ValueError(
+            "Persistent optical evidence relative threshold must lie in "
+            "[0, 0.10]"
+        )
     observation_key = f"{prefix}_observations"
     camera_key = f"{prefix}_camera_id"
     score_key = f"{prefix}_max_gradient"
@@ -16165,6 +16297,8 @@ def _record_persistent_optical_evidence(
     magnitude = torch.zeros(
         count, dtype=torch.float32, device=foliage.xyz.device
     )
+    event_maximum = magnitude.new_zeros(())
+    material_floor = magnitude.new_zeros(())
     if gradient is not None:
         source = torch.as_tensor(
             gradient,
@@ -16181,8 +16315,18 @@ def _record_persistent_optical_evidence(
             else (-source).clamp_min(0.0)
         )
         magnitude = directed.flatten(1).sum(dim=1).to(torch.float32)
-        rows = magnitude > 0
-        rows &= foliage.static_leaf_mask | foliage.persistent_envelope_mask
+        optical_owner = (
+            foliage.static_leaf_mask | foliage.persistent_envelope_mask
+        )
+        positive = optical_owner & torch.isfinite(magnitude) & (magnitude > 0)
+        if bool(positive.any()):
+            event_maximum = magnitude[positive].max()
+            material_floor = event_maximum * relative_magnitude_threshold
+            rows = positive & (magnitude >= material_floor)
+        else:
+            event_maximum = magnitude.new_zeros(())
+            material_floor = magnitude.new_zeros(())
+            rows = positive
     observations = volume_stats[observation_key]
     if bool(rows.any()):
         observations[rows] = (
@@ -16200,6 +16344,15 @@ def _record_persistent_optical_evidence(
         ),
         "source_rows": int(rows.sum()),
         "source_magnitude": float(magnitude[rows].sum()),
+        "raw_nonzero_rows": int(
+            ((magnitude > 0) & torch.isfinite(magnitude)).sum()
+        ),
+        "discarded_tail_rows": int(
+            ((magnitude > 0) & torch.isfinite(magnitude) & ~rows).sum()
+        ),
+        "event_maximum_magnitude": float(event_maximum),
+        "material_magnitude_floor": float(material_floor),
+        "relative_magnitude_threshold": relative_magnitude_threshold,
         "camera_id": -1 if camera_id is None else int(camera_id),
         "persistent_rows": int((observations > 0).sum()),
     }
@@ -16215,6 +16368,7 @@ def _update_persistent_rigid_front_conflict_debt(
         tuple[torch.Tensor | None, int | None], ...
     ]
     | None = None,
+    relative_magnitude_threshold: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, int | str]]:
     """Persist exact rigid-front contradictions across later positive steps.
 
@@ -16249,6 +16403,7 @@ def _update_persistent_rigid_front_conflict_debt(
             gradient=source,
             direction="retirement",
             camera_id=source_camera_id,
+            relative_magnitude_threshold=relative_magnitude_threshold,
         )
         current |= event_rows
     after = observations > 0
@@ -16276,6 +16431,7 @@ def _update_persistent_positive_optical_demand(
     growth_gradient: torch.Tensor | None,
     *,
     camera_id: int | None,
+    relative_magnitude_threshold: float = 0.0,
 ) -> dict[str, int | float | str]:
     """Persist raw canopy growth demand before rigid debt vetoes it."""
 
@@ -16286,8 +16442,77 @@ def _update_persistent_positive_optical_demand(
         gradient=growth_gradient,
         direction="growth",
         camera_id=camera_id,
+        relative_magnitude_threshold=relative_magnitude_threshold,
     )
     return audit
+
+
+@torch.no_grad()
+def _material_optical_source_gradient(
+    foliage,
+    gradient: torch.Tensor | None,
+    *,
+    direction: str,
+    relative_magnitude_threshold: float,
+) -> tuple[torch.Tensor, dict[str, int | float | str]]:
+    """Remove numerical raster tails before they acquire optimizer authority.
+
+    CUDA EWA footprints are intentionally smooth and therefore produce tiny
+    non-zero derivatives far from the material footprint. Adam normalizes a
+    tiny first derivative into an ordinary-size update, so ``gradient != 0``
+    is not a physical ownership test. Keep only rows whose source-separated
+    magnitude is material relative to the strongest owner in this exact
+    render. The threshold is event-relative and therefore invariant to the
+    configured loss weight.
+    """
+
+    if direction not in {"retirement", "growth"}:
+        raise ValueError(f"Unknown material optical direction {direction!r}")
+    relative = float(relative_magnitude_threshold)
+    if not 0.0 <= relative <= 0.10:
+        raise ValueError(
+            "Material optical relative threshold must lie in [0, 0.10]"
+        )
+    if gradient is None:
+        source = torch.zeros_like(foliage.opacity_logits)
+    else:
+        source = torch.as_tensor(
+            gradient,
+            device=foliage.opacity_logits.device,
+            dtype=foliage.opacity_logits.dtype,
+        )
+        if source.shape != foliage.opacity_logits.shape:
+            raise ValueError(
+                "Material optical source must align with opacity logits"
+            )
+    directed = (
+        source.clamp_min(0.0)
+        if direction == "retirement"
+        else source.clamp_max(0.0)
+    )
+    magnitude = directed.abs().flatten(1).sum(dim=1)
+    optical_owner = foliage.static_leaf_mask | foliage.persistent_envelope_mask
+    raw = optical_owner & torch.isfinite(magnitude) & (magnitude > 0)
+    maximum = magnitude[raw].max() if bool(raw.any()) else magnitude.new_zeros(())
+    floor = maximum * relative
+    material = raw & (magnitude >= floor)
+    filtered = torch.zeros_like(source)
+    filtered[material] = directed[material]
+    return filtered, {
+        "contract": (
+            "event_relative_material_source_filter__numerical_ewa_tails_do_"
+            "not_acquire_persistent_or_adam_authority"
+        ),
+        "direction": direction,
+        "relative_threshold": relative,
+        "raw_rows": int(raw.sum()),
+        "material_rows": int(material.sum()),
+        "discarded_tail_rows": int((raw & ~material).sum()),
+        "raw_magnitude": float(magnitude[raw].sum()),
+        "material_magnitude": float(magnitude[material].sum()),
+        "event_maximum_magnitude": float(maximum),
+        "material_magnitude_floor": float(floor),
+    }
 
 
 def _shared_envelope_localization_active(
@@ -16362,6 +16587,7 @@ def _select_shared_envelope_localization_actions(
     canonical_camera_ids: torch.Tensor,
     *,
     maximum_groups: int,
+    minimum_detail_radius_pixels: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | str]]:
     """Plan bounded localization without reopening generic densification.
 
@@ -16385,6 +16611,7 @@ def _select_shared_envelope_localization_actions(
         "split_detail_groups": 0,
         "unresolved_groups_rejected": 0,
         "insufficient_canonical_support_rows": 0,
+        "insufficient_detail_bandwidth_rows": 0,
         "debt_or_demandless_detail_rows_rejected": 0,
         "group_demand_fallback_detail_groups": 0,
         "existing_unlocalizable_detail_groups_rejected": 0,
@@ -16408,6 +16635,20 @@ def _select_shared_envelope_localization_actions(
             raise RuntimeError(
                 f"Shared-envelope localization ledger {name!r} is missing"
             )
+    minimum_detail_radius_pixels = float(minimum_detail_radius_pixels)
+    if minimum_detail_radius_pixels < 0:
+        raise ValueError("Minimum localization radius cannot be negative")
+    if minimum_detail_radius_pixels > 0:
+        radius = volume_stats.get("radius")
+        if radius is None or radius.shape != (len(foliage),):
+            raise RuntimeError(
+                "Shared-envelope localization requires current screen radii"
+            )
+        enough_bandwidth = radius >= minimum_detail_radius_pixels
+    else:
+        enough_bandwidth = torch.ones(
+            len(foliage), dtype=torch.bool, device=foliage.xyz.device
+        )
     canonical_ids = torch.as_tensor(
         canonical_camera_ids,
         device=foliage.xyz.device,
@@ -16517,15 +16758,25 @@ def _select_shared_envelope_localization_actions(
         & resolved
         & valid_group
         & enough_support
-        # A detail row that is itself proven in front of rigid structure may
-        # not be duplicated. Positive demand is required for the *group*,
-        # above, but not for this exact row: the renderer has one envelope
-        # opacity shared by the group, and demanding the same evidence on an
-        # already-local detail made thousands of proven mixed groups
-        # permanently unlocalizable. Splitting a durable, debt-free detail
-        # only adds bandwidth; it does not forge opacity or verification.
-        & (volume_stats["rigid_front_conflict_observations"] == 0)
+        & enough_bandwidth
+        # A durable detail that itself carries both positive and negative
+        # ownership is precisely the row that needs more spatial bandwidth.
+        # Excluding it made every existing mixed-detail group permanently
+        # unlocalizable. The binary split is mass conserving and its children
+        # must be independently reverified, so selection does not forge a new
+        # optical fact.
         & torch.isin(groups, selected_group_tensor)
+    )
+    audit["insufficient_detail_bandwidth_rows"] = int(
+        (
+            foliage.static_leaf_mask
+            & _persistent_static_evidence_mask(foliage)
+            & resolved
+            & valid_group
+            & enough_support
+            & torch.isin(groups, selected_group_tensor)
+            & ~enough_bandwidth
+        ).sum()
     )
     directly_demanded_detail = persistent_detail & (
         volume_stats["positive_optical_demand_observations"] > 0
@@ -16873,40 +17124,70 @@ def _apply_persistent_rigid_front_conflict_policy(
     foliage,
     volume_optimizer,
     conflict_rows: torch.Tensor,
+    shared_owner_rows: torch.Tensor | None = None,
 ) -> dict[str, int | float | str]:
-    """Block every opacity-growth source on unresolved ownership debt."""
+    """Retire pure conflicts and freeze unsatisfiable shared-opacity rows."""
 
     owners = torch.as_tensor(
         conflict_rows, device=foliage.xyz.device, dtype=torch.bool
     ).reshape(-1)
     if owners.shape != (len(foliage.xyz),):
         raise ValueError("Persistent rigid-front debt mask is misaligned")
+    shared = (
+        torch.zeros_like(owners)
+        if shared_owner_rows is None
+        else torch.as_tensor(
+            shared_owner_rows, device=owners.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    if shared.shape != owners.shape or bool((shared & ~owners).any()):
+        raise ValueError(
+            "Shared optical-owner rows must be a subset of rigid-front debt"
+        )
+    pure = owners & ~shared
     audit: dict[str, int | float | str] = {
         "contract": (
-            "persistent_rigid_front_debt_vetoes_all_opacity_growth_and_growth_"
-            "momentum_while_preserving_every_retirement_source"
+            "pure_rigid_front_debt_vetoes_growth_and_preserves_retirement__"
+            "shared_positive_negative_global_opacity_freezes_until_localized"
         ),
         "owner_rows": int(owners.sum()),
+        "pure_negative_rows": int(pure.sum()),
+        "shared_owner_rows": int(shared.sum()),
         "growth_rows_vetoed": 0,
         "growth_magnitude_vetoed": 0.0,
+        "shared_retirement_rows_deferred": 0,
+        "shared_retirement_magnitude_deferred": 0.0,
         "growth_momentum_rows_cleared": 0,
+        "shared_momentum_rows_cleared": 0,
     }
     gradient = foliage.opacity_logits.grad
     if gradient is not None and bool(owners.any()):
-        growth = (-gradient[owners]).clamp_min(0.0)
+        growth = (-gradient[pure]).clamp_min(0.0)
         audit["growth_rows_vetoed"] = int(
             growth.flatten(1).any(dim=1).sum()
         )
         audit["growth_magnitude_vetoed"] = float(growth.sum())
-        gradient[owners] = gradient[owners].clamp_min(0.0)
+        gradient[pure] = gradient[pure].clamp_min(0.0)
+        shared_retirement = gradient[shared].clamp_min(0.0)
+        audit["shared_retirement_rows_deferred"] = int(
+            shared_retirement.flatten(1).any(dim=1).sum()
+        )
+        audit["shared_retirement_magnitude_deferred"] = float(
+            shared_retirement.sum()
+        )
+        gradient[shared] = 0
     state = volume_optimizer.state.get(foliage.opacity_logits, {})
     first_moment = state.get("exp_avg")
     if torch.is_tensor(first_moment) and bool(owners.any()):
-        contaminated = owners[:, None] & (first_moment < 0)
+        contaminated = pure[:, None] & (first_moment < 0)
         audit["growth_momentum_rows_cleared"] = int(
             contaminated.flatten(1).any(dim=1).sum()
         )
         first_moment[contaminated] = 0
+        audit["shared_momentum_rows_cleared"] = int(
+            first_moment[shared].abs().flatten(1).any(dim=1).sum()
+        )
+        first_moment[shared] = 0
     return audit
 
 
@@ -16914,6 +17195,7 @@ def _apply_strict_rigid_front_opacity_policy(
     foliage,
     volume_optimizer,
     strict_gradient: torch.Tensor | None,
+    deferred_rows: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Inject source-separated rigid-front retirement after every growth policy.
 
@@ -16931,6 +17213,8 @@ def _apply_strict_rigid_front_opacity_policy(
         "source_magnitude": 0.0,
         "growth_rows_vetoed": 0,
         "growth_momentum_rows_cleared": 0,
+        "shared_source_rows_deferred": 0,
+        "shared_source_magnitude_deferred": 0.0,
     }
     if strict_gradient is None:
         return audit
@@ -16941,6 +17225,25 @@ def _apply_strict_rigid_front_opacity_policy(
     ).clamp_min(0.0)
     if source.shape != foliage.opacity_logits.shape:
         raise ValueError("Strict rigid-front gradient must align with opacity")
+    deferred = (
+        torch.zeros(
+            foliage.opacity_logits.shape[0],
+            dtype=torch.bool,
+            device=source.device,
+        )
+        if deferred_rows is None
+        else torch.as_tensor(
+            deferred_rows, device=source.device, dtype=torch.bool
+        ).reshape(-1)
+    )
+    if deferred.shape != (foliage.opacity_logits.shape[0],):
+        raise ValueError("Deferred strict-owner mask must align with foliage")
+    deferred_source = source[deferred]
+    audit["shared_source_rows_deferred"] = int(
+        deferred_source.flatten(1).any(dim=1).sum()
+    )
+    audit["shared_source_magnitude_deferred"] = float(deferred_source.sum())
+    source[deferred] = 0
     owners = (source > 0).flatten(1).any(dim=1)
     audit["owner_rows"] = int(owners.sum())
     audit["source_magnitude"] = float(source.sum())
@@ -17015,6 +17318,84 @@ def _enforce_strict_rigid_front_post_step(
         foliage.handoff_reference_mass[envelope_owners] = (
             realized[envelope_owners] / retained
         )
+    return audit
+
+
+@torch.no_grad()
+def _enforce_shared_optical_owner_post_step(
+    foliage,
+    volume_optimizer,
+    shared_rows: torch.Tensor,
+    reference_logits: torch.Tensor,
+    *,
+    allow_handoff_retirement: bool = False,
+) -> dict[str, int | float | str]:
+    """Close side paths while permitting explicit local mass transfer.
+
+    Before handoff a shared scalar has no valid gradient direction and is
+    restored exactly.  After handoff, an independently verified local detail
+    may take optical mass from its broad envelope; that one-sided decrease is
+    the representation-localization operation we were waiting for.  Preserve
+    it, while clamping any handoff restoration/growth because the exact rigid
+    contradiction remains live.
+    """
+
+    owners = torch.as_tensor(
+        shared_rows, device=foliage.opacity_logits.device, dtype=torch.bool
+    ).reshape(-1)
+    if owners.shape != (len(foliage),):
+        raise ValueError("Shared optical-owner mask must align with foliage")
+    expected = (int(owners.sum()), foliage.opacity_logits.shape[1])
+    if tuple(reference_logits.shape) != expected:
+        raise ValueError("Shared optical-owner snapshot has the wrong shape")
+    audit: dict[str, int | float | str] = {
+        "contract": (
+            "shared_positive_negative_global_opacity_is_exactly_frozen_"
+            "through_adam_scale_compensation_projection__verified_local_"
+            "mass_handoff_may_only_retire_the_broad_owner__handoff_"
+            "restoration_and_growth_are_blocked_while_rigid_debt_remains"
+        ),
+        "owner_rows": int(owners.sum()),
+        "changed_rows_restored": 0,
+        "maximum_absolute_logit_change_restored": 0.0,
+        "handoff_retirement_allowed": bool(allow_handoff_retirement),
+        "handoff_retirement_rows_preserved": 0,
+    }
+    if not bool(owners.any()):
+        return audit
+    current = foliage.opacity_logits[owners]
+    delta = current - reference_logits
+    if allow_handoff_retirement:
+        forbidden = delta.clamp_min(0.0)
+        changed = forbidden.flatten(1).any(dim=1)
+        audit["changed_rows_restored"] = int(changed.sum())
+        audit["maximum_absolute_logit_change_restored"] = float(
+            forbidden.max()
+        )
+        audit["handoff_retirement_rows_preserved"] = int(
+            (delta < 0).flatten(1).any(dim=1).sum()
+        )
+        foliage.opacity_logits[owners] = torch.minimum(
+            current, reference_logits
+        )
+    else:
+        changed = delta.abs().flatten(1).any(dim=1)
+        audit["changed_rows_restored"] = int(changed.sum())
+        audit["maximum_absolute_logit_change_restored"] = float(
+            delta.abs().max()
+        )
+        foliage.opacity_logits[owners] = reference_logits
+    state = volume_optimizer.state.get(foliage.opacity_logits, {})
+    first_moment = state.get("exp_avg")
+    if torch.is_tensor(first_moment):
+        first_moment[owners] = 0
+    envelope = owners & foliage.persistent_envelope_mask
+    if bool(envelope.any()):
+        realized = foliage.integrated_optical_mass().detach()
+        retained = (1.0 - foliage.handoff_retired_fraction[envelope]).clamp_min(
+            1.0e-4
+        )
+        foliage.handoff_reference_mass[envelope] = realized[envelope] / retained
     return audit
 
 
@@ -22918,16 +23299,31 @@ def main():
         "persistent_rigid_front_conflict_debt": (
             {
                 "contract": (
-                    "exact_rigid_front_contradiction_is_checkpointed_in_volume_"
-                    "stats__debt_is_monotone_until_representation_localization__"
-                    "completion_rgb_exact_hit_and_adam_growth_are_vetoed__all_"
-                    "retirement_and_post_step_handoff_monotonicity_remain_live"
+                    "event_relative_material_exact_rigid_front_contradiction_"
+                    "is_checkpointed_in_volume_stats__numerical_ewa_tails_do_"
+                    "not_acquire_optimizer_authority__pure_negative_rows_"
+                    "retire__shared_positive_negative_global_opacity_is_"
+                    "frozen_against_scalar_gradients_until_verified_local_"
+                    "handoff_can_retire_the_broad_owner__post_step_adam_"
+                    "scale_projection_and_handoff_restoration_are_closed"
                 ),
                 "state": "int16_per_primitive_observation_count",
                 "checkpoint_field": (
                     "volume_stats.rigid_front_conflict_observations"
                 ),
                 "topology_scope": "starts_after_volume_topology_settlement",
+                "event_relative_magnitude_threshold": float(
+                    args.persistent_optical_evidence_relative_threshold
+                ),
+                "state_machine": {
+                    "positive_only": "exact_evidence_may_grow",
+                    "negative_only": "exact_evidence_may_retire",
+                    "shared": (
+                        "freeze_scalar_gradient_then_allow_only_verified_"
+                        "local_mass_handoff_retirement"
+                    ),
+                    "unknown": "no_persistent_optical_authority",
+                },
             }
             if args.reconstruction_target == "static"
             else None
@@ -24109,7 +24505,7 @@ def main():
         ),
         "shared_envelope_ownership_localization": {
             "contract": SHARED_ENVELOPE_OWNERSHIP_LOCALIZATION_CONTRACT,
-            "capability_contract": V118_CAPABILITY_CONTRACT,
+            "capability_contract": V119_CAPABILITY_CONTRACT,
             "maximum_groups_per_event": int(
                 args.maximum_shared_envelope_localizations_per_event
             ),
@@ -24125,6 +24521,9 @@ def main():
             ),
             "maximum_open_transaction_rows": int(
                 args.maximum_open_shared_envelope_localization_rows
+            ),
+            "minimum_detail_radius_pixels": float(
+                args.volume_split_radius
             ),
             "generic_topology_reopened": False,
         },
@@ -25425,9 +25824,11 @@ def main():
         # iteration is evaluated.  A cleanup view sampled on the previous step
         # must already veto completion/RGB growth on the next, rather than
         # relying on those two cadences to happen to coincide.
-        persistent_rigid_front_conflict_rows = (
-            _persistent_rigid_front_conflict_rows(foliage, volume_stats)
-        )
+        (
+            persistent_rigid_front_conflict_rows,
+            persistent_pure_rigid_front_conflict_rows,
+            persistent_shared_optical_owner_rows,
+        ) = _persistent_optical_ownership_states(foliage, volume_stats)
         view = views[int(rgb_schedule[step])]
         task = fields.fields(
             view.image_name,
@@ -27405,10 +27806,20 @@ def main():
         )
         if canonical_occlusion_structural_package is not None:
             del canonical_occlusion_structural_package
-        volume_in_rigid = _weighted_mean(
-            package.volume_alpha,
-            static_tree_cleanup_task["p_rigid"],
-        )
+        if args.reconstruction_target == "static":
+            # ``package.volume_alpha`` is a mixed contribution alpha
+            # (T_before * alpha), not intrinsic volume occupancy. Penalizing
+            # it on rigid pixels gives a front surface an escape route: raise
+            # surface opacity and hide the volume contribution. Static rigid
+            # ownership is already enforced by the surface-zero, exact
+            # depth-clipped detail/envelope queries above, whose gradients
+            # cannot reach structural geometry or opacity.
+            volume_in_rigid = package.volume_alpha.sum() * 0.0
+        else:
+            volume_in_rigid = _weighted_mean(
+                package.volume_alpha,
+                static_tree_cleanup_task["p_rigid"],
+            )
         finite_in_sky = _weighted_mean(
             package.surface_alpha + package.volume_alpha,
             static_tree_cleanup_task["p_sky"],
@@ -27433,8 +27844,12 @@ def main():
             static_tree_cleanup_task
         )
         free = (
-            (-torch.log1p(-alpha) * negative).sum()
-            / negative.sum().clamp_min(1)
+            package.volume_alpha.sum() * 0.0
+            if args.reconstruction_target == "static"
+            else (
+                (-torch.log1p(-alpha) * negative).sum()
+                / negative.sum().clamp_min(1)
+            )
         )
         # A tree mask is not a target alpha.  Occupancy is supervised by the
         # per-candidate visual-hull ray/depth posterior produced during
@@ -27531,6 +27946,8 @@ def main():
             ),
         }
         canonical_detail_ray_loss = package.depth.new_zeros(())
+        ray_camera_id = None
+        canonical_ray_camera_id = None
         canonical_detail_ray_audit = {
             "scheduled": False,
             "rays": 0,
@@ -28138,6 +28555,9 @@ def main():
                         None
                         if canonical_occlusion_view is None
                         else int(canonical_occlusion_view.colmap_id)
+                    ),
+                    relative_magnitude_threshold=(
+                        args.persistent_optical_evidence_relative_threshold
                     ),
                 )
             )
@@ -29619,6 +30039,39 @@ def main():
             foliage, phase, dynamic_active=dynamic_active
         )
         if args.reconstruction_target == "static":
+            ray_growth_camera_id = (
+                canonical_ray_camera_id
+                if canonical_ray_camera_id is not None
+                else ray_camera_id
+            )
+            ray_audit["persistent_positive_optical_demand"] = (
+                _update_persistent_positive_optical_demand(
+                    foliage,
+                    volume_stats,
+                    exact_owner_ray_growth_gradient,
+                    camera_id=ray_growth_camera_id,
+                    relative_magnitude_threshold=(
+                        args.persistent_optical_evidence_relative_threshold
+                    ),
+                )
+            )
+            moge3_canopy_optical_audit[
+                "persistent_positive_optical_demand"
+            ] = _update_persistent_positive_optical_demand(
+                foliage,
+                volume_stats,
+                moge3_canopy_optical_growth_gradient,
+                camera_id=(
+                    int(view.colmap_id)
+                    if bool(
+                        moge3_canopy_optical_audit.get("scheduled", False)
+                    )
+                    else None
+                ),
+                relative_magnitude_threshold=(
+                    args.persistent_optical_evidence_relative_threshold
+                ),
+            )
             exact_static_optical_growth_gradient = torch.zeros_like(
                 foliage.opacity_logits
             )
@@ -29695,27 +30148,139 @@ def main():
                     exact_static_optical_retirement_gradient
                 ),
             )
-            strict_rigid_front_gradient = (
-                static_detail_cleanup_opacity_gradient
-                + persistent_envelope_cleanup_opacity_gradient
+            (
+                material_detail_cleanup_gradient,
+                detail_material_source_audit,
+            ) = _material_optical_source_gradient(
+                foliage,
+                static_detail_cleanup_opacity_gradient,
+                direction="retirement",
+                relative_magnitude_threshold=(
+                    args.persistent_optical_evidence_relative_threshold
+                ),
             )
             (
+                material_envelope_cleanup_gradient,
+                envelope_material_source_audit,
+            ) = _material_optical_source_gradient(
+                foliage,
+                persistent_envelope_cleanup_opacity_gradient,
+                direction="retirement",
+                relative_magnitude_threshold=(
+                    args.persistent_optical_evidence_relative_threshold
+                ),
+            )
+            static_detail_global_cleanup_audit[
+                "material_source_filter"
+            ] = detail_material_source_audit
+            persistent_envelope_global_cleanup_audit[
+                "material_source_filter"
+            ] = envelope_material_source_audit
+            strict_rigid_front_gradient = (
+                material_detail_cleanup_gradient
+                + material_envelope_cleanup_gradient
+            )
+            current_strict_rigid_front_rows = (
+                strict_rigid_front_gradient > 0
+            ).flatten(1).any(dim=1)
+            ownership_topology_settled = _persistent_optical_debt_active(
+                step + 1, args
+            )
+            if ownership_topology_settled:
+                (
+                    persistent_rigid_front_conflict_rows,
+                    rigid_front_conflict_debt_audit,
+                ) = _update_persistent_rigid_front_conflict_debt(
+                    foliage,
+                    volume_stats,
+                    strict_rigid_front_gradient,
+                    strict_source_events=(
+                        (
+                            material_detail_cleanup_gradient,
+                            static_detail_cleanup_camera_id,
+                        ),
+                        (
+                            material_envelope_cleanup_gradient,
+                            int(view.colmap_id),
+                        ),
+                    ),
+                )
+            else:
+                # Before ordinary volume topology closes, a conflict belongs
+                # to the current exact render only. Persisting it through
+                # clone/split mappings made a broad parent's wall pixel a
+                # permanent fact on every future local child. Apply the
+                # current negative source below, but start the monotone debt
+                # ledger only once primitive identity is stable.
+                persistent_rigid_front_conflict_rows = (
+                    _persistent_rigid_front_conflict_rows(
+                        foliage, volume_stats
+                    )
+                )
+                rigid_front_conflict_debt_audit = {
+                    "contract": (
+                        "current_exact_conflict_is_optimizer_evidence__"
+                        "persistent_debt_waits_for_volume_topology_settlement"
+                    ),
+                    "persistence_active": False,
+                    "current_source_rows": int(
+                        current_strict_rigid_front_rows.sum()
+                    ),
+                    "new_debt_rows": 0,
+                    "persistent_debt_rows": int(
+                        persistent_rigid_front_conflict_rows.sum()
+                    ),
+                    "provenance_camera_rows": int(
+                        (
+                            volume_stats[
+                                "rigid_front_conflict_camera_id"
+                            ]
+                            >= 0
+                        ).sum()
+                    ),
+                }
+            (
                 persistent_rigid_front_conflict_rows,
-                rigid_front_conflict_debt_audit,
-            ) = _update_persistent_rigid_front_conflict_debt(
+                persistent_pure_rigid_front_conflict_rows,
+                persistent_shared_optical_owner_rows,
+            ) = _persistent_optical_ownership_states(foliage, volume_stats)
+            (
+                _,
+                current_pure_rigid_front_conflict_rows,
+                current_shared_optical_owner_rows,
+            ) = _persistent_optical_ownership_states(
                 foliage,
                 volume_stats,
-                strict_rigid_front_gradient,
-                strict_source_events=(
-                    (
-                        static_detail_cleanup_opacity_gradient,
-                        static_detail_cleanup_camera_id,
+                conflict_rows=current_strict_rigid_front_rows,
+            )
+            active_rigid_front_conflict_rows = (
+                persistent_rigid_front_conflict_rows
+                | current_strict_rigid_front_rows
+            )
+            persistent_shared_optical_owner_rows = (
+                persistent_shared_optical_owner_rows
+                | current_shared_optical_owner_rows
+            )
+            persistent_pure_rigid_front_conflict_rows = (
+                active_rigid_front_conflict_rows
+                & ~persistent_shared_optical_owner_rows
+            )
+            rigid_front_conflict_debt_audit.update(
+                {
+                    "persistence_active": ownership_topology_settled,
+                    "current_pure_negative_rows": int(
+                        current_pure_rigid_front_conflict_rows.sum()
                     ),
-                    (
-                        persistent_envelope_cleanup_opacity_gradient,
-                        int(view.colmap_id),
+                    "current_shared_rows": int(
+                        current_shared_optical_owner_rows.sum()
                     ),
-                ),
+                    "pure_negative_rows": int(
+                        persistent_pure_rigid_front_conflict_rows.sum()
+                    ),
+                    "shared_positive_negative_rows": int(
+                        persistent_shared_optical_owner_rows.sum()
+                    ),
+                }
             )
             volume_opacity_settle_audit[
                 "persistent_rigid_front_conflict_debt"
@@ -29725,7 +30290,8 @@ def main():
             ] = _apply_persistent_rigid_front_conflict_policy(
                 foliage,
                 volume_optimizer,
-                persistent_rigid_front_conflict_rows,
+                active_rigid_front_conflict_rows,
+                persistent_shared_optical_owner_rows,
             )
             volume_opacity_settle_audit[
                 "strict_rigid_front_opacity"
@@ -29733,6 +30299,7 @@ def main():
                 foliage,
                 volume_optimizer,
                 strict_rigid_front_gradient,
+                deferred_rows=persistent_shared_optical_owner_rows,
             )
         else:
             volume_opacity_settle_audit = _apply_volume_opacity_settle_policy(
@@ -29852,7 +30419,7 @@ def main():
             persistent_envelope_cleanup_update_rows
         ].clone()
         strict_rigid_front_update_rows = (
-            persistent_rigid_front_conflict_rows
+            persistent_pure_rigid_front_conflict_rows
             if args.reconstruction_target == "static"
             else
             torch.zeros(len(foliage), dtype=torch.bool, device=foliage.xyz.device)
@@ -29860,6 +30427,18 @@ def main():
         pre_step_strict_rigid_front_logits = (
             foliage.opacity_logits.detach()[
                 strict_rigid_front_update_rows
+            ].clone()
+        )
+        shared_optical_owner_update_rows = (
+            persistent_shared_optical_owner_rows
+            if args.reconstruction_target == "static"
+            else torch.zeros(
+                len(foliage), dtype=torch.bool, device=foliage.xyz.device
+            )
+        )
+        pre_step_shared_optical_owner_logits = (
+            foliage.opacity_logits.detach()[
+                shared_optical_owner_update_rows
             ].clone()
         )
         # The parameter-space handoff must be applied after Adam and all
@@ -30350,6 +30929,14 @@ def main():
                 strict_rigid_front_update_rows,
                 pre_step_strict_rigid_front_logits,
             )
+            volume_opacity_settle_audit[
+                "shared_optical_owner_pre_handoff"
+            ] = _enforce_shared_optical_owner_post_step(
+                foliage,
+                volume_optimizer,
+                shared_optical_owner_update_rows,
+                pre_step_shared_optical_owner_logits,
+            )
             # First fold this iteration's legitimate hit/opacity update into
             # the unretired reference.  Then apply the local transfer after
             # Adam and scale compensation so it cannot be undone by a stale
@@ -30363,6 +30950,11 @@ def main():
             pre_handoff_strict_rigid_front_logits = (
                 foliage.opacity_logits.detach()[
                     strict_rigid_front_update_rows
+                ].clone()
+            )
+            pre_handoff_shared_optical_owner_logits = (
+                foliage.opacity_logits.detach()[
+                    shared_optical_owner_update_rows
                 ].clone()
             )
             static_mass_handoff_audit = (
@@ -30388,6 +30980,15 @@ def main():
                     volume_optimizer,
                     strict_rigid_front_update_rows,
                     pre_handoff_strict_rigid_front_logits,
+                )
+                volume_opacity_settle_audit[
+                    "shared_optical_owner_post_step"
+                ] = _enforce_shared_optical_owner_post_step(
+                    foliage,
+                    volume_optimizer,
+                    shared_optical_owner_update_rows,
+                    pre_handoff_shared_optical_owner_logits,
+                    allow_handoff_retirement=True,
                 )
             _assert_finite_foliage_optimization_state(
                 foliage,
@@ -30479,6 +31080,9 @@ def main():
                 volume_stats,
                 static_detail_verification_camera_ids,
                 maximum_groups=event_limit,
+                minimum_detail_radius_pixels=float(
+                    args.volume_split_radius
+                ),
             )
             localization_action_count = int(
                 len(localization_factorize_rows)
@@ -32135,7 +32739,7 @@ def main():
     scene.close()
     capability_manifest = {
         "protocol": PROTOCOL,
-        "contract": V118_CAPABILITY_CONTRACT,
+        "contract": V119_CAPABILITY_CONTRACT,
         "renderer": {
             "authoritative_image_formation": "native_single_pass_mixed",
             "per_pixel_surface_ray_depth": True,

@@ -157,6 +157,12 @@ def test_moge3_profile_explicitly_owns_depth_query_optics_and_births():
     assert profile["moge3_rigid_depth_weight"] == 0.04
     assert profile["moge3_rigid_normal_weight"] == 0.02
     assert profile["chart_base_source"] == "moge3_adaptive"
+    assert profile["mature_handoff_surface_policy"] == "appearance_only"
+    assert profile["maximum_rigid_completion_seeds"] == 0
+    assert (
+        profile["persistent_optical_evidence_relative_threshold"]
+        == 1.0e-3
+    )
 
 
 def test_fast_profile_shortens_training_without_halving_foliage_evidence():
@@ -396,13 +402,16 @@ def test_completed_teacher_requires_current_inputs_code_and_state(tmp_path):
                         "chart_atlas": {"base_source": "matcha"},
                         "moge3_rigid_depth": {"weight": 0.0},
                         "moge3_rigid_normal": {"weight": 0.0},
-                        "moge3_canopy_optical": {
-                            "weight": 0.0,
-                            "every": 0,
-                            "prehit_weight": 0.25,
-                            "maximum_birth_proposals_per_view": 256,
-                        },
-                        "initialization_version": "test-init-v1",
+                            "moge3_canopy_optical": {
+                                "weight": 0.0,
+                                "every": 0,
+                                "prehit_weight": 0.25,
+                                "maximum_birth_proposals_per_view": 256,
+                            },
+                            "persistent_rigid_front_conflict_debt": {
+                                "event_relative_magnitude_threshold": 1.0e-3,
+                            },
+                            "initialization_version": "test-init-v1",
                     "initialization_manifest_sha256": sha256_file(
                         manifest_path
                     ),
@@ -431,6 +440,16 @@ def test_completed_teacher_requires_current_inputs_code_and_state(tmp_path):
 
     assert _teacher_result_is_current(result_path, **arguments)
     changed = json.loads(result_path.read_text())
+    changed["training_contract"]["persistent_rigid_front_conflict_debt"][
+        "event_relative_magnitude_threshold"
+    ] = 2.0e-3
+    result_path.write_text(json.dumps(changed), encoding="utf-8")
+    assert not _teacher_result_is_current(result_path, **arguments)
+    changed["training_contract"]["persistent_rigid_front_conflict_debt"][
+        "event_relative_magnitude_threshold"
+    ] = 1.0e-3
+    result_path.write_text(json.dumps(changed), encoding="utf-8")
+    assert _teacher_result_is_current(result_path, **arguments)
     changed["training_contract"]["volume_densify_until_iteration"] = 39
     result_path.write_text(json.dumps(changed), encoding="utf-8")
     assert not _teacher_result_is_current(result_path, **arguments)
@@ -492,13 +511,16 @@ def test_completed_teacher_binds_the_exact_rigid_handoff(tmp_path):
                         "chart_atlas": {"base_source": "matcha"},
                         "moge3_rigid_depth": {"weight": 0.0},
                         "moge3_rigid_normal": {"weight": 0.0},
-                        "moge3_canopy_optical": {
-                            "weight": 0.0,
-                            "every": 0,
-                            "prehit_weight": 0.25,
-                            "maximum_birth_proposals_per_view": 256,
-                        },
-                        "initialization_version": "test-init-v1",
+                            "moge3_canopy_optical": {
+                                "weight": 0.0,
+                                "every": 0,
+                                "prehit_weight": 0.25,
+                                "maximum_birth_proposals_per_view": 256,
+                            },
+                            "persistent_rigid_front_conflict_debt": {
+                                "event_relative_magnitude_threshold": 1.0e-3,
+                            },
+                            "initialization_version": "test-init-v1",
                     "initialization_manifest_sha256": sha256_file(
                         manifest_path
                     ),
