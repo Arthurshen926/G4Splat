@@ -916,6 +916,26 @@ def test_audited_dav2_source_role_migration_is_render_equivalent():
     )
 
 
+def test_intrinsic_query_migration_requires_exact_opt_in_and_binary(monkeypatch):
+    hashes = {
+        "appearance_uncertainty": api.sha256_file(api.REPO_ROOT / "outdoor/appearance_uncertainty.py"),
+        "dataset_reader": api.sha256_file(api.SURFEL_ROOT / "scene/dataset_readers.py"),
+        "gaussian_model": api.sha256_file(api.SURFEL_ROOT / "scene/gaussian_model.py"),
+        **api.INTRINSIC_QUERY_REPAIR_PREDECESSOR,
+    }
+    monkeypatch.setattr(api, "_loaded_module_binary_sha256", lambda _: api.INTRINSIC_QUERY_REPAIR_TARGET["mixed_extension_binary"])
+    state = {"protocol": "cambridge_native_hybrid_teacher_v119_material_local_canopy_ownership",
+             "implementation_hashes": hashes}
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        api._validate_render_implementation(state)
+    audit = api._validate_render_implementation(state, allow_intrinsic_depth_query_repair=True)
+    assert audit["status"] == "intrinsic_depth_query_causal_repair"
+    assert not audit["exact"]
+    monkeypatch.setattr(api, "_loaded_module_binary_sha256", lambda _: "unrelated_binary")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        api._validate_render_implementation(state, allow_intrinsic_depth_query_repair=True)
+
+
 def test_rigid_stage_state_cannot_reenable_untrained_foliage(monkeypatch):
     observed = {}
 

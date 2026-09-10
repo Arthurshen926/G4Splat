@@ -85,6 +85,7 @@ from scripts.train_unified_outdoor_teacher import (
     _moge3_canopy_optical_loss,
     _moge3_depth_query_bounds,
     _moge3_uncovered_hit_proposals,
+    _spatially_stratified_proposal_indices,
     _configure_moge3_runtime,
     _cap_canonical_occlusion_order_gradient_responsibility,
     _canonical_occlusion_schedule_active,
@@ -113,6 +114,7 @@ from scripts.train_unified_outdoor_teacher import (
     _persistent_rigid_front_conflict_rows,
     _persistent_optical_debt_active,
     _persistent_optical_ownership_states,
+    _surface_replacement_retirement_allowed,
     _material_optical_source_gradient,
     _update_persistent_rigid_front_conflict_debt,
     _update_persistent_positive_optical_demand,
@@ -1927,7 +1929,16 @@ def test_ownerless_strict_visual_hull_birth_gets_bounded_additive_mass():
     assert before < after <= before * 1.005 + 1.0e-8
 
 
-def test_ownerless_single_sequence_birth_has_no_additive_authority():
+@pytest.mark.parametrize("canonical,camera_names,support,expected", [
+    (None, ["seq2__frame00001", "seq2__frame00002"], [7, 8], 0),
+    ("seq2", ["seq2__frame00001", "seq2__frame00002"], [7, 8], 1),
+    ("seq2", ["seq2__frame00001", "seq1__frame00002"], [7, 8], 0),
+    ("seq2", ["seq2__frame00001", "seq2__frame00002"], [7, 7], 0),
+    ("seq2", ["seq2__frame00001", "seq2__frame00002"], [7, 9], 0),
+])
+def test_ownerless_single_sequence_birth_requires_exact_canonical_consensus(
+    canonical, camera_names, support, expected,
+):
     foliage = VolumetricFoliageModel(1, device="cpu")
     foliage.initialize_from_volume_state(
         {
@@ -1946,7 +1957,7 @@ def test_ownerless_single_sequence_birth_has_no_additive_authority():
     before = foliage.integrated_optical_mass().sum().clone()
     appended = foliage.append_static_ray_births(
         torch.tensor([[3.0, 0.0, 2.0]]),
-        support_camera_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+        support_camera_ids=torch.tensor([support], dtype=torch.int32),
         support_sequence_count=torch.tensor([1], dtype=torch.int16),
     )
     birth = int(appended["_new_start"])
@@ -1955,13 +1966,20 @@ def test_ownerless_single_sequence_birth_has_no_additive_authority():
         SimpleNamespace(state={}),
         birth_rows=torch.tensor([birth]),
         owner_rows=torch.tensor([-1]),
-        view_by_camera_id={},
+        view_by_camera_id={
+            7: SimpleNamespace(image_name=camera_names[0]),
+            8: SimpleNamespace(image_name=camera_names[1]),
+        },
         maximum_fraction_per_event=0.02,
+        canonical_sequence=canonical,
     )
-    assert audit["additive_funded_children"] == 0
-    torch.testing.assert_close(
-        foliage.integrated_optical_mass().sum(), before, rtol=1e-5, atol=1e-8
-    )
+    assert audit["additive_funded_children"] == expected
+    after = foliage.integrated_optical_mass().sum()
+    if expected:
+        assert 0 < audit["additive_child_mass"] <= float(before * .005)
+        assert before < after <= before * 1.005 + 1e-8
+    else:
+        torch.testing.assert_close(after, before, rtol=1e-5, atol=1e-8)
 
 
 def test_unverified_envelope_is_ineligible_for_mass_handoff():
@@ -7357,6 +7375,89 @@ def test_visual_hull_static_child_refresh_uses_cross_sequence_support():
     assert audit["canonical_refreshed_children"] == 1
 
 
+def test_static_child_color_refresh_deduplicates_explicit_and_support_camera():
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([0], dtype=torch.int8),
+        "observation_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_uv": torch.full((1, 1, 2), 0.5),
+        "observation_depth": torch.tensor([[2.0]]),
+        "support_camera_ids": torch.tensor([[7, 8]], dtype=torch.int32),
+        "support_sequence_count": torch.tensor([2], dtype=torch.int16),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    _refresh_split_child_owner_colors(
+        foliage, child_start=0, owner_camera_ids=torch.tensor([-1]),
+        view_by_camera_id={
+            7: _solid_refresh_camera(7, [0.2, 0.4, 0.6]),
+            8: _solid_refresh_camera(8, [0.6, 0.4, 0.2]),
+        },
+    )
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.tensor([0.4, 0.4, 0.4]))
+
+
+@pytest.mark.parametrize("hit_depth,canopy,weight,transient,accepted", [
+    (2.0, 1.0, 1.0, 0.0, True),
+    (4.0, 1.0, 1.0, 0.0, False),
+    (2.0, 0.0, 1.0, 0.0, False),
+    (2.0, 1.0, 0.0, 0.0, False),
+    (2.0, 1.0, 1.0, 1.0, False),
+])
+def test_measured_child_color_uses_calibrated_hit_and_observed_canopy(
+    hit_depth, canopy, weight, transient, accepted,
+):
+    payload = {
+        "version": "independent_sfm_semantic_canopy_volume_v1",
+        "centers": torch.tensor([[0.0, 0.0, 2.0]]),
+        "scales": torch.full((1, 3), 0.05),
+        "colors": torch.full((1, 3), 0.25),
+        "opacities": torch.full((1, 1), 0.2),
+        "quaternions": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "layer_role": torch.tensor([0], dtype=torch.int8),
+        "observation_camera_ids": torch.tensor([[7]], dtype=torch.int32),
+        "observation_uv": torch.full((1, 1, 2), 0.5),
+        "observation_depth": torch.tensor([[2.0]]),
+        "support_camera_ids": torch.tensor([[7, 8]], dtype=torch.int32),
+        "support_sequence_count": torch.tensor([2], dtype=torch.int16),
+    }
+    foliage = VolumetricFoliageModel(1, device="cpu")
+    foliage.initialize_from_volume_state(payload)
+    cameras = {7: _solid_refresh_camera(7, [0.2, 0.4, 0.6]),
+               8: _solid_refresh_camera(8, [0.6, 0.4, 0.2])}
+    for key, view in cameras.items():
+        view.image_name = f"seq2/{key}"
+    field = lambda value: torch.full((1, 4, 4), value)
+    geometry = SimpleNamespace(inverse_root=None, fields=lambda *a, **k: {
+        "moge3_depth_m": field(1.0),
+        "moge3_canopy_depth_m": field(hit_depth),
+        "moge3_valid_mask": field(1.0),
+        "moge3_refinement_log_depth_std": field(0.0),
+        "moge3_refinement_final_delta_log_depth": field(0.0),
+    })
+    task_canopy = field(canopy)[0]
+    task_canopy[0] = 0  # Native task fields are HxW; first row is not the image.
+    task = SimpleNamespace(fields=lambda *a, **k: {
+        "p_canopy": task_canopy, "w_rgb": field(weight)[0],
+        "p_transient": field(transient)[0],
+    })
+    audit = _refresh_split_child_owner_colors(
+        foliage, child_start=0, owner_camera_ids=torch.tensor([-1]),
+        view_by_camera_id=cameras, geometry_evidence=geometry,
+        measured_canopy_task_fields=task,
+    )
+    dc_rgb = foliage.features[0, 0] * 0.28209479177387814 + 0.5
+    torch.testing.assert_close(dc_rgb, torch.full((3,), 0.4 if accepted else 0.25))
+    assert audit["measured_canopy_depth_refreshed_children"] == int(accepted)
+    assert audit["canonical_low_support_dc_only_children"] == int(not accepted)
+
+
 def test_static_child_support_fallback_runs_after_all_depth_samples_fail():
     payload = {
         "version": "independent_sfm_semantic_canopy_volume_v1",
@@ -8064,6 +8165,14 @@ def test_static_detail_positive_sequence_gets_soft_geometry_not_topology():
             [1.0, STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT, 0.0]
         ),
     )
+    widened = _static_detail_same_sequence_geometry_gate(
+        Foliage(), 1, sequence_lookup, exact, fallback_weight=1.0
+    )
+    torch.testing.assert_close(widened, torch.tensor([1.,1.,0.]))
+    # This permission change never modifies the independent topology owner.
+    torch.testing.assert_close(exact, torch.tensor([1.,0.,0.]))
+    from scripts.train_unified_outdoor_teacher import _static_detail_refinement_gate
+    torch.testing.assert_close(_static_detail_refinement_gate(Foliage(),exact),exact)
 
 
 def test_static_volume_isolated_only_refines_verified_exact_detail():
@@ -9163,6 +9272,91 @@ def test_moge3_canopy_optical_loss_grows_hit_retires_prehit_and_ignores_invalid(
     assert hit.grad[0, 0, 2].item() == 0.0
 
 
+def test_birth_budget_cannot_be_monopolized_by_one_high_score_patch():
+    rows = torch.tensor([0, 0, 1, 1, 0, 6, 6])
+    columns = torch.tensor([0, 1, 0, 1, 6, 0, 6])
+    score = torch.tensor([1., .99, .98, .97, .8, .8, .8])
+    chosen = _spatially_stratified_proposal_indices(
+        rows, columns, score, height=8, width=8, budget=4,
+    )
+    assert chosen.tolist() == [0, 4, 5, 6]
+    # A sparse tile layout still fills the budget, without duplicate rays.
+    chosen = _spatially_stratified_proposal_indices(
+        rows[:4], columns[:4], score[:4], height=8, width=8, budget=3,
+    )
+    assert chosen.tolist() == [0, 1, 2]
+
+
+def test_seeded_birth_sampling_explores_tiles_without_mutating_evidence_or_rng():
+    rows = torch.arange(8).repeat_interleave(8)
+    columns = torch.arange(8).repeat(8)
+    score = torch.linspace(.5,1.,64)
+    original = score.clone()
+    rng = torch.get_rng_state().clone()
+    def sample(seed):
+        return _spatially_stratified_proposal_indices(rows,columns,score,
+            height=8,width=8,budget=4,sampling_seed=seed)
+    torch.testing.assert_close(sample(17),sample(17))
+    union = set()
+    for seed in range(32):
+        chosen = sample(seed)
+        assert len(chosen.unique()) == 4
+        assert len(((rows[chosen]//4)*2+columns[chosen]//4).unique()) == 4
+        union.update(chosen.tolist())
+    assert len(union) > 32
+    torch.testing.assert_close(score,original)
+    torch.testing.assert_close(torch.get_rng_state(),rng)
+
+
+def test_moge3_auxiliary_camera_is_bound_to_loss_birth_render_and_ledger():
+    import ast
+    import inspect
+    import scripts.train_unified_outdoor_teacher as trainer
+    body = ast.parse(inspect.getsource(trainer.main))
+    calls = [node for node in ast.walk(body) if isinstance(node,ast.Call)]
+    def named(name):
+        return [node for node in calls if isinstance(node.func,ast.Name) and node.func.id == name]
+    proposals = named("_moge3_uncovered_hit_proposals")
+    assert len(proposals) == 1
+    assert ast.unparse(proposals[0].args[0]) == "moge3_view"
+    assert ast.unparse(proposals[0].args[3]) == "moge3_task"
+    losses = named("_moge3_canopy_optical_loss")
+    assert len(losses) == 1 and ast.unparse(losses[0].args[2]) == "moge3_task"
+    ledger = [node for node in named("_update_persistent_positive_optical_demand")
+              if ast.unparse(node.args[2]) == "moge3_canopy_optical_growth_gradient"]
+    assert len(ledger) == 1
+    camera = next(k.value for k in ledger[0].keywords if k.arg == "camera_id")
+    assert "moge3_view.colmap_id" in ast.unparse(camera)
+    render_count = 0
+    for node in ast.walk(body):
+        if isinstance(node,ast.Assign) and isinstance(node.value,ast.Call):
+            targets = {target.id for target in node.targets if isinstance(target,ast.Name)}
+            if targets & {"moge3_canopy_optical_package_prehit","moge3_canopy_optical_package_hit",
+                           "moge3_canopy_optical_package_coverage","verification_package"}:
+                assert ast.unparse(node.value.args[0]) == "moge3_view"
+                render_count += 1
+    assert render_count == 4
+
+
+def test_moge3_hit_coverage_audit_excludes_invalid_and_nontree_pixels():
+    hit = torch.tensor([[0., 0.005, 0.2, 0.8, 0., 0.]])
+    task = {
+        "p_canopy": torch.tensor([[1., 1., 1., 1., 1., 0.]]),
+        "p_canopy_core": torch.ones_like(hit),
+        "p_rigid": torch.zeros_like(hit),
+    }
+    _, audit = _moge3_canopy_optical_loss(
+        torch.zeros_like(hit), hit, task,
+        torch.tensor([[True, True, True, True, False, True]]),
+        torch.ones_like(hit),
+    )
+    assert audit["hit_supported_pixels"] == 4
+    assert audit["hit_zero_coverage_pixels"] == 1
+    assert audit["hit_positive_below_001_pixels"] == 1
+    assert audit["hit_below_target_pixels"] == 3
+    assert audit["hit_target_met_pixels"] == 1
+
+
 def test_moge3_hit_owner_uses_current_metric_ray_for_persistent_detail():
     foliage = SimpleNamespace(
         static_leaf_mask=torch.tensor(
@@ -9231,6 +9425,25 @@ def test_moge3_canopy_optical_loss_keeps_low_logit_growth_finite_and_stops_at_ta
     # Log optical depth keeps all three source gradients in one useful band.
     assert float(growth.max() / growth.min()) < 1.10
     assert abs(float(logits.grad[0, 0, 3])) < 1.0e-7
+
+
+def test_moge3_optical_mean_and_shared_parameter_gradient_are_resolution_invariant():
+    outputs = []
+    for height in (1, 7, 36):
+        logits = torch.tensor([-2., -8.], requires_grad=True)
+        prehit = logits[0].sigmoid().expand(height, 5)
+        hit = logits[1].sigmoid().expand(height, 5)
+        valid = torch.ones(height, 5, dtype=torch.bool)
+        one = torch.ones(height, 5)
+        task = {"p_canopy":one, "p_canopy_core":one, "p_rigid":one*0}
+        loss, _, negative, positive = _moge3_canopy_optical_loss(
+            prehit, hit, task, valid, one, return_components=True)
+        gradient = torch.autograd.grad(loss,logits)[0]
+        outputs.append((loss.detach(),negative.detach(),positive.detach(),gradient))
+    for actual in outputs[1:]:
+        for value,expected in zip(actual,outputs[0]):
+            torch.testing.assert_close(value,expected)
+    assert float(outputs[0][2]) > 7.0
 
 
 def test_moge3_prehit_retirement_and_hit_growth_are_source_separated():
@@ -9973,7 +10186,20 @@ def test_material_optical_source_rejects_numerical_ewa_tail():
     assert owners.tolist() == [True, False, False, False]
 
 
-def test_shared_optical_owner_freezes_while_pure_conflict_retires():
+@pytest.mark.parametrize("policy,allowed", [
+    ("joint", True), ("appearance_only", False),
+    ("frozen", False), ("atlas_residual", False),
+])
+def test_surface_retirement_respects_mature_opacity_authority(policy, allowed):
+    assert _surface_replacement_retirement_allowed(policy) is allowed
+
+
+@pytest.mark.parametrize("demands,expected_shared", [
+    ([0, 0, 0, 0], [False, False, False, False]),
+    ([0, 2, 0, 0], [False, False, False, False]),
+    ([2, 0, 0, 0], [True, False, False, False]),
+])
+def test_shared_optical_owner_requires_same_row_demand(demands, expected_shared):
     class FoliageStub(SimpleNamespace):
         def __len__(self):
             return len(self.xyz)
@@ -10001,15 +10227,15 @@ def test_shared_optical_owner_freezes_while_pure_conflict_retires():
             [3, 0, 2, 0], dtype=torch.int16
         ),
         "positive_optical_demand_observations": torch.tensor(
-            [0, 0, 0, 0], dtype=torch.int16
+            demands, dtype=torch.int16
         ),
     }
     conflict, pure, shared = _persistent_optical_ownership_states(
         foliage, stats
     )
     assert conflict.tolist() == [True, False, True, False]
-    assert pure.tolist() == [False, False, True, False]
-    assert shared.tolist() == [True, False, False, False]
+    assert shared.tolist() == expected_shared
+    assert torch.equal(pure, conflict & ~shared)
 
     opacity.grad = torch.tensor([[2.0], [-1.0], [-3.0], [-1.0]])
     first_moment = torch.tensor([[1.0], [-1.0], [-2.0], [-1.0]])
@@ -10020,12 +10246,16 @@ def test_shared_optical_owner_freezes_while_pure_conflict_retires():
     # Shared row zero cannot be globally retired; pure-negative row two may
     # retire but may never regrow.
     torch.testing.assert_close(
-        opacity.grad, torch.tensor([[0.0], [-1.0], [0.0], [-1.0]])
+        opacity.grad, torch.tensor([
+            [0.0 if expected_shared[0] else 2.0], [-1.0], [0.0], [-1.0]
+        ])
     )
     torch.testing.assert_close(
-        first_moment, torch.tensor([[0.0], [-1.0], [0.0], [-1.0]])
+        first_moment, torch.tensor([
+            [0.0 if expected_shared[0] else 1.0], [-1.0], [0.0], [-1.0]
+        ])
     )
-    assert audit["shared_retirement_rows_deferred"] == 1
+    assert audit["shared_retirement_rows_deferred"] == int(expected_shared[0])
     assert audit["growth_rows_vetoed"] == 1
 
 
@@ -10273,6 +10503,59 @@ def test_shared_envelope_localization_is_group_atomic_and_bounded():
     )
     assert camera_ids.tolist() == [7]
     torch.testing.assert_close(normals, torch.tensor([[0.0, 0.0, 1.0]]))
+
+
+def test_detail_only_dual_owner_has_localization_exit():
+    class FoliageStub(SimpleNamespace):
+        def __len__(self):
+            return len(self.xyz)
+
+    foliage = FoliageStub(
+        xyz=torch.zeros(1, 3),
+        static_leaf_mask=torch.tensor([True]),
+        persistent_envelope_mask=torch.tensor([False]),
+        dynamic_leaf_mask=torch.tensor([False]),
+        verification_state=torch.tensor([VERIFICATION_VERIFIED]),
+        proposal_kind=torch.tensor([PROPOSAL_NONE]),
+        replacement_group=torch.tensor([0]),
+        support_camera_ids=torch.tensor([[0, 1]]),
+        verified_camera_count=torch.tensor([2]),
+        verified_sequence_count=torch.tensor([1]),
+        scales=torch.ones(1, 3),
+    )
+    stats = {
+        "rigid_front_conflict_observations": torch.tensor([1]),
+        "rigid_front_conflict_camera_id": torch.tensor([0]),
+        "rigid_front_conflict_max_gradient": torch.tensor([0.5]),
+        "positive_optical_demand_observations": torch.tensor([1]),
+        "positive_optical_demand_camera_id": torch.tensor([1]),
+        "positive_optical_demand_max_gradient": torch.tensor([0.5]),
+        "radius": torch.tensor([3.0]),
+    }
+    factorize, split, audit = _select_shared_envelope_localization_actions(
+        foliage, stats, torch.tensor([0, 1]), maximum_groups=1,
+        minimum_detail_radius_pixels=2.0,
+    )
+    assert factorize.numel() == 0
+    assert split.tolist() == [0]
+    assert audit["selected_groups"] == 1
+    normals, cameras = _shared_envelope_detail_split_plane_normals(
+        foliage, stats, split, torch.tensor([[0., 0., 1.], [0., 1., 0.]])
+    )
+    assert cameras.tolist() == [0]
+    torch.testing.assert_close(normals, torch.tensor([[0., 0., 1.]]))
+    # With no optical demand, verification cannot self-exempt this detail.
+    stats["positive_optical_demand_observations"].zero_()
+    conflict, pure, shared = _persistent_optical_ownership_states(foliage, stats)
+    assert conflict.tolist() == pure.tolist() == [True]
+    assert shared.tolist() == [False]
+    # An ownerless birth can carry measured positive demand too. Missing
+    # replacement-group metadata must not erase that optical responsibility.
+    stats["positive_optical_demand_observations"].fill_(1)
+    foliage.replacement_group.fill_(-1)
+    _, pure, shared = _persistent_optical_ownership_states(foliage, stats)
+    assert pure.tolist() == [False]
+    assert shared.tolist() == [True]
 
 
 def test_shared_envelope_localization_defers_to_lifecycle_maintenance():

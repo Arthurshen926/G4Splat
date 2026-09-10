@@ -64,6 +64,174 @@ def _empty(rows, columns):
     return torch.empty(rows, columns, device="cuda")
 
 
+def test_supported_static_source_position_identity_and_native_gradient():
+    from scripts.canopy_static_source_position import StaticSourcePosition
+    _, _, Rasterizer = _api(); settings = _settings()
+    surface = torch.tensor([[0., 0., 3.]], device='cuda')
+    leaves = torch.tensor([[.07, 0., 2.], [.1, 0., 4.]], device='cuda')
+    scales = torch.full((2, 3), .2, device='cuda')
+    position = StaticSourcePosition(leaves, scales, torch.tensor([True, False], device='cuda'), 2.)
+    def render(xyz):
+        return Rasterizer(settings)(surface, torch.zeros_like(surface),
+            torch.tensor([[.5, .5]], device='cuda'), torch.tensor([[1., 0., 0., 0.]], device='cuda'),
+            xyz, torch.zeros_like(xyz), scales, torch.tensor([[1., 0., 0., 0.]]*2, device='cuda'),
+            torch.tensor([[.7, .7, .7], [.1, .3, .1], [.2, .3, .2]], device='cuda'),
+            torch.tensor([.99, .3, .3], device='cuda'))[0]
+    assert torch.equal(render(position.apply(leaves)), render(leaves))
+    def loss(): return (render(position.apply(leaves))[:, 18:21, 31:34]-.2).square().mean()
+    loss().backward(); analytic = position.code.grad[0, 0].clone()
+    assert analytic.abs() > 1e-6
+    with torch.no_grad():
+        position.code[0, 0] = .001; plus = loss()
+        position.code[0, 0] = -.001; minus = loss()
+        position.code.zero_()
+    torch.testing.assert_close(analytic, (plus-minus)/.002, atol=2e-5, rtol=3e-2)
+    assert surface.grad is None and leaves.grad is None and scales.grad is None
+
+
+def test_owned_foliage_color_keeps_native_opacity_and_geometry_gradient():
+    from scripts.canopy_color_gradient_ownership import backward_canopy_owned_colors
+    from scripts.canopy_frozen_reference_cache import FrozenReferenceCache
+    _, _, Rasterizer = _api(); settings = _settings()
+    surface = torch.tensor([[0., 0., 3.]], device='cuda')
+    leaves = torch.tensor([[0., 0., 2.], [.1, 0., 4.]], device='cuda', requires_grad=True)
+    logits = torch.tensor([-1.4, -1.4], device='cuda', requires_grad=True)
+    colors = torch.tensor([[.1, .3, .1], [.2, .3, .2]], device='cuda', requires_grad=True)
+    rgb = Rasterizer(settings)(surface, torch.zeros_like(surface),
+        torch.tensor([[.5, .5]], device='cuda'), torch.tensor([[1., 0., 0., 0.]], device='cuda'),
+        leaves, torch.zeros_like(leaves), torch.full((2, 3), .2, device='cuda'),
+        torch.tensor([[1., 0., 0., 0.]]*2, device='cuda'),
+        torch.cat((colors.new_tensor([[.7, .7, .7]]), colors)),
+        torch.cat((logits.new_tensor([.99]), logits.sigmoid())))[0]
+    cache = FrozenReferenceCache(1)
+    first = cache.get('native', lambda: rgb, torch.device('cuda'))
+    second = cache.get('native', lambda: rgb*0, torch.device('cuda'))
+    assert torch.equal(first, rgb.detach()) and torch.equal(second, first)
+    assert not first.requires_grad and cache.stats()['hits'] == 1
+    tree = (rgb[:, 18:21, 31:34]-.2).square().mean()
+    background = 4*(rgb[:, 22:25, 35:38]-.7).square().mean()
+    expected_color, = torch.autograd.grad(tree, colors, retain_graph=True)
+    expected_optics = torch.autograd.grad(tree+background, (logits, leaves), retain_graph=True)
+    backward_canopy_owned_colors(tree, background, color_parameters=[colors],
+                                 optical_geometry_parameters=[logits, leaves])
+    torch.testing.assert_close(colors.grad, expected_color, atol=2e-6, rtol=2e-4)
+    for parameter, expected in zip((logits, leaves), expected_optics):
+        torch.testing.assert_close(parameter.grad, expected, atol=2e-6, rtol=2e-4)
+
+
+def test_boundary_reference_loss_rejects_foreground_occlusion_but_not_hidden_leaves():
+    from scripts.canopy_boundary_preservation import boundary_rgb_preservation
+    _, _, Rasterizer = _api(); settings = _settings()
+    surface = torch.tensor([[0., 0., 3.]], device='cuda')
+    leaves = torch.tensor([[0., 0., 2.], [0., 0., 4.]], device='cuda')
+    logits = torch.tensor([-1.4, -1.4], device='cuda', requires_grad=True)
+    mask = torch.zeros(47, 61, device='cuda', dtype=torch.bool); mask[19:22, 33:36] = True
+    def render(alpha):
+        return Rasterizer(settings)(surface, torch.zeros_like(surface),
+            torch.tensor([[.5, .5]], device='cuda'), torch.tensor([[1., 0., 0., 0.]], device='cuda'),
+            leaves, torch.zeros_like(leaves), torch.full((2, 3), .2, device='cuda'),
+            torch.tensor([[1., 0., 0., 0.]]*2, device='cuda'),
+            torch.tensor([[.7, .7, .7], [0., 0., 0.], [0., 0., 0.]], device='cuda'),
+            torch.cat((alpha.new_tensor([.99]), alpha)))[0]
+    reference = render(torch.zeros_like(logits)).detach()
+    def objective(value):
+        return boundary_rgb_preservation(render(value.sigmoid()), reference, mask, mask)
+    objective(logits).backward()
+    assert logits.grad[0] > 0 and logits.grad[1] == 0
+    with torch.no_grad():
+        delta = logits.new_tensor([.001, 0.])
+        finite_difference = (objective(logits+delta)-objective(logits-delta))/.002
+    torch.testing.assert_close(logits.grad[0], finite_difference, atol=2e-5, rtol=2e-3)
+
+
+@pytest.mark.parametrize('domain', ['absolute', 'relative'])
+def test_surface_rgb_floor_has_only_actual_foreground_extinction_gradient(domain):
+    from scripts.canopy_surface_rgb_feasibility import surface_rgb_feasibility_loss
+    from scripts.canopy_relative_radiance_feasibility import initial_gradient_normalization, relative_surface_rgb_feasibility_loss
+    _, _, Rasterizer = _api(); settings = _settings()
+    surface = torch.tensor([[0., 0., 3.]], device='cuda')
+    leaves = torch.tensor([[0., 0., 2.], [0., 0., 4.]], device='cuda')
+    logits = torch.tensor([-1.4, -1.4], device='cuda', requires_grad=True)
+    mask = torch.zeros(47, 61, device='cuda', dtype=torch.bool); mask[19:22, 33:36] = True
+    initial_scale = None
+    def loss_at(value):
+        nonlocal initial_scale
+        colors = torch.tensor([[.7, .7, .7], [0., 0., 0.], [0., 0., 0.]], device='cuda')
+        opacity = torch.cat((value.new_tensor([.99]), value.sigmoid()))
+        rgb, _, _, _, _ = Rasterizer(settings)(surface, torch.zeros_like(surface),
+            torch.tensor([[.5, .5]], device='cuda'), torch.tensor([[1., 0., 0., 0.]], device='cuda'),
+            leaves, torch.zeros_like(leaves), torch.full((2, 3), .2, device='cuda'),
+            torch.tensor([[1., 0., 0., 0.]]*2, device='cuda'), colors, opacity)
+        target = torch.full_like(rgb, .1)
+        if domain == 'relative':
+            if initial_scale is None: initial_scale = initial_gradient_normalization(rgb, target, mask)
+            return relative_surface_rgb_feasibility_loss(rgb, target, mask, initial_scale)
+        return surface_rgb_feasibility_loss(rgb, target, mask)
+    loss_at(logits).backward()
+    assert logits.grad[0] < 0 and logits.grad[1] == 0
+    with torch.no_grad():
+        delta = logits.new_tensor([.001, 0.])
+        finite_difference = (loss_at(logits+delta)-loss_at(logits-delta))/.002
+    torch.testing.assert_close(logits.grad[0], finite_difference, atol=2e-5, rtol=2e-3)
+
+
+def test_native_mass_retraction_requires_scale_opacity_chain_rule():
+    from outdoor.optical_mass_gradient import mass_preserving_scale_alpha
+    _, _, Rasterizer = _api()
+    settings = _settings()
+    s = torch.tensor(.18, device='cuda').log().requires_grad_()
+    alpha = torch.tensor(.3, device='cuda')
+    mass = (-torch.log1p(-alpha)*(2*s).exp()).detach()
+
+    def objective(log_scale, peak_alpha):
+        _, _, aux, _, _ = Rasterizer(settings)(
+            _empty(0, 3), _empty(0, 3), _empty(0, 2), _empty(0, 4),
+            torch.tensor([[0., 0., 2.4]], device='cuda'), _empty(1, 3).zero_(),
+            log_scale.exp().expand(1, 3),
+            torch.tensor([[1., 0., 0., 0.]], device='cuda'),
+            torch.ones(1, 3, device='cuda'), peak_alpha.reshape(1, 1))
+        return (aux[8, 20, 36]-.7).square()
+
+    initial = objective(s, alpha)
+    raw_g = torch.autograd.grad(initial, s)[0]
+    corrected = mass_preserving_scale_alpha(alpha, (2*s).exp())
+    assert torch.equal(corrected, alpha)
+    corrected_g = torch.autograd.grad(objective(s, corrected), s)[0]
+    def retracted(x): return objective(x, -torch.expm1(-mass/(2*x).exp()))
+    with torch.no_grad():
+        h = 1e-3
+        fd = (retracted(s+h)-retracted(s-h))/(2*h)
+        torch.testing.assert_close(corrected_g, fd, atol=2e-4, rtol=3e-3)
+        assert raw_g < 0 < corrected_g
+        assert retracted(s-.001*raw_g) > initial
+        assert retracted(s-.001*corrected_g) < initial
+
+
+def test_darkening_bound_adam_grows_only_real_wall_front_leaf():
+    from outdoor.canopy_foreground_evidence import foreground_darkening_loss
+    _,_,MixedGaussianRasterizer=_api();settings=_settings()
+    logits=torch.nn.Parameter(torch.logit(torch.tensor([[.99],[.10],[.10]],device='cuda')))
+    colors=torch.ones(3,3,device='cuda',requires_grad=True)*.5
+    surface=torch.tensor([[0.,0.,3.]],device='cuda',requires_grad=True)
+    leaves=torch.tensor([[0.,0.,2.],[0.,0.,4.]],device='cuda',requires_grad=True)
+    bounds=torch.empty(2,47,61,device='cuda');bounds[0]=.2001;bounds[1]=2.97
+    _,_,aux,_,_=MixedGaussianRasterizer(settings)(
+        surface,torch.zeros_like(surface),torch.tensor([[.5,.5]],device='cuda'),
+        torch.tensor([[1.,0.,0.,0.]],device='cuda'),leaves,torch.zeros_like(leaves),
+        torch.full((2,3),.2,device='cuda'),torch.tensor([[1.,0.,0.,0.]]*2,device='cuda'),
+        colors,logits.sigmoid(),depth_query_bounds=bounds)
+    mask=torch.zeros(47,61,device='cuda',dtype=torch.bool);mask[19:22,33:36]=True
+    # Zero-based aux[12] is the intrinsic interval hit; behind-wall alpha is excluded.
+    loss=foreground_darkening_loss(aux[12],torch.full((47,61),.8,device='cuda'),mask)
+    loss.backward()
+    assert logits.grad[1]<0
+    assert logits.grad[0]==0 and logits.grad[2]==0
+    assert torch.count_nonzero(surface.grad)==0
+    before=logits.detach().clone()
+    optimizer=torch.optim.Adam([logits],lr=.05,eps=1.e-15);optimizer.step()
+    assert logits[1]>before[1] and torch.equal(logits[[0,2]],before[[0,2]])
+
+
 def test_zero_volume_is_exactly_the_native_surfel_path():
     _, GaussianRasterizer, MixedGaussianRasterizer = _api()
     settings = _settings()
@@ -105,6 +273,47 @@ def test_zero_volume_is_exactly_the_native_surfel_path():
     assert torch.allclose(mixed_aux[9:10], legacy_aux[0:1], atol=2e-7, rtol=0)
     assert torch.count_nonzero(mixed_aux[[8, 10, 11, 12]]).item() == 0
     assert gate_audit.numel() == 0
+
+
+@pytest.mark.parametrize("surface_prefix", [False, True])
+def test_intrinsic_hit_survives_opaque_prefix_without_changing_rgb(surface_prefix):
+    _, _, Rasterizer = _api()
+    settings = _settings()
+    prefix = torch.tensor([[0., 0., 1. + .1 * i] for i in range(6)], device="cuda")
+    hits = torch.tensor([[0., 0., 3.], [0., 0., 4.]], device="cuda")
+    surface = prefix if surface_prefix else _empty(0, 3)
+    volume = hits if surface_prefix else torch.cat((prefix, hits))
+    colors = torch.full((8, 3), .4, device="cuda")
+    rotations = torch.tensor([[1., 0., 0., 0.]], device="cuda")
+    bounds = torch.empty(2, settings.image_height, settings.image_width, device="cuda")
+    bounds[0].fill_(2.5); bounds[1].fill_(3.5)
+
+    def render(opacity, query):
+        return Rasterizer(settings)(
+            surface, torch.zeros_like(surface),
+            torch.full((len(surface), 2), .8, device="cuda"),
+            rotations.repeat(len(surface), 1),
+            volume, torch.zeros_like(volume),
+            torch.full((len(volume), 3), .8, device="cuda"),
+            rotations.repeat(len(volume), 1), colors, opacity,
+            **({"depth_query_bounds": bounds} if query else {}),
+        )
+
+    opacity = torch.tensor([[.99]] * 6 + [[.4], [.2]], device="cuda", requires_grad=True)
+    queried = render(opacity, True)
+    ordinary = render(opacity, False)
+    torch.testing.assert_close(queried[0], ordinary[0], rtol=0, atol=0)
+    torch.testing.assert_close(queried[2][:11], ordinary[2][:11], rtol=0, atol=0)
+    hit = queried[2][12, 20, 34]
+    assert float(hit) > .2
+    hit.backward()
+    assert float(opacity.grad[6]) > .5
+    assert torch.count_nonzero(opacity.grad[:6]) == 0
+    assert float(opacity.grad[7]) == 0
+    plus, minus = opacity.detach().clone(), opacity.detach().clone()
+    plus[6] += .001; minus[6] -= .001
+    finite = (render(plus, True)[2][12, 20, 34] - render(minus, True)[2][12, 20, 34]) / .002
+    torch.testing.assert_close(opacity.grad[6, 0], finite, rtol=.003, atol=.001)
 
 
 def test_volume_depth_query_separates_prehit_hit_and_behind_alpha():
@@ -170,6 +379,30 @@ def test_volume_depth_query_separates_prehit_hit_and_behind_alpha():
     for alpha in isolated_alpha:
         expected_total = expected_total * (1.0 - alpha)
     assert torch.allclose(queried[8, 20, 34], 1.0 - expected_total)
+
+
+def test_opaque_rigid_bound_removes_hidden_leaf_retirement_gradient():
+    from outdoor.canopy_support_expansion import clip_canopy_depth_queries_before_rigid
+    _,_,Rasterizer=_api();settings=_settings()
+    shape=(settings.image_height,settings.image_width)
+    pre=torch.stack((torch.full(shape,3.5,device='cuda'),torch.full(shape,4.,device='cuda')))
+    hit=torch.stack((torch.full(shape,3.8,device='cuda'),torch.full(shape,4.2,device='cuda')))
+    clipped,_,_,_=clip_canopy_depth_queries_before_rigid(pre,hit,torch.ones(shape,dtype=torch.bool,device='cuda'),
+        torch.zeros(shape,device='cuda'),torch.ones(shape,device='cuda'),
+        torch.full(shape,2.5,device='cuda'),torch.ones(shape,device='cuda'))
+    volume=torch.tensor([[0.,0.,2.],[0.,0.,3.]],device='cuda')
+    def render(bounds):
+        opacity=torch.tensor([[.2],[.3]],device='cuda',requires_grad=True)
+        result=Rasterizer(settings)(_empty(0,3),_empty(0,3),_empty(0,2),_empty(0,4),
+            volume,torch.zeros_like(volume),torch.full((2,3),.15,device='cuda'),
+            torch.tensor([[1.,0.,0.,0.]]*2,device='cuda'),torch.full((2,3),.4,device='cuda'),
+            opacity,depth_query_bounds=bounds)
+        result[2][11,20,34].backward()
+        return result[0].detach(),opacity.grad
+    old_rgb,old_gradient=render(pre);new_rgb,new_gradient=render(clipped)
+    assert old_gradient[1]>0 and new_gradient[1]==0
+    assert new_gradient[0]>0
+    assert torch.equal(old_rgb,new_rgb)
 
 
 def test_volume_depth_query_backward_matches_finite_difference_and_excludes_behind():
@@ -760,8 +993,16 @@ def test_volume_backward_matches_finite_difference():
 
     loss = render_loss()
     loss.backward()
-    analytic = [xyz.grad[0, 0].item(), scale.grad[0, 1].item(), color.grad[0, 2].item(), opacity.grad.item()]
-    tensors_and_indices = [(xyz, (0, 0)), (scale, (0, 1)), (color, (0, 2)), (opacity, (0, 0))]
+    # Checking only screen-x did not exercise depth or thin-leaf orientation.
+    # Those are essential for escaping a wrong canopy depth hypothesis.
+    tensors_and_indices = (
+        [(xyz, (0, axis)) for axis in range(3)]
+        + [(scale, (0, axis)) for axis in range(3)]
+        + [(quat, (0, axis)) for axis in range(4)]
+        + [(color, (0, axis)) for axis in range(3)]
+        + [(opacity, (0, 0))]
+    )
+    analytic = [tensor.grad[index].item() for tensor, index in tensors_and_indices]
     epsilon = 1e-3
     numeric = []
     with torch.no_grad():
@@ -829,7 +1070,7 @@ def test_surface_uv_gate_is_local_differentiable_and_auditable():
     atlas = torch.ones(1, 8, 8, device="cuda", requires_grad=True)
     with torch.no_grad():
         atlas[:, :, :4] = 0.05
-    locally_gated, _, _, _, gate_audit = MixedGaussianRasterizer(settings)(
+    locally_gated, _, _, primitive_audit, gate_audit = MixedGaussianRasterizer(settings)(
         surface,
         means2d,
         scales,
@@ -850,6 +1091,10 @@ def test_surface_uv_gate_is_local_differentiable_and_auditable():
     assert gate_audit[..., 0].sum() > 0
     assert gate_audit[..., 1].sum() > 0
     assert gate_audit[..., 2].sum() > 0
+    # Channel zero is unconditional mass; supplied fields follow it. The
+    # all-ones first field must reproduce mass at every local atlas node.
+    assert torch.allclose(gate_audit[..., 0], gate_audit[..., 1], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(gate_audit.sum((1, 2)), primitive_audit, atol=1e-3, rtol=3e-5)
     locally_gated.square().mean().backward()
     assert atlas.grad is not None
     assert torch.isfinite(atlas.grad).all()

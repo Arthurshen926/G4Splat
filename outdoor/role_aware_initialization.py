@@ -5156,6 +5156,17 @@ def _resolve_moge3_foliage_scene_scale(
     }
 
 
+def _moge3_semantic_support(channels: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Use the same object/sky/distortion validity for scale and foliage."""
+    if len(channels) != 4:
+        raise ValueError("MoGe3 semantic support requires four keep channels")
+    masks = [np.asarray(channel, dtype=bool) for channel in channels]
+    if any(mask.shape != masks[0].shape for mask in masks):
+        raise ValueError("MoGe3 keep channels must share one raster")
+    valid = masks[0] & masks[1] & masks[2]
+    return valid & masks[3], valid & ~masks[3]
+
+
 def _moge3_foliage_samples(
     store: dict,
     images: dict[int, dict],
@@ -5334,7 +5345,7 @@ def _moge3_foliage_samples(
             )
         zbuffer = rigid_zbuffer(image_id, image_record, camera, depth.shape)
         channels = resize_mask_channels(image_record, depth.shape)
-        rigid = channels[0] & channels[1] & channels[3]
+        rigid, _ = _moge3_semantic_support(channels)
         valid = (
             view["valid_mask"].astype(bool)
             & view["refinement_valid_mask"].astype(bool)
@@ -5411,7 +5422,7 @@ def _moge3_foliage_samples(
             & (final_delta <= 0.35)
         )
         channels = resize_mask_channels(image_record, depth.shape)
-        canopy = channels[0] & channels[1] & ~channels[3]
+        _, canopy = _moge3_semantic_support(channels)
         rigid_known = np.isfinite(zbuffer) & (zbuffer > 0.05)
         clearance = np.maximum(0.03, 0.01 * np.where(rigid_known, zbuffer, 0.0))
         in_front = ~rigid_known | (depth < zbuffer - clearance)

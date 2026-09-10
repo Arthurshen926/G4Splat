@@ -78,6 +78,15 @@ from outdoor.hybrid_teacher_api import (  # noqa: E402
     _static_surface_evidence_mixture,
 )
 from outdoor.lazy_scene import LazyScene, rgb_source_contract  # noqa: E402
+from outdoor.checkpoint_encoding import compact_static_birth_vectors  # noqa: E402
+from outdoor.moge3_prehit_authority import observed_rigid_prehit_authority  # noqa: E402
+from outdoor.canopy_support_expansion import (  # noqa: E402
+    independent_canopy_camera_candidates, measured_single_canonical_eligibility,
+    temporary_camera_support, front_of_known_rigid_mask,
+    clip_canopy_depth_queries_before_rigid,
+    canopy_material_audit_fields,
+)
+from outdoor.rowwise_optimizer_step import rescale_adam_row_displacement  # noqa: E402
 from outdoor.moge3_chart_base import (  # noqa: E402
     MOGE3_CHART_BASE_SOURCES,
 )
@@ -375,6 +384,11 @@ STATIC_DETAIL_ISOLATED_CONTRACT = (
     "is_read_only_and_owned_only_by_the_volume_isolated_stream__persistent_"
     "envelope_and_read_only_detail_cannot_authorize_another_row"
 )
+STATIC_DETAIL_NATIVE_CONTRACT = (
+    "native_mixed_rgb_geometry_and_opacity_with_all_deployment_occluders__"
+    "configured_verified_gradient_owners__read_only_rows_preserve_occlusion__"
+    "no_surface_sky_or_sh_updates"
+)
 STATIC_VOLUME_ISOLATED_V84_PREDECESSOR_CONTRACT = (
     "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
     "support__geometry_sh_screen_bandwidth_only__opacity_read_only"
@@ -385,11 +399,11 @@ STATIC_VOLUME_ISOLATED_V85_PREDECESSOR_CONTRACT = (
     "screen_bandwidth__opacity_read_only__alpha_normalized_color_floor005"
 )
 STATIC_VOLUME_ISOLATED_CONTRACT = (
-    "volume_only_intrinsic_rgb_on_real_canopy_and_detached_projected_"
-    "support__forward_rows_equal_union_of_live_geometry_sh_and_screen_"
-    "owners__persistent_scene_canonical_sh__persistent_or_exact_measured_"
-    "geometry__exact_owner_screen_bandwidth__opacity_read_only__oriented_"
-    "multiscale_edge_loss__alpha_normalized_color_floor005"
+    "native_mixed_rgb_target_with_all_deployment_static_occluders_preserved__"
+    "real_canopy_and_detached_native_volume_support_floor005__persistent_"
+    "scene_canonical_sh__persistent_or_exact_measured_geometry__exact_owner_"
+    "screen_bandwidth__opacity_surface_sky_read_only__no_intrinsic_rgb_to_"
+    "background_mixed_observation_mismatch"
 )
 STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR = 0.005
 STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT = 0.0
@@ -1009,6 +1023,19 @@ TRAINING_PROFILES = {
         "foliage_start": 0.0,
         "dynamic_start": 2.0,
     },
+    "static_measured_handoff_quality": {
+        # Fresh leaves already have measured source bearings and native
+        # multiview witnesses. There is no envelope to bootstrap or replace.
+        "iterations": 30_000,
+        "phases": (
+            ("static_foliage", 0.45),
+            ("dynamic_appearance", 0.65),
+            ("ownership_cleanup", 0.85),
+            ("canonical_polish", 1.00),
+        ),
+        "foliage_start": 0.0,
+        "dynamic_start": 2.0,
+    },
     "static_handoff_fast": {
         "iterations": 12_000,
         "phases": (
@@ -1112,6 +1139,7 @@ def _apply_training_profile_optimizer_defaults(
         )
     elif args.training_profile in {
         "static_handoff_quality",
+        "static_measured_handoff_quality",
         "static_handoff_fast",
     }:
         defaults.update(STATIC_HANDOFF_PROFILE_DEFAULTS)
@@ -1225,6 +1253,14 @@ def _trainer_repair_hash_change_is_allowed(
         "trainer",
         "training_evidence",
         "static_ray_birth",
+        "moge3_prehit_authority",
+        "optical_mass_gradient",
+        "mass_consistent_foliage",
+        # Lossless encoding of small CPU candidate vectors only; model and
+        # optimizer tensor schemas and numerical values are unchanged.
+        "checkpoint_encoding",
+        "canopy_support_expansion",
+        "rowwise_optimizer_step",
         "chart_surface_model",
         # The public deployment compositor is hashed into the checkpoint for
         # reproducible evaluation but is not called by the training loop.
@@ -1492,6 +1528,13 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--static-detail-same-sequence-geometry-weight",
+        type=float, default=STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT,
+        help="Explicit verified positive-sequence geometry permission; topology remains exact-camera owned.",
+    )
+    parser.add_argument('--static-detail-rigid-alpha-weight',type=float,default=0.,
+        help='Native leaf extinction on observed rigid interiors in the same geometry RGB stream; no render masking.')
+    parser.add_argument(
         "--static-detail-same-sequence-optical-weight",
         type=float,
         default=0.0,
@@ -1510,6 +1553,8 @@ def _parse_args():
             "scale update and physical scale clamp."
         ),
     )
+    parser.add_argument('--mass-consistent-scale-gradients', action=argparse.BooleanOptionalAction, default=True,
+        help='Static training: include the chain rule of post-scale optical mass compensation, preserving forward alpha and gradient authority.')
     parser.add_argument(
         "--static-replacement-ema-decay",
         type=float,
@@ -1651,6 +1696,12 @@ def _parse_args():
             "have acquired the corresponding bandwidth."
         ),
     )
+    parser.add_argument("--static-detail-opacity-lr-multiplier",type=float,default=1.,
+        help="True row-local Adam LR multiplier for static detail only, applied before all mass/ownership constraints")
+    parser.add_argument('--synchronous-measured-split-verification',action=argparse.BooleanOptionalAction,default=False,
+        help='Verify a new measured split within its topology event; otherwise restore its exact parent before publication')
+    parser.add_argument("--static-measured-independent-camera-verification",action=argparse.BooleanOptionalAction,default=True,
+        help="Let a measured leaf obtain a new canonical camera witness only after independent depth and native contribution checks")
     parser.add_argument(
         "--volume-opacity-settle-policy",
         choices=("none", "freeze", "retirement_only", "evidence_trust_region"),
@@ -1838,6 +1889,13 @@ def _parse_args():
             "the lower MoGe3 target-depth bound."
         ),
     )
+    parser.add_argument(
+        "--moge3-canopy-camera-stream", choices=("rgb", "canonical_canopy"),
+        default="canonical_canopy",
+        help="Dedicated all-canonical canopy stream for effective optical/birth updates; does not replace the all-scene RGB schedule.",
+    )
+    parser.add_argument('--moge3-prehit-authority',choices=('observed_rigid','legacy_moge'),default='observed_rigid',
+        help='Negative optical authority: known opaque rigid pixels only; legacy_moge reproduces monocular canopy free-space assumptions.')
     parser.add_argument(
         "--moge3-canopy-maximum-birth-proposals",
         type=int,
@@ -2310,9 +2368,10 @@ def _parse_args():
         type=int,
         default=4,
         help=(
-            "Render a true volume-only intrinsic-colour counterfactual at "
-            "this cadence. It routes canopy RGB/edge/screen-bandwidth only "
-            "to static volume rows and never grants opacity growth."
+            "Render native mixed RGB with gradient-isolated leaf colour and "
+            "geometry at this cadence. Keep actual read-only occluders; "
+            "never compare unpremultiplied leaf colour to background-mixed "
+            "RGB or grant opacity growth through this stream."
         ),
     )
     parser.add_argument(
@@ -2492,7 +2551,7 @@ def _parse_args():
     parser.add_argument(
         "--static-ray-birth-voxel-size",
         type=float,
-        default=0.15,
+        default=0.04,
         help=(
             "Exact posterior-midpoint consensus voxel retained for legacy "
             "pending evidence and interval-free unit inputs."
@@ -2501,12 +2560,17 @@ def _parse_args():
     parser.add_argument(
         "--static-ray-birth-visual-hull-voxel-size",
         type=float,
-        default=0.30,
+        default=0.08,
         help=(
             "Voxel size used to intersect complete cross-sequence foliage "
             "hit intervals. It must be no smaller than the midpoint voxel; "
-            "promotion still requires two cameras and two sequences."
+            "promotion still requires independent cameras and configured sequence support. "
+            "Default spacing matches twice the 0.04 newborn scale, not a whole crown cell."
         ),
+    )
+    parser.add_argument(
+        "--static-ray-birth-minimum-separation", type=float, default=0.04,
+        help="World-space centre deduplication across fine voxel boundaries; zero preserves legacy behavior.",
     )
     parser.add_argument(
         "--static-ray-birth-maximum-segment-samples",
@@ -2786,6 +2850,12 @@ def _parse_args():
             "trainer-repair-resume."
         ),
     )
+    parser.add_argument('--allow-static-ray-birth-budget-ablation-resume',action='store_true',
+        help='Explicit future-trajectory experiment: change only the per-event ray birth allocator cap; evidence and global budgets remain exact.')
+    parser.add_argument('--allow-moge3-prehit-authority-ablation-resume',action='store_true',
+        help='Explicitly change only MoGe prehit negative authority; hit/birth, evidence, geometry and other losses stay exact.')
+    parser.add_argument('--allow-optical-mass-gradient-repair-resume',action='store_true',
+        help='Explicitly change only static mass-retraction scale gradients; model/Adam tensors, RGB forward and other contracts remain exact.')
     parser.add_argument(
         "--allow-static-detail-isolated-repair-resume",
         action="store_true",
@@ -2986,6 +3056,12 @@ def _parse_args():
                     "--allow-canonical-occlusion-weight-ablation-resume",
                     args.allow_canonical_occlusion_weight_ablation_resume,
                 ),
+                ('--allow-static-ray-birth-budget-ablation-resume',
+                 args.allow_static_ray_birth_budget_ablation_resume),
+                ('--allow-moge3-prehit-authority-ablation-resume',
+                 args.allow_moge3_prehit_authority_ablation_resume),
+                ('--allow-optical-mass-gradient-repair-resume',
+                 args.allow_optical_mass_gradient_repair_resume),
                 (
                     "--allow-static-detail-isolated-repair-resume",
                     args.allow_static_detail_isolated_repair_resume,
@@ -3129,6 +3205,12 @@ def _parse_args():
         )
     if args.static_leaf_min_supporting_views < 2:
         parser.error("--static-leaf-min-supporting-views must be >= 2")
+    if not 0.0 <= args.static_detail_same_sequence_geometry_weight <= 1.0:
+        parser.error('--static-detail-same-sequence-geometry-weight must be in [0,1]')
+    if not math.isfinite(args.static_detail_rigid_alpha_weight) or args.static_detail_rigid_alpha_weight<0:
+        parser.error('--static-detail-rigid-alpha-weight must be finite and nonnegative')
+    if args.static_detail_rigid_alpha_weight>0 and args.training_profile!='static_measured_handoff_quality':
+        parser.error('Native rigid-alpha constraint requires the measured native geometry profile')
     if not 0.0 <= args.static_detail_same_sequence_appearance_weight <= 1.0:
         parser.error(
             "--static-detail-same-sequence-appearance-weight must be in "
@@ -3188,6 +3270,8 @@ def _parse_args():
         parser.error("--canonical-occlusion-every must be positive")
     if args.static_ray_birth_voxel_size <= 0:
         parser.error("--static-ray-birth-voxel-size must be positive")
+    if not math.isfinite(args.static_ray_birth_minimum_separation) or args.static_ray_birth_minimum_separation < 0:
+        parser.error("--static-ray-birth-minimum-separation must be finite and nonnegative")
     if (
         args.static_ray_birth_visual_hull_voxel_size
         < args.static_ray_birth_voxel_size
@@ -3381,6 +3465,15 @@ def _parse_args():
             "--resume and either the generic trainer-repair boundary or "
             "the exact v100 cleanup boundary"
         )
+    if args.allow_static_ray_birth_budget_ablation_resume and (
+            args.resume is None or not args.allow_trainer_repair_resume):
+        parser.error('Ray birth budget ablation requires --resume and --allow-trainer-repair-resume')
+    if args.allow_moge3_prehit_authority_ablation_resume and (
+            args.resume is None or not args.allow_trainer_repair_resume):
+        parser.error('MoGe prehit authority ablation requires --resume and --allow-trainer-repair-resume')
+    if args.allow_optical_mass_gradient_repair_resume and (
+            args.resume is None or not args.allow_trainer_repair_resume):
+        parser.error('Optical mass gradient repair requires --resume and --allow-trainer-repair-resume')
     if args.allow_v38_causal_repair_resume and (
         args.resume is None or not args.allow_trainer_repair_resume
     ):
@@ -3538,6 +3631,8 @@ def _parse_args():
         args.volume_opacity_lr = 2e-3
     if args.volume_opacity_lr <= 0:
         parser.error("--volume-opacity-lr must be positive")
+    if not math.isfinite(args.static_detail_opacity_lr_multiplier) or args.static_detail_opacity_lr_multiplier<=0:
+        parser.error("--static-detail-opacity-lr-multiplier must be finite and positive")
     if args.volume_topology_ramp_iterations is None:
         args.volume_topology_ramp_iterations = (
             int(round(0.08 * args.phase_schedule_horizon))
@@ -3545,6 +3640,7 @@ def _parse_args():
             in {
                 "hybrid_handoff_quality",
                 "static_handoff_quality",
+                "static_measured_handoff_quality",
                 "static_handoff_fast",
             }
             else 0
@@ -3644,6 +3740,7 @@ def _parse_args():
                 "hybrid_quality",
                 "hybrid_fast",
                 "static_handoff_quality",
+                "static_measured_handoff_quality",
                 "static_handoff_fast",
             }
             else 600
@@ -3821,17 +3918,14 @@ def _parse_args():
             "--volume-opacity-retirement-until-iteration must lie between "
             "the settle start and --phase-schedule-horizon"
         )
-    topology_end = next(
-        end for name, end in profile["phases"] if name == "topology"
-    )
-    bootstrap_end = next(
-        end
-        for name, end in profile["phases"]
-        if name == "canonical_bootstrap"
-    )
+    measured_handoff = args.training_profile == 'static_measured_handoff_quality'
+    topology_end = next((end for name, end in profile["phases"] if name == "topology"), 0.0)
+    bootstrap_end = next((end for name, end in profile["phases"] if name == "canonical_bootstrap"), 0.0)
     if args.bootstrap_evidence_release_fraction is None:
         args.bootstrap_evidence_release_fraction = float(bootstrap_end)
-    if not (
+    if measured_handoff and args.bootstrap_evidence_release_fraction != 0.0:
+        parser.error('Measured canonical handoff has no envelope bootstrap phase')
+    if not measured_handoff and not (
         0.0
         < args.bootstrap_evidence_release_fraction
         <= float(topology_end)
@@ -3866,6 +3960,13 @@ def _load(path: Path):
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def _assert_training_resume_payload(payload):
+    """Render exports and causal ablations must not become resume states."""
+    if isinstance(payload,dict) and (payload.get('diagnostic_only')
+        or payload.get('checkpoint_kind')=='render_state_only_nonresumable'):
+        raise RuntimeError('This is a diagnostic/render-only state, not a resumable training checkpoint; use the original full checkpoint')
 
 
 def _surface_capture_to_device(capture, device: torch.device):
@@ -3927,6 +4028,13 @@ def _atomic_torch_save(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload,dict) and isinstance(payload.get("static_ray_birth_state"),dict):
+        payload=dict(payload)
+        payload["static_ray_birth_state"]=compact_static_birth_vectors(payload["static_ray_birth_state"])
+        payload["checkpoint_io_encoding"]={
+            "policy":"lossless_static_birth_three_vector_lists_v1",
+            "model_optimizer_rng_schedule_and_training_contract_unchanged":True,
+        }
     temporary = _temporary_artifact_path(path)
     previous_temporary = _temporary_artifact_path(
         path.with_suffix(path.suffix + ".previous")
@@ -4654,6 +4762,7 @@ def _static_detail_same_sequence_geometry_gate(
     exact_ownership_gate: torch.Tensor,
     *,
     positive_evidence_sequence_gate: torch.Tensor | None = None,
+    fallback_weight: float = STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT,
 ) -> torch.Tensor:
     """Allow verified detail to align softly inside a positive sequence.
 
@@ -4672,7 +4781,7 @@ def _static_detail_same_sequence_geometry_gate(
         int(camera_id),
         camera_sequence_lookup,
         exact_ownership_gate,
-        fallback_weight=STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT,
+        fallback_weight=fallback_weight,
         positive_evidence_sequence_gate=positive_evidence_sequence_gate,
     )
     return _static_detail_refinement_gate(foliage, soft)
@@ -6243,6 +6352,9 @@ def _resume_training_contract_differences(
     allow_v115_persistent_ownership_debt_migration: bool = False,
     allow_trainer_repair_migration: bool = False,
     allow_canonical_occlusion_weight_ablation: bool = False,
+    allow_static_ray_birth_budget_ablation: bool = False,
+    allow_moge3_prehit_authority_ablation: bool = False,
+    allow_optical_mass_gradient_repair: bool = False,
     allow_conditioned_schedule_repair_migration: bool = False,
     allow_volume_capacity_repair_migration: bool = False,
     allow_volume_topology_settle_migration: bool = False,
@@ -6894,6 +7006,44 @@ def _resume_training_contract_differences(
         # Every other top-level contract key remains subject to exact compare.
         saved["static_detail_global_cleanup"] = current_detail
         saved["persistent_envelope_global_cleanup"] = current_envelope
+    # Absent key in old checkpoints denotes the old uncompensated scale
+    # derivative, not permission to silently switch optimization coordinates.
+    old_mass_gradient = saved.get('mass_consistent_scale_gradients', False)
+    new_mass_gradient = current.get('mass_consistent_scale_gradients', False)
+    if type(old_mass_gradient) is not bool or type(new_mass_gradient) is not bool:
+        raise RuntimeError('Explicit boolean optical mass gradient contract required')
+    if old_mass_gradient == new_mass_gradient or allow_optical_mass_gradient_repair:
+        saved = dict(saved)
+        if 'mass_consistent_scale_gradients' in current:
+            saved['mass_consistent_scale_gradients'] = new_mass_gradient
+        else:
+            saved.pop('mass_consistent_scale_gradients', None)
+    old_optical=saved.get('moge3_canopy_optical');new_optical=current.get('moge3_canopy_optical')
+    if isinstance(old_optical,dict) and isinstance(new_optical,dict):
+        old_rest=dict(old_optical);new_rest=dict(new_optical)
+        old_domain=old_rest.pop('prehit_authority','legacy_moge')
+        new_domain=new_rest.pop('prehit_authority','legacy_moge')
+        if allow_moge3_prehit_authority_ablation:
+            if (old_rest!=new_rest or old_domain not in ('legacy_moge','observed_rigid')
+                or new_domain not in ('legacy_moge','observed_rigid')):
+                raise RuntimeError('MoGe prehit authority ablation may change only its negative domain')
+            saved=dict(saved);saved['moge3_canopy_optical']=new_optical
+        elif old_domain==new_domain and old_rest==new_rest:
+            # Absent legacy key means the old monocular prehit behavior.
+            saved=dict(saved);saved['moge3_canopy_optical']=new_optical
+    elif allow_moge3_prehit_authority_ablation:
+        raise RuntimeError('MoGe prehit authority ablation requires both optical contracts')
+    if allow_static_ray_birth_budget_ablation:
+        old=saved.get('static_ray_birth');new=current.get('static_ray_birth')
+        if not isinstance(old,dict) or not isinstance(new,dict):
+            raise RuntimeError('Ray birth allocator ablation requires both complete contracts')
+        old_rest=dict(old);new_rest=dict(new)
+        old_cap=old_rest.pop('maximum_births_per_topology_event',None)
+        new_cap=new_rest.pop('maximum_births_per_topology_event',None)
+        if (old_rest!=new_rest or new_rest.get('contract')!=STATIC_RAY_BIRTH_VISUAL_HULL_CONTRACT
+                or any(type(x) is not int or x<=0 for x in (old_cap,new_cap))):
+            raise RuntimeError('Ray birth allocator ablation may change only its positive integer event cap')
+        saved=dict(saved);saved['static_ray_birth']=new
     if allow_canonical_occlusion_weight_ablation:
         for field in (
             "canonical_occlusion_completion",
@@ -6935,6 +7085,11 @@ def _resume_training_contract_differences(
     # persists them and all later resumes compare them normally.
     if allow_trainer_repair_migration:
         saved = dict(saved)
+        # Explicit first introduction of training-only controls. This does not
+        # permit changing them again in a later ordinary resume.
+        for key in ("static_detail_opacity_lr_multiplier","static_measured_independent_camera_verification"):
+            if key not in saved and key in current:
+                saved[key]=current[key]
         for key in (
             "maximum_volume_scale",
             "maximum_dynamic_volume_scale",
@@ -8341,6 +8496,16 @@ def _resume_training_contract_differences(
         ):
             saved[key] = copy.deepcopy(current.get(key))
 
+    # This count describes the *positive* support population, which can grow
+    # through topology/verification. The negative cleanup schedule is bound
+    # independently by its camera_count, canonical_sequence and SHA256. It
+    # must not make a valid checkpoint unrestorable after such growth.
+    saved=copy.deepcopy(saved)
+    current=copy.deepcopy(current)
+    for contract in (saved,current):
+        cleanup=contract.get("static_detail_global_cleanup")
+        if isinstance(cleanup,dict) and isinstance(cleanup.get("camera_schedule"),dict):
+            cleanup["camera_schedule"].pop("positive_exact_support_camera_count",None)
     differences = {
         key
         for key in set(saved) | set(current)
@@ -8800,18 +8965,17 @@ def _masked_ssim_loss(
     target_variance = F.avg_pool2d(
         target.square(), window_size, stride=1, padding=padding
     ) - mu_target.square()
-    covariance = F.avg_pool2d(
-        prediction * target, window_size, stride=1, padding=padding
-    ) - mu_prediction * mu_target
     c1, c2 = 0.01**2, 0.03**2
-    similarity = (
-        (2 * mu_prediction * mu_target + c1)
-        * (2 * covariance + c2)
-        / (
-            (mu_prediction.square() + mu_target.square() + c1)
-            * (prediction_variance + target_variance + c2)
-        ).clamp_min(1e-8)
-    ).mean(1, keepdim=True)
+    # Equivalent SSIM difference form: at prediction == target both
+    # numerators and their derivatives are exactly zero. The covariance
+    # quotient left ~1e-10 cancellation gradients even at exact equality;
+    # Adam eps1e-15 could turn those into a full-sized spurious colour step.
+    difference=prediction-target
+    mean_difference=F.avg_pool2d(difference,window_size,stride=1,padding=padding)
+    difference_variance=(F.avg_pool2d(difference.square(),window_size,stride=1,padding=padding)-mean_difference.square()).clamp_min(0)
+    luminance=1-mean_difference.square()/(mu_prediction.square()+mu_target.square()+c1).clamp_min(1e-8)
+    structure=1-difference_variance/(prediction_variance+target_variance+c2).clamp_min(1e-8)
+    similarity=(luminance*structure).mean(1,keepdim=True)
     # A minimum pool erodes hard masks and preserves the confidence floor for
     # soft masks. Padding is explicitly invalid so image borders do not gain
     # synthetic support.
@@ -8876,7 +9040,7 @@ def _oriented_multiscale_high_frequency_loss(
         [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
     ).reshape(1, 1, 3, 3) / 8.0
     sobel_y = sobel_x.transpose(2, 3)
-    total = prediction.new_zeros(())
+    total = prediction.sum()*0
     used = 0
     for scale in (1, 2):
         pred = prediction[None]
@@ -8885,7 +9049,8 @@ def _oriented_multiscale_high_frequency_loss(
         if scale > 1:
             pred = F.avg_pool2d(pred, scale, stride=scale)
             truth = F.avg_pool2d(truth, scale, stride=scale)
-            support = F.avg_pool2d(support, scale, stride=scale)
+            # Every RGB sample in the downsampled pixel must be owned.
+            support = -F.max_pool2d(-support, scale, stride=scale)
         pred_luma = (pred * luminance).sum(dim=1, keepdim=True)
         truth_luma = (truth * luminance).sum(dim=1, keepdim=True)
         pred_grad = torch.cat(
@@ -8919,7 +9084,10 @@ def _oriented_multiscale_high_frequency_loss(
         edge_confidence = (
             truth_magnitude / (truth_magnitude + 0.02)
         ).detach()
-        pixel_weight = support[:, 0] * edge_confidence
+        # A centre-only mask lets the Sobel stencil write gradients into
+        # adjacent rigid/unknown pixels. Require its entire footprint.
+        stencil_support=-F.max_pool2d(-F.pad(support,(1,1,1,1),value=0.),3,stride=1)
+        pixel_weight = stencil_support[:, 0] * edge_confidence
         if not bool((pixel_weight > 1.0e-6).any()):
             continue
         dot = (pred_grad * truth_grad).sum(dim=1)
@@ -9342,7 +9510,9 @@ def _moge3_depth_query_bounds(
     if float(maximum_hit_metric_half_width) <= 0.0:
         raise ValueError("MoGe3 maximum hit metric half-width must be positive")
 
-    depth = evidence["moge3_depth_m"][0].detach()
+    # Canopy-only calibration must not rewrite the rigid/Chart target. Apply
+    # it before the metric half-width cap, never to already capped bounds.
+    depth = evidence.get("moge3_canopy_depth_m", evidence["moge3_depth_m"])[0].detach()
     refinement_std = evidence[
         "moge3_refinement_log_depth_std"
     ][0].detach()
@@ -9449,6 +9619,7 @@ def _moge3_canopy_optical_loss(
     minimum_hit_alpha: float = 0.35,
     core_hit_alpha: float = 0.75,
     return_components: bool = False,
+    prehit_authority: torch.Tensor | None = None,
 ) -> (
     tuple[torch.Tensor, dict[str, object]]
     | tuple[
@@ -9465,6 +9636,9 @@ def _moge3_canopy_optical_loss(
     MoGe's first visible target depth says which volume interval may own the
     ray, while semantics says whether that interval is expected to contain
     canopy.  Volume behind the upper bound is absent from both derivatives.
+    An explicit prehit authority restricts negative supervision to separately
+    established empty-space evidence; a canopy location prior alone does not
+    establish emptiness in front. None reproduces the historical control.
     """
     if float(prehit_weight) < 0.0:
         raise ValueError("MoGe3 prehit weight cannot be negative")
@@ -9493,7 +9667,15 @@ def _moge3_canopy_optical_loss(
     canopy = task["p_canopy"].clamp(0.0, 1.0)
     canopy_core = task["p_canopy_core"].clamp(0.0, 1.0)
     rigid_or_canopy = (task["p_rigid"] + canopy).clamp(0.0, 1.0)
-    prehit_permission = (common * rigid_or_canopy).detach()
+    if prehit_authority is not None:
+        if (prehit_authority.shape!=valid.shape or not torch.isfinite(prehit_authority).all()
+            or (prehit_authority<0).any() or (prehit_authority>1).any()):
+            raise ValueError('Finite aligned prehit authority in [0,1] required')
+        prehit_permission=(common*prehit_authority).detach()
+    else:
+        # Explicit legacy/control calls retain the historical prior. Production
+        # supplies independently bounded rigid authority by default.
+        prehit_permission = (common * rigid_or_canopy).detach()
     hit_permission = (common * canopy).detach()
     target_hit = (
         float(minimum_hit_alpha)
@@ -9512,24 +9694,47 @@ def _moge3_canopy_optical_loss(
         torch.log(target_hit_optical_depth + optical_depth_floor)
         - torch.log(hit_optical_depth + optical_depth_floor)
     ).clamp_min(0.0)
-    prehit_loss = _weighted_mean(prehit_optical_depth, prehit_permission)
+    # _weighted_mean consumes CxHxW. These optical fields are scalar HxW
+    # maps: without the explicit channel dimension it divides by H again,
+    # making both supervision sources spuriously weaker at higher resolution.
+    # Keep this repair local; do not retune unrelated rigid/RGB objectives.
+    # Restrict authority without renormalizing the remaining wall gradients
+    # upward merely because canopy pixels were removed from the numerator.
+    prehit_loss = ((prehit_optical_depth*prehit_permission).sum()
+                   /(common*rigid_or_canopy).sum().clamp_min(1.0))
     hit_loss_map = F.smooth_l1_loss(
         log_tau_deficit,
         torch.zeros_like(log_tau_deficit),
         reduction="none",
         beta=0.5,
     )
-    hit_loss = _weighted_mean(hit_loss_map, hit_permission)
+    hit_loss = _weighted_mean(hit_loss_map[None], hit_permission)
     total = hit_loss + float(prehit_weight) * prehit_loss
     prehit_supported = prehit_permission > 1.0e-4
     hit_supported = hit_permission > 1.0e-4
     audit = {
         "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+        "prehit_authority_domain": ('explicit_independent_authority' if prehit_authority is not None else 'legacy_monocular_rigid_and_canopy'),
         "prehit": float(prehit_loss.detach()),
         "hit": float(hit_loss.detach()),
         "prehit_weight": float(prehit_weight),
         "prehit_supported_pixels": int(prehit_supported.sum()),
         "hit_supported_pixels": int(hit_supported.sum()),
+        # These are rendered-coverage states, not geometry diagnoses: zero
+        # alpha can mean absent geometry OR contributor filtering. Keep the
+        # distinction explicit so a low mean does not trigger blind births.
+        "hit_zero_coverage_pixels": int(
+            (hit_supported & (hit.detach() <= 0)).sum()
+        ),
+        "hit_positive_below_001_pixels": int(
+            (hit_supported & (hit.detach() > 0) & (hit.detach() < 0.01)).sum()
+        ),
+        "hit_below_target_pixels": int(
+            (hit_supported & (hit.detach() < target_hit)).sum()
+        ),
+        "hit_target_met_pixels": int(
+            (hit_supported & (hit.detach() >= target_hit)).sum()
+        ),
         "mean_prehit_alpha": (
             float(prehit.detach()[prehit_supported].mean())
             if bool(prehit_supported.any())
@@ -9546,6 +9751,7 @@ def _moge3_canopy_optical_loss(
             else 0.0
         ),
         "hit_loss_domain": "one_sided_log_optical_depth_huber",
+        "scalar_map_normalization": "weighted_mean_one_channel_no_height_factor",
         "hit_optical_depth_floor": float(optical_depth_floor),
         "gradient_owner": "volume_opacity_only_in_owner_isolated_passes",
         "behind_interval_gradient": False,
@@ -9558,6 +9764,59 @@ def _moge3_canopy_optical_loss(
             hit_loss,
         )
     return total, audit
+
+
+@torch.no_grad()
+def _spatially_stratified_proposal_indices(
+    rows: torch.Tensor,
+    columns: torch.Tensor,
+    score: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    budget: int,
+    sampling_seed: int | None = None,
+) -> torch.Tensor:
+    """Reserve one best ray per occupied image tile before global top-up.
+
+    Global top-k alone can spend the entire birth budget on one small patch.
+    Spatial allocation changes no depth, semantic or independent-view gate.
+    Stable tie-breaking also avoids backend-dependent choices on flat scores.
+    """
+    if budget <= 0 or height <= 0 or width <= 0:
+        raise ValueError("Proposal image dimensions and budget must be positive")
+    if rows.shape != columns.shape or rows.shape != score.shape or rows.ndim != 1:
+        raise ValueError("Proposal coordinates and scores must be aligned vectors")
+    if len(rows) <= budget:
+        return torch.arange(len(rows), device=rows.device)
+    priority = score
+    if sampling_seed is not None:
+        # Repeated maximum-score rays can already be tombstoned while other
+        # valid pixels in their tile have never been proposed. A local seeded
+        # weighted draw explores those pixels without changing their evidence
+        # confidence or counting a repeated camera as independent support.
+        generator = torch.Generator(device=score.device).manual_seed(int(sampling_seed))
+        uniform = torch.rand(score.shape,device=score.device,dtype=score.dtype,generator=generator).clamp(1e-7,1-1e-7)
+        priority = torch.log(score.clamp_min(1e-12)) - torch.log(-torch.log(uniform))
+    tile_rows = min(height, budget, max(1, int((budget * height / width) ** 0.5)))
+    tile_columns = min(width, max(1, budget // tile_rows))
+    tile = (rows * tile_rows // height) * tile_columns + columns * tile_columns // width
+    tile_count = tile_rows * tile_columns
+    best_score = score.new_full((tile_count,), -float("inf"))
+    best_score.scatter_reduce_(0, tile, priority, reduce="amax", include_self=True)
+    index = torch.arange(len(rows), device=rows.device)
+    winner = torch.full((tile_count,), len(rows), dtype=torch.long, device=rows.device)
+    candidate = torch.where(priority == best_score[tile], index, len(rows))
+    winner.scatter_reduce_(0, tile, candidate, reduce="amin", include_self=True)
+    selected = winner[winner < len(rows)]
+    remaining = budget - len(selected)
+    if remaining:
+        available = torch.ones_like(index, dtype=torch.bool)
+        available[selected] = False
+        other = index[available]
+        order = torch.argsort(priority[other], descending=True, stable=True)
+        selected = torch.cat((selected, other[order[:remaining]]))
+    return selected
 
 
 @torch.no_grad()
@@ -9575,6 +9834,7 @@ def _moge3_uncovered_hit_proposals(
     minimum_support: float = 0.10,
     minimum_hit_alpha: float = 0.35,
     core_hit_alpha: float = 0.75,
+    sampling_seed: int | None = None,
 ) -> tuple[dict[str, torch.Tensor | int] | None, dict[str, object]]:
     """Convert uncovered MoGe hit pixels into bounded world-ray intervals.
 
@@ -9652,12 +9912,11 @@ def _moge3_uncovered_hit_proposals(
         deficit[rows, columns] / target[rows, columns].clamp_min(1.0e-4)
     )
     if len(rows) > int(maximum_proposals):
-        selected = torch.topk(
-            score,
-            k=int(maximum_proposals),
-            largest=True,
-            sorted=True,
-        ).indices
+        selected = _spatially_stratified_proposal_indices(
+            rows, columns, score, height=valid.shape[0], width=valid.shape[1],
+            budget=int(maximum_proposals),
+            sampling_seed=sampling_seed,
+        )
         rows, columns, score = rows[selected], columns[selected], score[selected]
 
     dtype, device = lower.dtype, lower.device
@@ -9696,6 +9955,7 @@ def _moge3_uncovered_hit_proposals(
 
     proposals: dict[str, torch.Tensor | int] = {
         "centers": centers.detach().cpu(),
+        "single_first_hit": True,
         "confidence": score.clamp(0.05, 1.0).detach().cpu(),
         "camera_id": int(view.colmap_id),
         "origins": origin.expand(len(rows), -1).detach().cpu(),
@@ -9710,6 +9970,8 @@ def _moge3_uncovered_hit_proposals(
     audit.update(
         {
             "selected_proposals": int(len(rows)),
+            "proposal_allocation": ("seeded_weighted_per_tile_then_global_topup" if sampling_seed is not None else "best_per_image_tile_then_global_topup"),
+            "sampling_seed": sampling_seed,
             "mean_selected_alpha_deficit": float(
                 deficit[rows, columns].mean()
             ),
@@ -9781,6 +10043,9 @@ def _configure_moge3_runtime(
             f"foliage={float(scale):.6f}, chart={float(chart_scale):.6f}"
         )
     geometry.configure_moge3_metric_scale(float(scale))
+    canonical_seed = seed_payload.get('audit', {}).get('fresh_canonical_leaves')
+    if canonical_seed is not None:
+        geometry.configure_moge3_canopy_depth_scales(canonical_seed['depth_profiles_by_image'])
     global_log_sigma = float(
         initialization.get("global_log_scale_sigma", 0.0)
     )
@@ -12679,6 +12944,7 @@ def _refresh_split_child_owner_colors(
     support_fallback_enabled: bool = True,
     geometry_evidence=None,
     foliage_ray_evidence: FoliageRayEvidence | None = None,
+    measured_canopy_task_fields=None,
 ) -> dict[str, object]:
     """Re-anchor optical children to full-resolution immutable RGB evidence.
 
@@ -12760,6 +13026,47 @@ def _refresh_split_child_owner_colors(
         (len(child_indices),), float("nan")
     )
     metric_depth_cache: dict[int, tuple[torch.Tensor, ...] | None] = {}
+    measured_color_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    measured_color_refreshed = torch.zeros_like(dynamic_child)
+
+    def measured_color_witness(view, uv, depth):
+        """Current calibrated hit + observed canopy, never a support ID alone."""
+        camera_id = int(view.colmap_id)
+        if camera_id not in measured_color_cache:
+            shape = (view.image_height, view.image_width)
+            observed = measured_canopy_task_fields.fields(
+                view.image_name, shape, foliage.xyz.device
+            )
+            current = geometry_evidence.fields(
+                view.image_name, device=foliage.xyz.device, shape=shape
+            )
+            if "moge3_canopy_depth_m" not in current:
+                raise RuntimeError("Measured child RGB requires calibrated canopy depth")
+            _, bounds, valid_depth, _, _ = _moge3_depth_query_bounds(
+                current, global_log_scale_sigma=0.0
+            )
+            valid_color = (
+                valid_depth & (observed["p_canopy"].reshape_as(valid_depth) > 0.95)
+                & (observed["w_rgb"].reshape_as(valid_depth) > 0)
+                & (observed["p_transient"].reshape_as(valid_depth) < 0.05)
+            )
+            measured_color_cache[camera_id] = (bounds, valid_color)
+        bounds, valid_color = measured_color_cache[camera_id]
+        grid = (2.0 * uv - 1.0).reshape(1, -1, 1, 2)
+        sampled_bounds = F.grid_sample(
+            bounds[None], grid, mode="nearest", padding_mode="zeros",
+            align_corners=False,
+        )[0, :, :, 0]
+        # RGB is bilinear: every contributing pixel must be eligible.
+        coverage = F.grid_sample(
+            valid_color.to(depth.dtype)[None, None], grid,
+            mode="bilinear", padding_mode="zeros", align_corners=False,
+        ).reshape(-1)
+        return (
+            (coverage >= 1.0 - 1e-6)
+            & torch.isfinite(sampled_bounds).all(dim=0)
+            & (depth >= sampled_bounds[0]) & (depth <= sampled_bounds[1])
+        )
 
     def metric_inverse_depth_fields(view) -> tuple[torch.Tensor, ...] | None:
         """Load immutable world-metric ray posterior without audit mutation."""
@@ -12989,6 +13296,16 @@ def _refresh_split_child_owner_colors(
             # dense metric evidence is available, reject RGB lookup unless
             # that current child projection lies in its posterior interval.
             valid &= ray_consistent | metric_consistent
+        if require_canonical_sequence and measured_canopy_task_fields is not None:
+            # The MoGe-only path has no legacy inverse-depth/ray files.
+            # Use its current calibrated hit, including for support fallback;
+            # stale inherited posteriors cannot override an observed conflict.
+            valid = (
+                torch.isfinite(normalized_uv).all(dim=1)
+                & torch.isfinite(depth) & (depth > 0.05)
+                & measured_color_witness(view, normalized_uv, depth)
+            )
+            measured_color_refreshed[local_child_indices[valid]] = True
         if not bool(valid.any()):
             return local_child_indices[:0], foliage.xyz.new_empty((0, 3))
         target = view.original_image.to(
@@ -13076,12 +13393,24 @@ def _refresh_split_child_owner_colors(
     color_count = foliage.xyz.new_zeros(len(child_indices))
     color_observation_indices: list[torch.Tensor] = []
     color_observations: list[torch.Tensor] = []
+    # An explicit posterior and support fallback may name the same camera.
+    # Count independent images, not successful calls to the sampler.
+    color_seen_cameras = torch.full(
+        (len(child_indices), foliage.observation_camera_ids.shape[1]
+         + min(foliage.support_camera_ids.shape[1], 8)),
+        -1, dtype=torch.long, device=foliage.xyz.device,
+    )
 
     def record_color_observations(
-        local_indices: torch.Tensor, colors: torch.Tensor
+        local_indices: torch.Tensor, colors: torch.Tensor, camera_id: int
     ) -> None:
         if not len(local_indices):
             return
+        unseen = ~(color_seen_cameras[local_indices] == camera_id).any(dim=1)
+        local_indices, colors = local_indices[unseen], colors[unseen]
+        if not len(local_indices):
+            return
+        color_seen_cameras[local_indices, color_count[local_indices].long()] = camera_id
         color_sum.index_add_(0, local_indices, colors)
         color_count.index_add_(
             0,
@@ -13129,7 +13458,7 @@ def _refresh_split_child_owner_colors(
                 if not len(valid_local):
                     continue
                 canonical_depth_refreshed[valid_local] = True
-                record_color_observations(valid_local, colors)
+                record_color_observations(valid_local, colors, camera_id)
     # Visual-hull canonical rows carry the calibrated cameras that jointly
     # supported their cross-sequence intersection, but older evidence stores
     # do not duplicate a depth scalar per support view.  Those are still much
@@ -13183,7 +13512,7 @@ def _refresh_split_child_owner_colors(
                     )
                     if not len(valid_local):
                         continue
-                    record_color_observations(valid_local, colors)
+                    record_color_observations(valid_local, colors, camera_id)
     valid_canonical = canonical_child & (color_count > 0)
     low_support_canonical = canonical_child & (color_count < 2)
     if (
@@ -13282,6 +13611,8 @@ def _refresh_split_child_owner_colors(
             ).sum()
         ),
         "refreshed_children": int(refreshed_mask.sum()),
+        "measured_canopy_depth_refreshed_children": int(measured_color_refreshed.sum()),
+        "color_observation_identity_contract": "distinct_camera_ids_not_sampler_calls",
         "dynamic_candidate_children": int(
             (dynamic_child & (owner_camera_ids >= 0)).sum()
         ),
@@ -14195,6 +14526,7 @@ def _adapt_volume(
     canonical_rgb_sequence: str | None = None,
     geometry_evidence=None,
     foliage_ray_evidence: FoliageRayEvidence | None = None,
+    measured_canopy_task_fields=None,
     current_iteration: int = 0,
     prune_only_maintenance: bool = False,
 ):
@@ -15525,6 +15857,7 @@ def _adapt_volume(
         ),
         geometry_evidence=geometry_evidence,
         foliage_ray_evidence=foliage_ray_evidence,
+        measured_canopy_task_fields=measured_canopy_task_fields,
     )
     mutated = pruned > 0 or split_parents > 0
     return {
@@ -15729,6 +16062,143 @@ def _adapt_volume(
             )
         ),
         "_new_to_old": final_to_old if mutated else None,
+    }
+
+
+@torch.no_grad()
+def _verify_measured_split_children_now(
+    foliage, rows, *, surface, geometry, task_fields, view_by_camera_id,
+    camera_sequence_lookup, canonical_sequence,
+):
+    """Use existing calibrated candidate rays and native witnesses before publish."""
+    support = foliage.support_camera_ids[rows]
+    cameras = torch.unique(support[support >= 0]).tolist()
+    for camera_id in cameras:
+        view = view_by_camera_id.get(camera_id)
+        if view is None or sequence_id(view.image_name) != canonical_sequence:
+            raise RuntimeError('A measured split lacks its canonical verification camera')
+    records = []
+    for camera_id in cameras:
+        view = view_by_camera_id[camera_id]
+        unresolved = foliage.verification_state[rows] != VERIFICATION_VERIFIED
+        exact = (support == camera_id).any(dim=1)
+        eligible = torch.zeros(len(foliage), dtype=torch.bool, device=foliage.xyz.device)
+        eligible[rows[unresolved & exact]] = True
+        if not bool(eligible.any()):
+            continue
+        shape = (view.image_height, view.image_width)
+        task = task_fields.fields(view.image_name, shape, foliage.xyz.device)
+        evidence = geometry.fields(view.image_name, device=foliage.xyz.device, shape=shape)
+        if 'moge3_canopy_depth_m' not in evidence:
+            raise RuntimeError('Split verification lacks checkpoint-matched canopy calibration')
+        _, bounds, valid, _, _ = _moge3_depth_query_bounds(evidence, global_log_scale_sigma=0.)
+        canopy = valid & (task['p_canopy'].reshape_as(valid) > .95) & (task['w_rgb'].reshape_as(valid) > 0)
+        rigid = render_hybrid(
+            view, surface, foliage, background=foliage.xyz.new_ones(3),
+            include_dynamic=False, optical_replacement_policy='disabled',
+            structural_trainable_start=None, volume_gate=torch.zeros_like(eligible, dtype=foliage.xyz.dtype),
+        )
+        candidates = independent_canopy_camera_candidates(
+            foliage.xyz, view, bounds, canopy, eligible,
+            rigid_depth=rigid.median_depth, rigid_alpha=rigid.surface_alpha,
+        )
+        del rigid
+        if not len(candidates):
+            records.append({'camera_id':camera_id, 'depth_candidates':0})
+            continue
+        allowed = torch.zeros_like(eligible)
+        allowed[candidates] = True
+        package = render_hybrid(
+            view, surface, foliage, background=foliage.xyz.new_ones(3),
+            include_dynamic=False, optical_replacement_policy='disabled', structural_trainable_start=None,
+            volume_gate=static_detail_forward_visibility_gate(foliage,camera_id,include_pending_exact=True),
+            audit_fields=canopy_material_audit_fields(task['p_canopy'],task['p_rigid'],
+                task['p_sky'],view.original_image.to(foliage.xyz.device)),
+        )
+        package.responsibility[package.structural_count:][~allowed] = 0
+        audit = _update_static_child_verification_from_render(
+            foliage, package, camera_id=camera_id, camera_sequence_lookup=camera_sequence_lookup,
+            required_sequence_count=1, candidate_geometry_gate=allowed,
+            canopy_color_audit=True, sky_audit_column=7,
+        )
+        records.append({'camera_id':camera_id,'depth_candidates':len(candidates),**audit})
+        del package
+    return {'candidate_rows':len(rows), 'verified_rows':int((foliage.verification_state[rows] == VERIFICATION_VERIFIED).sum()),
+            'camera_count':len(cameras), 'records':records}
+
+
+@torch.no_grad()
+def _finalize_synchronous_measured_splits(
+    args, foliage, event, *, current_iteration: int, verify_children,
+):
+    """Publish verified child families or the exact original parent, never a hole.
+
+    Called within the topology event, before its single optimizer migration.
+    Failed fresh proposals have taken no Adam step, so their restored parent
+    retains its original optimizer history through the composed row mapping.
+    """
+    new = ((foliage.proposal_kind == PROPOSAL_SPLIT)
+           & (foliage.birth_iteration == int(current_iteration)))
+    rows = torch.nonzero(new, as_tuple=False).flatten()
+    if not len(rows):
+        return
+    if bool((new & ~foliage.static_leaf_mask).any()):
+        raise ValueError('Synchronous measured split publication is static-leaf only')
+    mapping = event['_new_to_old']
+    if mapping is None or len(mapping) != len(foliage):
+        raise RuntimeError('Split publication requires its complete optimizer row mapping')
+    families = torch.unique(foliage.split_proposal_family_id[rows])
+    verification = verify_children(rows)
+    local_args = copy.copy(args)
+    local_args.maximum_volume_family_rollbacks_per_event = max(
+        int(getattr(args, 'maximum_volume_family_rollbacks_per_event', 0)), len(families)
+    )
+    remove, restored, resolution = _rollback_failed_split_families(
+        local_args, foliage, torch.zeros_like(new), force_family_candidate=new,
+    )
+    committed = new.clone()
+    committed[remove] = False
+    committed[restored] = False
+    removed = int(remove.sum())
+    if removed:
+        compact = foliage.replace_and_split_adaptive(
+            remove, rows[:0], rows[:0], allow_static_skeleton=True,
+            birth_iteration=int(current_iteration), transaction_remove=remove,
+        )
+        compact_map = compact['_new_to_old']
+        mapping = mapping[compact_map]
+        committed = committed[compact_map]
+    if bool(((foliage.proposal_kind == PROPOSAL_SPLIT)
+             & (foliage.birth_iteration == int(current_iteration))).any()):
+        raise RuntimeError('A new split escaped synchronous resolution')
+    event['_new_to_old'] = mapping
+    event['_synchronously_committed_split_rows'] = torch.nonzero(committed, as_tuple=False).flatten()
+    event['attempted_split_parents'] = event['split_parents']
+    event['attempted_children'] = event['children']
+    rolled_back = int(resolution['rolled_back_families'])
+    event['split_parents'] -= rolled_back
+    event['children'] -= removed + rolled_back
+    event['net_growth'] -= removed
+    event['split_capacity_saturated'] = bool(event['split_capacity'] > 0 and event['net_growth'] == event['split_capacity'])
+    event['new_count'] = len(foliage)
+    event['remaining'] += removed
+    event['role_split_parents']['canonical_crown'] -= rolled_back
+    event['role_net_growth']['canonical_crown'] -= removed
+    event['selection_audit']['scope'] = 'attempted_parent_selection_before_synchronous_verification'
+    lifecycle = event['child_verification_lifecycle']
+    lifecycle['new_children_are_unverified'] = False
+    lifecycle['unverified_after_mutation'] = int((foliage.verification_state == VERIFICATION_UNVERIFIED).sum())
+    lifecycle['unresolved_after_mutation'] = int(_verification_debt_mask(foliage).sum())
+    lifecycle['unresolved_split_snapshot_families'] = len(foliage.split_parent_snapshot_family_id)
+    lifecycle['sparse_split_snapshot_bytes'] = sum(
+        getattr(foliage, name).numel() * getattr(foliage, name).element_size()
+        for name in ('split_parent_snapshot_family_id',) + tuple(foliage.split_parent_snapshot_names)
+    )
+    lifecycle['synchronous_publication'] = {
+        'contract': 'all_children_have_native_witnesses_or_exact_parent_is_restored_before_next_render',
+        'attempted_families': len(families), 'verification': verification,
+        'resolution': resolution, 'new_unresolved_families': 0,
+        'optimizer_migration': 'single_composed_mapping__failed_proposals_preserve_parent_moments',
     }
 
 
@@ -16177,13 +16647,11 @@ def _persistent_optical_ownership_states(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return conflict, pure-negative, and shared-owner row masks.
 
-    One Gaussian has one global opacity. A row proven in front of rigid
-    structure cannot be retired as a scalar when its replacement group also
-    carries material canopy demand *or already has a durable local detail
-    receiver*: doing so fixes the wall by opening a tree hole. Such rows are
-    frozen against scalar gradients while verified ray-local handoff moves
-    their mass to detail. Only groups with neither signal are safe one-sided
-    retirement owners.
+    One Gaussian has one global opacity. Only measured positive demand on
+    that same row establishes a competing optical responsibility. Verified
+    geometry is not positive optical evidence, and another group member's
+    demand must not exempt this row from a rigid contradiction. Genuine
+    dual-responsibility rows still require spatial localization.
     """
 
     conflict = (
@@ -16212,30 +16680,11 @@ def _persistent_optical_ownership_states(
         raise RuntimeError(
             "Replacement groups no longer align with optical ownership"
         )
-    valid_group = groups >= 0
     demanded = (
         (demand_observations > 0)
         & (foliage.static_leaf_mask | foliage.persistent_envelope_mask)
-        & valid_group
     )
-    durable_local_detail = (
-        foliage.static_leaf_mask
-        & _persistent_static_evidence_mask(foliage)
-        & _resolved_static_owner_mask(foliage)
-        & valid_group
-    )
-    shared_evidence = demanded | durable_local_detail
-    shared_group = torch.zeros_like(conflict)
-    if bool(shared_evidence.any()) and bool((conflict & valid_group).any()):
-        maximum_group = int(groups[valid_group].max())
-        group_has_demand = torch.zeros(
-            maximum_group + 1,
-            dtype=torch.bool,
-            device=groups.device,
-        )
-        group_has_demand[groups[shared_evidence]] = True
-        shared_group[valid_group] = group_has_demand[groups[valid_group]]
-    shared = conflict & shared_group
+    shared = conflict & demanded
     pure_negative = conflict & ~shared
     return conflict, pure_negative, shared
 
@@ -16677,8 +17126,15 @@ def _select_shared_envelope_localization_actions(
     unresolved_groups = torch.unique(
         groups[(foliage.proposal_kind != PROPOSAL_NONE) & valid_group]
     )
+    # A dual-responsibility detail must not require a separate envelope to
+    # enter repair. It can use the existing mass-conserving detail split.
+    repair_owner = foliage.persistent_envelope_mask | (
+        foliage.static_leaf_mask
+        & _persistent_static_evidence_mask(foliage)
+        & (volume_stats["positive_optical_demand_observations"] > 0)
+    )
     envelope = (
-        foliage.persistent_envelope_mask
+        repair_owner
         & resolved
         & valid_group
         & (volume_stats["rigid_front_conflict_observations"] > 0)
@@ -16951,9 +17407,16 @@ def _shared_envelope_detail_split_plane_normals(
         candidates = torch.nonzero(
             envelope & (groups == group), as_tuple=False
         ).flatten()
+        # Prefer this detail's own contradiction over a group proxy; this
+        # also provides a repair plane for detail-only replacement groups.
+        if (
+            int(volume_stats["rigid_front_conflict_observations"][detail_row]) > 0
+            and int(volume_stats["rigid_front_conflict_camera_id"][detail_row]) >= 0
+        ):
+            candidates = rows.new_tensor([detail_row])
         if not len(candidates):
             raise RuntimeError(
-                "Selected detail has no resolved debt envelope in its group"
+                "Selected detail has neither own conflict nor resolved debt envelope"
             )
         best = candidates[
             torch.argmax(conflict_score[candidates])
@@ -18122,6 +18585,7 @@ def _initialize_static_ray_birth_mass_handoff(
     view_by_camera_id: dict[int, object],
     maximum_fraction_per_event: float,
     maximum_additive_fraction_per_event: float = 0.005,
+    canonical_sequence: str | None = None,
 ) -> dict[str, float | int | str]:
     """Fund newborn detail mass from its ray-local envelope owner.
 
@@ -18205,7 +18669,10 @@ def _initialize_static_ray_birth_mass_handoff(
         len(birth_rows), dtype=torch.int16, device=foliage.xyz.device
     )
     support = foliage.support_camera_ids[birth_rows]
-    support_count = (support >= 0).sum(dim=1)
+    sorted_support = support.sort(dim=1).values
+    distinct_support = sorted_support >= 0
+    distinct_support[:, 1:] &= sorted_support[:, 1:] != sorted_support[:, :-1]
+    support_count = distinct_support.sum(dim=1)
     unique_camera_ids = torch.unique(support[support >= 0]).tolist()
     rotations = _rotation_matrices_from_quaternions(
         foliage.normalized_quaternions
@@ -18379,6 +18846,21 @@ def _initialize_static_ray_birth_mass_handoff(
         (support_count >= 2)
         & (foliage.support_sequence_count[birth_rows] >= 2)
     )
+    if canonical_sequence is not None:
+        # Match the accumulator's scene-canonical consensus contract. A
+        # sequence count of one is expected here, not a reason to extinguish
+        # a two-camera proposal. Check actual camera provenance rather than
+        # trusting a scalar support count or widening authority to other seqs.
+        canonical_ids = support.new_tensor([
+            int(camera_id) for camera_id, camera in view_by_camera_id.items()
+            if sequence_id(camera.image_name) == canonical_sequence
+        ])
+        in_canonical = torch.isin(support, canonical_ids)
+        strong_visual_hull = (
+            (support_count >= 2)
+            & ((support < 0) | in_canonical).all(dim=1)
+            & (foliage.support_sequence_count[birth_rows] == 1)
+        )
     # ``ray_local`` only means that both centres project validly; it does not
     # mean the donor actually funded the birth. In real Cambridge events most
     # assigned rows had sub-percent overlap and were still reduced to nearly
@@ -18462,6 +18944,10 @@ def _update_static_child_verification_from_render(
     camera_sequence_lookup: torch.Tensor | None,
     volume_optimizer=None,
     required_sequence_count: int | None = None,
+    candidate_geometry_gate: torch.Tensor | None = None,
+    canopy_color_audit: bool = False,
+    sky_audit_column: int | None = None,
+    update_color: bool = True,
 ) -> dict[str, int | str]:
     """Re-verify topology children from native real-ray contribution.
 
@@ -18499,6 +18985,11 @@ def _update_static_child_verification_from_render(
     total = volume[:, 0].clamp_min(1.0e-8)
     canopy_fraction = volume[:, 1] / total
     rigid_fraction = volume[:, 2] / total
+    sky_fraction=torch.zeros_like(rigid_fraction)
+    if sky_audit_column is not None:
+        if sky_audit_column<3 or sky_audit_column>=volume.shape[1]:
+            raise ValueError('Advertised sky audit channel is missing')
+        sky_fraction=volume[:,sky_audit_column].clamp_min(0)/total
     candidate_camera = (foliage.support_camera_ids == int(camera_id)).any(
         dim=1
     ) if foliage.support_camera_ids.shape[1] else torch.zeros_like(
@@ -18508,8 +18999,15 @@ def _update_static_child_verification_from_render(
         verification_candidate
         & candidate_camera
         & (volume[:, 0] > 1.0e-5)
-        & (canopy_fraction > rigid_fraction)
+        & (volume[:, 1] > 1.0e-5)
+        & (canopy_fraction > rigid_fraction+sky_fraction)
     )
+    geometry_rejected_witness_rows=0
+    if candidate_geometry_gate is not None:
+        gate=torch.as_tensor(candidate_geometry_gate,device=witnessed.device,dtype=torch.bool).reshape(-1)
+        if gate.shape!=witnessed.shape: raise ValueError("Verification geometry gate is not aligned")
+        geometry_rejected_witness_rows=int((witnessed & ~gate).sum())
+        witnessed &= gate
     rows = torch.nonzero(witnessed, as_tuple=False).flatten()
     added = 0
     color_witnesses = 0
@@ -18529,17 +19027,23 @@ def _update_static_child_verification_from_render(
                 insert_rows, insert_slots
             ] = int(camera_id)
             added = int(len(insert_rows))
-            # The main native render appends the observed full-resolution RGB
-            # as audit fields 3:6.  Its per-primitive responsibility is
-            # exactly sum(T_before * alpha * RGB), so division by the ordinary
-            # responsibility yields a geometrically visible colour witness.
+            # Audit fields 3:6 carry canopy_probability * observed RGB.
+            # Divide their real T*alpha sum by canopy responsibility, not
+            # total footprint responsibility (which includes sky / walls).
             # Use a clipped online mean: the first witness replaces the stale
             # parent DC; later independent views refine it without allowing a
             # single highlight or exposure outlier to create a bright speck.
-            if volume.shape[1] >= 7:
+            if volume.shape[1] >= 7 and update_color:
+                # Legacy unmasked RGB is safe only for an entirely canopy
+                # footprint. Never average sky/wall RGB into a leaf's DC.
+                if not canopy_color_audit:
+                    color_local=canopy_fraction[insert_rows]>=1.-1.e-6
+                    insert_rows=insert_rows[color_local]
+                    previous_count=previous_count[color_local]
+                color_mass=volume[insert_rows,1].clamp_min(1.e-8) if canopy_color_audit else total[insert_rows]
                 observed_rgb = (
                     volume[insert_rows, 4:7]
-                    / total[insert_rows, None]
+                    / color_mass[:, None]
                 ).clamp(0.0, 1.0)
                 dc_constant = 0.28209479177387814
                 current_rgb = (
@@ -18643,6 +19147,7 @@ def _update_static_child_verification_from_render(
         "real_contributing_candidates": int(witnessed.sum()),
         "new_camera_witnesses": int(added),
         "new_color_witnesses": int(color_witnesses),
+        "geometry_rejected_witness_rows":geometry_rejected_witness_rows,
         "newly_verified": int(verified.sum()),
         "resolved_ray_births": int(resolved_ray_birth.sum()),
         "remaining_unverified": int(
@@ -18872,8 +19377,8 @@ def _static_detail_isolated_gradient_gates(
     # alpha, fitting its white-background composite can reduce the loss by
     # driving intrinsic SH toward black.  When later ray evidence raises
     # opacity, those stale black colours become high-contrast speckles.  The
-    # volume-only alpha-normalized stream below is the unique intrinsic-colour
-    # owner.  This branch owns only the real occlusion residual for opacity.
+    # gradient-isolated native-composite stream below owns leaf colour.
+    # This branch owns only the real occlusion residual for opacity.
     appearance_read_only = torch.zeros_like(geometry_gate)
     return geometry_gate, appearance_read_only, opacity
 
@@ -18993,6 +19498,29 @@ def _static_volume_intrinsic_color_inputs(
     ).clamp(0.0, 1.0)
     support = (detached_alpha[0] / floor).clamp(0.0, 1.0)
     return intrinsic, semantic_weight * support
+
+
+def _static_volume_native_color_inputs(
+    native_rgb: torch.Tensor,
+    native_volume_alpha: torch.Tensor,
+    semantic_weight: torch.Tensor,
+    *,
+    alpha_floor: float = STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compare like quantities: native composite RGB against observed RGB.
+
+    Intrinsic leaf colour F cannot be targeted by C=(1-A)B+A*F unless A=1
+    or B=F. Doing so brightens correct foliage toward its background. Keep
+    native ordering and all read-only occluders in the forward calculation.
+    Detached native contribution only determines whether colour is observed;
+    it never grants authority to paint a leaf hidden behind a wall.
+    """
+    if native_rgb.shape!=(3,*semantic_weight.shape) or native_volume_alpha.shape!=(1,*semantic_weight.shape):
+        raise ValueError('Aligned native RGB, volume contribution alpha and semantic weights required')
+    if not math.isfinite(float(alpha_floor)) or alpha_floor<=0:
+        raise ValueError('Positive finite native colour support floor required')
+    support=(native_volume_alpha.detach()[0]/float(alpha_floor)).clamp(0,1)
+    return native_rgb,semantic_weight*support
 
 
 def _static_ray_candidate_masks(
@@ -19707,9 +20235,8 @@ def _apply_mature_surface_gradient_policy(
     opacity to the completed rigid stage. Semantic retirement is intentionally
     absent here: Adam normalizes even tiny positive opacity gradients and
     therefore turned a one-sided ownership gradient into almost global
-    extinction. Local retirement is instead performed at replacement events
-    from accumulated cross-sequence responsibility with an explicit optical
-    mass budget.
+    extinction. Replacement-event retirement must obey the same policy;
+    appearance_only and frozen do not grant direct opacity-write authority.
     """
     if policy not in {
         "joint",
@@ -20553,6 +21080,31 @@ def _bounded_surface_retirement_fractions(
         ),
         "allocation_scale": float(scale),
     }
+
+
+def _final_surface_prune_mask(proposed, policy: str, *, residual_start=None):
+    """Export cannot acquire topology authority that training did not own."""
+    if policy not in {"joint", "atlas_residual", "appearance_only", "frozen"}:
+        raise ValueError(f"Unknown mature surface policy: {policy}")
+    allowed = proposed.clone()
+    if policy in {"appearance_only", "frozen"}:
+        allowed.zero_()
+    elif policy == "atlas_residual":
+        if residual_start is None or not 0 <= int(residual_start) <= len(proposed):
+            raise RuntimeError("Final surface cleanup requires a valid immutable prefix")
+        allowed[:int(residual_start)] = False
+    return allowed
+
+
+def _surface_replacement_retirement_allowed(policy: str) -> bool:
+    """Whole-surface retirement requires whole-surface opacity authority.
+
+    Atlas residual training only owns a suffix; the legacy replacement audit
+    cannot distinguish that suffix and must not mutate its immutable prefix.
+    """
+    if policy not in {"joint", "atlas_residual", "appearance_only", "frozen"}:
+        raise ValueError(f"Unknown mature surface policy: {policy}")
+    return policy == "joint"
 
 
 @torch.no_grad()
@@ -21477,6 +22029,7 @@ def main():
         in {
             "hybrid_handoff_quality",
             "static_handoff_quality",
+            "static_measured_handoff_quality",
             "static_handoff_fast",
         }
         and surface_warmstart is None
@@ -21564,6 +22117,7 @@ def main():
                 + "; ".join(gate_failures)
             )
     resume = _load(args.resume.resolve()) if args.resume else None
+    _assert_training_resume_payload(resume)
     v116_shared_envelope_localization_resume = False
     if args.allow_v116_shared_envelope_localization_resume:
         predecessor = V116_SHARED_ENVELOPE_LOCALIZATION_PREDECESSOR
@@ -22048,10 +22602,27 @@ def main():
             else int(args.dynamic_rank)
         )
     )
-    foliage = VolumetricFoliageModel(
+    foliage_class = VolumetricFoliageModel
+    if (args.reconstruction_target == 'static' and args.integrated_optical_mass_compensation
+            and args.mass_consistent_scale_gradients):
+        from outdoor.mass_consistent_foliage import MassConsistentFoliage
+        foliage_class = MassConsistentFoliage
+    foliage = foliage_class(
         dataset.sh_degree, dynamic_rank=foliage_dynamic_rank
     ).cuda()
     seed_payload = _load(Path(initialization["foliage_seed"]))
+    if args.synchronous_measured_split_verification and args.training_profile != 'static_measured_handoff_quality':
+        raise ValueError('Synchronous measured split verification requires the fresh measured profile')
+    from outdoor.canopy_position_uncertainty import CONTRACT as POSITION_UNCERTAINTY_CONTRACT
+    full_position_uncertainty = (
+        seed_payload.get('audit', {}).get('fresh_canonical_leaves', {}).get(
+            'position_uncertainty_contract') == POSITION_UNCERTAINTY_CONTRACT
+    )
+    if args.training_profile == 'static_measured_handoff_quality':
+        if (args.reconstruction_target != 'static'
+                or seed_payload.get('audit', {}).get('fresh_canonical_leaves') is None
+                or args.mature_handoff_surface_policy not in {'frozen', 'appearance_only'}):
+            raise ValueError('Measured handoff requires fresh canonical leaves and preserved rigid geometry')
     static_fusion_audit = None
     if args.reconstruction_target == "static":
         fixed_camera_sequences = [
@@ -22062,8 +22633,13 @@ def main():
             }
             for view in views
         ]
-        seed_payload, static_fusion_audit = (
-            fuse_sequence_evidence_into_static_leaves(
+        if seed_payload.get('audit', {}).get('fresh_canonical_leaves') is not None:
+            from outdoor.canonical_canopy_initialization import validate_fresh_canonical_seed
+            if args.static_canonical_sequence_policy != 'scene':
+                raise ValueError('Fresh canonical leaves require scene-canonical training')
+            static_fusion_audit = validate_fresh_canonical_seed(seed_payload, fixed_camera_sequences)
+        else:
+            seed_payload, static_fusion_audit = fuse_sequence_evidence_into_static_leaves(
                 seed_payload,
                 minimum_supporting_views=(
                     args.static_leaf_min_supporting_views
@@ -22073,7 +22649,6 @@ def main():
                 ),
                 fixed_camera_sequences=fixed_camera_sequences,
             )
-        )
     static_canonical_sequence = None
     static_canonical_sequence_index = None
     if (
@@ -22215,6 +22790,8 @@ def main():
     foliage_rays = FoliageRayEvidence(seed_payload.get("ray_evidence"))
     static_ray_births = StaticRayBirthAccumulator(
         voxel_size=args.static_ray_birth_voxel_size,
+        minimum_birth_separation=args.static_ray_birth_minimum_separation,
+        maximum_proposals_per_update=max(256, args.moge3_canopy_maximum_birth_proposals),
         visual_hull_voxel_size=(
             args.static_ray_birth_visual_hull_voxel_size
         ),
@@ -22232,9 +22809,9 @@ def main():
         # tombstone. Reconstruct those keys from extant runtime-birth
         # provenance before another ray proposal can recreate the same static
         # occupancy cell after resume.
-        if (static_ray_birth_state or {}).get("version") != (
-            "static-ray-birth-accumulator-v5"
-        ):
+        if (static_ray_birth_state or {}).get("version") not in {
+            "static-ray-birth-accumulator-v5", "static-ray-birth-accumulator-v6"
+        }:
             runtime_birth_rows = foliage.initialization_source == 6
             static_ray_births.mark_consumed_centers(
                 foliage.xyz.detach()[runtime_birth_rows]
@@ -23126,9 +23703,23 @@ def main():
         and PROTOCOL
         == "cambridge_native_hybrid_teacher_v88_exact_optical_handoff_schedule"
     )
+    moge3_canopy_view_indices = sorted(
+        set(all_canopy_view_indices) & canonical_sequence_view_indices
+    )
+    moge3_canopy_view_indices = [i for i in moge3_canopy_view_indices
+        if Path(str(views[i].image_name)).stem in geometry.moge3_records]
+    moge3_canopy_schedule = _cycle_schedule(
+        moge3_canopy_view_indices or list(range(len(views))),
+        args.phase_schedule_horizon, args.seed + 17,
+    )
+    from outdoor.canonical_canopy_initialization import exclude_validation_cameras
+    fresh_excluded_camera_ids = set(seed_payload.get('audit', {}).get(
+        'fresh_canonical_leaves', {}).get('excluded_camera_ids', []))
+    fresh_excluded_view_indices = {index for index, candidate in enumerate(views)
+        if int(candidate.colmap_id) in fresh_excluded_camera_ids}
     camera_schedules, restored_schedule_names = (
         _restore_resume_camera_schedules(
-            {
+            exclude_validation_cameras({
                 "rgb": rgb_schedule,
                 "conditioned": conditioned_schedule,
                 "geometry": geometry_schedule,
@@ -23138,7 +23729,8 @@ def main():
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
                 "static_canonical_ray": static_canonical_ray_schedule,
-            },
+                "moge3_canopy": moge3_canopy_schedule,
+            }, fresh_excluded_view_indices),
             resume,
             horizon=args.phase_schedule_horizon,
             allow_conditioned_repair=(
@@ -23161,6 +23753,7 @@ def main():
     static_canonical_ray_schedule = camera_schedules[
         "static_canonical_ray"
     ]
+    moge3_canopy_schedule = camera_schedules["moge3_canopy"]
     if resume is not None:
         saved_contract = resume.get("training_contract", {})
         if "conditioned" in restored_schedule_names:
@@ -23214,6 +23807,7 @@ def main():
         static_skeleton_schedule,
         static_volume_schedule,
         static_canonical_ray_schedule,
+        moge3_canopy_schedule,
     )
     deployment_optical_replacement_policy = (
         "disabled"
@@ -23274,6 +23868,8 @@ def main():
         "integrated_optical_mass_compensation": bool(
             args.integrated_optical_mass_compensation
         ),
+        "mass_consistent_scale_gradients": bool(args.reconstruction_target == 'static'
+            and args.integrated_optical_mass_compensation and args.mass_consistent_scale_gradients),
         "static_optical_policy_contract": (
             STATIC_OPTICAL_POLICY_CONTRACT
             if args.reconstruction_target == "static"
@@ -23513,9 +24109,17 @@ def main():
             else None
         ),
         "static_detail_isolated_supervision": {
-            "contract": STATIC_DETAIL_ISOLATED_CONTRACT,
+            "split_color_evidence": (
+                "current_calibrated_moge_thin_hit_and_full_bilinear_known_canopy__distinct_camera_votes"
+                if args.training_profile == 'static_measured_handoff_quality'
+                else "legacy_depth_and_ray_posteriors__distinct_camera_votes"
+            ),
+            "contract": (STATIC_DETAIL_NATIVE_CONTRACT
+                         if args.training_profile == 'static_measured_handoff_quality'
+                         else STATIC_DETAIL_ISOLATED_CONTRACT),
             "every": int(args.static_detail_isolated_every),
             "weight": float(args.static_detail_isolated_weight),
+            "native_rigid_alpha_weight": float(args.static_detail_rigid_alpha_weight),
             "active_only_after_static_detail_stage": True,
             "view_schedule": static_detail_schedule_audit,
             "gradient_owners": [
@@ -23526,7 +24130,7 @@ def main():
                 "verified_consensus_static_detail_ray_optical_mass",
                 "verified_exact_support_static_detail_means2d_topology",
             ],
-            "forward_rows_equal_gradient_owner_union": True,
+            "forward_rows_equal_gradient_owner_union": args.training_profile != 'static_measured_handoff_quality',
             "high_frequency_objective": (
                 "detached_gt_edge_gated_two_scale_sobel_direction_and_"
                 "relative_magnitude"
@@ -23574,6 +24178,8 @@ def main():
             "intrinsic_alpha_floor": float(
                 STATIC_VOLUME_INTRINSIC_ALPHA_FLOOR
             ),
+            "color_quantity": "native_composite_rgb__not_unpremultiplied_leaf_color",
+            "forward_occluders": "all_deployment_visible_static_roles_and_frozen_surface",
             "view_schedule": static_volume_schedule_audit,
             "gradient_owners": [
                 "verified_exact_support_or_witness_static_detail_"
@@ -23687,9 +24293,12 @@ def main():
                 "same_continuous_smoothstep_capacity_as_ordinary_split"
             ),
             "initial_opacity": 0.04,
+            "minimum_birth_separation": args.static_ray_birth_minimum_separation,
+            "maximum_proposals_per_update": max(256, args.moge3_canopy_maximum_birth_proposals),
             "consumed_cell_policy": (
                 "persistent_midpoint_and_visual_hull_tombstones"
             ),
+            "first_hit_capacity": "one_physical_hit_per_camera_ray__posterior_width_is_not_matter",
             "legacy_tombstone_recovery": (
                 "extant_initialization_source_6_centers"
             ),
@@ -23773,9 +24382,11 @@ def main():
             ),
             "geometry_topology_owner": (
                 "verified_exact_persisted_support_or_witness_camera_only"
+                if args.static_detail_same_sequence_geometry_weight == 0
+                else "geometry_verified_positive_sequence__topology_exact_persisted_camera_only"
             ),
             "same_sequence_geometry_weight": float(
-                STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT
+                args.static_detail_same_sequence_geometry_weight
             ),
             "appearance_owner": (
                 "exact_persisted_support_or_witness_camera_weight1_only"
@@ -23955,9 +24566,8 @@ def main():
                     "surface_ownership_contract"
                 ]
             )
-            if (
-                args.mature_handoff_surface_policy == "appearance_only"
-                or args.mature_handoff_surface_policy == "atlas_residual"
+            if _surface_replacement_retirement_allowed(
+                args.mature_handoff_surface_policy
             )
             and args.surface_retirement_optical_mass_fraction_per_event > 0
             else "surface_opacity_follows_mature_handoff_policy"
@@ -24213,6 +24823,9 @@ def main():
         ),
         "volume_split_radius": float(args.volume_split_radius),
         "volume_opacity_lr": float(args.volume_opacity_lr),
+        "static_detail_opacity_lr_multiplier":float(args.static_detail_opacity_lr_multiplier),
+        "static_measured_independent_camera_verification":bool(args.static_measured_independent_camera_verification),
+        "synchronous_measured_split_verification":bool(args.synchronous_measured_split_verification),
         "volume_appearance_polish": {
             "contract": (
                 "static_geometry_mass_frozen__remaining_sh_appearance_sky_"
@@ -24295,9 +24908,13 @@ def main():
         },
         "moge3_canopy_optical": {
             "contract": MOGE3_CANOPY_OPTICAL_CONTRACT,
+            "camera_stream": args.moge3_canopy_camera_stream,
+            "canonical_canopy_camera_count": len(moge3_canopy_view_indices),
+            "proposal_sampling": "seeded_weighted_per_tile_then_global_topup",
             "weight": float(args.moge3_canopy_optical_weight),
             "every": int(args.moge3_canopy_optical_every),
             "prehit_weight": float(args.moge3_canopy_prehit_weight),
+            "prehit_authority": args.moge3_prehit_authority,
             "maximum_birth_proposals_per_view": int(
                 args.moge3_canopy_maximum_birth_proposals
             ),
@@ -24618,6 +25235,9 @@ def main():
     }
     implementation_hashes = {
         "trainer": _file_sha256(Path(__file__)),
+        "moge3_prehit_authority": _file_sha256(REPO_ROOT / 'outdoor/moge3_prehit_authority.py'),
+        "optical_mass_gradient": _file_sha256(REPO_ROOT / 'outdoor/optical_mass_gradient.py'),
+        "mass_consistent_foliage": _file_sha256(REPO_ROOT / 'outdoor/mass_consistent_foliage.py'),
         "static_foliage": _file_sha256(
             REPO_ROOT / "outdoor/static_foliage.py"
         ),
@@ -24666,6 +25286,13 @@ def main():
         "static_ray_birth": _file_sha256(
             REPO_ROOT / "outdoor/static_ray_birth.py"
         ),
+        "checkpoint_encoding": _file_sha256(
+            REPO_ROOT / "outdoor/checkpoint_encoding.py"
+        ),
+        "canopy_support_expansion": _file_sha256(REPO_ROOT / "outdoor/canopy_support_expansion.py"),
+        "canonical_canopy_initialization": _file_sha256(REPO_ROOT / "outdoor/canonical_canopy_initialization.py"),
+        "canopy_position_uncertainty": _file_sha256(REPO_ROOT / "outdoor/canopy_position_uncertainty.py"),
+        "rowwise_optimizer_step": _file_sha256(REPO_ROOT / "outdoor/rowwise_optimizer_step.py"),
         "directional_sky": _file_sha256(
             REPO_ROOT / "outdoor/directional_sky.py"
         ),
@@ -25124,6 +25751,7 @@ def main():
             "static_skeleton": static_skeleton_schedule,
             "static_volume": static_volume_schedule,
             "static_canonical_ray": static_canonical_ray_schedule,
+            "moge3_canopy": moge3_canopy_schedule,
         }
         changed_non_conditioned = [
             name
@@ -25167,6 +25795,9 @@ def main():
             allow_canonical_occlusion_weight_ablation=bool(
                 args.allow_canonical_occlusion_weight_ablation_resume
             ),
+            allow_static_ray_birth_budget_ablation=bool(args.allow_static_ray_birth_budget_ablation_resume),
+            allow_moge3_prehit_authority_ablation=bool(args.allow_moge3_prehit_authority_ablation_resume),
+            allow_optical_mass_gradient_repair=bool(args.allow_optical_mass_gradient_repair_resume),
             allow_conditioned_schedule_repair_migration=bool(
                 args.allow_conditioned_schedule_repair_resume
             ),
@@ -25221,6 +25852,10 @@ def main():
             "Resume optimization/evidence-ownership contract changed "
             f"({', '.join(sorted(contract_differences))}); start a clean run"
         )
+    if resume is not None and args.allow_static_ray_birth_budget_ablation_resume:
+        previous_cap=resume['training_contract']['static_ray_birth']['maximum_births_per_topology_event']
+        print(f'Explicit ray-birth allocator experiment: {previous_cap} -> '
+              f'{args.maximum_static_ray_births_per_event}; all evidence, mass and global capacity constraints unchanged.',flush=True)
     if (
         resume is not None
         and args.allow_canonical_occlusion_weight_ablation_resume
@@ -25891,7 +26526,7 @@ def main():
                 args.static_detail_same_sequence_optical_weight
             ),
             "same_sequence_geometry_weight": float(
-                STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT
+                args.static_detail_same_sequence_geometry_weight
             ),
             "refinement_rows": 0,
             "same_sequence_non_support_rows": 0,
@@ -25963,6 +26598,7 @@ def main():
                     int(view.colmap_id),
                     camera_sequence_lookup,
                     static_detail_gradient_gate,
+                    fallback_weight=args.static_detail_same_sequence_geometry_weight,
                     positive_evidence_sequence_gate=(
                         static_detail_positive_evidence_sequence_gate
                     ),
@@ -26023,7 +26659,7 @@ def main():
                     ).sum()
                 ),
                 "same_sequence_geometry_weight": float(
-                    STATIC_DETAIL_SAME_SEQUENCE_GEOMETRY_WEIGHT
+                    args.static_detail_same_sequence_geometry_weight
                 ),
                 "same_sequence_appearance_weight": float(
                     args.static_detail_same_sequence_appearance_weight
@@ -26130,19 +26766,8 @@ def main():
             # two disabled-policy role renders and then committed as a
             # persistent, reversible parameter-space mass handoff.
             optical_replacement_policy="disabled",
-            audit_fields=torch.cat(
-                [
-                    torch.stack(
-                        [
-                            task["p_canopy_core"],
-                            task["p_rigid"],
-                            canopy_topology_signal,
-                        ]
-                    ),
-                    target.detach(),
-                ],
-                dim=0,
-            ),
+            audit_fields=canopy_material_audit_fields(task["p_canopy_core"],task["p_rigid"],
+                task["p_sky"],target.detach(),canopy_topology_signal),
         )
         # The mixed image is the authoritative image-formation model, but it
         # is not a valid source of rigid RGB gradients for the structural
@@ -26179,6 +26804,7 @@ def main():
         moge3_canopy_optical_package_prehit = None
         moge3_canopy_optical_package_hit = None
         moge3_canopy_optical_package_coverage = None
+        moge3_ordering_depth = moge3_ordering_alpha = None
         moge3_canopy_optical = package.volume_alpha.sum() * 0.0
         moge3_canopy_optical_prehit = package.volume_alpha.sum() * 0.0
         moge3_canopy_optical_hit = package.volume_alpha.sum() * 0.0
@@ -26210,11 +26836,19 @@ def main():
                 "direct_append": False,
             },
         }
-        moge3_view_stem = Path(str(view.image_name)).stem
+        moge3_view = view
+        if (args.moge3_canopy_camera_stream == "canonical_canopy"
+                and moge3_canopy_view_indices and args.moge3_canopy_optical_every > 0
+                and (step+1) % args.moge3_canopy_optical_every == 0):
+            moge3_view = views[int(moge3_canopy_schedule[
+                _periodic_schedule_index(step,args.moge3_canopy_optical_every)])]
+        moge3_view_is_canonical = int(moge3_view.colmap_id) in canonical_sequence_camera_ids
+        moge3_canopy_optical_audit["noncanonical_positive_updates_blocked"] = not moge3_view_is_canonical
+        moge3_view_stem = Path(str(moge3_view.image_name)).stem
         moge3_canopy_optical_scheduled = bool(
             args.reconstruction_target == "static"
             and args.static_canonical_sequence_policy == "scene"
-            and static_scene_view_is_canonical
+            and moge3_view_is_canonical
             and foliage_active
             and static_detail_active
             and phase != "canonical_polish"
@@ -26224,10 +26858,12 @@ def main():
             and moge3_view_stem in geometry.moge3_records
         )
         if moge3_canopy_optical_scheduled:
+            moge3_task = fields.fields(moge3_view.image_name,
+                (moge3_view.image_height,moge3_view.image_width),torch.device("cuda"))
             moge3_current_fields = geometry.fields(
-                view.image_name,
+                moge3_view.image_name,
                 device=torch.device("cuda"),
-                shape=(view.image_height, view.image_width),
+                shape=(moge3_view.image_height, moge3_view.image_width),
             )
             (
                 moge3_prehit_query_bounds,
@@ -26239,13 +26875,26 @@ def main():
                 moge3_current_fields,
                 global_log_scale_sigma=moge3_global_log_scale_sigma,
             )
-            exact_camera = _static_detail_canonical_ownership_gate(
+            with torch.no_grad():
+                ordering_package=render_hybrid(moge3_view,surface,foliage,background=background,
+                    include_dynamic=False,optical_replacement_policy="disabled",structural_trainable_start=None,
+                    volume_gate=torch.zeros_like(foliage.opacity_logits.reshape(-1)))
+                moge3_ordering_depth=ordering_package.median_depth.detach()
+                moge3_ordering_alpha=ordering_package.surface_alpha.detach()
+                del ordering_package
+                (moge3_prehit_query_bounds,moge3_hit_query_bounds,moge3_query_valid,
+                 ordering_audit)=clip_canopy_depth_queries_before_rigid(
+                    moge3_prehit_query_bounds,moge3_hit_query_bounds,moge3_query_valid,
+                    moge3_task["p_canopy"],moge3_task["p_rigid"],
+                    moge3_ordering_depth,moge3_ordering_alpha)
+                moge3_query_audit["independent_rigid_ordering"]=ordering_audit
+            moge3_exact_camera = _static_detail_canonical_ownership_gate(
                 foliage,
-                int(view.colmap_id),
+                int(moge3_view.colmap_id),
                 camera_sequence_lookup,
             ) > 0
             hit_owner_mask = _moge3_canopy_hit_owner_mask(
-                foliage, exact_camera
+                foliage, moge3_exact_camera
             )
             prehit_owner_mask = (
                 (
@@ -26268,7 +26917,7 @@ def main():
                 moge3_query_valid.any()
             ):
                 moge3_canopy_optical_package_prehit = render_hybrid(
-                    view,
+                    moge3_view,
                     surface,
                     foliage,
                     background=background,
@@ -26285,7 +26934,7 @@ def main():
                 )
             if bool(hit_owner_mask.any()) and bool(moge3_query_valid.any()):
                 moge3_canopy_optical_package_hit = render_hybrid(
-                    view,
+                    moge3_view,
                     surface,
                     foliage,
                     background=background,
@@ -26315,7 +26964,7 @@ def main():
                 # CUDA backward graph for the read-only coverage question.
                 with torch.no_grad():
                     moge3_canopy_optical_package_coverage = render_hybrid(
-                        view,
+                        moge3_view,
                         surface,
                         foliage,
                         background=background,
@@ -26333,17 +26982,17 @@ def main():
             prehit_alpha = (
                 moge3_canopy_optical_package_prehit.volume_prehit_alpha
                 if moge3_canopy_optical_package_prehit is not None
-                else package.volume_alpha.detach() * 0.0
+                else torch.zeros_like(moge3_query_reliability)
             )
             hit_alpha = (
                 moge3_canopy_optical_package_hit.volume_hit_interval_alpha
                 if moge3_canopy_optical_package_hit is not None
-                else package.volume_alpha.detach() * 0.0
+                else torch.zeros_like(moge3_query_reliability)
             )
             coverage_hit_alpha = (
                 moge3_canopy_optical_package_coverage.volume_hit_interval_alpha
                 if moge3_canopy_optical_package_coverage is not None
-                else package.volume_alpha.detach() * 0.0
+                else torch.zeros_like(moge3_query_reliability)
             )
             (
                 moge3_canopy_optical,
@@ -26353,10 +27002,13 @@ def main():
             ) = _moge3_canopy_optical_loss(
                 prehit_alpha,
                 hit_alpha,
-                task,
+                moge3_task,
                 moge3_query_valid,
                 moge3_query_reliability,
                 prehit_weight=args.moge3_canopy_prehit_weight,
+                prehit_authority=(
+                    observed_rigid_prehit_authority(moge3_task,moge3_ordering_depth,moge3_ordering_alpha)
+                    if args.moge3_prehit_authority=='observed_rigid' else None),
                 return_components=True,
             )
             moge3_birth_proposals = None
@@ -26372,15 +27024,16 @@ def main():
                     moge3_birth_proposals,
                     moge3_birth_audit,
                 ) = _moge3_uncovered_hit_proposals(
-                    view,
+                    moge3_view,
                     moge3_hit_query_bounds,
                     coverage_hit_alpha,
-                    task,
+                    moge3_task,
                     moge3_query_valid,
                     moge3_query_reliability,
                     maximum_proposals=(
                         args.moge3_canopy_maximum_birth_proposals
                     ),
+                    sampling_seed=args.seed + 1000003 * (step + 1) + int(moge3_view.colmap_id),
                 )
                 accepted_moge3_birth_proposals = static_ray_births.add(
                     moge3_birth_proposals,
@@ -26402,6 +27055,9 @@ def main():
             moge3_canopy_optical_audit = {
                 **moge3_query_audit,
                 **moge3_loss_audit,
+                "camera_stream": args.moge3_canopy_camera_stream,
+                "camera_id": int(moge3_view.colmap_id),
+                "image_name": str(moge3_view.image_name),
                 "scheduled": bool(
                     moge3_canopy_optical_package_prehit is not None
                     or moge3_canopy_optical_package_hit is not None
@@ -26773,6 +27429,7 @@ def main():
         static_detail_isolated_view = None
         static_detail_isolated_photo = canonical.new_zeros(())
         static_detail_isolated_high_frequency = canonical.new_zeros(())
+        static_detail_isolated_rigid_alpha = canonical.new_zeros(())
         static_detail_isolated_scheduled = bool(
             args.reconstruction_target == "static"
             and foliage_active
@@ -26834,6 +27491,7 @@ def main():
                     int(static_detail_isolated_view.colmap_id),
                     camera_sequence_lookup,
                     static_detail_isolated_ownership_gate,
+                    fallback_weight=args.static_detail_same_sequence_geometry_weight,
                 )
             )
             static_detail_isolated_appearance_gate = (
@@ -26901,6 +27559,14 @@ def main():
                     | (static_detail_isolated_appearance_gate > 0)
                 )
             ).to(dtype=foliage.opacities.dtype)
+            if args.training_profile == 'static_measured_handoff_quality':
+                # Fresh measured leaves have no envelope handoff to expose.
+                # RGB must see the deployed scene, including read-only leaves.
+                # A row's optimization permission is NOT its visibility.
+                static_detail_gate = static_detail_forward_visibility_gate(
+                    foliage, int(static_detail_isolated_view.colmap_id),
+                    include_pending_exact=False,
+                )
             static_detail_isolated_appearance_rows = int(
                 (
                     foliage.static_leaf_mask
@@ -26930,7 +27596,8 @@ def main():
                     static_detail_isolated_opacity_gate
                 ),
                 volume_opacity_scale=1.0,
-                structural_trainable_start=0,
+                structural_trainable_start=(None if args.training_profile == 'static_measured_handoff_quality' else 0),
+                optical_replacement_policy=('disabled' if args.training_profile == 'static_measured_handoff_quality' else 'view_depth_local'),
                 audit_fields=torch.stack(
                     [
                         static_detail_isolated_task["p_canopy_core"],
@@ -26947,6 +27614,13 @@ def main():
                 static_detail_isolated_package.alpha,
                 sky(static_detail_isolated_view),
             )
+            if args.static_detail_rigid_alpha_weight>0:
+                from outdoor.canopy_detail_loss import native_rigid_foliage_extinction_loss
+                rigid_observed=((static_detail_isolated_task['p_rigid']>.95)
+                    & (static_detail_isolated_task['w_rgb']>0)
+                    & (static_detail_isolated_task['p_transient']<.05))
+                static_detail_isolated_rigid_alpha=native_rigid_foliage_extinction_loss(
+                    static_detail_isolated_package.volume_alpha,rigid_observed)
             static_detail_isolated_weight = (
                 (
                     static_detail_isolated_task["w_gaussian_rgb"]
@@ -27087,14 +27761,10 @@ def main():
             and len(static_volume_view_indices) > 0
         )
         if static_volume_isolated_scheduled:
-            # This is the missing third branch forward: surface-only protects
-            # rigid gradients, full mixed is authoritative for occlusion, and
-            # volume-only exposes intrinsic foliage colour/bandwidth when a
-            # wrongly front-running surface would otherwise cut its gradient.
-            # Opacity is explicitly detached at the renderer input. Optical
-            # existence remains owned by full mixed RGB and free/hit/behind
-            # ray factors, so this pass cannot turn a colour residual into an
-            # opaque low-frequency canopy wall.
+            # Isolate gradients, NOT forward occlusion. Comparing volume-only
+            # intrinsic colour to observed mixed RGB taught background colour
+            # to foliage even when the actual composite was already correct.
+            # Existing optical/free-space branches still own opacity updates.
             static_volume_isolated_view = views[
                 int(
                     static_volume_schedule[
@@ -27161,24 +27831,15 @@ def main():
             static_volume_isolated_appearance_rows = int(
                 (static_volume_appearance_gate > 0).sum()
             )
-            static_volume_forward_gate = (
-                foliage.static_leaf_mask
-                & (
-                    (static_volume_geometry_gate > 0)
-                    | (static_volume_appearance_gate > 0)
-                    | (static_volume_opacity_gate > 0)
-                )
-            ).to(dtype=foliage.opacities.dtype)
+            static_volume_forward_gate = static_detail_forward_visibility_gate(
+                foliage,int(static_volume_isolated_view.colmap_id),include_pending_exact=False,
+            )
             static_volume_isolated_package = render_hybrid(
                 static_volume_isolated_view,
                 surface,
                 foliage,
                 background=background,
                 include_dynamic=False,
-                surface_gate=torch.zeros_like(
-                    surface.get_opacity.reshape(-1)
-                ),
-                volume_role_mask=foliage.static_leaf_mask,
                 volume_gate=static_volume_forward_gate,
                 volume_geometry_gradient_gate=(
                     static_volume_geometry_gate
@@ -27197,12 +27858,15 @@ def main():
                 static_volume_isolated_package.volume_alpha
             )
             (
-                isolated_intrinsic_rgb,
+                isolated_native_rgb,
                 static_volume_isolated_weight,
-            ) = _static_volume_intrinsic_color_inputs(
-                static_volume_isolated_package.render,
+            ) = _static_volume_native_color_inputs(
+                composite_white_background(
+                    static_volume_isolated_package.render,
+                    static_volume_isolated_package.alpha,
+                    sky(static_volume_isolated_view).detach(),
+                ),
                 isolated_alpha,
-                background,
                 static_volume_isolated_task["p_canopy"]
                 * static_volume_isolated_task["w_rgb"],
             )
@@ -27210,14 +27874,14 @@ def main():
                 (static_volume_isolated_weight > 0).sum()
             )
             static_volume_isolated_photo = _photo_loss(
-                isolated_intrinsic_rgb,
+                isolated_native_rgb,
                 static_volume_isolated_target,
                 static_volume_isolated_weight,
                 0.10,
             )
             static_volume_isolated_high_frequency = (
                 _oriented_multiscale_high_frequency_loss(
-                isolated_intrinsic_rgb,
+                isolated_native_rgb,
                 static_volume_isolated_target,
                 static_volume_isolated_weight
                 * _boundary_evidence_weight(
@@ -28265,10 +28929,14 @@ def main():
             else package.depth.new_zeros(())
         )
         delta = foliage.xyz - foliage.initialization_center
-        variance = foliage.position_covariance.diagonal(
-            dim1=-2, dim2=-1
-        ).clamp_min(1e-6)
-        position_nll = (delta.square() / variance).sum(-1)
+        if full_position_uncertainty:
+            from outdoor.canopy_position_uncertainty import position_mahalanobis_error
+            position_nll = position_mahalanobis_error(delta, foliage.position_covariance)
+        else:
+            variance = foliage.position_covariance.diagonal(
+                dim1=-2, dim2=-1
+            ).clamp_min(1e-6)
+            position_nll = (delta.square() / variance).sum(-1)
         skeleton_confidence = getattr(
             foliage,
             "static_skeleton_confidence",
@@ -28727,6 +29395,8 @@ def main():
                     static_detail_isolated_photo
                     + args.high_frequency_weight
                     * static_detail_isolated_high_frequency
+                    + args.static_detail_rigid_alpha_weight
+                    * static_detail_isolated_rigid_alpha
                 )
             )
             static_detail_inputs = tuple(foliage.parameters())
@@ -29000,6 +29670,15 @@ def main():
                 static_volume_isolated_gate,
             )
             del static_volume_isolated_package
+        main_verification_geometry_gate=None
+        if args.reconstruction_target=="static" and foliage_active and static_scene_view_is_canonical:
+            with torch.no_grad():
+                main_rigid_witness_package=render_hybrid(view,surface,foliage,background=background,
+                    include_dynamic=False,optical_replacement_policy="disabled",structural_trainable_start=None,
+                    volume_gate=torch.zeros_like(foliage.opacity_logits.reshape(-1)))
+                main_verification_geometry_gate=front_of_known_rigid_mask(foliage.xyz,view,
+                    main_rigid_witness_package.median_depth,main_rigid_witness_package.surface_alpha)
+                del main_rigid_witness_package
         static_child_verification_audit = (
             _update_static_child_verification_from_render(
                 foliage,
@@ -29007,6 +29686,8 @@ def main():
                 camera_id=int(view.colmap_id),
                 camera_sequence_lookup=camera_sequence_lookup,
                 volume_optimizer=volume_optimizer,
+                candidate_geometry_gate=main_verification_geometry_gate,
+                canopy_color_audit=True,sky_audit_column=7,
                 required_sequence_count=(
                     1
                     if args.static_canonical_sequence_policy == "scene"
@@ -29024,6 +29705,52 @@ def main():
                 "newly_verified": 0,
             }
         )
+        if moge3_canopy_optical_audit.get("scheduled", False):
+            # Birth cameras must also get real-render verification visits.
+            # Otherwise a dedicated positive stream creates proposals that
+            # wait on the much slower all-scene RGB epoch for permission.
+            pending = ((foliage.verification_state == VERIFICATION_UNVERIFIED)
+                | (foliage.verification_state == VERIFICATION_MEASURED_SINGLE)
+                | (foliage.verification_state == VERIFICATION_FACTORIZED_RECEIVER))
+            exact = (foliage.support_camera_ids == int(moge3_view.colmap_id)).any(dim=1)
+            witnessed = (foliage.verified_camera_ids == int(moge3_view.colmap_id)).any(dim=1)
+            independent_rows=torch.empty(0,dtype=torch.long,device=foliage.xyz.device)
+            auxiliary_verification_geometry_gate=None
+            if args.static_measured_independent_camera_verification:
+                eligible=measured_single_canonical_eligibility(foliage,int(moge3_view.colmap_id),camera_sequence_lookup,
+                    measured_state=VERIFICATION_MEASURED_SINGLE,proposal_none=PROPOSAL_NONE)
+                if bool(eligible.any()):
+                    obj,sky_keep,distortion,tree_keep=fields.lookup.get_index_masks(moge3_view.image_name,(0,1,2,3),
+                        (moge3_view.image_height,moge3_view.image_width),torch.device("cuda"))
+                    with torch.no_grad():
+                        independent_rows=independent_canopy_camera_candidates(foliage.xyz,moge3_view,moge3_hit_query_bounds,
+                            obj & sky_keep & distortion & ~tree_keep & moge3_query_valid,eligible,
+                            rigid_depth=moge3_ordering_depth,rigid_alpha=moge3_ordering_alpha)
+                        auxiliary_verification_geometry_gate=front_of_known_rigid_mask(foliage.xyz,moge3_view,
+                            moge3_ordering_depth,moge3_ordering_alpha)
+            missing_existing=(pending & exact & ~witnessed & ~foliage.dynamic_leaf_mask)
+            if len(independent_rows) or (int(moge3_view.colmap_id)!=int(view.colmap_id) and bool(missing_existing.any())):
+                with torch.no_grad(), temporary_camera_support(foliage,independent_rows,int(moge3_view.colmap_id)) as support_trial:
+                    if auxiliary_verification_geometry_gate is None:
+                        auxiliary_verification_geometry_gate=front_of_known_rigid_mask(foliage.xyz,moge3_view,
+                            moge3_ordering_depth,moge3_ordering_alpha)
+                    verification_package = render_hybrid(
+                        moge3_view, surface, foliage, background=background,
+                        include_dynamic=False, optical_replacement_policy="disabled",
+                        volume_gate=static_detail_forward_visibility_gate(
+                            foliage,int(moge3_view.colmap_id),include_pending_exact=True),
+                        structural_trainable_start=None,
+                        audit_fields=canopy_material_audit_fields(moge3_task["p_canopy_core"],
+                            moge3_task["p_rigid"],moge3_task["p_sky"],moge3_view.original_image.cuda()),
+                    )
+                    moge3_canopy_optical_audit["real_render_verification"] = _update_static_child_verification_from_render(
+                        foliage,verification_package,camera_id=int(moge3_view.colmap_id),
+                        camera_sequence_lookup=camera_sequence_lookup,
+                        volume_optimizer=volume_optimizer,required_sequence_count=1,
+                        canopy_color_audit=True,sky_audit_column=7,
+                        candidate_geometry_gate=auxiliary_verification_geometry_gate)
+                    del verification_package
+                moge3_canopy_optical_audit["independent_measured_support"] = support_trial
         static_replacement_scheduled = (
             static_replacement_candidate_scheduled
         )
@@ -29925,6 +30652,9 @@ def main():
             foliage_active
             and anchors_released
             and (step + 1) > int(args.densify_until_iter)
+            and _surface_replacement_retirement_allowed(
+                args.mature_handoff_surface_policy
+            )
         )
         if replacement_active:
             if replacement_stats is None:
@@ -30062,7 +30792,7 @@ def main():
                 volume_stats,
                 moge3_canopy_optical_growth_gradient,
                 camera_id=(
-                    int(view.colmap_id)
+                    int(moge3_view.colmap_id)
                     if bool(
                         moge3_canopy_optical_audit.get("scheduled", False)
                     )
@@ -30479,8 +31209,13 @@ def main():
             and len(foliage)
             else None
         )
+        detail_opacity_before_step=(foliage.opacity_logits.detach().clone()
+            if args.reconstruction_target=="static" and args.static_detail_opacity_lr_multiplier!=1. else None)
         surface.optimizer.step()
         volume_optimizer.step()
+        if detail_opacity_before_step is not None:
+            rescale_adam_row_displacement(foliage.opacity_logits,detail_opacity_before_step,
+                foliage.static_leaf_mask,args.static_detail_opacity_lr_multiplier)
         static_detail_sh_trust_audit = (
             _enforce_static_detail_sh_trust_region(
                 foliage,
@@ -31440,6 +32175,10 @@ def main():
                     birth_support_sequence_count,
                     birth_audit,
                 ) = static_ray_births.drain(
+                    progress_callback=lambda status: print(json.dumps({
+                        'static_ray_birth_progress': status,
+                        'iteration': step + 1,
+                    }), flush=True),
                     maximum_births=min(
                         effective_birth_limit,
                         max(int(volume_budget) - len(foliage), 0),
@@ -31513,6 +32252,7 @@ def main():
                             maximum_additive_fraction_per_event=(
                                 args.static_ray_birth_additive_mass_fraction_per_event
                             ),
+                            canonical_sequence=static_canonical_sequence,
                         )
                     )
                     volume_stats = _extend_volume_stats_for_births(
@@ -31544,8 +32284,23 @@ def main():
                 canonical_rgb_sequence=static_canonical_sequence,
                 geometry_evidence=geometry,
                 foliage_ray_evidence=foliage_rays,
+                measured_canopy_task_fields=(
+                    fields if args.training_profile == 'static_measured_handoff_quality'
+                    else None
+                ),
                 current_iteration=step + 1,
             )
+            if args.synchronous_measured_split_verification:
+                _finalize_synchronous_measured_splits(
+                    args, foliage, event, current_iteration=step + 1,
+                    verify_children=lambda rows: _verify_measured_split_children_now(
+                        foliage, rows, surface=surface, geometry=geometry, task_fields=fields,
+                        view_by_camera_id=view_by_camera_id,
+                        camera_sequence_lookup=camera_sequence_lookup,
+                        canonical_sequence=static_canonical_sequence,
+                    ),
+                )
+            synchronous_committed_rows = event.pop('_synchronously_committed_split_rows', None)
             rollback_old_rows = event.pop(
                 "_rollback_old_rows",
                 torch.empty(
@@ -31570,6 +32325,8 @@ def main():
                     _zero_volume_optimizer_rows(
                         volume_optimizer, rollback_new_rows
                     )
+                if synchronous_committed_rows is not None:
+                    _zero_volume_optimizer_rows(volume_optimizer, synchronous_committed_rows)
             if args.reconstruction_target == "static":
                 event["static_detail_receiver_materialization"] = (
                     {
@@ -31602,6 +32359,9 @@ def main():
             volume_stats = _reset_volume_stats_after_topology(
                 foliage, volume_stats, new_to_old
             )
+            if synchronous_committed_rows is not None:
+                for key, (_, default) in _PERSISTENT_VOLUME_STAT_DEFAULTS.items():
+                    volume_stats[key][synchronous_committed_rows] = default
             if topology_event is None:
                 topology_event = {
                     "iteration": step + 1,
@@ -31895,7 +32655,9 @@ def main():
                     static_canopy_high_frequency.detach()
                 ),
                 "static_detail_isolated": {
-                    "contract": STATIC_DETAIL_ISOLATED_CONTRACT,
+                    "contract": (STATIC_DETAIL_NATIVE_CONTRACT
+                                 if args.training_profile == 'static_measured_handoff_quality'
+                                 else STATIC_DETAIL_ISOLATED_CONTRACT),
                     "scheduled": bool(
                         static_detail_isolated_scheduled
                     ),
@@ -31905,6 +32667,7 @@ def main():
                     "high_frequency": float(
                         static_detail_isolated_high_frequency.detach()
                     ),
+                    "native_rigid_alpha": float(static_detail_isolated_rigid_alpha.detach()),
                     "every": int(args.static_detail_isolated_every),
                     "weight": float(args.static_detail_isolated_weight),
                     "opacity_gradient_permission": bool(
@@ -32149,6 +32912,7 @@ def main():
                     surface_spatial_confidence_audit
                 ),
                 "mature_surface_policy": mature_surface_policy_audit,
+                "static_detail_opacity_lr_multiplier":float(args.static_detail_opacity_lr_multiplier),
                 "surface_count": len(surface.get_xyz),
                 "surface_track_anchors": int(
                     (surface._track_id >= 0).sum()
@@ -32248,6 +33012,7 @@ def main():
                         "static_canonical_ray": (
                             static_canonical_ray_schedule
                         ),
+                        "moge3_canopy": moge3_canopy_schedule,
                     },
                     "conditioned_visit_counts": (
                         conditioned_visit_counts.copy()
@@ -32467,10 +33232,18 @@ def main():
                 replacement_stats["retired"]
                 & ~surface._protected_flag
             )
+        final_policy_blocked = int(final_remove.sum())
+        final_remove = _final_surface_prune_mask(
+            final_remove, args.mature_handoff_surface_policy,
+            residual_start=rigid_surface_residual_start,
+        )
+        final_policy_blocked -= int(final_remove.sum())
         final_cleanup = {
             "before": len(surface.get_xyz),
             "retired": retired_before_compaction,
             "transparent_unprotected": int(final_remove.sum()),
+            "mature_surface_policy": args.mature_handoff_surface_policy,
+            "immutable_handoff_pruning_blocked": final_policy_blocked,
             "opacity_cull_policy": (
                 "source_aware_continuous_observation_maturity__chart_"
                 "atlas_requires_explicit_receiver_or_contradiction"
@@ -32578,11 +33351,13 @@ def main():
             ),
         }
 
+    from scripts.deployment_teacher_state import deployment_surface_capture, deployment_birth_audit
     teacher_state = output / "hybrid_teacher_state.pth"
     _atomic_torch_save(
         teacher_state,
         {
             "protocol": PROTOCOL,
+            "checkpoint_kind": "render_state_only_nonresumable",
             "iteration": args.iterations,
             "training_profile": args.training_profile,
             "phase_schedule": TRAINING_PROFILES[
@@ -32613,6 +33388,7 @@ def main():
                 "static_skeleton": static_skeleton_schedule,
                 "static_volume": static_volume_schedule,
                 "static_canonical_ray": static_canonical_ray_schedule,
+                "moge3_canopy": moge3_canopy_schedule,
             },
             "conditioned_visit_counts": (
                 conditioned_visit_counts.copy()
@@ -32623,13 +33399,13 @@ def main():
             "implementation_hashes": implementation_hashes,
             "runtime_provenance": runtime_provenance,
             "geometry_evidence_audit": geometry.audit(),
-            "surface": surface.capture(),
+            "surface": deployment_surface_capture(surface.capture()),
             "surface_audit": surface_audit,
             "surface_warmstart": surface_warmstart,
             "chart_surface": chart_surface.capture(),
             "foliage": foliage.capture(),
             "foliage_ray_evidence_audit": foliage_rays.audit(),
-            "static_ray_birth_state": static_ray_births.capture(),
+            "static_ray_birth_audit": deployment_birth_audit(static_ray_births),
             "camera_ownership_contract": {
                 "sequence_lookup": camera_sequence_lookup.cpu(),
                 "frame_lookup": camera_frame_lookup.cpu(),

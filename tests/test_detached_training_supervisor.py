@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -18,6 +19,39 @@ from scripts import supervise_detached_training as supervisor
 
 
 SCRIPT = REPO_ROOT / "scripts" / "supervise_detached_training.py"
+
+
+def test_slow_detached_ack_is_unknown_not_failed_or_started():
+    reader, writer = os.pipe()
+    try:
+        response = supervisor._read_handshake(reader, .01)
+        assert response['status'] == 'launch_unconfirmed'
+        assert response['training_pid'] is None
+        assert 'do not relaunch' in response['detail']
+    finally:
+        os.close(writer)
+
+
+def test_detached_pipe_eof_without_ack_remains_failure():
+    reader, writer = os.pipe()
+    os.close(writer)
+    with pytest.raises(supervisor.SupervisorError, match='closed its launch pipe'):
+        supervisor._read_handshake(reader, .1)
+
+
+def test_large_stored_metadata_is_streamed_but_compressed_expansion_stays_bounded(tmp_path,monkeypatch):
+    monkeypatch.setattr(supervisor,"MAX_PICKLE_BYTES",64)
+    for compression in (zipfile.ZIP_STORED,zipfile.ZIP_DEFLATED):
+        path=tmp_path/f"checkpoint_{compression}.pth"
+        with zipfile.ZipFile(path,"w",compression=compression) as archive:
+            archive.writestr("archive/data.pkl",b"metadata"*100)
+            archive.writestr("archive/version",b"3\n")
+        if compression==zipfile.ZIP_STORED:
+            fingerprint=supervisor._validate_pytorch_zip(path,minimum_checkpoint_bytes=1)
+            assert fingerprint.size==path.stat().st_size
+        else:
+            with pytest.raises(supervisor.SupervisorError,match="unsafe uncompressed size"):
+                supervisor._validate_pytorch_zip(path,minimum_checkpoint_bytes=1)
 
 
 def _write_checkpoint(path: Path, *, corrupt: bool = False) -> None:

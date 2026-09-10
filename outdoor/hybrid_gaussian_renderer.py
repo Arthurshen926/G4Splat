@@ -11,9 +11,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
+import sys
 
 import torch
 from torch import nn
+
+# Editable installations may point to a different worktree's CUDA extension.
+# Bind native imports to this implementation before any lazy render import.
+_LOCAL_RASTER_ROOT = (Path(__file__).resolve().parents[1]
+                      / "2d-gaussian-splatting/submodules/diff-surfel-rasterization")
+sys.path.insert(0, str(_LOCAL_RASTER_ROOT))
 
 PRIMITIVE_HULL = 0
 PRIMITIVE_SFM_TRACK = 1
@@ -4029,7 +4037,10 @@ def render_hybrid(
     from diff_surfel_rasterization import (
         GaussianRasterizationSettings,
         MixedGaussianRasterizer,
+        _C,
     )
+    if Path(_C.__file__).resolve().parent != (_LOCAL_RASTER_ROOT / "diff_surfel_rasterization").resolve():
+        raise RuntimeError("Mixed CUDA extension was loaded from another worktree; restart with this repository's extension path")
     from utils.sh_utils import eval_sh
 
     structural_count = int(len(structural.get_xyz))

@@ -443,7 +443,14 @@ def _validate_pytorch_zip(
                         )
                     if (
                         pickle_member.file_size <= 0
-                        or pickle_member.file_size > MAX_PICKLE_BYTES
+                        or (
+                            pickle_member.file_size > MAX_PICKLE_BYTES
+                            and not (
+                                pickle_member.compress_type == zipfile.ZIP_STORED
+                                and pickle_member.file_size == pickle_member.compress_size
+                                and pickle_member.file_size <= int(before.st_size)
+                            )
+                        )
                     ):
                         raise SupervisorError(
                             "Checkpoint data.pkl has an unsafe uncompressed size: "
@@ -455,6 +462,10 @@ def _validate_pytorch_zip(
                         )
                     if pickle_member.flag_bits & 0x1 or version_member.flag_bits & 0x1:
                         raise SupervisorError("Encrypted checkpoint ZIP is unsupported")
+                    # Plain-list candidate metadata can legitimately exceed
+                    # 256 MiB. Uncompressed, physically file-bounded members
+                    # are streamed in 1 MiB chunks, not loaded/unpickled. Keep
+                    # the expansion cap for compressed metadata (ZIP bombs).
                     # Reading to EOF makes zipfile verify CRC for the two
                     # serialization metadata members without loading tensor
                     # storage (and therefore without risking GPU/host OOM).
@@ -1184,6 +1195,7 @@ def _daemon_entry(config: SupervisorConfig, handshake_descriptor: int) -> None:
 def _read_handshake(descriptor: int, timeout_seconds: float) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     chunks: list[bytes] = []
+    reached_eof = False
     try:
         while time.monotonic() < deadline:
             ready, _, _ = select.select(
@@ -1193,6 +1205,7 @@ def _read_handshake(descriptor: int, timeout_seconds: float) -> dict[str, Any]:
                 break
             chunk = os.read(descriptor, 4096)
             if not chunk:
+                reached_eof = True
                 break
             chunks.append(chunk)
             if b"\n" in chunk:
@@ -1200,8 +1213,14 @@ def _read_handshake(descriptor: int, timeout_seconds: float) -> dict[str, Any]:
     finally:
         os.close(descriptor)
     if not chunks:
+        if not reached_eof:
+            # The daemon is detached already. A slow checkpoint/NFS read can
+            # delay its acknowledgement without preventing a later launch.
+            # Never report this as a definite failure that invites a retry.
+            return {"status": "launch_unconfirmed", "training_pid": None,
+                    "detail": "Acknowledgement timed out; detached supervisor may still launch. Check heartbeat; do not relaunch."}
         raise SupervisorError(
-            "Detached supervisor did not acknowledge launch before timeout"
+            "Detached supervisor closed its launch pipe without acknowledgement"
         )
     raw = b"".join(chunks).split(b"\n", 1)[0]
     try:
@@ -1222,7 +1241,12 @@ def _double_fork(config: SupervisorConfig) -> dict[str, Any]:
         if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
             os.close(read_descriptor)
             raise SupervisorError("First detach fork failed")
-        return _read_handshake(read_descriptor, config.launch_timeout_seconds)
+        response = _read_handshake(read_descriptor, config.launch_timeout_seconds)
+        if response.get("status") == "launch_unconfirmed":
+            response.update(heartbeat=str(config.heartbeat_file),
+                            command_sha256=config.command_sha256,
+                            training_log=str(config.training_log))
+        return response
 
     os.close(read_descriptor)
     try:
@@ -1477,6 +1501,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"supervisor launch failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(response, sort_keys=True))
+    if response.get("status") == "launch_unconfirmed":
+        # Successful dispatch is not confirmation of running training. The
+        # explicit JSON status and durable heartbeat remain authoritative.
+        print(response["detail"], file=sys.stderr)
+        return 0
     if response.get("status") != "started":
         print(
             "supervisor launch failed: " + str(response.get("error", response)),

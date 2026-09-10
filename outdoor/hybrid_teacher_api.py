@@ -172,6 +172,21 @@ SUPPORTED_TEACHER_PROTOCOLS = {
     "unified_outdoor_mixed_teacher_v1",
 }
 
+INTRINSIC_QUERY_REPAIR_PREDECESSOR = {
+    "hybrid_renderer": "b186024839bffe30e545a617d2aa624902c734324351c83c497242ea9d8395e4",
+    "mixed_forward_cuda": "baf34231c62e0188a3eada69d90127277d3f78be974fb8c4da897e6ab759ce7d",
+    "mixed_backward_cuda": "ba3f11c426f0c9dd2ec3c78628f5782a967f4015e8f03c472f4cdff9354557c4",
+    "mixed_extension_source_tree": "8d3be082abd3637de3c37849286a08e3f2597fee8b5056d35e2a9d845a4f8fe1",
+    "mixed_extension_binary": "2cdce859ca3b31ea6489a726c42b93380f28adbacdf19787698a1a87f63ca54f",
+}
+INTRINSIC_QUERY_REPAIR_TARGET = {
+    "hybrid_renderer": "daf1256ef309627ba45e80552dd52435c15d80f0e9a6d2ed8e57918cf85a9eef",
+    "mixed_forward_cuda": "c8a3f33b832acdcddb5ae3b84396a2fc674c904dedd76bd0f6eea0154c99bd2e",
+    "mixed_backward_cuda": "b33e86b85bd3e0dfe4c76a5e01365a703ef016996731f93dcc4fa01ac9fd559f",
+    "mixed_extension_source_tree": "6147e02b7e3bb68ecb073aa3601ecbaa57b9fa904c19e4a63875f42b6d618c6c",
+    "mixed_extension_binary": "ffc174016c3f4775fc720bd6ccad0b7f1e4386a380b2f2c2fb2bdf9ce1fb3d9b",
+}
+
 MIXED_PIXEL_DEPTH_REPAIR_PREDECESSOR = {
     "protocol": (
         "cambridge_native_hybrid_teacher_v95_atomic_split_intrinsic_occlusion"
@@ -964,6 +979,7 @@ def _validate_render_implementation(
     allow_static_foliage_render_repair: bool = False,
     allow_static_optical_handoff_repair: bool = False,
     allow_mixed_pixel_depth_repair: bool = False,
+    allow_intrinsic_depth_query_repair: bool = False,
 ) -> dict:
     """Reject silently reinterpreting a state with different render code."""
     expected = state.get("implementation_hashes")
@@ -1038,6 +1054,20 @@ def _validate_render_implementation(
         if expected.get(name) != actual:
             changed.append(name)
     causal_repair = None
+    if (
+        allow_intrinsic_depth_query_repair
+        and state.get("protocol") == "cambridge_native_hybrid_teacher_v119_material_local_canopy_ownership"
+        and set(changed) == set(INTRINSIC_QUERY_REPAIR_TARGET)
+        and all(expected.get(k) == v for k, v in INTRINSIC_QUERY_REPAIR_PREDECESSOR.items())
+        and all(actual_hashes.get(k) == v for k, v in INTRINSIC_QUERY_REPAIR_TARGET.items())
+    ):
+        causal_repair = {
+            "kind": "intrinsic_depth_query_independent_of_rgb_termination",
+            "state_hashes": INTRINSIC_QUERY_REPAIR_PREDECESSOR,
+            "runtime_hashes": INTRINSIC_QUERY_REPAIR_TARGET,
+            "reason": "explicit diagnostic migration; RGB unchanged, intrinsic query and gradient corrected",
+        }
+        changed.clear()
     deployment_static = state.get("training_contract", {}).get(
         "deployment_static_contract", {}
     )
@@ -1174,7 +1204,10 @@ def _validate_render_implementation(
         )
     return {
         "status": (
-            "mixed_pixel_depth_order_causal_repair"
+            "intrinsic_depth_query_causal_repair"
+            if causal_repair is not None
+            and causal_repair.get("kind") == "intrinsic_depth_query_independent_of_rgb_termination"
+            else "mixed_pixel_depth_order_causal_repair"
             if causal_repair is not None
             and causal_repair.get("kind") == "mixed_pixel_depth_order"
             else "static_foliage_render_causal_repair"
@@ -1758,6 +1791,7 @@ def load_hybrid_teacher(
     allow_static_foliage_render_repair: bool = False,
     allow_static_optical_handoff_repair: bool = False,
     allow_mixed_pixel_depth_repair: bool = False,
+    allow_intrinsic_depth_query_repair: bool = False,
 ) -> HybridTeacher:
     """Load a Teacher state. No student conversion or COLMAP geometry is used."""
     try:
@@ -1781,6 +1815,7 @@ def load_hybrid_teacher(
             allow_static_optical_handoff_repair
         ),
         allow_mixed_pixel_depth_repair=allow_mixed_pixel_depth_repair,
+        allow_intrinsic_depth_query_repair=allow_intrinsic_depth_query_repair,
     )
     state["_render_implementation_validation"] = implementation_validation
     surface = GaussianModel(sh_degree)

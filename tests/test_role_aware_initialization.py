@@ -7,6 +7,22 @@ import torch
 from PIL import Image
 from scipy.spatial import cKDTree
 
+
+def test_moge3_initialization_excludes_distortion_from_scale_and_canopy():
+    from outdoor.role_aware_initialization import _moge3_semantic_support
+    channels = [np.ones((2, 4), dtype=bool) for _ in range(4)]
+    channels[3][1] = False
+    channels[2][:, 0] = False
+    channels[0][:, 1] = False
+    channels[1][:, 2] = False
+    rigid, canopy = _moge3_semantic_support(channels)
+    assert rigid.sum() == canopy.sum() == 1
+    assert rigid[0, 3] and canopy[1, 3]
+    with pytest.raises(ValueError, match="four"):
+        _moge3_semantic_support(channels[:3])
+    with pytest.raises(ValueError, match="raster"):
+        _moge3_semantic_support(channels[:3] + [np.ones((1, 4))])
+
 from outdoor.chart_surface_model import (
     ChartSurfaceModel,
     LearnableInverseDepthAtlas,

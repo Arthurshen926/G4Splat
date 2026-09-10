@@ -15,6 +15,22 @@ from outdoor.static_foliage import fuse_sequence_evidence_into_static_leaves
 from outdoor.static_ray_birth import StaticRayBirthAccumulator
 
 
+def test_unknown_birth_color_remains_finite_and_does_not_grant_verification():
+    payload,_=fuse_sequence_evidence_into_static_leaves(_payload())
+    foliage=VolumetricFoliageModel(1,device='cpu')
+    foliage.initialize_from_volume_state(payload)
+    before={name:value.detach().clone() for name,value in foliage.named_parameters()}
+    count=len(foliage)
+    foliage.append_static_ray_births(torch.tensor([[.15,.15,.18]]),
+        colors=torch.full((1,3),float('nan')),support_camera_ids=torch.tensor([[1,2]]),
+        support_sequence_count=torch.tensor([1]),birth_iteration=10)
+    assert torch.isfinite(foliage.features[-1]).all()
+    assert foliage.verification_state[-1]==VERIFICATION_UNVERIFIED
+    assert foliage.verified_camera_count[-1]==0
+    for name,value in foliage.named_parameters():
+        torch.testing.assert_close(value[:count],before[name],rtol=0,atol=0)
+
+
 def _payload():
     # Two envelope cells, one skeleton, four associated observations and two
     # ownerless cross-sequence hit proposals in the same 15 cm voxel.
@@ -534,6 +550,95 @@ def test_uncovered_hits_require_cross_sequence_consensus_before_birth():
     assert audit["born"] == 1
 
 
+def test_repeated_camera_cannot_bias_birth_center_or_priority_after_resume():
+    accumulator = StaticRayBirthAccumulator(voxel_size=1.0,
+                                           visual_hull_voxel_size=1.0)
+    first = {
+        "centers": torch.tensor([[0.1, 0.1, 0.1]]),
+        "colors": torch.tensor([[0.2, 0.2, 0.2]]),
+        "confidence": torch.tensor([1.0]), "camera_id": 0,
+    }
+    accumulator.add(first, sequence_id="seq0")
+    state = accumulator.capture()
+    restored = StaticRayBirthAccumulator(voxel_size=1.0,
+                                        visual_hull_voxel_size=1.0)
+    restored.restore(state)
+    repeated = dict(first, centers=torch.tensor([[0.9, 0.9, 0.9]]))
+    for _ in range(100):
+        restored.add(repeated, sequence_id="seq0")
+    cell = restored.cells[(0, 0, 0)]
+    assert cell.weight == 1.0
+    assert len(cell.cameras) == 1
+    assert restored.drain(maximum_births=1, minimum_sequences=1)[4]["born"] == 0
+    restored.add(dict(repeated, camera_id=1), sequence_id="seq0")
+    centers, _, _, _, audit = restored.drain(maximum_births=1, minimum_sequences=1)
+    assert audit["born"] == 1
+    torch.testing.assert_close(centers, torch.tensor([[0.5, 0.5, 0.5]]))
+
+
+def test_fine_birth_grid_preserves_distinct_leaves_without_boundary_duplicates():
+    def observe(accumulator, point):
+        center = torch.tensor([point])
+        for camera, x in ((1, 0.), (2, .1)):
+            origin = torch.tensor([[x, 0., 0.]])
+            delta = center-origin
+            depth = delta.norm(dim=1)
+            accumulator.add(dict(centers=center, confidence=torch.ones(1), camera_id=camera,
+                origins=origin, directions=delta/depth[:, None],
+                hit_start=depth-.001, hit_end=depth+.001), sequence_id="seq2")
+        return accumulator.drain(maximum_births=10, minimum_sequences=1)
+
+    coarse = StaticRayBirthAccumulator(voxel_size=.04, visual_hull_voxel_size=.30)
+    assert observe(coarse, [.06, .06, 1.06])[4]["born"] == 1
+    assert observe(coarse, [.24, .24, 1.06])[4]["born"] == 0
+    fine = StaticRayBirthAccumulator(voxel_size=.04, visual_hull_voxel_size=.08,
+                                     minimum_birth_separation=.04)
+    assert observe(fine, [.06, .06, 1.06])[4]["born"] == 1
+    result = observe(fine, [.24, .24, 1.06])
+    assert result[4]["born"] == 1
+    assert result[4]["duplicate_center_cells"] >= 1
+    restored = StaticRayBirthAccumulator(voxel_size=.04, visual_hull_voxel_size=.08,
+                                         minimum_birth_separation=.04)
+    restored.restore(fine.capture())
+    assert observe(restored, [.241, .241, 1.061])[4]["born"] == 0
+    assert observe(restored, [.42, .42, 1.06])[4]["born"] == 1
+    wrong = StaticRayBirthAccumulator(voxel_size=.04, visual_hull_voxel_size=.08)
+    with pytest.raises(RuntimeError, match="separation"):
+        wrong.restore(fine.capture())
+
+
+def test_first_hit_uncertainty_does_not_create_a_chain_of_material():
+    def add_pair(accumulator, point, cameras=(1,2), first_hit=True):
+        center = torch.tensor([point])
+        for camera,x in zip(cameras,(0.,.2)):
+            origin = torch.tensor([[x,0.,0.]])
+            delta = center-origin
+            depth = delta.norm(dim=1)
+            accumulator.add(dict(centers=center,confidence=torch.ones(1),camera_id=camera,
+                origins=origin,directions=delta/depth[:,None],hit_start=depth-.3,
+                hit_end=depth+.3,single_first_hit=first_hit),sequence_id="seq2")
+        return accumulator.drain(maximum_births=100,minimum_sequences=1)
+    def create():
+        return StaticRayBirthAccumulator(voxel_size=.04,visual_hull_voxel_size=.08,
+                                         minimum_birth_separation=.04)
+    legacy = create()
+    assert add_pair(legacy,[.18,.18,5.1],first_hit=False)[4]["born"] > 1
+    fixed = create()
+    result = add_pair(fixed,[.18,.18,5.1])
+    assert result[4]["born"] == 1
+    assert abs(float(result[0][0,2])-5.1) < .08
+    assert result[4]["spent_first_hit_witness_cells"] > 0
+    restored = create()
+    restored.restore(fixed.capture())
+    assert add_pair(restored,[.18,.18,5.1])[4]["born"] == 0
+    # New cameras observing that same local hit associate with it rather
+    # than spending their uncertainty on another point further down the ray.
+    assert add_pair(restored,[.18,.18,5.1],cameras=(3,4))[4]["born"] == 0
+    assert len(restored.consumed_first_hit_witnesses) == 4
+    # The same original cameras can still support a DIFFERENT pixel/leaf.
+    assert add_pair(restored,[.58,.58,5.1])[4]["born"] == 1
+
+
 def test_scene_snapshot_birth_accepts_two_cameras_in_canonical_sequence():
     accumulator = StaticRayBirthAccumulator(voxel_size=0.15)
     for camera_id, center in (
@@ -558,6 +663,40 @@ def test_scene_snapshot_birth_accepts_two_cameras_in_canonical_sequence():
     assert int((cameras[0] >= 0).sum()) == 2
     assert int(sequences[0]) == 1
     assert audit["born"] == 1
+
+
+def test_same_voxel_disjoint_depth_intervals_cannot_authorize_birth():
+    accumulator = StaticRayBirthAccumulator()
+    for camera, (lo, hi) in enumerate([(3.01, 3.03), (3.22, 3.24)]):
+        accumulator.add({
+            "centers": torch.tensor([[0., 0., (lo + hi) / 2]]),
+            "confidence": torch.ones(1), "camera_id": camera,
+            "origins": torch.zeros(1, 3),
+            "directions": torch.tensor([[0., 0., 1.]]),
+            "hit_start": torch.tensor([lo]), "hit_end": torch.tensor([hi]),
+        }, sequence_id="seq2")
+    restored = StaticRayBirthAccumulator()
+    restored.restore(accumulator.capture())
+    centers, _, _, _, audit = restored.drain(maximum_births=8, minimum_sequences=1)
+    assert len(centers) == 0
+    assert audit["depth_consensus_rejected_cells"] == 1
+    assert not restored.consumed_visual_hull_cells
+
+
+def test_overlapping_intervals_project_mean_into_actual_overlap():
+    accumulator = StaticRayBirthAccumulator()
+    for camera, (lo, hi) in enumerate([(3.01, 3.20), (3.19, 3.22)]):
+        accumulator.add({
+            "centers": torch.tensor([[0., 0., (lo + hi) / 2]]),
+            "confidence": torch.ones(1), "camera_id": camera,
+            "origins": torch.zeros(1, 3),
+            "directions": torch.tensor([[0., 0., 1.]]),
+            "hit_start": torch.tensor([lo]), "hit_end": torch.tensor([hi]),
+        }, sequence_id="seq2")
+    centers, _, _, _, audit = accumulator.drain(maximum_births=8, minimum_sequences=1)
+    assert len(centers) == 1
+    assert 3.19 - 1e-5 <= float(centers[0, 2]) <= 3.20 + 1e-5
+    assert audit["depth_consensus_rejected_cells"] == 0
 
 
 def test_cross_sequence_hit_intervals_form_visual_hull_birth():
@@ -667,7 +806,7 @@ def test_consumed_ray_birth_cells_survive_capture_and_legacy_recovery():
     add(1, "seq1")
     assert len(producer.drain(maximum_births=1)[0]) == 1
     state = producer.capture()
-    assert state["version"] == "static-ray-birth-accumulator-v5"
+    assert state["version"] == "static-ray-birth-accumulator-v6"
 
     restored = StaticRayBirthAccumulator(voxel_size=0.15)
     restored.restore(state)

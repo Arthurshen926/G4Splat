@@ -195,6 +195,46 @@ mixedRenderBackwardCUDA(
 	float last_dL_dT = 0;
 	const float ddelx_dx = 0.5f * W;
 	const float ddely_dy = 0.5f * H;
+	// Replay intrinsic query contributors independently of n_contrib and
+	// RGB transmittance. A hidden hit still owns its interval derivative.
+	if (query_valid && (dL_dvolume_prehit_alpha != 0.0f
+			|| dL_dvolume_hit_interval_alpha != 0.0f))
+	{
+		for (uint32_t offset = range.x; offset < range.y; ++offset)
+		{
+			const uint32_t id = point_list[offset];
+			if (id < static_cast<uint32_t>(surface_count)) continue;
+			const MixedPrimitiveData primitive = mixedLoadPrimitive(
+				id, surface_count, points_xy, opacities,
+				surface_transMats, surface_normals, volume_conic, depths);
+			const MixedPixelCandidate candidate = mixedEvaluateCandidate(
+				primitive, surface_count, pix, pixf, surface_gate_indices,
+				surface_gate_atlas, gate_count, gate_size);
+			if (!candidate.valid) continue;
+			float grad = 0.0f;
+			if (candidate.depth < query_near)
+				grad = volume_prehit_T_final * dL_dvolume_prehit_alpha;
+			else if (candidate.depth <= query_far)
+				grad = volume_hit_interval_T_final * dL_dvolume_hit_interval_alpha;
+			if (grad == 0.0f) continue;
+			const float4 shape = primitive.shape;
+			const float G = candidate.G;
+			if (shape.w * G * candidate.gate_value >= 0.99f) continue;
+			grad /= max(1.0f - candidate.alpha, 1.0e-6f);
+			const float gradG = shape.w * candidate.gate_value * grad;
+			const float2 d = candidate.d;
+			const float gdx = G * d.x, gdy = G * d.y;
+			atomicAdd(&dL_dmean2D[id].x,
+				gradG * (-gdx * shape.x - gdy * shape.y) * ddelx_dx);
+			atomicAdd(&dL_dmean2D[id].y,
+				gradG * (-gdy * shape.z - gdx * shape.y) * ddely_dy);
+			const int volume_id = id - surface_count;
+			atomicAdd(&dL_dvolume_conic[volume_id].x, -0.5f * gdx * d.x * gradG);
+			atomicAdd(&dL_dvolume_conic[volume_id].y, -0.5f * gdx * d.y * gradG);
+			atomicAdd(&dL_dvolume_conic[volume_id].w, -0.5f * gdy * d.y * gradG);
+			atomicAdd(&dL_dopacity[id], G * candidate.gate_value * grad);
+		}
+	}
 
 	// Replay the forward order in exact, bounded batches.  Capacity controls
 	// scan granularity, not the number of supported overlapping surfaces.
@@ -440,26 +480,6 @@ mixedRenderBackwardCUDA(
 			}
 
 			dL_dalpha *= T;
-			// Conditional volume optical alpha in detached target-depth
-			// intervals.  Membership is not differentiated, while opacity and
-			// footprint receive the exact product-transmittance derivative.
-			if (!is_surface && query_valid)
-			{
-				const float inv_one_minus_alpha =
-					1.0f / max(1.0f - alpha, 1.0e-6f);
-				if (depth < query_near)
-				{
-					dL_dalpha += volume_prehit_T_final
-						* inv_one_minus_alpha
-						* dL_dvolume_prehit_alpha;
-				}
-				else if (depth <= query_far)
-				{
-					dL_dalpha += volume_hit_interval_T_final
-						* inv_one_minus_alpha
-						* dL_dvolume_hit_interval_alpha;
-				}
-			}
 			last_alpha = alpha;
 			float bg_dot_dpixel = 0;
 			for (int ch = 0; ch < C; ++ch)

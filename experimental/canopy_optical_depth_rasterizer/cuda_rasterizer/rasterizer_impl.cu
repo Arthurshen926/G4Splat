@@ -1,0 +1,1025 @@
+/*
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ */
+
+#include "rasterizer_impl.h"
+#include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <numeric>
+#include <cuda.h>
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <cub/cub.cuh>
+#include <cub/device/device_radix_sort.cuh>
+#define GLM_FORCE_CUDA
+#include <glm/glm.hpp>
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+namespace cg = cooperative_groups;
+
+#include "auxiliary.h"
+#include "forward.h"
+#include "backward.h"
+#include "mixed_backward.h"
+
+// Helper function to find the next-highest bit of the MSB
+// on the CPU.
+uint32_t getHigherMsb(uint32_t n)
+{
+	uint32_t msb = sizeof(n) * 4;
+	uint32_t step = msb;
+	while (step > 1)
+	{
+		step /= 2;
+		if (n >> msb)
+			msb += step;
+		else
+			msb -= step;
+	}
+	if (n >> msb)
+		msb++;
+	return msb;
+}
+
+// Wrapper method to call auxiliary coarse frustum containment test.
+// Mark all Gaussians that pass it.
+__global__ void checkFrustum(int P,
+	const float* orig_points,
+	const float* viewmatrix,
+	const float* projmatrix,
+	bool* present)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	float3 p_view;
+	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
+}
+
+// Generates one key/value pair for all Gaussian / tile overlaps. 
+// Run once per Gaussian (1:N mapping).
+__global__ void duplicateWithKeys(
+	int P,
+	const float2* points_xy,
+	const float* depths,
+	const uint32_t* offsets,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	int* radii,
+	dim3 grid)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	// Generate no key/value pair for invisible Gaussians
+	if (radii[idx] > 0)
+	{
+		// Find this Gaussian's offset in buffer for writing keys/values.
+		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		uint2 rect_min, rect_max;
+
+		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+
+		// For each tile that the bounding rect overlaps, emit a 
+		// key/value pair. The key is |  tile ID  |      depth      |,
+		// and the value is the ID of the Gaussian. Sorting the values 
+		// with this key yields Gaussian IDs in a list, such that they
+		// are first sorted by tile and then by depth. 
+		for (int y = rect_min.y; y < rect_max.y; y++)
+		{
+			for (int x = rect_min.x; x < rect_max.x; x++)
+			{
+				uint64_t key = y * grid.x + x;
+				key <<= 32;
+				key |= *((uint32_t*)&depths[idx]);
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
+				off++;
+			}
+		}
+	}
+}
+
+// Return a conservative depth interval for one surfel over one image tile.
+// Ray/plane depth is fractional-linear in image coordinates. When the
+// projective denominator has one sign over the tile, its extrema occur at the
+// four corners. The low-pass fallback uses Tw.z, so include that value too.
+// Horizon ambiguity falls back to the complete finite 3-sigma patch range;
+// mixed preprocessing has already rejected patches whose own support crosses
+// the camera plane.
+__device__ __forceinline__ float2 mixedSurfaceTileDepthInterval(
+	int id,
+	int tile_x,
+	int tile_y,
+	int width,
+	int height,
+	const float* surface_transMats)
+{
+	const float3 Tu = {
+		surface_transMats[9 * id + 0],
+		surface_transMats[9 * id + 1],
+		surface_transMats[9 * id + 2]};
+	const float3 Tv = {
+		surface_transMats[9 * id + 3],
+		surface_transMats[9 * id + 4],
+		surface_transMats[9 * id + 5]};
+	const float3 Tw = {
+		surface_transMats[9 * id + 6],
+		surface_transMats[9 * id + 7],
+		surface_transMats[9 * id + 8]};
+	const float x0 = float(tile_x * BLOCK_X);
+	const float y0 = float(tile_y * BLOCK_Y);
+	const float x1 = min(float(width - 1), x0 + float(BLOCK_X - 1));
+	const float y1 = min(float(height - 1), y0 + float(BLOCK_Y - 1));
+	const float xs[4] = {x0, x1, x0, x1};
+	const float ys[4] = {y0, y0, y1, y1};
+	float minimum = Tw.z;
+	float maximum = Tw.z;
+	float denominator_sign = 0.0f;
+	bool bounded = isfinite(Tw.z);
+	for (int corner = 0; corner < 4; ++corner)
+	{
+		const float3 k = xs[corner] * Tw - Tu;
+		const float3 l = ys[corner] * Tw - Tv;
+		const float3 p = cross(k, l);
+		if (!isfinite(p.z) || fabsf(p.z) < 1.0e-8f)
+		{
+			bounded = false;
+			break;
+		}
+		const float sign = p.z > 0.0f ? 1.0f : -1.0f;
+		if (corner == 0)
+			denominator_sign = sign;
+		else if (sign != denominator_sign)
+		{
+			bounded = false;
+			break;
+		}
+		const float u = p.x / p.z;
+		const float v = p.y / p.z;
+		const float depth = u * Tw.x + v * Tw.y + Tw.z;
+		if (!isfinite(depth))
+		{
+			bounded = false;
+			break;
+		}
+		minimum = min(minimum, depth);
+		maximum = max(maximum, depth);
+	}
+	if (!bounded)
+	{
+		const float span = 3.0f * (fabsf(Tw.x) + fabsf(Tw.y));
+		minimum = Tw.z - span;
+		maximum = Tw.z + span;
+	}
+	const float padding = 1.0e-5f
+		* max(1.0f, max(fabsf(minimum), fabsf(maximum)));
+	return {
+		max(near_n, minimum - padding),
+		max(near_n, maximum + padding)};
+}
+
+// Mixed 2D/3D binning sorts by a conservative lower depth bound rather than
+// by a primitive or tile-centre sample. A later component pass groups every
+// overlapping interval; only primitives inside one component can exchange
+// order at a pixel, and forward/backward sort that component by exact ray
+// depth. Volumes have the degenerate interval [centre_z, centre_z].
+__global__ void mixedDuplicateWithKeys(
+	int primitive_count,
+	int surface_count,
+	int width,
+	int height,
+	const float2* points_xy,
+	const float* center_depths,
+	const float* surface_transMats,
+	const uint32_t* offsets,
+	uint64_t* keys_unsorted,
+	uint64_t* upper_keys_unsorted,
+	uint32_t* values_unsorted,
+	int* radii,
+	dim3 grid)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= primitive_count || radii[idx] <= 0)
+		return;
+
+	uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+	uint2 rect_min, rect_max;
+	getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+	for (int y = rect_min.y; y < rect_max.y; ++y)
+	{
+		for (int x = rect_min.x; x < rect_max.x; ++x)
+		{
+			float key_depth = center_depths[idx];
+			float upper_depth = center_depths[idx];
+			if (idx < surface_count)
+			{
+				const float2 interval = mixedSurfaceTileDepthInterval(
+					idx, x, y, width, height, surface_transMats);
+				key_depth = interval.x;
+				upper_depth = interval.y;
+			}
+			uint64_t key = y * grid.x + x;
+			key <<= 32;
+			key |= *((uint32_t*)&key_depth);
+			uint64_t upper_key = y * grid.x + x;
+			upper_key <<= 32;
+			upper_key |= *((uint32_t*)&upper_depth);
+			keys_unsorted[off] = key;
+			upper_keys_unsorted[off] = upper_key;
+			values_unsorted[off] = idx;
+			++off;
+		}
+	}
+}
+
+// Mark the end of every connected conservative depth-interval component.
+// One thread owns one tile, so component construction is deterministic and
+// its boundary array is replayed unchanged by the backward pass.
+__global__ void identifyMixedIntervalGroups(
+	int tile_count,
+	int surface_count,
+	int width,
+	int height,
+	dim3 grid,
+	const uint2* ranges,
+	const uint64_t* sorted_keys,
+	const uint32_t* point_list,
+	const float* center_depths,
+	const float* surface_transMats,
+	uint8_t* group_end)
+{
+	const int tile = cg::this_grid().thread_rank();
+	if (tile >= tile_count)
+		return;
+	const uint2 range = ranges[tile];
+	if (range.x >= range.y)
+		return;
+	const int tile_x = tile % int(grid.x);
+	const int tile_y = tile / int(grid.x);
+	uint32_t cursor = range.x;
+	while (cursor < range.y)
+	{
+		const uint32_t first_id = point_list[cursor];
+		float component_max = first_id < uint32_t(surface_count)
+			? mixedSurfaceTileDepthInterval(
+				int(first_id), tile_x, tile_y, width, height,
+				surface_transMats).y
+			: center_depths[first_id];
+		++cursor;
+		while (cursor < range.y)
+		{
+			const uint32_t lower_bits = uint32_t(sorted_keys[cursor]);
+			const float lower = __uint_as_float(lower_bits);
+			if (lower > component_max)
+				break;
+			const uint32_t id = point_list[cursor];
+			const float upper = id < uint32_t(surface_count)
+				? mixedSurfaceTileDepthInterval(
+					int(id), tile_x, tile_y, width, height,
+					surface_transMats).y
+				: center_depths[id];
+			component_max = max(component_max, upper);
+			++cursor;
+		}
+		group_end[cursor - 1] = uint8_t(1);
+	}
+}
+
+// Check keys to see if it is at the start/end of one tile's range in 
+// the full sorted list. If yes, write start/end of this tile. 
+// Run once per instanced (duplicated) Gaussian ID.
+__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= L)
+		return;
+
+	// Read tile ID from key. Update start/end of tile range if at limit.
+	uint64_t key = point_list_keys[idx];
+	uint32_t currtile = key >> 32;
+	if (idx == 0)
+		ranges[currtile].x = 0;
+	else
+	{
+		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+		if (currtile != prevtile)
+		{
+			ranges[prevtile].y = idx;
+			ranges[currtile].x = idx;
+		}
+	}
+	if (idx == L - 1)
+		ranges[currtile].y = L;
+}
+
+// Mark Gaussians as visible/invisible, based on view frustum testing
+void CudaRasterizer::Rasterizer::markVisible(
+	int P,
+	float* means3D,
+	float* viewmatrix,
+	float* projmatrix,
+	bool* present)
+{
+	checkFrustum << <(P + 255) / 256, 256 >> > (
+		P,
+		means3D,
+		viewmatrix, projmatrix,
+		present);
+}
+
+CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
+{
+	GeometryState geom;
+	obtain(chunk, geom.depths, P, 128);
+	obtain(chunk, geom.clamped, P * 3, 128);
+	obtain(chunk, geom.internal_radii, P, 128);
+	obtain(chunk, geom.means2D, P, 128);
+	obtain(chunk, geom.transMat, P * 9, 128);
+	obtain(chunk, geom.normal_opacity, P, 128);
+	obtain(chunk, geom.rgb, P * 3, 128);
+	obtain(chunk, geom.tiles_touched, P, 128);
+	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
+	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
+	obtain(chunk, geom.point_offsets, P, 128);
+	return geom;
+}
+
+CudaRasterizer::MixedGeometryState CudaRasterizer::MixedGeometryState::fromChunk(
+	char*& chunk,
+	size_t surface_count,
+	size_t volume_count)
+{
+	const size_t primitive_count = surface_count + volume_count;
+	MixedGeometryState geom;
+	obtain(chunk, geom.depths, primitive_count, 128);
+	obtain(chunk, geom.internal_radii, primitive_count, 128);
+	obtain(chunk, geom.means2D, primitive_count, 128);
+	obtain(chunk, geom.surface_transMat, surface_count * 9, 128);
+	obtain(chunk, geom.surface_normals, surface_count, 128);
+	obtain(chunk, geom.volume_cov3D, volume_count * 6, 128);
+	obtain(chunk, geom.volume_conic, volume_count, 128);
+	obtain(chunk, geom.tiles_touched, primitive_count, 128);
+	cub::DeviceScan::InclusiveSum(
+		nullptr,
+		geom.scan_size,
+		geom.tiles_touched,
+		geom.tiles_touched,
+		primitive_count);
+	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
+	obtain(chunk, geom.point_offsets, primitive_count, 128);
+	return geom;
+}
+
+CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
+{
+	ImageState img;
+	obtain(chunk, img.accum_alpha, N * 3, 128);
+	obtain(chunk, img.n_contrib, N * 2, 128);
+	obtain(chunk, img.ranges, N, 128);
+	return img;
+}
+
+CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
+{
+	BinningState binning;
+	obtain(chunk, binning.point_list, P, 128);
+	obtain(chunk, binning.point_list_unsorted, P, 128);
+	obtain(chunk, binning.point_list_keys, P, 128);
+	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
+	cub::DeviceRadixSort::SortPairs(
+		nullptr, binning.sorting_size,
+		binning.point_list_keys_unsorted, binning.point_list_keys,
+		binning.point_list_unsorted, binning.point_list, P);
+	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
+	return binning;
+}
+
+// Forward rendering procedure for differentiable rasterization
+// of Gaussians.
+int CudaRasterizer::Rasterizer::forward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* transMat_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	float* out_color,
+	float* out_others,
+	int* radii,
+	bool debug)
+{
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// Dynamically resize image-based auxiliary buffers during training
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	{
+		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	CHECK_CUDA(FORWARD::preprocess(
+		P, D, M,
+		means3D,
+		(glm::vec2*)scales,
+		scale_modifier,
+		(glm::vec4*)rotations,
+		opacities,
+		shs,
+		geomState.clamped,
+		transMat_precomp,
+		colors_precomp,
+		viewmatrix, projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		radii,
+		geomState.means2D,
+		geomState.depths,
+		geomState.transMat,
+		geomState.rgb,
+		geomState.normal_opacity,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered
+	), debug)
+
+	// Compute prefix sum over full list of touched tile counts by Gaussians
+	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+	int num_rendered;
+	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+	// and corresponding dublicated Gaussian indices to be sorted
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid)
+	CHECK_CUDA(, debug)
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	// Sort complete list of (duplicated) Gaussian indices by keys
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit), debug)
+
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	// Identify start and end of per-tile workloads in sorted list
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	CHECK_CUDA(, debug)
+
+	// Let each tile blend its range of Gaussians independently in parallel
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* transMat_ptr = transMat_precomp != nullptr ? transMat_precomp : geomState.transMat;
+	CHECK_CUDA(FORWARD::render(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		focal_x, focal_y,
+		geomState.means2D,
+		feature_ptr,
+		transMat_ptr,
+		geomState.depths,
+		geomState.normal_opacity,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		background,
+		out_color,
+		out_others), debug)
+
+	return num_rendered;
+}
+
+int CudaRasterizer::Rasterizer::mixedForward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int surface_count,
+	const int volume_count,
+	const float* background,
+	const int width,
+	const int height,
+	const float* surface_means3D,
+	const float* surface_scales,
+	const float* surface_rotations,
+	const float* volume_means3D,
+	const float* volume_scales,
+	const float* volume_rotations,
+	const float* colors,
+	const float* opacities,
+	const int* surface_gate_indices,
+	const float* surface_gate_atlas,
+	const int gate_count,
+	const int gate_size,
+	const float* depth_query_bounds,
+	const bool has_depth_query,
+	const float scale_modifier,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const bool prefiltered,
+	const float* audit_fields,
+	const int audit_field_count,
+	float* primitive_responsibility,
+	float* gate_responsibility,
+	float* out_color,
+	float* out_others,
+	int* radii,
+	bool debug)
+{
+	const int primitive_count = surface_count + volume_count;
+	if (primitive_count <= 0)
+		return 0;
+
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+	char* size_ptr = nullptr;
+	MixedGeometryState::fromChunk(size_ptr, surface_count, volume_count);
+	const size_t chunk_size = reinterpret_cast<size_t>(size_ptr) + 128;
+	char* chunkptr = geometryBuffer(chunk_size);
+	MixedGeometryState geomState =
+		MixedGeometryState::fromChunk(chunkptr, surface_count, volume_count);
+	if (radii == nullptr)
+		radii = geomState.internal_radii;
+
+	const dim3 tile_grid(
+		(width + BLOCK_X - 1) / BLOCK_X,
+		(height + BLOCK_Y - 1) / BLOCK_Y,
+		1);
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	const size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (surface_count > 0)
+	{
+		CHECK_CUDA(FORWARD::mixed_preprocess_surfaces(
+			surface_count,
+			surface_means3D,
+			reinterpret_cast<const glm::vec2*>(surface_scales),
+			scale_modifier,
+			reinterpret_cast<const glm::vec4*>(surface_rotations),
+			opacities,
+			viewmatrix,
+			projmatrix,
+			width,
+			height,
+			radii,
+			geomState.means2D,
+			geomState.depths,
+			geomState.surface_transMat,
+			geomState.surface_normals,
+			tile_grid,
+			geomState.tiles_touched,
+			prefiltered), debug)
+	}
+	if (volume_count > 0)
+	{
+		CHECK_CUDA(FORWARD::mixed_preprocess_volumes(
+			surface_count,
+			volume_count,
+			volume_means3D,
+			reinterpret_cast<const glm::vec3*>(volume_scales),
+			scale_modifier,
+			reinterpret_cast<const glm::vec4*>(volume_rotations),
+			opacities + surface_count,
+			viewmatrix,
+			projmatrix,
+			width,
+			height,
+			focal_x,
+			focal_y,
+			tan_fovx,
+			tan_fovy,
+			radii,
+			geomState.means2D,
+			geomState.depths,
+			geomState.volume_cov3D,
+			geomState.volume_conic,
+			tile_grid,
+			geomState.tiles_touched,
+			prefiltered), debug)
+	}
+
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+		geomState.scanning_space,
+		geomState.scan_size,
+		geomState.tiles_touched,
+		geomState.point_offsets,
+		primitive_count), debug)
+
+	int num_rendered = 0;
+	CHECK_CUDA(cudaMemcpy(
+		&num_rendered,
+		geomState.point_offsets + primitive_count - 1,
+		sizeof(int),
+		cudaMemcpyDeviceToHost), debug)
+
+	const size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(
+		binning_chunkptr,
+		num_rendered);
+
+	duplicateWithKeys<<<(primitive_count + 255) / 256, 256>>>(
+		primitive_count,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid);
+	CHECK_CUDA(, debug)
+
+	const int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_keys,
+		binningState.point_list_unsorted,
+		binningState.point_list,
+		num_rendered,
+		0,
+		32 + bit), debug)
+	CHECK_CUDA(cudaMemset(
+		imgState.ranges,
+		0,
+		tile_grid.x * tile_grid.y * sizeof(uint2)), debug)
+	if (num_rendered > 0)
+	{
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+	}
+	CHECK_CUDA(, debug)
+	CHECK_CUDA(FORWARD::mixed_render(
+		tile_grid,
+		block,
+		imgState.ranges,
+		binningState.point_list,
+		binningState.point_list_keys,
+		surface_count,
+		width,
+		height,
+		geomState.means2D,
+		colors,
+		opacities,
+		surface_gate_indices,
+		surface_gate_atlas,
+		gate_count,
+		gate_size,
+		depth_query_bounds,
+		has_depth_query,
+		geomState.surface_transMat,
+		geomState.surface_normals,
+		geomState.volume_conic,
+		geomState.depths,
+		audit_fields,
+		audit_field_count,
+		primitive_responsibility,
+		gate_responsibility,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		background,
+		out_color,
+		out_others), debug)
+	return num_rendered;
+}
+
+// Produce necessary gradients for optimization, corresponding
+// to forward render pass
+void CudaRasterizer::Rasterizer::backward(
+	const int P, int D, int M, int R,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* transMat_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* campos,
+	const float tan_fovx, float tan_fovy,
+	const int* radii,
+	char* geom_buffer,
+	char* binning_buffer,
+	char* img_buffer,
+	const float* dL_dpix,
+	const float* dL_depths,
+	float* dL_dmean2D,
+	float* dL_dnormal,
+	float* dL_dopacity,
+	float* dL_dcolor,
+	float* dL_dmean3D,
+	float* dL_dtransMat,
+	float* dL_dsh,
+	float* dL_dscale,
+	float* dL_drot,
+	bool debug)
+{
+	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
+
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
+
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
+	// opacity and RGB of Gaussians from per-pixel loss gradients.
+	// If we were given precomputed colors and not SHs, use them.
+	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+	const float* depth_ptr = geomState.depths;
+	const float* transMat_ptr = (transMat_precomp != nullptr) ? transMat_precomp : geomState.transMat;
+	CHECK_CUDA(BACKWARD::render(
+		tile_grid,
+		block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		focal_x, focal_y,
+		background,
+		geomState.means2D,
+		geomState.normal_opacity,
+		color_ptr,
+		transMat_ptr,
+		depth_ptr,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		dL_dpix,
+		dL_depths,
+		dL_dtransMat,
+		(float3*)dL_dmean2D,
+		dL_dnormal,
+		dL_dopacity,
+		dL_dcolor), debug)
+
+	// Take care of the rest of preprocessing. Was the precomputed covariance
+	// given to us or a scales/rot pair? If precomputed, pass that. If not,
+	// use the one we computed ourselves.
+	// const float* transMat_ptr = (transMat_precomp != nullptr) ? transMat_precomp : geomState.transMat;
+	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
+		(float3*)means3D,
+		radii,
+		shs,
+		geomState.clamped,
+		(glm::vec2*)scales,
+		(glm::vec4*)rotations,
+		scale_modifier,
+		transMat_ptr,
+		viewmatrix,
+		projmatrix,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		(glm::vec3*)campos,
+		(float3*)dL_dmean2D, // gradient inputs
+		dL_dnormal,		     // gradient inputs
+		dL_dtransMat,
+		dL_dcolor,
+		dL_dsh,
+		(glm::vec3*)dL_dmean3D,
+		(glm::vec2*)dL_dscale,
+		(glm::vec4*)dL_drot), debug)
+}
+
+void CudaRasterizer::Rasterizer::mixedBackward(
+	const int surface_count,
+	const int volume_count,
+	const int rendered_count,
+	const float* background,
+	const int width,
+	const int height,
+	const float* surface_means3D,
+	const float* surface_scales,
+	const float* surface_rotations,
+	const float* volume_means3D,
+	const float* volume_scales,
+	const float* volume_rotations,
+	const float* colors,
+	const float* opacities,
+	const int* surface_gate_indices,
+	const float* surface_gate_atlas,
+	const int gate_count,
+	const int gate_size,
+	const float* depth_query_bounds,
+	const bool has_depth_query,
+	const float scale_modifier,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const int* radii,
+	char* geom_buffer,
+	char* binning_buffer,
+	char* image_buffer,
+	const float* dL_dpixels,
+	const float* dL_dothers,
+	const float* forward_others,
+	float* dL_dmean2D,
+	float* dL_dsurface_normal,
+	float* dL_dsurface_transMat,
+	float* dL_dvolume_conic,
+	float* dL_ddepth,
+	float* dL_dopacity,
+	float* dL_dsurface_gate_atlas,
+	float* dL_dcolors,
+	float* dL_dsurface_means3D,
+	float* dL_dsurface_scales,
+	float* dL_dsurface_rotations,
+	float* dL_dvolume_cov3D,
+	float* dL_dvolume_means3D,
+	float* dL_dvolume_scales,
+	float* dL_dvolume_rotations,
+	bool debug)
+{
+	char* geom_ptr = geom_buffer;
+	MixedGeometryState geomState = MixedGeometryState::fromChunk(
+		geom_ptr,
+		surface_count,
+		volume_count);
+	char* binning_ptr = binning_buffer;
+	BinningState binningState =
+		BinningState::fromChunk(binning_ptr, rendered_count);
+	char* image_ptr = image_buffer;
+	ImageState imageState =
+		ImageState::fromChunk(image_ptr, width * height);
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+	const dim3 tile_grid(
+		(width + BLOCK_X - 1) / BLOCK_X,
+		(height + BLOCK_Y - 1) / BLOCK_Y,
+		1);
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	CHECK_CUDA(MIXED_BACKWARD::render(
+		tile_grid,
+		block,
+		imageState.ranges,
+		binningState.point_list,
+		binningState.point_list_keys,
+		surface_count,
+		width,
+		height,
+		background,
+		geomState.means2D,
+		colors,
+		opacities,
+		surface_gate_indices,
+		surface_gate_atlas,
+		gate_count,
+		gate_size,
+		depth_query_bounds,
+		has_depth_query,
+		geomState.surface_transMat,
+		geomState.surface_normals,
+		geomState.volume_conic,
+		geomState.depths,
+		imageState.accum_alpha,
+		imageState.n_contrib,
+		dL_dpixels,
+		dL_dothers,
+		forward_others,
+		dL_dsurface_transMat,
+		reinterpret_cast<float3*>(dL_dmean2D),
+		reinterpret_cast<float3*>(dL_dsurface_normal),
+		reinterpret_cast<float4*>(dL_dvolume_conic),
+		dL_ddepth,
+		dL_dopacity,
+		dL_dsurface_gate_atlas,
+		dL_dcolors), debug)
+
+	if (surface_count > 0)
+	{
+		CHECK_CUDA(BACKWARD::preprocess(
+			surface_count,
+			0,
+			0,
+			reinterpret_cast<const float3*>(surface_means3D),
+			radii,
+			nullptr,
+			nullptr,
+			reinterpret_cast<const glm::vec2*>(surface_scales),
+			reinterpret_cast<const glm::vec4*>(surface_rotations),
+			scale_modifier,
+			geomState.surface_transMat,
+			viewmatrix,
+			projmatrix,
+			focal_x,
+			focal_y,
+			tan_fovx,
+			tan_fovy,
+			nullptr,
+			reinterpret_cast<float3*>(dL_dmean2D),
+			dL_dsurface_normal,
+			dL_dsurface_transMat,
+			dL_dcolors,
+			nullptr,
+			reinterpret_cast<glm::vec3*>(dL_dsurface_means3D),
+			reinterpret_cast<glm::vec2*>(dL_dsurface_scales),
+			reinterpret_cast<glm::vec4*>(dL_dsurface_rotations)), debug)
+	}
+	if (volume_count > 0)
+	{
+		CHECK_CUDA(MIXED_BACKWARD::preprocessVolumes(
+			volume_count,
+			reinterpret_cast<const float3*>(volume_means3D),
+			radii + surface_count,
+			reinterpret_cast<const glm::vec3*>(volume_scales),
+			reinterpret_cast<const glm::vec4*>(volume_rotations),
+			scale_modifier,
+			geomState.volume_cov3D,
+			viewmatrix,
+			projmatrix,
+			focal_x,
+			focal_y,
+			tan_fovx,
+			tan_fovy,
+			reinterpret_cast<const float3*>(dL_dmean2D)
+				+ surface_count,
+			reinterpret_cast<const float4*>(dL_dvolume_conic),
+			dL_ddepth + surface_count,
+			reinterpret_cast<glm::vec3*>(dL_dvolume_means3D),
+			dL_dvolume_cov3D,
+			reinterpret_cast<glm::vec3*>(dL_dvolume_scales),
+			reinterpret_cast<glm::vec4*>(dL_dvolume_rotations)), debug)
+	}
+}

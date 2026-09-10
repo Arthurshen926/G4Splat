@@ -1718,6 +1718,7 @@ class FoliageRayEvidence:
                 ).reshape(3, -1).T
             self._latest_uncovered_hit_proposals = {
                 "centers": proposal_centers.detach().cpu(),
+                "single_first_hit": True,
                 "confidence": weight[proposal_rows].detach().cpu(),
                 "camera_id": int(view.colmap_id),
                 # Retain the complete calibrated hit interval. Static birth
@@ -2429,6 +2430,7 @@ class OutdoorGeometryEvidence:
         # silently mix coordinate systems. Placeholder foliage used by the
         # causal rigid pretrain intentionally leaves this disabled.
         self.moge3_runtime_enabled = False
+        self.moge3_canopy_depth_scales = {}
         self._verified_moge3_stems: set[str] = set()
         self._moge3_cache: OrderedDict[str, dict[str, np.ndarray]] = (
             OrderedDict()
@@ -2626,6 +2628,16 @@ class OutdoorGeometryEvidence:
             raise ValueError("MoGe3 metric-to-Cambridge scale must be positive")
         self.moge3_metric_to_cambridge_scale = scale
         self.moge3_runtime_enabled = True
+
+    def configure_moge3_canopy_depth_scales(self, profiles: dict) -> None:
+        """Immutable canopy-only calibration; rigid/Chart gauge is unchanged."""
+        checked = {}
+        for stem, value in profiles.items():
+            value = float(value)
+            if stem not in self.moge3_records or not np.isfinite(value) or value <= 0:
+                raise ValueError('Invalid canonical MoGe canopy calibration')
+            checked[str(stem)] = value
+        self.moge3_canopy_depth_scales = checked
 
     def chart_native_factor(
         self,
@@ -3734,6 +3746,9 @@ class OutdoorGeometryEvidence:
                 device=device,
                 shape=shape,
             )
+            canopy_scale = getattr(self, 'moge3_canopy_depth_scales', {}).get(stem)
+            if canopy_scale is not None:
+                result['moge3_canopy_depth_m'] = result['moge3_depth_m'] * canopy_scale
             result["moge3_valid_mask"] = self._tensor(
                 valid.astype(np.float32),
                 device=device,

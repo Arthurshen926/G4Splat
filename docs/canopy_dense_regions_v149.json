@@ -1,0 +1,11 @@
+{
+  "scope": "posthoc_ground_truth_dense_crown_regions__not_training_masks_or_preselected_blind_acceptance",
+  "resolution": [640, 360],
+  "regions": {
+    "657": [470, 40, 630, 200],
+    "660": [390, 45, 610, 195],
+    "690": [180, 120, 440, 280],
+    "713": [30, 100, 150, 280],
+    "768": [90, 210, 170, 270]
+  }
+}
