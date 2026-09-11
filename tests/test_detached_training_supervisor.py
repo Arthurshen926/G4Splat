@@ -256,10 +256,38 @@ def _wait_for_terminal_heartbeat(run_dir: Path) -> dict:
         except (FileNotFoundError, json.JSONDecodeError):
             time.sleep(0.02)
             continue
-        if last.get("state") in {"completed", "failed", "stopped_checkpointed"}:
+        if last.get("state") in {"completed", "failed", "stopped_checkpointed", "stopped_uncheckpointed"}:
             return last
         time.sleep(0.02)
     raise AssertionError(f"supervisor did not finish; last heartbeat={last!r}")
+
+
+@pytest.mark.parametrize('requested', [False, True])
+def test_requested_stop_without_checkpoint_is_not_an_unexpected_failure(tmp_path, requested):
+    run=tmp_path/'stop-run';run.mkdir();worker=run/'worker.py'
+    worker.write_text(textwrap.dedent('''
+        import argparse,time
+        from pathlib import Path
+        p=argparse.ArgumentParser();p.add_argument('--run-dir');a=p.parse_args()
+        (Path(a.run_dir)/'ready').write_text('ready')
+        while True: time.sleep(.05)
+    '''))
+    launched=_launch(run,worker)
+    assert launched.returncode==0,launched.stderr
+    ack=json.loads(launched.stdout)
+    try:
+        deadline=time.monotonic()+5
+        while not (run/'ready').exists() and time.monotonic()<deadline:time.sleep(.02)
+        assert (run/'ready').exists()
+        os.kill(ack['supervisor_pid'] if requested else ack['training_pid'],signal.SIGINT)
+        result=_wait_for_terminal_heartbeat(run)
+        assert result['state']==('stopped_uncheckpointed' if requested else 'failed')
+        assert result['failure_kind']==('requested_stop_without_valid_checkpoint' if requested else 'invalid_interruption_pair')
+        assert result['safe_restart_count']==0 and result['validated_iteration'] is None
+        assert not (run/'hybrid_teacher_checkpoint.pth').exists()
+    finally:
+        try:os.kill(ack['supervisor_pid'],signal.SIGTERM)
+        except ProcessLookupError:pass
 
 
 def test_detached_supervisor_resumes_only_valid_safe_interruption(tmp_path):

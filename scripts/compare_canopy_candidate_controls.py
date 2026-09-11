@@ -17,15 +17,48 @@ def validate_matching_camera_inputs(directories):
             raise ValueError(f'Unmatched camera input: {name}')
 
 
-def compare(narrow, wide, step, changed_argument='ratios'):
-    if changed_argument not in ('ratios', 'ray_log_radius', 'rigid_rgb_preservation_weight', 'search_depth_center',
+CONTROLLED_ARGUMENTS = ('ratios', 'ray_log_radius', 'rigid_rgb_preservation_weight', 'search_depth_center',
                                 'rays_per_view', 'footprint_log_radius', 'noncanopy_rgb_target', 'position_radius_sigmas', 'candidate_gain',
                                 'surface_rgb_feasibility_weight', 'depth_search_policy', 'source_rest_step_multiplier',
                                 'rigid_boundary_preservation_weight', 'spatial_footprint_log_radius', 'source_opacity_lr', 'gradient_accumulation',
                                 'canopy_only_color_gradients', 'seed_ray_policy', 'source_position_radius_sigmas',
-                                'surface_rgb_feasibility_domain'):
+                                'surface_rgb_feasibility_domain', 'optimizer_policy', 'leaf_optical_kernel', 'candidate_pixel_coordinates',
+                                'candidate_shape_lr','candidate_rotation_lr','candidate_optical_coordinate','moge_position_weight',
+                                'native_rgb_training','reshuffle_training_epochs','moge_position_native_directory',
+                                'moge_position_refresh_every','representation_policy')
+
+
+def compare(narrow, wide, step, changed_argument='ratios'):
+    if changed_argument not in CONTROLLED_ARGUMENTS:
         raise ValueError('One explicit controlled argument required')
     manifests = [json.loads((d/'manifest.json').read_text()) for d in (narrow, wide)]
+    if changed_argument == 'representation_policy':
+        from scripts.canopy_representation_comparison import validate_recipe_manifest
+        if ({m['args']['representation_policy'] for m in manifests} != {'coarse','dense_fine'}
+                or not manifests[0].get('representation_helper_sha256')
+                or manifests[0]['representation_helper_sha256'] != manifests[1].get('representation_helper_sha256')
+                or validate_recipe_manifest(manifests[0]) != validate_recipe_manifest(manifests[1])):
+            raise ValueError('Unmatched representation recipe or seed populations')
+    for key in ('native_rgb_helper_sha256','native_crop_camera_helper_sha256','training_schedule_helper_sha256','moge_refresh_helper_sha256'):
+        if manifests[0].get(key)!=manifests[1].get(key):raise ValueError('Unmatched implementation: '+key)
+    if changed_argument!='native_rgb_training' and manifests[0].get('native_rgb_training_sources')!=manifests[1].get('native_rgb_training_sources'):
+        raise ValueError('Unmatched native RGB sources')
+    if manifests[0].get('candidate_orientation_helper_sha256')!=manifests[1].get('candidate_orientation_helper_sha256'):
+        raise ValueError('Unmatched candidate orientation implementation')
+    for key in ('observed_background_risk_helper_sha256','visible_rigid_policy'):
+        if manifests[0].get(key)!=manifests[1].get(key):raise ValueError('Unmatched background risk contract: '+key)
+    for key in ('candidate_shape_helper_sha256','candidate_shape_cohort_sha256','candidate_shape_selected_count'):
+        if manifests[0].get(key)!=manifests[1].get(key):raise ValueError('Unmatched selective shape contract: '+key)
+    if manifests[0].get('native_pixel_camera_helper_sha256') != manifests[1].get('native_pixel_camera_helper_sha256'):
+        raise ValueError('Unmatched pixel-coordinate helper')
+    if manifests[0].get('kernel_adapter_helper_sha256') != manifests[1].get('kernel_adapter_helper_sha256'):
+        raise ValueError('Unmatched independent kernel adapter')
+    if changed_argument != 'leaf_optical_kernel':
+        for key in ('experimental_renderer_hash', 'experimental_binary_sha256'):
+            if manifests[0].get(key) != manifests[1].get(key):
+                raise ValueError('Unmatched renderer implementation: '+key)
+    for key in ('row_active_optimizer_helper_sha256','actual_update_helper_sha256','declared_objective_helper_sha256','diagnostic_resume_helper_sha256'):
+        if manifests[0].get(key)!=manifests[1].get(key):raise ValueError('Unmatched implementation: '+key)
     validate_matching_camera_inputs((narrow, wide))
     if manifests[0].get('relative_radiance_helper_sha256') != manifests[1].get('relative_radiance_helper_sha256'):
         raise ValueError('Unmatched relative radiance helper')
@@ -57,8 +90,9 @@ def compare(narrow, wide, step, changed_argument='ratios'):
                 'seed_audit', 'candidate_count', 'initial_opacity', 'calibration',
                 'helper_sha256', 'script_sha256', 'masks_sha256', 'runtime_index_sha256', 'depth_sha256'):
         if changed_argument == 'rays_per_view' and key in ('seed_audit', 'candidate_count'): continue
+        if changed_argument == 'representation_policy' and key in ('seed_audit','candidate_count','initial_opacity'): continue
         if manifests[0][key] != manifests[1][key]: raise ValueError(f'Unmatched candidate contract: {key}')
-    if changed_argument == 'rays_per_view':
+    if changed_argument in ('rays_per_view','representation_policy'):
         image_identity = lambda m: [(r['index'], r['image_sha256']) for r in m['seed_audit']]
         if image_identity(manifests[0]) != image_identity(manifests[1]): raise ValueError('Changed seed images')
         for m in manifests:
@@ -78,7 +112,15 @@ def compare(narrow, wide, step, changed_argument='ratios'):
         raise ValueError('Unmatched diagnostic checkpoint publisher')
     if manifests[0].get('directional_sh_step_helper_sha256') != manifests[1].get('directional_sh_step_helper_sha256'):
         raise ValueError('Unmatched directional SH step policy')
-    allowed = {'output', changed_argument}
+    # A deliberate early stop does not change an already executed prefix.
+    # Keep the LR horizon and all actual training arguments matched.
+    for manifest in manifests:
+        stop=manifest['args'].get('stop_after')
+        if stop is not None and (stop<step or stop>manifest['args'].get('steps',-1)):
+            raise ValueError('Comparison exceeds the stopped training prefix or declared horizon')
+    allowed = {'output', 'stop_after', changed_argument}
+    if changed_argument == 'representation_policy':
+        allowed |= {'rays_per_view','position_radius_sigmas'}
     if ({k: v for k, v in manifests[0]['args'].items() if k not in allowed}
             != {k: v for k, v in manifests[1]['args'].items() if k not in allowed}):
         raise ValueError('Only the explicit controlled argument may change between paired candidates')
@@ -121,13 +163,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('narrow', 'wide', 'output'): p.add_argument('--'+key, type=Path, required=True)
     p.add_argument('--step', type=int, required=True)
-    p.add_argument('--changed-argument', choices=('ratios', 'ray_log_radius', 'rigid_rgb_preservation_weight',
-                   'search_depth_center', 'rays_per_view', 'footprint_log_radius', 'noncanopy_rgb_target',
-                   'position_radius_sigmas', 'candidate_gain', 'surface_rgb_feasibility_weight', 'depth_search_policy',
-                   'source_rest_step_multiplier', 'rigid_boundary_preservation_weight',
-                   'spatial_footprint_log_radius', 'source_opacity_lr', 'gradient_accumulation',
-                   'canopy_only_color_gradients', 'seed_ray_policy', 'source_position_radius_sigmas',
-                   'surface_rgb_feasibility_domain'), default='ratios')
+    p.add_argument('--changed-argument', choices=CONTROLLED_ARGUMENTS, default='ratios')
     a = p.parse_args(); report = compare(a.narrow, a.wide, a.step, a.changed_argument)
     with a.output.open('x') as f: json.dump(report, f, indent=2)
     print(json.dumps({k: {q: v for q, v in row.items() if q not in ('per_view', 'worst_wide_views')}

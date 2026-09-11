@@ -815,7 +815,7 @@ def _supervise(
         if stop_state["signal"] is not None:
             _heartbeat(
                 config,
-                state="stopped_checkpointed",
+                state=("stopped_checkpointed" if previous_iteration >= 0 else "stopped_uncheckpointed"),
                 training_pid=None,
                 safe_restart_count=safe_restart_count,
                 detail="Supervisor stop requested while no child was running",
@@ -1037,19 +1037,25 @@ def _supervise(
                 minimum_checkpoint_bytes=config.minimum_checkpoint_bytes,
             )
         except SupervisorError as exc:
+            requested_stop = (
+                stop_state["signal"] == safe_signal
+                and heartbeat_failure is None
+            )
             _heartbeat(
                 config,
-                state="failed",
+                state="stopped_uncheckpointed" if requested_stop else "failed",
                 training_pid=None,
                 safe_restart_count=safe_restart_count,
                 returncode=returncode,
-                failure_kind="invalid_interruption_pair",
-                detail=str(exc),
+                failure_kind=("requested_stop_without_valid_checkpoint" if requested_stop
+                              else "invalid_interruption_pair"),
+                detail=(("Supervisor stop was requested; no valid interruption checkpoint; "
+                         "no restart and no claim of recoverable current progress. ") if requested_stop else "")+str(exc),
                 validated_iteration=(
                     previous_iteration if previous_iteration >= 0 else None
                 ),
             )
-            return 1
+            return 0 if requested_stop else 1
 
         previous_iteration = validated.iteration
         if heartbeat_failure is not None:

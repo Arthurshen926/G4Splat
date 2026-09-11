@@ -1099,3 +1099,24 @@ def test_surface_uv_gate_is_local_differentiable_and_auditable():
     assert atlas.grad is not None
     assert torch.isfinite(atlas.grad).all()
     assert atlas.grad.abs().sum() > 0
+
+
+def test_surface_median_does_not_bound_foreground_radiance():
+    """An opaque leaf before the median cannot remove an earlier surface."""
+    _, _, Rasterizer = _api()
+    settings = _settings()
+    surfaces = torch.tensor([[0.,0.,2.],[0.,0.,4.],[0.,0.,4.1]],device='cuda')
+    quat = torch.tensor([[1.,0.,0.,0.]]*3,device='cuda')
+    def render(depth, enabled):
+        volume = torch.tensor([[0.,0.,depth]]*3,device='cuda')
+        return Rasterizer(settings)(surfaces,torch.zeros_like(surfaces),
+            torch.full((3,2),10.,device='cuda'),quat,
+            volume,torch.zeros_like(volume),torch.full((3,3),10.,device='cuda'),quat,
+            torch.cat((torch.ones(3,3,device='cuda'),torch.zeros(3,3,device='cuda'))),
+            torch.tensor([.4,.99,.99]+([.999999]*3 if enabled else [0.]*3),device='cuda'))
+    wall=render(3.,False)
+    assert wall[2][5,20,34].item() == pytest.approx(4.,abs=1e-4)
+    middle=render(3.,True)[0][:,20,34]
+    near=render(1.,True)[0][:,20,34]
+    assert (middle > .39).all()
+    assert (near < 1e-4).all()

@@ -19,15 +19,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def main():
-    output = Path(sys.argv[sys.argv.index('--output') + 1])
-    if output.exists():
-        raise ValueError('Fresh experimental output required')
-    old_backend = original._C
-    provenance = dict(experimental=True, read_only=True,
-        original_binary=str(old_backend.__file__), original_sha256=digest(old_backend.__file__),
-        experimental_binary=str(experimental._C.__file__), experimental_sha256=digest(experimental._C.__file__),
-        kernel='volume_projected_optical_depth__surface_unchanged__same_support_and_order')
+def independent_render():
     # Clone only the render function into private globals. Preserve its path
     # guard, changing the expected path to the explicitly approved extension.
     # No production module globals, source files or module identities change.
@@ -42,8 +34,20 @@ def main():
     namespace['_EXPERIMENTAL_BINARY_PARENT'] = Path(experimental._C.__file__).resolve().parent
     source = 'from __future__ import annotations\n' + source
     exec(compile(source, '<isolated_optical_depth_render_adapter>', 'exec'), namespace)
-    audit.render_hybrid = namespace['render_hybrid']
-    provenance['adapter_source_sha256'] = hashlib.sha256(source.encode()).hexdigest()
+    return namespace['render_hybrid'], hashlib.sha256(source.encode()).hexdigest()
+
+
+def main():
+    output = Path(sys.argv[sys.argv.index('--output') + 1])
+    if output.exists(): raise ValueError('Fresh experimental output required')
+    old_backend = original._C
+    function, adapter_hash = independent_render()
+    provenance = dict(experimental=True, read_only=True,
+        original_binary=str(old_backend.__file__), original_sha256=digest(old_backend.__file__),
+        experimental_binary=str(experimental._C.__file__), experimental_sha256=digest(experimental._C.__file__),
+        adapter_source_sha256=adapter_hash,
+        kernel='volume_projected_optical_depth__surface_unchanged__same_support_and_order')
+    audit.render_hybrid = function
     audit.main()
     if digest(old_backend.__file__) != provenance['original_sha256']:
         raise RuntimeError('Original binary changed during audit')

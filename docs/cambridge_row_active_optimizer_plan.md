@@ -1,6 +1,13 @@
 # Isolated nonzero-gradient-row Adam hypothesis
 
-Not connected to the training script yet. Existing runs remain standard Adam.
+Update: integrated as an OPTIONAL diagnostic policy, default remains Adam.
+Matched v386/v387800 does NOT support adoption: row-active loses .425175dB
+mean tree PSNR versus ordinary Adam, while improving rigid .011231 and hard
+.017464dB. Eight-step causal checks confirm inactive rows stay fixed, but that
+algorithmic property is not a reconstruction improvement. Production unchanged.
+See cambridge_v369_joint_feasibility_and_update_replay.md for current results.
+
+Historical rationale (before the controlled test):
 Local installed torch.optim.Adam code confirms that dense zero gradients still
 decay moments, advance the tensor-wide clock and may move parameters through
 stored momentum. This is STANDARD ADAM, not evidence of an implementation bug.

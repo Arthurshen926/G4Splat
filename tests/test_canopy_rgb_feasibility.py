@@ -24,3 +24,14 @@ def test_nonnegative_floor_only_bounds_overbright_residual_not_high_radiance():
     out = nonnegative_color_floor(black, black+1, target, torch.ones(1, 1, dtype=torch.bool))
     assert out['minimum_nonnegative_color_mse'] == pytest.approx(.25/3)
     assert out['below_black_floor_fraction'] == 1
+
+
+def test_floor_metric_domain_matches_clamped_final_psnr():
+    black=torch.full((3,1,1),1.2);current=black+.3;target=torch.full_like(black,.8);mask=torch.ones(1,1,dtype=torch.bool)
+    raw=nonnegative_color_floor(black,current,target,mask)
+    final=nonnegative_color_floor(black,current,target,mask,metric_domain='clamped_unit_rgb')
+    assert raw['current_mse']==pytest.approx(.49)
+    assert final['current_mse']==pytest.approx(.04)
+    assert final['minimum_nonnegative_color_mse']==pytest.approx(.04)
+    assert final['irreducible_error_fraction']==pytest.approx(1.)
+    assert final['metric_domain']=='clamped_unit_rgb'

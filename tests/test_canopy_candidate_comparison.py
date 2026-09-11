@@ -33,6 +33,13 @@ def test_candidate_comparison_checks_source_not_different_initial_candidates(tmp
     assert report['frozen_audits'] == [None, None]
     assert report['training_images_per_arm'] == 10
     assert report['optimizer_updates_per_arm'] == [10, 10]
+    manifest['args']['stop_after']=10
+    (dirs[1]/'manifest.json').write_text(json.dumps(manifest))
+    assert compare(*dirs,10)['metrics']['tree']['mean_wide_minus_narrow']==pytest.approx(.2)
+    manifest['args']['stop_after']=5
+    (dirs[1]/'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError,match='stopped training prefix'):compare(*dirs,10)
+    manifest['args']['stop_after']=10
     manifest['args']['steps'] = 11
     (dirs[1]/'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='explicit controlled argument'): compare(*dirs, 10)
@@ -83,3 +90,26 @@ def test_boundary_control_requires_matching_helper_and_one_argument(tmp_path):
     (dirs[1]/'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='boundary preservation helper'):
         compare(*dirs, 400, 'rigid_boundary_preservation_weight')
+
+
+def test_kernel_comparison_requires_explicit_change_and_common_source(tmp_path):
+    dirs = [tmp_path/'native', tmp_path/'tau']
+    keys = ('tree', 'tree_interior', 'tree_boundary', 'rigid', 'hard')
+    for i, d in enumerate(dirs):
+        d.mkdir()
+        manifest = {k:'same' for k in ('scope', 'source_checkpoint_sha256', 'seed_audit',
+            'calibration', 'helper_sha256', 'script_sha256', 'masks_sha256',
+            'runtime_index_sha256', 'depth_sha256', 'kernel_adapter_helper_sha256')}
+        manifest.update(training_views=[2], excluded_views=[1], candidate_count=3, initial_opacity=.001,
+            experimental_binary_sha256=None if i==0 else 'independent',
+            args=dict(output=str(d), leaf_optical_kernel='native' if i==0 else 'projected_tau'))
+        (d/'manifest.json').write_text(json.dumps(manifest))
+        docs = dict(results=[dict(step=0, per_view=[dict(index=1, modes={'source':dict.fromkeys(keys,15.)})]),
+            dict(step=8, per_view=[dict(index=1, modes={'candidate':dict.fromkeys(keys,15.+i*.1)})])])
+        (d/'metrics.json').write_text(json.dumps(docs))
+    assert compare(*dirs,8,'leaf_optical_kernel')['metrics']['tree']['mean_wide_minus_narrow']==pytest.approx(.1)
+    with pytest.raises(ValueError, match='renderer implementation'):
+        compare(*dirs,8,'ratios')
+    docs['results'][0]['per_view'][0]['modes']['source']['tree']=15.1
+    (dirs[1]/'metrics.json').write_text(json.dumps(docs))
+    with pytest.raises(ValueError):compare(*dirs,8,'leaf_optical_kernel')

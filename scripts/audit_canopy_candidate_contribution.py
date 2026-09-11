@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import numpy as np
+from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT/'2d-gaussian-splatting')]
 import torch
@@ -38,16 +39,40 @@ LEAKAGE_ROIS = {657: (420, 170, 610, 270), 660: (470, 205, 630, 335),
                 690: (40, 110, 160, 250)}
 
 
+def scaled_regression_roi(box,width,height):
+    return tuple(round(value*scale) for value,scale in zip(box,(width/640,height/360,width/640,height/360)))
+
+
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser(description=__doc__); model = ModelParams(p)
     p.set_defaults(data_device='cpu', resolution=640, white_background=True)
     for key in ('run', 'output'): p.add_argument('--'+key, type=Path, required=True)
     p.add_argument('--step', type=int, required=True)
+    p.add_argument('--save-rgb-pairs',action='store_true')
     p.add_argument('--rgb-feasibility-probe', action='store_true')
     p.add_argument('--persistent-black-floor-probe', action='store_true')
     p.add_argument('--building-floor-probe', action='store_true')
     p.add_argument('--training-gradient-conflict-probe', action='store_true')
+    p.add_argument('--joint-feasibility-probe', action='store_true',
+                   help='Training-only conditional sparse optical feasibility; no model updates')
+    p.add_argument('--joint-feasibility-rays', type=int, default=8)
+    p.add_argument('--joint-feasibility-violated-only', action='store_true')
+    p.add_argument('--joint-feasibility-risk-solution', type=Path)
+    p.add_argument('--joint-feasibility-all-training-views', action='store_true')
+    p.add_argument('--joint-feasibility-replay', type=Path,
+                   help='Read-only native verification of an explicitly supplied LP solution')
+    p.add_argument('--joint-replay-kernel',choices=('native','projected_tau'),default='projected_tau',
+                   help='Explicit LP replay image model; historical replays used experimental projected_tau')
+    p.add_argument('--saved-actual-update-probe', action='store_true')
+    p.add_argument('--training-selectivity-cohort', action='store_true')
+    p.add_argument('--selected-optical-signal', type=Path,
+                   help='Read-only full-training gradients for exact prefix-LP increased candidates')
+    p.add_argument('--surface-prefix-replay', type=Path,
+                   help='Native surface-prefix diagnosis of a completed joint_native_replay.json')
+    p.add_argument('--surface-prefix-constraints', type=Path)
+    p.add_argument('--joint-native-prefix', type=Path,
+                   help='Build multi-depth necessary constraints from a completed surface_prefix.json')
     p.add_argument('--roi-optical-capacity-probe', action='store_true')
     p.add_argument('--persistent-optical-ceiling-probe', action='store_true',
                    help='Read-only near-opaque persistent leaves plus candidates; never training targets')
@@ -55,6 +80,12 @@ def main():
                    help='Read-only probe peak; 1 uses finite float32 logit20, never infinite parameters')
     p.add_argument('--stratified-depth-min-ratio-counterfactual', type=float)
     p.add_argument('--source-optics-component-probe', action='store_true')
+    p.add_argument('--joint-component-rollback', action='store_true',
+                   help='Read-only leave-one-component-out analysis with exact tensor restoration')
+    p.add_argument('--growth-direction-audit', action='store_true',
+                   help='Training-only current size derivatives; no parameter updates')
+    p.add_argument('--growth-counterfactual', type=Path,
+                   help='Finite read-only size probes from matching training-only growth directions')
     p.add_argument('--coverage-ceiling-probe', action='store_true',
                    help='Read-only .99 candidate-opacity counterfactual; NEVER a train target or fix')
     p.add_argument('--intrinsic-coverage-probe', action='store_true',
@@ -79,6 +110,28 @@ def main():
     # A render audit must not allocate every saved Adam tensor on the GPU.
     payload = torch.load(payload_path, map_location='cpu', weights_only=False)
     manifest = payload['manifest']; args = manifest['args']
+    if args.get('moge_position_weight',0) and (a.saved_actual_update_probe or a.selected_optical_signal is not None or a.training_gradient_conflict_probe):
+        raise ValueError('Offline optimizer probe does not yet reconstruct MoGe position loss; use in-training full objective audit')
+    if args.get('candidate_optical_coordinate','legacy_logit')!='legacy_logit':
+        if a.saved_actual_update_probe or a.selected_optical_signal is not None or a.training_gradient_conflict_probe:
+            raise ValueError('Optical-coordinate offline optimizer probes require coordinate-aware replay; use the saved in-training actual-update audit')
+    if args.get('visible_rigid_alpha_weight',0):
+        if manifest.get('observed_background_risk_helper_sha256')!=sha256_file(Path(__file__).with_name('canopy_observed_background_risk.py')):
+            raise ValueError('Visible-rigid audit policy changed')
+    audit_renderer = render_hybrid
+    kernel = args.get('leaf_optical_kernel', 'native')
+    if kernel == 'projected_tau':
+        if a.training_gradient_conflict_probe or a.saved_actual_update_probe:
+            raise ValueError('Saved-gradient probes are not yet kernel-aware; refusing native-kernel reinterpretation')
+        from scripts.audit_canopy_optical_depth_kernel import independent_render
+        audit_renderer, renderer_hash = independent_render()
+        import canopy_optical_depth_rasterization as independent_native
+        if (renderer_hash != manifest.get('experimental_renderer_hash')
+                or sha256_file(Path(independent_native._C.__file__)) != manifest.get('experimental_binary_sha256')
+                or sha256_file(Path(__file__).with_name('audit_canopy_optical_depth_kernel.py')) != manifest.get('kernel_adapter_helper_sha256')):
+            raise ValueError('Experimental checkpoint renderer provenance changed')
+    elif kernel != 'native':
+        raise ValueError('Unknown checkpoint optical kernel')
     if (not payload['diagnostic_only'] or payload['step'] != a.step
             or manifest['helper_sha256'] != sha256_file(Path(__file__).with_name('canopy_candidate_diagnostic.py'))
             or sha256_file(args['checkpoint']) != manifest['source_checkpoint_sha256']
@@ -113,6 +166,21 @@ def main():
                 raise ValueError('Changed joint spatial footprint helper')
             candidate = SpatialFootprintCandidates(candidate.cloud, position_radius,
                                                    args['spatial_footprint_log_radius'])
+    if args.get('candidate_shape_cohort') is not None:
+        from scripts.canopy_selective_shape import load_shape_cohort,SelectiveSpatialFootprintCandidates
+        if (manifest.get('candidate_shape_helper_sha256')!=sha256_file(Path(__file__).with_name('canopy_selective_shape.py'))
+                or manifest.get('candidate_shape_cohort_sha256')!=sha256_file(args['candidate_shape_cohort'])):
+            raise ValueError('Selective shape implementation or cohort changed')
+        shape_eligible=load_shape_cohort(args['candidate_shape_cohort'],candidate.cloud,
+            manifest['source_checkpoint_sha256'],manifest['training_views'],manifest['excluded_views'])
+        candidate=SelectiveSpatialFootprintCandidates(candidate.cloud,shape_eligible,position_radius,
+                                                       args['spatial_footprint_log_radius'])
+        if args.get('candidate_orientation_control',False):
+            from scripts.canopy_selective_orientation import OrientedSelectiveCandidates
+            if manifest.get('candidate_orientation_helper_sha256')!=sha256_file(Path(__file__).with_name('canopy_selective_orientation.py')):
+                raise ValueError('Candidate orientation implementation changed')
+            candidate=OrientedSelectiveCandidates(candidate.cloud,shape_eligible,position_radius,
+                args['spatial_footprint_log_radius'])
     candidate.load_state_dict(state)
     candidate = candidate.cuda()
     ceiling_logit = (candidate.logits.new_tensor(20.) if a.optical_ceiling_opacity == 1.
@@ -173,6 +241,58 @@ def main():
     holdout = FIXED+ADDITIONAL
     if set(holdout) != set(manifest['excluded_views']) or set(holdout)&set(manifest['training_views']):
         raise ValueError('All 48 cameras must remain excluded from fitting')
+    if a.growth_direction_audit:
+        from scripts.canopy_growth_direction_audit import audit_growth
+        audit_growth(teacher,base,candidate,adapter,views,masks,manifest,a.output,
+                     snapshot_sha256=sha256_file(payload_path))
+        return
+    if a.joint_component_rollback or a.growth_counterfactual is not None:
+        if source_optics is None or source_position is None or candidate_gain != 1:
+            raise ValueError('Joint optics, positions and enabled candidates required')
+        from scripts.canopy_joint_component_rollback import audit_joint_components
+        audit_joint_components(teacher,base,refined_base,source_position,candidate,adapter,
+            views,masks,manifest,audit_renderer,a.output,snapshot_sha256=sha256_file(payload_path),
+            growth_evidence=a.growth_counterfactual)
+        return
+    if a.training_selectivity_cohort:
+        from scripts.canopy_candidate_selectivity_audit import audit_selectivity
+        audit_selectivity(teacher,base,adapter,candidate,views,masks,manifest,a.output,
+                         snapshot_sha256=sha256_file(payload_path))
+        return
+    if a.joint_native_prefix is not None:
+        if a.surface_prefix_constraints is None:raise ValueError('Prior constraints required')
+        from scripts.canopy_prefix_joint_feasibility import prefix_joint_feasibility
+        prefix_joint_feasibility(base,adapter,candidate,views,manifest,a.surface_prefix_constraints,a.joint_native_prefix,a.output,
+                                 snapshot_sha256=sha256_file(payload_path))
+        return
+    if a.selected_optical_signal is not None:
+        from scripts.canopy_selected_optical_signal import audit_selected_signal
+        audit_selected_signal(teacher,base,adapter,candidate,views,masks,payload,
+                              a.selected_optical_signal,a.output,snapshot_sha256=sha256_file(payload_path))
+        return
+    if a.surface_prefix_replay is not None:
+        if a.surface_prefix_constraints is None:
+            raise ValueError('Explicit prior prefix constraints required')
+        from scripts.canopy_native_surface_prefix_probe import probe_surface_prefix
+        probe_surface_prefix(teacher,base,views,manifest,a.surface_prefix_constraints,a.surface_prefix_replay,a.output,
+                             snapshot_sha256=sha256_file(payload_path))
+        return
+    if a.joint_feasibility_probe:
+        from scripts.canopy_joint_scene_feasibility import audit_joint_scene
+        audit_joint_scene(teacher, base, adapter, candidate, views, masks, manifest, a.output,
+                         rays_per_kind=a.joint_feasibility_rays,violated_only=a.joint_feasibility_violated_only,
+                         snapshot_sha256=sha256_file(payload_path),risk_solution=a.joint_feasibility_risk_solution,
+                         all_training_views=a.joint_feasibility_all_training_views)
+        return
+    if a.joint_feasibility_replay is not None:
+        from scripts.canopy_joint_solution_replay import replay_joint_solution
+        replay_joint_solution(teacher,base,adapter,candidate,views,masks,manifest,a.joint_feasibility_replay,a.output,
+                              snapshot_sha256=sha256_file(payload_path),kernel=a.joint_replay_kernel)
+        return
+    if a.saved_actual_update_probe:
+        from scripts.canopy_saved_update_probe import probe_saved_updates
+        probe_saved_updates(teacher,base,adapter,candidate,views,masks,payload,a.output)
+        return
     mass = torch.zeros(len(candidate.xyz), 4, device='cuda')
     visible_views = torch.zeros(len(candidate.xyz), dtype=torch.int32, device='cuda')
     records = []
@@ -186,18 +306,31 @@ def main():
         common = dict(background=torch.zeros(3, device='cuda'), include_dynamic=False,
                       optical_replacement_policy='disabled', structural_trainable_start=None)
         original = render_hybrid(v, teacher.surface, base, volume_gate=gate, **common)
-        updated = render_hybrid(v, teacher.surface, adapter,
+        updated = audit_renderer(v, teacher.surface, adapter,
             volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))),
             audit_fields=torch.stack((canopy, rigid, sky_mask)).float(), **common)
+        visible_rigid_risk=None
+        if args.get('visible_rigid_alpha_weight',0):
+            from scripts.canopy_observed_background_risk import conservative_visible_rigid_mask
+            _,risk_boundary,_=_tree_boundary_masks(~canopy)
+            reference_rgb=original.render+(1-original.alpha)*teacher.sky(v)
+            risk_mask=conservative_visible_rigid_mask(reference_rgb,v.original_image.cuda(),original.surface_alpha,
+                dict(rigid=rigid,hard=rigid&risk_boundary))
+            drop=(original.surface_alpha-updated.surface_alpha).reshape_as(rigid).clamp_min(0)
+            visible_rigid_risk=dict(pixels=int(risk_mask.sum()),
+                mean_surface_contribution_drop=float(drop[risk_mask].mean()) if risk_mask.any() else None,
+                maximum_surface_contribution_drop=float(drop[risk_mask].max()) if risk_mask.any() else None,
+                fraction_drop_above_001=float((drop[risk_mask]>.01).float().mean()) if risk_mask.any() else None,
+                scope='conditional_conservative_visible_mask__evaluation_only')
         contribution = updated.responsibility[len(teacher.surface.get_xyz)+len(base):]
         if contribution.shape != mass.shape or not torch.isfinite(contribution).all() or (contribution < 0).any():
             raise RuntimeError('Invalid native candidate contribution')
         mass += contribution; visible_views += contribution[:, 1] > .001
         roi_optics = None
         if (a.training_gradient_conflict_probe or a.roi_optical_capacity_probe) and index in LEAKAGE_ROIS:
-            x0, y0, x1, y1 = LEAKAGE_ROIS[index]
+            x0, y0, x1, y1 = scaled_regression_roi(LEAKAGE_ROIS[index],v.image_width,v.image_height)
             roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
-            probe = render_hybrid(v, teacher.surface, adapter,
+            probe = audit_renderer(v, teacher.surface, adapter,
                 volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))),
                 audit_fields=torch.stack((roi, rigid, sky_mask)).float(), **common)
             roi_weights[index] = probe.responsibility[len(teacher.surface.get_xyz)+len(base):, 1].clone()
@@ -208,9 +341,17 @@ def main():
             if position_radius:
                 ratio = (candidate.scales/candidate.cloud.scales).log().mean(1).exp()
                 roi_optics['candidate_size'] = weighted_size_summary(ratio, roi_weights[index])
+                if args.get('candidate_shape_cohort') is not None:
+                    axis_ratio=candidate.scales/candidate.cloud.scales
+                    equivalent=axis_ratio.log().mean(1).exp()
+                    roi_optics['candidate_size']=weighted_size_summary(equivalent,roi_weights[index])
+                    roi_optics['candidate_size']['scope']='actual_ROI_weighted_geometric_mean_axis_ratio__anisotropic_not_geometry_truth'
+                    weights=roi_weights[index];denominator=weights.sum().clamp_min(1e-12)
+                    roi_optics['candidate_size']['weighted_aspect_ratio']=float(
+                        ((candidate.scales.max(1).values/candidate.scales.min(1).values)*weights).sum()/denominator)
             del probe
         def region_mean(tensor, mask): return float(tensor.reshape_as(mask)[mask].mean()) if mask.any() else None
-        records.append(dict(index=index, candidate_canopy_mass=float(contribution[:, 1].sum()),
+        records.append(dict(index=index, visible_rigid_risk=visible_rigid_risk,candidate_canopy_mass=float(contribution[:, 1].sum()),
             candidate_rigid_mass=float(contribution[:, 2].sum()), candidate_sky_mass=float(contribution[:, 3].sum()),
             canopy_surface_alpha_before=region_mean(original.surface_alpha, canopy),
             canopy_surface_alpha_after=region_mean(updated.surface_alpha, canopy),
@@ -222,13 +363,27 @@ def main():
         source_rgb = (original.render+(1-original.alpha)*background).clamp(0, 1)
         updated_rgb = (updated.render+(1-updated.alpha)*background).clamp(0, 1)
         target = v.original_image.cuda()
+        records[-1]['image_shape']=[v.image_height,v.image_width]
+        all_regions=dict(tree=canopy,tree_interior=canopy&~inner_tree_band,
+                         tree_boundary=canopy&inner_tree_band,rigid=rigid,hard=rigid&outer_tree_band)
+        records[-1]['rgb_regions']=dict(source=region_psnr(source_rgb,target,all_regions),
+                                       updated=region_psnr(updated_rgb,target,all_regions))
+        if a.save_rgb_pairs:
+            panel=torch.cat((target,source_rgb,updated_rgb),2).permute(1,2,0).cpu().clamp(0,1).numpy()
+            Image.fromarray((panel*255).round().astype('uint8')).save(a.output/f'view_{index}.png')
         records[-1]['rigid_rgb_regions'] = rgb_region_audit(source_rgb, updated_rgb, target, rigid, outer_tree_band)
+        records[-1]['sky_rgb'] = dict(pixels=int(sky_mask.sum()),
+            source_psnr=region_psnr(source_rgb,target,dict(sky=sky_mask))['sky'],
+            updated_psnr=region_psnr(updated_rgb,target,dict(sky=sky_mask))['sky'],
+            source_volume_alpha=region_mean(original.volume_alpha,sky_mask),
+            updated_volume_alpha=region_mean(updated.volume_alpha,sky_mask),
+            scope='fixed_view_sky_regression__not_positive_foliage_supervision')
         records[-1]['tree_interface_radius_pixels'] = radius
         if a.source_optics_component_probe:
             component_regions = dict(tree=canopy, tree_interior=canopy & ~inner_tree_band,
                 tree_boundary=canopy & inner_tree_band, rigid=rigid, hard=rigid & outer_tree_band)
             def component_render():
-                component = render_hybrid(v, teacher.surface, adapter,
+                component = audit_renderer(v, teacher.surface, adapter,
                     volume_gate=torch.cat((gate, gate.new_zeros((len(candidate.xyz),)))), **common)
                 return component.render+(1-component.alpha)*background
             parts = source_optics_components(base, refined_base, component_render, target, component_regions)
@@ -240,19 +395,20 @@ def main():
         if black_adapter is not None:
             # All leaf radiance and sky are absent, but ALL actual opacity,
             # positions and ordering remain. No model parameter is modified.
-            probe = render_hybrid(v, teacher.surface, black_adapter,
+            probe = audit_renderer(v, teacher.surface, black_adapter,
                 volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
             if (probe.alpha-updated.alpha).abs().max() > 2e-5:
                 raise RuntimeError('Black-radiance adapter changed optical weights')
             floor_regions = {'canopy': canopy}
             if index in LEAKAGE_ROIS:
-                x0, y0, x1, y1 = LEAKAGE_ROIS[index]
+                x0, y0, x1, y1 = scaled_regression_roi(LEAKAGE_ROIS[index],v.image_width,v.image_height)
                 roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
                 floor_regions['supplemental_leakage_roi'] = roi
             current_raw = updated.render+(1-updated.alpha)*background
             floor_records = {}
             for name, mask in floor_regions.items():
-                value = nonnegative_color_floor(probe.render, current_raw, target, mask)
+                value = nonnegative_color_floor(probe.render, current_raw, target, mask,metric_domain='clamped_unit_rgb')
+                value['raw_domain'] = nonnegative_color_floor(probe.render,current_raw,target,mask)
                 value['scope'] = 'unaltered_surface_radiance_through_actual_opacity__all_foliage_and_sky_radiance_zero__read_only'
                 floor_records[name] = value
             records[-1]['building_radiance_floor'] = floor_records
@@ -264,17 +420,17 @@ def main():
                 candidate.dc.fill_(-.5/.28209479177387814)
                 refined_base.features[black_eligible] = 0
                 refined_base.features[black_eligible, 0] = -.5/.28209479177387814
-                probe = render_hybrid(v, teacher.surface, adapter,
+                probe = audit_renderer(v, teacher.surface, adapter,
                     volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                 black_rgb = probe.render+(1-probe.alpha)*background
                 current_raw = updated.render+(1-updated.alpha)*background
                 floor_regions = {'canopy': canopy}
                 if index in LEAKAGE_ROIS:
-                    x0, y0, x1, y1 = LEAKAGE_ROIS[index]
+                    x0, y0, x1, y1 = scaled_regression_roi(LEAKAGE_ROIS[index],v.image_width,v.image_height)
                     roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
                     floor_regions['supplemental_leakage_roi'] = roi
                 records[-1]['persistent_black_floor'] = {name: nonnegative_color_floor(
-                    black_rgb, current_raw, target, mask) for name, mask in floor_regions.items()}
+                    black_rgb, current_raw, target, mask,metric_domain='clamped_unit_rgb') for name, mask in floor_regions.items()}
                 del probe
             finally:
                 candidate.dc.copy_(saved_dc)
@@ -285,14 +441,14 @@ def main():
                 endpoints = []
                 for color in (0., 1.):
                     candidate.dc.fill_((color-.5)/.28209479177387814)
-                    probe = render_hybrid(v, teacher.surface, adapter,
+                    probe = audit_renderer(v, teacher.surface, adapter,
                         volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                     endpoints.append(probe.render+(1-probe.alpha)*background)
                     del probe
                 current_raw = updated.render+(1-updated.alpha)*background
                 probe_regions = {'canopy': canopy, 'rigid': rigid}
                 if index in LEAKAGE_ROIS:
-                    x0, y0, x1, y1 = LEAKAGE_ROIS[index]
+                    x0, y0, x1, y1 = scaled_regression_roi(LEAKAGE_ROIS[index],v.image_width,v.image_height)
                     roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
                     probe_regions['supplemental_leakage_roi'] = roi
                 records[-1]['color_feasibility'] = {name: color_feasibility(
@@ -303,11 +459,11 @@ def main():
         for roi_name, roi_map in (('preset_dense_roi', DENSE_ROIS), ('supplemental_leakage_roi', LEAKAGE_ROIS)):
             if index not in roi_map:
                 continue
-            x0, y0, x1, y1 = roi_map[index]
+            x0, y0, x1, y1 = scaled_regression_roi(roi_map[index],v.image_width,v.image_height)
             roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
             def psnr(rgb):
                 return float(-10*(rgb[:, roi]-target[:, roi]).square().mean().clamp_min(1e-12).log10()) if roi.any() else None
-            records[-1][roi_name] = dict(xyxy=roi_map[index], canopy_pixels=int(roi.sum()),
+            records[-1][roi_name] = dict(xyxy=[x0,y0,x1,y1], canopy_pixels=int(roi.sum()),
                 source_psnr=psnr(source_rgb), updated_psnr=psnr(updated_rgb),
                 source_surface_alpha=region_mean(original.surface_alpha, roi),
                 updated_surface_alpha=region_mean(updated.surface_alpha, roi),
@@ -317,7 +473,7 @@ def main():
             saved_logits = candidate.logits.clone()
             try:
                 candidate.logits.fill_(ceiling_logit)
-                ceiling = render_hybrid(v, teacher.surface, adapter,
+                ceiling = audit_renderer(v, teacher.surface, adapter,
                     volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                 blocked = canopy & (original.surface_alpha[0] > .25)
                 records[-1]['coverage_ceiling'] = dict(
@@ -328,7 +484,7 @@ def main():
                     high_surface_pixels_reduced_below_01=int((blocked & (ceiling.surface_alpha[0] < .1)).sum()),
                     scope='geometric_coverage_counterfactual_not_physical_leaf_truth')
                 if index in LEAKAGE_ROIS:
-                    x0, y0, x1, y1 = LEAKAGE_ROIS[index]
+                    x0, y0, x1, y1 = scaled_regression_roi(LEAKAGE_ROIS[index],v.image_width,v.image_height)
                     roi = torch.zeros_like(canopy); roi[y0:y1, x0:x1] = canopy[y0:y1, x0:x1]
                     records[-1]['coverage_ceiling']['supplemental_roi_surface_alpha'] = region_mean(ceiling.surface_alpha, roi)
                     records[-1]['coverage_ceiling']['supplemental_roi_volume_alpha'] = region_mean(ceiling.volume_alpha, roi)
@@ -338,7 +494,7 @@ def main():
                         near_opaque = ceiling_logit
                         candidate.logits.copy_(torch.maximum(saved_logits, near_opaque))
                         refined_base.opacity_logits[black_eligible] = torch.maximum(saved_persistent_logits, near_opaque)
-                        persistent_ceiling = render_hybrid(v, teacher.surface, adapter,
+                        persistent_ceiling = audit_renderer(v, teacher.surface, adapter,
                             volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                         ceiling_record = dict(canopy_surface_alpha=region_mean(persistent_ceiling.surface_alpha, canopy),
                             canopy_volume_alpha=region_mean(persistent_ceiling.volume_alpha, canopy),
@@ -347,10 +503,11 @@ def main():
                         if index in LEAKAGE_ROIS:
                             ceiling_record['supplemental_roi_surface_alpha'] = region_mean(persistent_ceiling.surface_alpha, roi)
                             ceiling_record['supplemental_roi_volume_alpha'] = region_mean(persistent_ceiling.volume_alpha, roi)
-                            black_probe = render_hybrid(v, teacher.surface, BlackRadianceCandidateView(refined_base, candidate),
+                            black_probe = audit_renderer(v, teacher.surface, BlackRadianceCandidateView(refined_base, candidate),
                                 volume_gate=torch.cat((gate, gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                             ceiling_record['supplemental_roi_building_floor'] = nonnegative_color_floor(
-                                black_probe.render, updated.render+(1-updated.alpha)*background, target, roi)
+                                black_probe.render, persistent_ceiling.render+(1-persistent_ceiling.alpha)*background,
+                                target, roi,metric_domain='clamped_unit_rgb')
                             ceiling_record['supplemental_roi_building_floor']['scope'] = 'surface_only_floor_at_near_opaque_persistent_and_candidate_counterfactual'
                             del black_probe
                         records[-1]['persistent_optical_ceiling'] = ceiling_record
@@ -359,7 +516,7 @@ def main():
                         refined_base.opacity_logits[black_eligible] = saved_persistent_logits
                         candidate.logits.fill_(ceiling_logit)
                 if a.intrinsic_coverage_probe:
-                    intrinsic = render_hybrid(v, teacher.surface, adapter,
+                    intrinsic = audit_renderer(v, teacher.surface, adapter,
                         surface_gate=torch.zeros(len(teacher.surface.get_xyz), device='cuda'),
                         volume_gate=torch.cat((torch.zeros_like(gate), gate.new_full((len(candidate.xyz),), candidate_gain))), **common)
                     alpha = intrinsic.volume_alpha[0]
@@ -399,6 +556,8 @@ def main():
     torch.save(dict(contribution_mass=mass.cpu(), evaluation_canopy_view_count=visible_views.cpu()),
                a.output/'contribution.pth')
     report = dict(scope='evaluation_only__not_verified_support_or_promotion_authority',
+                  leaf_optical_kernel=kernel,
+                  experimental_binary_sha256=manifest.get('experimental_binary_sha256'),
                   source_optics_refined=source_optics is not None,
                   source_position=(source_position.audit() if source_position is not None else None),
                   source_position_helper_sha256=manifest.get('source_position_helper_sha256'),

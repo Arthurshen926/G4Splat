@@ -4,10 +4,12 @@ import torch
 
 
 class FrozenReferenceCache:
-    def __init__(self, capacity=0):
+    def __init__(self, capacity=0, *, channels=3):
         if not isinstance(capacity, int) or not 0 <= capacity <= 512:
             raise ValueError('Bounded CPU reference cache required')
         self.capacity = capacity
+        if channels not in (1,3):raise ValueError('One-channel contribution or three-channel RGB required')
+        self.channels=channels
         self.values = OrderedDict()
         self.hits = self.misses = 0
 
@@ -20,7 +22,7 @@ class FrozenReferenceCache:
         else:
             self.misses += 1
             value = render().detach()
-            if value.ndim != 3 or value.shape[0] != 3 or not value.is_floating_point():
+            if value.ndim != 3 or value.shape[0] != self.channels or not value.is_floating_point():
                 raise ValueError('Unquantized CHW floating-point reference RGB required')
             if not self.capacity:
                 return value

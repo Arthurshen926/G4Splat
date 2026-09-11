@@ -2,16 +2,18 @@
 import torch
 
 
-def nonnegative_color_floor(black, current, target, mask):
+def nonnegative_color_floor(black, current, target, mask, *, metric_domain='raw'):
     """Allow arbitrary nonnegative leaf radiance, not just unit RGB."""
     if not (black.shape == current.shape == target.shape == (3, *mask.shape)):
         raise ValueError('Aligned CHW images required')
     if not all(torch.isfinite(t).all() for t in (black, current, target)) or (black > current+2e-5).any():
         raise ValueError('Removing nonnegative leaf radiance must not brighten pixels')
+    if metric_domain not in ('raw','clamped_unit_rgb'):raise ValueError('Explicit supported metric domain required')
+    if metric_domain=='clamped_unit_rgb':black,current=black.clamp(0,1),current.clamp(0,1)
     if not mask.any(): return dict(pixels=0)
     error = (current-target).square().mean(0)[mask]
     lower = (black-target).clamp_min(0).square().mean(0)[mask]
-    return dict(pixels=int(mask.sum()), below_black_floor_fraction=float(((target < black-1/255).any(0))[mask].float().mean()),
+    return dict(metric_domain=metric_domain,pixels=int(mask.sum()), below_black_floor_fraction=float(((target < black-1/255).any(0))[mask].float().mean()),
                 current_mse=float(error.mean()), minimum_nonnegative_color_mse=float(lower.mean()),
                 irreducible_error_fraction=float(lower.sum()/error.sum().clamp_min(1e-12)),
                 scope='all_persistent_leaf_colors_relaxed__fixed_opacity_geometry__not_training_truth')

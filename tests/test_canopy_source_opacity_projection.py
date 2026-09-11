@@ -1,5 +1,6 @@
 import torch
 from scripts.canopy_source_opacity_projection import project_source_opacity_
+from scripts.canopy_source_opacity_projection import LIVE_OPACITY_FLOOR
 
 
 def test_frozen_opacity_is_not_changed_by_post_step_projection():
@@ -16,3 +17,4 @@ def test_enabled_projection_preserves_unauthorized_rows():
     value = torch.tensor([[-30.], [30.], [30.]])
     project_source_opacity_(value, torch.tensor([True, True, False]), enabled=True)
     assert value[0] > -30 and value[1] < 30 and value[2] == 30
+    assert torch.allclose(value[0].sigmoid(),torch.tensor([LIVE_OPACITY_FLOOR]),rtol=1e-5,atol=0.)
