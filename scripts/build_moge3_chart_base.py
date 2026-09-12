@@ -30,6 +30,7 @@ from outdoor.moge3_evidence import (  # noqa: E402
     load_view as load_moge3_view,
     sha256_file,
 )
+from outdoor.moge3_depth_layers import reduce_depth_layers
 
 
 def _sha256(path: Path) -> str:
@@ -45,8 +46,10 @@ def _resize_scalar(
     valid: np.ndarray,
     shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    source = torch.from_numpy(np.asarray(value, dtype=np.float32))[None, None]
-    mask = torch.from_numpy(np.asarray(valid, dtype=np.float32))[None, None]
+    value = np.asarray(value, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool) & np.isfinite(value)
+    source = torch.from_numpy(np.where(valid, value, 0.))[None, None]
+    mask = torch.from_numpy(valid.astype(np.float32))[None, None]
     numerator = F.interpolate(source * mask, size=shape, mode="area")
     denominator = F.interpolate(mask, size=shape, mode="area")
     resized = numerator / denominator.clamp_min(1.0e-6)
@@ -59,10 +62,10 @@ def _resize_normal(
     valid: np.ndarray,
     shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    source = torch.from_numpy(
-        np.asarray(value, dtype=np.float32)
-    ).permute(2, 0, 1)[None]
-    mask = torch.from_numpy(np.asarray(valid, dtype=np.float32))[None, None]
+    value = np.asarray(value, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool) & np.isfinite(value).all(-1)
+    source = torch.from_numpy(np.where(valid[..., None], value, 0.)).permute(2, 0, 1)[None]
+    mask = torch.from_numpy(valid.astype(np.float32))[None, None]
     numerator = F.interpolate(source * mask, size=shape, mode="area")
     denominator = F.interpolate(mask, size=shape, mode="area")
     resized = numerator / denominator.clamp_min(1.0e-6)
@@ -105,6 +108,8 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--tree-mask-pickle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument('--depth-evidence-policy', choices=('legacy', 'layered'), default='legacy',
+                        help='Layered: preserve native depth proposals, reject mixed-cell base replacement, decouple normal validity')
     args = parser.parse_args()
 
     charts_path = args.charts_data.expanduser().resolve()
@@ -159,6 +164,8 @@ def main() -> None:
     direct_normals: list[np.ndarray] = []
     depth_normals: list[np.ndarray] = []
     depth_normal_valids: list[np.ndarray] = []
+    depth_valids: list[np.ndarray] = []
+    layer_records: list[dict] = []
     rigid_masks: list[np.ndarray] = []
     calibration_samples: list[np.ndarray] = []
     for chart_index, (name, stem) in enumerate(zip(names, stems)):
@@ -198,6 +205,11 @@ def main() -> None:
             & direct_valid
             & derived_valid
         )
+        independent_valid = depth_valid & refinement_valid & delta_valid
+        if args.depth_evidence_policy == 'layered':
+            layers = reduce_depth_layers(view['depth_m'], valid, shape)
+            layer_records.append(layers)
+            independent_valid &= layers['continuous_valid']
         rigid = masks.get_mask(
             name, shape, torch.device("cpu")
         ).numpy()
@@ -213,6 +225,8 @@ def main() -> None:
             & np.isfinite(chart_confidence[chart_index])
             & (chart_confidence[chart_index] > 0.0)
         )
+        if args.depth_evidence_policy == 'layered':
+            calibration_valid &= independent_valid
         calibration_samples.append(
             np.log(
                 reference_metric[chart_index][calibration_valid]
@@ -229,6 +243,7 @@ def main() -> None:
         direct_normals.append(direct)
         depth_normals.append(derived)
         depth_normal_valids.append(combined_valid)
+        depth_valids.append(independent_valid)
         rigid_masks.append(rigid)
 
     scale_audit = robust_scene_scale(calibration_samples)
@@ -240,6 +255,8 @@ def main() -> None:
         "validity": [],
         "moge3_precision": [],
         "moge3_adaptive_weight": [],
+        "moge3_depth_valid": [],
+        "moge3_normal_valid": [],
     }
     for chart_index in range(len(names)):
         matcha_base = np.where(
@@ -253,7 +270,8 @@ def main() -> None:
             rigid_valid=(
                 rigid_masks[chart_index]
                 & reference_mask[chart_index]
-                & depth_normal_valids[chart_index]
+                & (depth_valids[chart_index] if args.depth_evidence_policy == 'layered'
+                   else depth_normal_valids[chart_index])
             ),
             refinement_sigma=np.sqrt(
                 refinement_sigmas[chart_index] ** 2 + global_sigma**2
@@ -261,10 +279,14 @@ def main() -> None:
             normal_direct_camera=direct_normals[chart_index],
             normal_depth_camera=depth_normals[chart_index],
             depth_normal_valid=depth_normal_valids[chart_index],
+            depth_valid_independent_of_normal=args.depth_evidence_policy == 'layered',
         )
         for key in outputs:
             outputs[key].append(variants[key])
     arrays = {key: np.stack(value) for key, value in outputs.items()}
+    if layer_records:
+        for key in layer_records[0]:
+            arrays['native_layer_' + key] = np.stack([r[key] for r in layer_records])
     metadata = {
         "schema_version": MOGE3_CHART_BASE_VERSION,
         "depth_units": "cambridge_metric_camera_z",
@@ -281,6 +303,9 @@ def main() -> None:
         },
         "camera_count": len(names),
         "shape": list(shape),
+        "depth_evidence_policy": args.depth_evidence_policy,
+        "native_layer_depth_units": "moge_raw_metric_camera_z",
+        "native_layer_authority": "unverified_samples_with_original_integer_pixel_indices_not_cell_center_geometry",
     }
     payload = {
         "schema_version": np.asarray(MOGE3_CHART_BASE_VERSION),

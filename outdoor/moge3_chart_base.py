@@ -106,6 +106,7 @@ def chart_base_variants(
     normal_direct_camera: np.ndarray,
     normal_depth_camera: np.ndarray,
     depth_normal_valid: np.ndarray,
+    depth_valid_independent_of_normal: bool = False,
 ) -> dict[str, np.ndarray]:
     """Build direct and adaptive Chart bases without erasing MAtCha holes."""
     matcha = np.asarray(matcha_depth_m, dtype=np.float32)
@@ -164,10 +165,16 @@ def chart_base_variants(
     agreement = 1.0 / (
         1.0 + np.square((log_matcha - log_moge) / 0.12)
     )
-    valid = rigid & moge_valid & normal_valid
+    valid = rigid & moge_valid & np.isfinite(sigma)
+    if not depth_valid_independent_of_normal:
+        valid &= normal_valid
+    # Missing normals supply no agreement evidence, but do not invalidate a
+    # depth measurement. This explicit policy is for new source archives;
+    # existing archives retain their original numerical interpretation.
+    normal_factor = np.where(normal_valid, normal_agreement, 1.0)
     precision = np.where(
         valid,
-        refinement_precision * normal_agreement * boundary_precision,
+        refinement_precision * normal_factor * boundary_precision,
         0.0,
     ).astype(np.float32)
     # MAtCha/MASt3R remains the multiview authority.  Disagreement therefore
@@ -196,6 +203,8 @@ def chart_base_variants(
         "validity": output_valid.astype(np.uint8),
         "moge3_precision": precision,
         "moge3_adaptive_weight": adaptive_weight,
+        "moge3_depth_valid": valid.astype(np.uint8),
+        "moge3_normal_valid": (valid & normal_valid).astype(np.uint8),
     }
 
 
